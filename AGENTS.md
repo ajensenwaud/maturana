@@ -18,8 +18,8 @@ Maturan combines the elegance of Unix, the agentic engineering workflow of Codex
 
 ## Getting started
 1. Clone the repo from Github
-2. Run `./install.sh` which fetches the runtime and hypervisor componetns
-3. Open Codex
+2. Run `./install.sh` which fetches the necessary components, runtim, and hypervisor components and installs them
+3. Open Codex in the folder
 4. Codex initialises the Maturna framework (skills and tools) for engineering agents
 5. Codex writes or edits a a `MATURANA.md` agent spec.
 6. Maturana materializes the spec as a Firecracker (Linux) or Hyper-V- (Windows) -backed agent.
