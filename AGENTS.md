@@ -1,6 +1,6 @@
 # Maturana
 
-> Secure agentic orchestration platform built on Codex
+> Secure multi-platform agentic orchestration platform built on Codex
 
 ## Motivation
 There is a ton of agent harnesses and agentic orchestration platform out there from industry leasers like OpenClaw and Hermes to commercial engineering focused multi-agent platforms like Devin. However, most of these platforms are built for features, not security. Platforms like OpenClaw and Hermes have almost unlimited flexbiltiy given their architecture, but it comes at the cost of an increased attack surface. Their software is now so complex that they need vetted shells from vendors such as NVIDIA and Microsoft to reduce the security exposure. 
@@ -39,7 +39,7 @@ Codex is the product surface for defining, configuring, building, and running th
 - `MATURANA.md` is the agent contract: identity, scope, harness,
   capabilities, memory, tools, skills, schedules, and channels.
 - The Rust core is a small runtime
-- Every agent runs in its own Hyper-VM or Firecrackre VM.
+- Every agent runs in its own Hyper-VM or Firecracker VM.
 - The VM agentic runtime is agnostic: Codex, Claude Code, and OpenCode are
   first-class guest harnesses, but it should be extensible to support other harnesses later on (e.g. Grok Build)
 
@@ -61,10 +61,11 @@ Codex is the product surface for defining, configuring, building, and running th
 - Agents communicate with users through a consoloe TUI, Telegram, and Discord.
 - Credentials (except OAuth tokens for OpenAI and Claude Code) are handled through a Pipelock-style egress governance and credentials handling module.  
 - Maturana can stop, snaphot and rewind an agent to a desired snapshot in case of a fault or compromise. This is done using skills that invoke system calls through Rust runtime.
+- Maturana supports guest VM agent harnesses (Claude Code, Codex) that use OAuth (subscription) for authentication. OAuth credentials need to be injected into to the VMs from the hos at runtime.
 
 ## Architecture
 
-### Codex skill framework
+### Codex skills framework
 Maturana ships a set of Codex skill. The skill pack is the main product
 interface. It gives Codex procedures, templates, validations, and tool
 bindings for agent engineering.
@@ -142,3 +143,6 @@ On Linux, the Firecracker guest OS of course Linux. On Windows, the Hyper-V gues
 2. Treat Codex skills as the primary user-facing surface.
 3. Keep the core small and move extension behavior into skills or tools
 4. Keep it simple - composable Unix-like tool over complex monoliths
+5. Keep it simple, stupid. Prefer direct, boring, skill-invoked workflows
+   over clever automation. Use known-good VM images in their native format
+   before building conversion or provisioning machinery.
