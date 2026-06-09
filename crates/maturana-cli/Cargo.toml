@@ -20,3 +20,9 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 ureq = { version = "2.10.1", features = ["json"] }
+
+[features]
+default = []
+# Build the maturana binary with the WebAssembly tool engine so `maturana tool
+# run` can actually execute tools (otherwise it explains the engine is absent).
+wasm-runtime = ["maturana-core/wasm-runtime"]

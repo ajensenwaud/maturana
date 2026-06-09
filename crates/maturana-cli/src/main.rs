@@ -9,7 +9,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use maturana_core::{
     audit::{append_event, AuditEvent},
     inspect_agent, materialize_agent,
+    orchestrator::{plan_processes, AgentRuntime, OrchestratorConfig, SupervisedProcess},
     pipelock::PipelockVault,
+    improvement::TrajectoryStore,
+    tools::{run_tool, Capabilities, ResourceLimits, ToolManifest, ToolRegistry},
     pipelock_proxy::{ensure_mitm_ca_cert, run_proxy, HeaderInjection, ProxyConfig},
     secrets::resolve_secret_source_with_home,
     session_db::{ensure_session, insert_inbound, list_undelivered, mark_delivered, session_paths},
@@ -71,8 +74,136 @@ enum Command {
     Skill(SkillCommand),
     Channel(ChannelCommand),
     Session(SessionCommand),
+    Up(UpCommand),
+    Tool(ToolCommand),
+    Improve(ImproveCommand),
     Doctor(DoctorCommand),
     Repair(RepairCommand),
+}
+
+/// Self-improvement flywheel: capture agent trajectories, attach reward
+/// signals, and curate training/preference datasets.
+#[derive(Debug, Args)]
+struct ImproveCommand {
+    #[command(subcommand)]
+    command: ImproveSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ImproveSubcommand {
+    /// Record one agent turn as a trajectory.
+    Record {
+        agent_id: String,
+        #[arg(long, default_value = "telegram-main")]
+        session_id: String,
+        #[arg(long, default_value = "chat")]
+        kind: String,
+        #[arg(long)]
+        input: String,
+        #[arg(long)]
+        output: String,
+        #[arg(long, default_value = "[]")]
+        tool_calls: String,
+    },
+    /// Attach a reward signal to a trajectory (or the latest one for an agent).
+    Reward {
+        #[arg(long, conflicts_with_all = ["agent_id", "session_id"])]
+        trajectory_id: Option<String>,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long, default_value = "telegram-main")]
+        session_id: String,
+        #[arg(long, default_value = "user")]
+        source: String,
+        #[arg(long, allow_hyphen_values = true)]
+        value: f64,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// List curated examples at or above a reward threshold.
+    Curate {
+        #[arg(long, default_value_t = 1.0, allow_hyphen_values = true)]
+        min_reward: f64,
+        #[arg(long)]
+        jsonl: bool,
+    },
+    /// Summary of the trajectory/reward corpus.
+    Report {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Author, register, and run sandboxed WebAssembly tools that agents build on
+/// the fly. Tools live under `<home>/tools/<name>/`.
+#[derive(Debug, Args)]
+struct ToolCommand {
+    #[command(subcommand)]
+    command: ToolSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ToolSubcommand {
+    /// Register a compiled `.wasm` module under a manifest into the registry.
+    Register {
+        name: String,
+        #[arg(long)]
+        wasm: PathBuf,
+        /// Optional manifest JSON; defaults to a pure-compute manifest.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+        #[arg(long, default_value = "0.1.0")]
+        version: String,
+        #[arg(long, default_value = "")]
+        description: String,
+    },
+    /// List registered tools.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a tool's manifest.
+    Inspect { name: String },
+    /// Run a registered tool with a JSON input (requires the wasm-runtime build).
+    Run {
+        name: String,
+        #[arg(long, default_value = "{}")]
+        input: String,
+        #[arg(long)]
+        input_file: Option<PathBuf>,
+        /// Record this run as a self-improvement trajectory step.
+        #[arg(long)]
+        agent_id: Option<String>,
+    },
+}
+
+/// Supervise the host runtime plane (sessiond + per-agent channel bridges and
+/// schedule runners) as one coherent, restart-on-failure process group.
+#[derive(Debug, Args)]
+struct UpCommand {
+    /// Agents to run. Defaults to every materialized agent under the home.
+    #[arg(long = "agent-id")]
+    agent_ids: Vec<String>,
+    #[arg(long, default_value = "0.0.0.0:47834")]
+    sessiond_bind: String,
+    #[arg(long, env = "MATURANA_SESSIOND_TOKEN")]
+    sessiond_token: Option<String>,
+    #[arg(long, default_value = "telegram-main")]
+    session_id: String,
+    #[arg(long, default_value = "pipelock:telegram/bot-token")]
+    telegram_token_source: String,
+    #[arg(long)]
+    no_telegram: bool,
+    #[arg(long)]
+    no_schedules: bool,
+    #[arg(long, default_value_t = 5)]
+    channel_poll_seconds: u64,
+    #[arg(long, default_value_t = 60)]
+    schedule_poll_seconds: u64,
+    /// Print the resolved process plan and the canonical guest session ids,
+    /// then exit without launching anything.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1025,6 +1156,9 @@ fn main() -> anyhow::Result<()> {
         Command::Skill(command) => handle_skill(command)?,
         Command::Channel(command) => handle_channel(command, &home)?,
         Command::Session(command) => handle_session(command, &home)?,
+        Command::Up(command) => run_up(&home, command)?,
+        Command::Tool(command) => run_tool_command(&home, command)?,
+        Command::Improve(command) => run_improve_command(&home, command)?,
         Command::Doctor(command) => run_doctor(&home, command)?,
         Command::Repair(command) => run_repair(&home, command)?,
     }
@@ -1255,6 +1389,321 @@ struct DoctorAgentReport {
 struct DoctorCheck {
     ok: bool,
     message: String,
+}
+
+fn tool_registry(home: &MaturanaHome) -> ToolRegistry {
+    ToolRegistry::new(home.root().join("tools"))
+}
+
+fn run_tool_command(home: &MaturanaHome, command: ToolCommand) -> anyhow::Result<()> {
+    let registry = tool_registry(home);
+    match command.command {
+        ToolSubcommand::Register {
+            name,
+            wasm,
+            manifest,
+            version,
+            description,
+        } => {
+            let wasm_bytes = fs::read(&wasm)
+                .with_context(|| format!("failed to read wasm {}", wasm.display()))?;
+            let manifest = match manifest {
+                Some(path) => {
+                    let raw = fs::read_to_string(&path)
+                        .with_context(|| format!("failed to read {}", path.display()))?;
+                    let mut parsed: ToolManifest = serde_json::from_str(&raw)
+                        .with_context(|| format!("failed to parse manifest {}", path.display()))?;
+                    parsed.name = name.clone();
+                    parsed
+                }
+                None => ToolManifest {
+                    name: name.clone(),
+                    version,
+                    description,
+                    wasm: "module.wasm".to_string(),
+                    capabilities: Capabilities::default(),
+                    limits: ResourceLimits::default(),
+                    input_schema: serde_json::Value::Null,
+                    output_schema: serde_json::Value::Null,
+                },
+            };
+            let stored = registry.register(&manifest, &wasm_bytes)?;
+            audit_agent_event(
+                home,
+                &name,
+                "tool.register",
+                format!("registered wasm tool {} v{}", stored.name, stored.version),
+            )
+            .ok();
+            println!(
+                "registered tool {} v{} ({})",
+                stored.name,
+                stored.version,
+                registry.tool_dir(&stored.name).display()
+            );
+            if !stored.capabilities.is_pure() {
+                println!(
+                    "capabilities: fs_read={:?} fs_write={:?} env={:?} net={:?}",
+                    stored.capabilities.fs_read,
+                    stored.capabilities.fs_write,
+                    stored.capabilities.env,
+                    stored.capabilities.net
+                );
+            }
+        }
+        ToolSubcommand::List { json } => {
+            let tools = registry.list()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&tools)?);
+            } else if tools.is_empty() {
+                println!("no tools registered under {}", registry.root().display());
+            } else {
+                for tool in tools {
+                    println!(
+                        "{} v{} pure={} :: {}",
+                        tool.name,
+                        tool.version,
+                        tool.capabilities.is_pure(),
+                        tool.description
+                    );
+                }
+            }
+        }
+        ToolSubcommand::Inspect { name } => {
+            let manifest = registry.load(&name)?;
+            println!("{}", serde_json::to_string_pretty(&manifest)?);
+        }
+        ToolSubcommand::Run {
+            name,
+            input,
+            input_file,
+            agent_id,
+        } => {
+            let input = match input_file {
+                Some(path) => fs::read_to_string(&path)
+                    .with_context(|| format!("failed to read {}", path.display()))?,
+                None => input,
+            };
+            let result = run_tool(&registry, &name, &input)?;
+            if let Some(agent_id) = agent_id {
+                audit_agent_event(
+                    home,
+                    &agent_id,
+                    "tool.run",
+                    format!(
+                        "ran tool {} ok={} duration_ms={}",
+                        result.tool, result.ok, result.duration_ms
+                    ),
+                )
+                .ok();
+            }
+            print!("{}", result.stdout);
+            if !result.stdout.ends_with('\n') && !result.stdout.is_empty() {
+                println!();
+            }
+            if !result.ok {
+                anyhow::bail!("tool {} failed: {}", result.tool, result.stderr.trim());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_improve_command(home: &MaturanaHome, command: ImproveCommand) -> anyhow::Result<()> {
+    let store = TrajectoryStore::open(&TrajectoryStore::store_path(home.root()))?;
+    match command.command {
+        ImproveSubcommand::Record {
+            agent_id,
+            session_id,
+            kind,
+            input,
+            output,
+            tool_calls,
+        } => {
+            let id = store.record(&agent_id, &session_id, &kind, &input, &output, &tool_calls)?;
+            println!("recorded trajectory {id}");
+        }
+        ImproveSubcommand::Reward {
+            trajectory_id,
+            agent_id,
+            session_id,
+            source,
+            value,
+            note,
+        } => match (trajectory_id, agent_id) {
+            (Some(id), _) => {
+                store.attach_reward(&id, &source, value, note.as_deref())?;
+                println!("rewarded {id} ({source} {value:+})");
+            }
+            (None, Some(agent_id)) => {
+                match store.reward_latest(&agent_id, &session_id, &source, value, note.as_deref())? {
+                    Some(id) => println!("rewarded latest trajectory {id} ({source} {value:+})"),
+                    None => println!("no trajectory for {agent_id}/{session_id} to reward"),
+                }
+            }
+            (None, None) => anyhow::bail!("pass --trajectory-id or --agent-id"),
+        },
+        ImproveSubcommand::Curate { min_reward, jsonl } => {
+            if jsonl {
+                print!("{}", store.export_sft_jsonl(min_reward)?);
+            } else {
+                let curated = store.curate(min_reward)?;
+                if curated.is_empty() {
+                    println!("no trajectories at or above reward {min_reward}");
+                }
+                for example in curated {
+                    println!(
+                        "{} reward={:+} ({} signals) :: {}",
+                        example.trajectory.id,
+                        example.reward.total,
+                        example.reward.count,
+                        truncate_inline(&example.trajectory.input, 60)
+                    );
+                }
+            }
+        }
+        ImproveSubcommand::Report { json } => {
+            let report = store.report()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("trajectories: {}", report.trajectories);
+                println!("rewarded: {}", report.rewarded);
+                println!("net-positive: {}", report.positive);
+                println!("net-negative: {}", report.negative);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn truncate_inline(value: &str, limit: usize) -> String {
+    let value = value.replace('\n', " ");
+    if value.chars().count() <= limit {
+        value
+    } else {
+        value.chars().take(limit).collect::<String>() + "…"
+    }
+}
+
+fn build_orchestrator_config(
+    home: &MaturanaHome,
+    command: &UpCommand,
+) -> anyhow::Result<OrchestratorConfig> {
+    let agent_ids = if command.agent_ids.is_empty() {
+        discover_agent_ids(home)?
+    } else {
+        command.agent_ids.clone()
+    };
+    if agent_ids.is_empty() {
+        anyhow::bail!(
+            "no agents to supervise; launch one with `maturana agent launch` or pass --agent-id"
+        );
+    }
+    let agents = agent_ids
+        .into_iter()
+        .map(|agent_id| AgentRuntime {
+            agent_id,
+            session_id: command.session_id.clone(),
+            telegram: !command.no_telegram,
+            telegram_token_source: command.telegram_token_source.clone(),
+            schedules: !command.no_schedules,
+        })
+        .collect();
+    Ok(OrchestratorConfig {
+        sessiond_bind: command.sessiond_bind.clone(),
+        sessiond_token: command.sessiond_token.clone(),
+        channel_poll_seconds: command.channel_poll_seconds,
+        schedule_poll_seconds: command.schedule_poll_seconds,
+        agents,
+    })
+}
+
+fn run_up(home: &MaturanaHome, command: UpCommand) -> anyhow::Result<()> {
+    let config = build_orchestrator_config(home, &command)?;
+    let plan = plan_processes(&config);
+
+    if command.dry_run {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+        println!("\nguest workers must claim from these session ids:");
+        for agent in &config.agents {
+            println!("  {} -> {}", agent.agent_id, agent.session_id);
+        }
+        return Ok(());
+    }
+
+    supervise_plan(home, &plan)
+}
+
+struct Supervised {
+    process: SupervisedProcess,
+    child: std::process::Child,
+    started_at: Instant,
+    restarts: u32,
+}
+
+fn spawn_supervised(
+    home: &MaturanaHome,
+    process: &SupervisedProcess,
+) -> anyhow::Result<std::process::Child> {
+    let exe = std::env::current_exe().context("failed to resolve maturana executable path")?;
+    ProcessCommand::new(exe)
+        .arg("--home")
+        .arg(home.root())
+        .args(&process.args)
+        .stdin(Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to spawn {}", process.name))
+}
+
+fn supervise_plan(home: &MaturanaHome, plan: &[SupervisedProcess]) -> anyhow::Result<()> {
+    let mut supervised = Vec::new();
+    for process in plan {
+        let child = spawn_supervised(home, process)?;
+        println!("up: started {} (pid {})", process.name, child.id());
+        supervised.push(Supervised {
+            process: process.clone(),
+            child,
+            started_at: Instant::now(),
+            restarts: 0,
+        });
+    }
+
+    loop {
+        for slot in supervised.iter_mut() {
+            match slot.child.try_wait() {
+                Ok(Some(status)) => {
+                    if slot.process.critical {
+                        anyhow::bail!(
+                            "critical process {} exited with {status}; shutting down the plane",
+                            slot.process.name
+                        );
+                    }
+                    // Reset the restart counter after a process has stayed up a
+                    // while, so a flaky transient does not exhaust the budget.
+                    if slot.started_at.elapsed() > Duration::from_secs(60) {
+                        slot.restarts = 0;
+                    }
+                    let backoff = Duration::from_secs((1u64 << slot.restarts.min(4)).min(16));
+                    eprintln!(
+                        "up: {} exited with {status}; restarting in {}s",
+                        slot.process.name,
+                        backoff.as_secs()
+                    );
+                    thread::sleep(backoff);
+                    slot.child = spawn_supervised(home, &slot.process)?;
+                    slot.started_at = Instant::now();
+                    slot.restarts = slot.restarts.saturating_add(1);
+                    println!("up: restarted {} (pid {})", slot.process.name, slot.child.id());
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("up: failed to poll {}: {error}", slot.process.name);
+                }
+            }
+        }
+        thread::sleep(Duration::from_secs(2));
+    }
 }
 
 fn run_doctor(home: &MaturanaHome, command: DoctorCommand) -> anyhow::Result<()> {
