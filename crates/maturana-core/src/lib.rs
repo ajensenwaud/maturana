@@ -1,5 +1,8 @@
+pub mod animation;
 pub mod audit;
+pub mod improvement;
 pub mod materialize;
+pub mod orchestrator;
 pub mod pipelock;
 pub mod pipelock_proxy;
 pub mod providers;
@@ -8,6 +11,7 @@ pub mod session_db;
 pub mod snapshots;
 pub mod spec;
 pub mod state;
+pub mod tools;
 pub mod validation;
 pub mod worker;
 
