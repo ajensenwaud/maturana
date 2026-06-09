@@ -11,24 +11,24 @@ $imagePath = Join-Path $repoRoot ".maturana\images\ubuntu-noble\noble-server-clo
 
 Push-Location $repoRoot
 try {
+    Write-Host "Building maturana CLI with the Windows GNU toolchain..."
+    & .\scripts\maturana.ps1 --help | Out-Null
+
     Write-Host "Preparing agent SSH key..."
-    & .\scripts\init-agent-ssh-key.ps1
+    & .\scripts\maturana.ps1 repair ssh-key
 
     if (!$SkipImage) {
         if ($ForceImage -or !(Test-Path -LiteralPath $imagePath)) {
             Write-Host "Preparing official Ubuntu Hyper-V image..."
             $imageArgs = @()
             if ($ForceImage) {
-                $imageArgs += "-Force"
+                $imageArgs += "--force"
             }
-            & .\scripts\get-ubuntu-cloudimg.ps1 @imageArgs
+            & .\scripts\maturana.ps1 repair ubuntu-cloudimg @imageArgs
         } else {
             Write-Host "Using existing Ubuntu Hyper-V image: $imagePath"
         }
     }
-
-    Write-Host "Building maturana CLI with the Windows GNU toolchain..."
-    & .\scripts\maturana.ps1 --help | Out-Null
 
     if (!$SkipHostd) {
         Write-Host "Installing privileged host daemon. Windows may show one UAC prompt."

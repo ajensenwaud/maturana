@@ -122,6 +122,30 @@ pub struct DeployCommand {
     pub command: DeploySubcommand,
 }
 
+#[derive(Debug, Args)]
+pub struct DevelopCommand {
+    #[command(subcommand)]
+    pub command: DevelopSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DevelopSubcommand {
+    Skill {
+        name: String,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long, default_value = "skills")]
+        root: PathBuf,
+    },
+    Tool {
+        name: String,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long, default_value = "tools")]
+        root: PathBuf,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 pub enum DeploySubcommand {
     Skill(DeployItem),
@@ -246,6 +270,21 @@ pub fn handle_deploy(command: DeployCommand, home: &MaturanaHome) -> anyhow::Res
     match command.command {
         DeploySubcommand::Skill(item) => deploy_item(home, DeployKind::Skill, item),
         DeploySubcommand::Tool(item) => deploy_item(home, DeployKind::Tool, item),
+    }
+}
+
+pub fn handle_develop(command: DevelopCommand) -> anyhow::Result<()> {
+    match command.command {
+        DevelopSubcommand::Skill {
+            name,
+            description,
+            root,
+        } => scaffold_skill(&root, &name, description.as_deref()),
+        DevelopSubcommand::Tool {
+            name,
+            description,
+            root,
+        } => scaffold_tool(&root, &name, description.as_deref()),
     }
 }
 
@@ -569,14 +608,7 @@ fn enqueue_schedule(
         "scheduled_at": now,
     })
     .to_string();
-    let id = insert_inbound(
-        &paths,
-        "schedule",
-        channel,
-        &schedule.id,
-        None,
-        &content,
-    )?;
+    let id = insert_inbound(&paths, "schedule", channel, &schedule.id, None, &content)?;
     append_event(
         home.audit_dir().join(format!("{agent_id}.jsonl")),
         &AuditEvent {
@@ -710,6 +742,43 @@ fn deploy_item(home: &MaturanaHome, kind: DeployKind, item: DeployItem) -> anyho
     Ok(())
 }
 
+fn scaffold_skill(root: &Path, name: &str, description: Option<&str>) -> anyhow::Result<()> {
+    let slug = slugify(name);
+    let dir = root.join(&slug);
+    fs::create_dir_all(&dir)?;
+    let description = description.unwrap_or("Use this skill for a Maturana capability.");
+    write_if_missing(
+        &dir.join("SKILL.md"),
+        &format!(
+            "# {slug}\n\n{description}\n\nThis is a state-aware Maturana workflow. Keep the implementation small, but do not collapse it into a thin CLI wrapper.\n\n## Grounding\n\n1. Read `/agent/MATURANA.md`, `/agent/AGENTS.md`, and `/agent/SOUL.md`.\n2. Identify the target agent, harness, allowed capabilities, and relevant memory/wiki context.\n3. Inspect existing skills and tools before creating duplicate behavior.\n\n## Preflight\n\n- Confirm the requested action is inside the agent contract.\n- Confirm required credentials are available through the approved path.\n- Confirm no raw secrets will be written to specs, source, logs, or audit output.\n- Confirm the smallest useful verification command before changing state.\n\n## Decision Path\n\n- If the task is policy or procedure, keep it in this skill.\n- If the task needs side effects, call an approved tool or Maturana command.\n- If the task needs a new executable capability, develop a tool first and deploy it separately.\n- If the task is outside the contract, stop and ask for an updated spec.\n\n## Actions\n\n1. Gather the minimum evidence needed for the task.\n2. Run the smallest approved command or tool invocation.\n3. Record durable facts in `/memory/MEMORY.md` only when they should survive future sessions.\n4. Prefer wiki updates for reusable shared context.\n\n## Evidence\n\nBefore claiming success, collect:\n\n- The relevant contract or policy file path.\n- The command/tool output or file change that proves the action completed.\n- Any audit entry, heartbeat, snapshot, or deploy evidence created by the action.\n- Any memory or wiki update made intentionally.\n\n## Recovery\n\n- Missing contract: inspect or initialize the agent before continuing.\n- Missing credential: request or configure the approved credential source; do not paste secrets into files.\n- Failed command: inspect logs/audit before retrying.\n- Out-of-scope request: update `MATURANA.md` and validate before acting.\n\n## Boundaries\n\n- Do not bypass spec validation.\n- Do not add a command queue or generic host command endpoint.\n- Do not store raw secrets in source, docs, memory, wiki, or audit logs.\n- Do not use shell scripts for provider state machines.\n- Do not deploy untested tools into a guest VM.\n"
+        ),
+        false,
+    )?;
+    println!("skill scaffolded: {}", dir.display());
+    Ok(())
+}
+
+fn scaffold_tool(root: &Path, name: &str, description: Option<&str>) -> anyhow::Result<()> {
+    let slug = slugify(name);
+    let dir = root.join(&slug);
+    fs::create_dir_all(&dir)?;
+    write_if_missing(
+        &dir.join("README.md"),
+        &format!(
+            "# {slug}\n\n{}\n\nBuild and test this tool in Codex, then deploy it with `maturana deploy tool`.\n",
+            description.unwrap_or("A Maturana guest tool.")
+        ),
+        false,
+    )?;
+    write_if_missing(
+        &dir.join("run.sh"),
+        "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"tool scaffold: replace me\"\n",
+        false,
+    )?;
+    println!("tool scaffolded: {}", dir.display());
+    Ok(())
+}
+
 fn write_if_missing(path: &Path, contents: &str, force: bool) -> anyhow::Result<()> {
     if path.exists() && !force {
         return Ok(());
@@ -726,6 +795,10 @@ fn wiki_dir(home: &MaturanaHome) -> PathBuf {
 
 fn schedules_path(home: &MaturanaHome, agent_id: &str) -> PathBuf {
     home.agent_dir(agent_id).join("schedules/schedules.json")
+}
+
+fn schedule_last_run_path(home: &MaturanaHome, agent_id: &str) -> PathBuf {
+    home.agent_dir(agent_id).join("schedules/last-run.json")
 }
 
 fn append_wiki_index(
@@ -824,6 +897,13 @@ fn write_schedules(path: &Path, schedules: &[ScheduleRecord]) -> anyhow::Result<
     }
     fs::write(path, serde_json::to_string_pretty(schedules)?)
         .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn read_schedule_runs(path: &Path) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    if !path.exists() {
+        return Ok(std::collections::HashMap::new());
+    }
+    Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
 }
 
 fn run_scp(
@@ -991,6 +1071,51 @@ mod tests {
         assert_eq!(schedules[0].id, "morning-brief");
         assert_eq!(schedules[0].cron, "30 9 * * *");
         assert_eq!(schedules[0].channel.as_deref(), Some("discord"));
+    }
+
+    #[test]
+    fn schedule_run_due_enqueues_once_per_minute() {
+        let home = test_home("schedule-run-due");
+        add_schedule(&home, "demo", "Every Minute", "* * * * *", "ping", None).unwrap();
+        run_due_schedules(&home, "demo", "main", Some("2026-06-08T12:34:00Z")).unwrap();
+        run_due_schedules(&home, "demo", "main", Some("2026-06-08T12:34:30Z")).unwrap();
+        let paths = session_paths(&home.agent_dir("demo"), "main");
+        let messages = maturana_core::session_db::claim_pending_inbound(&paths, 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].kind, "schedule");
+        assert!(messages[0].content.contains("ping"));
+    }
+
+    #[test]
+    fn cron_matching_supports_steps_ranges_and_lists() {
+        let now = DateTime::parse_from_rfc3339("2026-06-08T12:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(cron_matches("*/5 12 * * *", now).unwrap());
+        assert!(cron_matches("15,30,45 10-13 * * *", now).unwrap());
+        assert!(!cron_matches("31 12 * * *", now).unwrap());
+    }
+
+    #[test]
+    fn scaffold_skill_and_tool_create_expected_files() {
+        let home = test_home("develop");
+        scaffold_skill(&home.root().join("skills"), "Example Skill", Some("Demo")).unwrap();
+        scaffold_tool(&home.root().join("tools"), "Example Tool", Some("Demo")).unwrap();
+        let skill = fs::read_to_string(home.root().join("skills/example-skill/SKILL.md")).unwrap();
+        for section in [
+            "## Grounding",
+            "## Preflight",
+            "## Decision Path",
+            "## Actions",
+            "## Evidence",
+            "## Recovery",
+            "## Boundaries",
+        ] {
+            assert!(skill.contains(section), "missing {section}");
+        }
+        assert!(!skill.contains("## Procedure"));
+        assert!(skill.contains("do not collapse it into a thin CLI wrapper"));
+        assert!(home.root().join("tools/example-tool/run.sh").exists());
     }
 
     #[test]

@@ -1,13 +1,23 @@
 # Harness operations
 
-Maturana's Windows MVP has four moving parts:
+Maturana's Windows Hyper-V path has four moving parts:
 
-- `maturana-hostd.ps1`: tracks and launches Hyper-V VMs.
+- `maturana hostd serve`: exposes fixed Hyper-V lifecycle endpoints.
 - `maturana session serve`: host-side session bridge used by guest workers.
 - `maturana channel serve telegram`: one Telegram runner per agent.
 - `/opt/maturana/bin/run-agent.sh`: guest worker loop that calls Codex, Claude Code, or OpenCode inside the VM.
 
 Keep the model simple: channels receive messages, `sessiond` stores turns, guest workers run the selected harness, channels deliver replies.
+
+Hyper-V launch is a synchronous operator action: Rust renders the launch
+artifacts, hostd invokes the fixed Ubuntu launcher, and the CLI receives the
+launcher result directly. Hostd does not queue generic jobs or execute arbitrary
+commands.
+
+`maturana agent run` follows that same path: it enqueues a CLI message into the
+agent session and optionally waits for the matching outbound response. It does
+not write `/agent/prompt.txt`, write `/agent/run-command`, or restart the guest
+service for normal turns.
 
 ## Health
 
@@ -30,21 +40,35 @@ Use JSON for automation:
 .\target\x86_64-pc-windows-msvc\debug\maturana.exe doctor --json
 ```
 
-## Repair
-
-Restart the local session bridge and all configured Telegram channel runners:
+Inspect one live VM and, when needed, its guest harness state:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\repair-windows-harnesses.ps1
+.\scripts\maturana.ps1 agent inspect codex-demo --live
+.\scripts\maturana.ps1 agent inspect codex-demo --live --guest
+```
+
+`--guest` runs the narrow SSH diagnostic from Rust: harness versions, systemd
+state, heartbeat, last message, agent log tail, and browser smoke output when
+`browser.headless_chrome: true` is set in the materialized spec.
+
+## Repair
+
+Restart the local session bridge, refresh guest workers, start Telegram channel
+runners, and run doctor:
+
+```powershell
+.\scripts\maturana.ps1 repair windows-harnesses
 ```
 
 Install persistent scheduled tasks instead of direct background processes:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\repair-windows-harnesses.ps1 -RegisterTasks
+.\scripts\maturana.ps1 repair windows-harnesses --register-tasks
 ```
 
-The repair script does not rebuild VMs. It only restarts host-side harness plumbing.
+The repair command does not rebuild VMs. It owns the repair decision path and
+guest worker rendering in Rust, then uses narrow host adapters only for task
+registration.
 
 ## Files
 
@@ -56,4 +80,8 @@ The repair script does not rebuild VMs. It only restarts host-side harness plumb
 
 ## Rule of Thumb
 
-If Telegram does not reply, run `maturana doctor` first. If the VM is running but Telegram or worker heartbeat is stale, run `repair-windows-harnesses.ps1`. If the VM itself is missing or has no IP, relaunch that VM from its `MATURANA.md` or launch script.
+If Telegram does not reply, run `maturana doctor` first, then
+`maturana agent inspect <agent-id> --live --guest`. If the VM is running but
+Telegram or worker heartbeat is stale, run
+`maturana repair windows-harnesses`. If the VM itself is missing or has no IP,
+relaunch that VM from its `MATURANA.md`.

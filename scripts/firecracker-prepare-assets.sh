@@ -3,7 +3,7 @@ set -euo pipefail
 
 output_dir="${1:-.maturana/images/firecracker}"
 ssh_key_path="${2:-$output_dir/maturana-firecracker.id_rsa}"
-auth_source="${3:-.maturana/host-auth/codex}"
+auth_source="${3:-}"
 
 release="${MATURANA_UBUNTU_RELEASE:-noble}"
 case "$(uname -m)" in
@@ -15,11 +15,18 @@ esac
 guest_ip="${MATURANA_FIRECRACKER_GUEST_IP:-172.30.0.2}"
 host_ip="${MATURANA_FIRECRACKER_HOST_IP:-172.30.0.1}"
 guest_mac="${MATURANA_FIRECRACKER_GUEST_MAC:-aa:fc:00:00:00:01}"
+tap_name="${MATURANA_FIRECRACKER_TAP_NAME:-}"
 agent_id="${MATURANA_AGENT_ID:-firecracker-demo}"
-harness="${MATURANA_HARNESS:-codex}"
-proxy_port="${MATURANA_PROXY_PORT:-}"
-proxy_https="${MATURANA_PROXY_HTTPS:-0}"
+asset_manifest_path="${MATURANA_FIRECRACKER_ASSET_MANIFEST_PATH:-$output_dir/asset-manifest.json}"
+proxy_env_path="${MATURANA_PROXY_ENV_PATH:-}"
 proxy_ca_cert_path="${MATURANA_PROXY_CA_CERT_PATH:-}"
+sessiond_env_path="${MATURANA_SESSIOND_ENV_PATH:-}"
+run_agent_path="${MATURANA_RUN_AGENT_PATH:-}"
+agent_service_path="${MATURANA_AGENT_SERVICE_PATH:-}"
+harness_install_path="${MATURANA_HARNESS_INSTALL_PATH:-}"
+firecracker_bootstrap_path="${MATURANA_FIRECRACKER_BOOTSTRAP_PATH:-}"
+netplan_path="${MATURANA_NETPLAN_PATH:-}"
+cloud_cfg_path="${MATURANA_CLOUD_CFG_PATH:-}"
 
 image_name="${release}-server-cloudimg-${ubuntu_arch}.img"
 image_url="${MATURANA_UBUNTU_IMAGE_URL:-https://cloud-images.ubuntu.com/$release/current/$image_name}"
@@ -32,6 +39,15 @@ need() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "missing required command: $1" >&2
     echo "install on Ubuntu with: sudo apt-get install -y qemu-utils libguestfs-tools" >&2
+    exit 1
+  fi
+}
+
+require_file() {
+  local path="$1"
+  local name="$2"
+  if [[ -z "$path" || ! -f "$path" ]]; then
+    echo "$name must point to a Rust-rendered file" >&2
     exit 1
   fi
 }
@@ -49,6 +65,18 @@ need tar
 need mkfs.ext4
 need truncate
 need ssh-keygen
+
+require_file "$sessiond_env_path" "MATURANA_SESSIOND_ENV_PATH"
+require_file "$run_agent_path" "MATURANA_RUN_AGENT_PATH"
+require_file "$agent_service_path" "MATURANA_AGENT_SERVICE_PATH"
+require_file "$harness_install_path" "MATURANA_HARNESS_INSTALL_PATH"
+require_file "$firecracker_bootstrap_path" "MATURANA_FIRECRACKER_BOOTSTRAP_PATH"
+require_file "$netplan_path" "MATURANA_NETPLAN_PATH"
+require_file "$cloud_cfg_path" "MATURANA_CLOUD_CFG_PATH"
+if [[ -z "$auth_source" ]]; then
+  echo "auth source must be supplied by Rust; no default harness auth path is allowed" >&2
+  exit 1
+fi
 
 find_extract_vmlinux() {
   if [[ -n "${MATURANA_EXTRACT_VMLINUX:-}" ]]; then
@@ -122,29 +150,8 @@ virt-resize --expand "$source_root_partition" "$image_path" "$resized_img" >/dev
 work_img="$resized_img"
 root_partition="${MATURANA_UBUNTU_ROOT_PARTITION:-$(detect_root_partition "$work_img")}"
 
-cat > "$work_dir/50-maturana-firecracker.yaml" <<YAML
-network:
-  version: 2
-  ethernets:
-    eth0:
-      match:
-        macaddress: "$guest_mac"
-      set-name: eth0
-      dhcp4: false
-      addresses:
-        - $guest_ip/30
-      routes:
-        - to: default
-          via: $host_ip
-      nameservers:
-        addresses:
-          - 1.1.1.1
-          - 8.8.8.8
-YAML
-
-cat > "$work_dir/99-disable-network-config.cfg" <<'CFG'
-network: {config: disabled}
-CFG
+cp "$netplan_path" "$work_dir/50-maturana-firecracker.yaml"
+cp "$cloud_cfg_path" "$work_dir/99-disable-network-config.cfg"
 
 mkdir -p "$work_dir/agent"
 for name in MATURANA.md AGENTS.md SOUL.md; do
@@ -155,20 +162,11 @@ for name in MATURANA.md AGENTS.md SOUL.md; do
   fi
 done
 
-cat > "$work_dir/agent/prompt.txt" <<'PROMPT'
-Inspect /agent/MATURANA.md and report that the Codex guest harness is ready.
-PROMPT
+if [[ -n "$proxy_env_path" ]]; then
+  require_file "$proxy_env_path" "MATURANA_PROXY_ENV_PATH"
+  cp "$proxy_env_path" "$work_dir/agent/proxy.env"
 
-if [[ -n "$proxy_port" && "$proxy_port" != "0" ]]; then
-  cat > "$work_dir/agent/proxy.env" <<PROXYENV
-MATURANA_USE_HOST_PROXY=1
-MATURANA_PROXY_HOST=$host_ip
-MATURANA_PROXY_PORT=$proxy_port
-MATURANA_PROXY_HTTPS=$proxy_https
-NO_PROXY=localhost,127.0.0.1,::1
-PROXYENV
-
-  if [[ "$proxy_https" == "1" ]]; then
+  if grep -q '^MATURANA_PROXY_HTTPS=1$' "$proxy_env_path"; then
     if [[ -z "$proxy_ca_cert_path" || ! -f "$proxy_ca_cert_path" ]]; then
       echo "MATURANA_PROXY_HTTPS=1 requires MATURANA_PROXY_CA_CERT_PATH to point to the Maturana pipelock CA cert" >&2
       exit 1
@@ -177,99 +175,26 @@ PROXYENV
   fi
 fi
 
-cat > "$work_dir/run-agent.sh" <<'RUNNER'
-#!/usr/bin/env bash
-set -euo pipefail
-export MATURANA_AGENT_ID="${MATURANA_AGENT_ID:-firecracker-demo}"
-export MATURANA_HARNESS="${MATURANA_HARNESS:-codex}"
-export CODEX_HOME="${CODEX_HOME:-/home/ubuntu/.codex}"
-
-mkdir -p /var/log/maturana /workspace /memory /wiki
-
-if [ -f /agent/proxy.env ]; then
-  # shellcheck disable=SC1091
-  . /agent/proxy.env
-  if [ "${MATURANA_USE_HOST_PROXY:-0}" = "1" ] && [ -n "${MATURANA_PROXY_HOST:-}" ] && [ -n "${MATURANA_PROXY_PORT:-}" ]; then
-    export HTTP_PROXY="http://${MATURANA_PROXY_HOST}:${MATURANA_PROXY_PORT}"
-    export http_proxy="$HTTP_PROXY"
-    if [ "${MATURANA_PROXY_HTTPS:-0}" = "1" ]; then
-      export HTTPS_PROXY="$HTTP_PROXY"
-      export https_proxy="$HTTP_PROXY"
-    fi
-    export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1,::1}"
-    export no_proxy="$NO_PROXY"
-  fi
-fi
-
-cd /workspace
-
-echo "Maturana $MATURANA_HARNESS agent $MATURANA_AGENT_ID starting"
-
-if ! command -v codex >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
-  sudo npm install -g @openai/codex >> /var/log/maturana/harness.out.log 2>> /var/log/maturana/harness.err.log || true
-fi
-
-if [ -f /agent/run-command ] && [ ! -f /var/log/maturana/run.done ]; then
-  echo "Executing /agent/run-command"
-  bash /agent/run-command > /var/log/maturana/harness.out.log 2> /var/log/maturana/harness.err.log
-  touch /var/log/maturana/run.done
-elif [ -f /agent/prompt.txt ] && [ ! -f /var/log/maturana/run.done ]; then
-  echo "Executing $MATURANA_HARNESS prompt from /agent/prompt.txt"
-  if command -v codex >/dev/null 2>&1; then
-    codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C /workspace -o /var/log/maturana/last-message.txt "$(cat /agent/prompt.txt)" > /var/log/maturana/harness.out.log 2> /var/log/maturana/harness.err.log
-  else
-    echo "codex is not installed" | tee /var/log/maturana/last-message.txt
-  fi
-  touch /var/log/maturana/run.done
-else
-  echo "No pending Maturana run"
-fi
-
-echo "Maturana $MATURANA_HARNESS agent $MATURANA_AGENT_ID ready"
-while true; do
-  date -Is > /var/log/maturana/heartbeat
-  sleep 60
-done
-RUNNER
-
-cat > "$work_dir/maturana-agent.service" <<'SERVICE'
-[Unit]
-Description=Maturana Codex agent
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-User=ubuntu
-WorkingDirectory=/workspace
-ExecStart=/opt/maturana/bin/run-agent.sh
-Restart=on-failure
-RestartSec=10
-StandardOutput=append:/var/log/maturana/agent.log
-StandardError=append:/var/log/maturana/agent.err.log
-
-[Install]
-WantedBy=multi-user.target
-SERVICE
+cp "$sessiond_env_path" "$work_dir/sessiond.env"
+cp "$run_agent_path" "$work_dir/run-agent.sh"
+cp "$agent_service_path" "$work_dir/maturana-agent.service"
+cp "$harness_install_path" "$work_dir/install-harness.sh"
+cp "$firecracker_bootstrap_path" "$work_dir/firecracker-bootstrap.sh"
 
 echo "Customizing Ubuntu image offline..."
+virt-copy-in -a "$work_img" "$work_dir/firecracker-bootstrap.sh" /tmp
 virt-customize -a "$work_img" \
-  --run-command 'apt-get update' \
-  --run-command 'DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server curl ca-certificates nodejs npm' \
-  --run-command 'id ubuntu >/dev/null 2>&1 || useradd -m -s /bin/bash ubuntu' \
-  --ssh-inject "ubuntu:file:$ssh_key_path.pub" \
-  --run-command 'mkdir -p /etc/sudoers.d /etc/netplan /etc/cloud/cloud.cfg.d /agent /workspace /memory /wiki /opt/maturana/bin /var/log/maturana' \
-  --run-command 'sed -i.bak -e "\|[[:space:]]/boot[[:space:]]|d" -e "\|[[:space:]]/boot/efi[[:space:]]|d" -e "/LABEL=BOOT/d" -e "/LABEL=UEFI/d" /etc/fstab' \
-  --run-command 'printf "ubuntu ALL=(ALL) NOPASSWD: ALL\n" > /etc/sudoers.d/90-maturana-ubuntu' \
-  --run-command 'chmod 0440 /etc/sudoers.d/90-maturana-ubuntu' \
-  --run-command 'ssh-keygen -A' \
-  --run-command 'systemctl disable ssh.socket || true' \
-  --run-command 'systemctl enable ssh.service || systemctl enable ssh || true'
+  --run-command 'chmod 0755 /tmp/firecracker-bootstrap.sh' \
+  --run-command '/tmp/firecracker-bootstrap.sh' \
+  --ssh-inject "ubuntu:file:$ssh_key_path.pub"
 
 virt-copy-in -a "$work_img" "$work_dir/50-maturana-firecracker.yaml" /etc/netplan
 virt-copy-in -a "$work_img" "$work_dir/99-disable-network-config.cfg" /etc/cloud/cloud.cfg.d
 virt-copy-in -a "$work_img" "$work_dir/agent" /
+virt-copy-in -a "$work_img" "$work_dir/sessiond.env" /agent
 virt-copy-in -a "$work_img" "$work_dir/run-agent.sh" /opt/maturana/bin
 virt-copy-in -a "$work_img" "$work_dir/maturana-agent.service" /etc/systemd/system
+virt-copy-in -a "$work_img" "$work_dir/install-harness.sh" /tmp
 
 if [[ -f "$work_dir/maturana-pipelock-ca.crt" ]]; then
   virt-copy-in -a "$work_img" "$work_dir/maturana-pipelock-ca.crt" /usr/local/share/ca-certificates
@@ -281,13 +206,22 @@ if [[ -d "$auth_source" ]]; then
   virt-copy-in -a "$work_img" "$work_dir/.codex" /home/ubuntu
 fi
 
-virt-copy-out -a "$work_img" /boot "$work_dir"
-kernel_candidate="$(find "$work_dir/boot" -maxdepth 1 -type f -name 'vmlinuz-*' | sort -V | tail -n 1)"
-if [[ -z "$kernel_candidate" ]]; then
-  echo "could not find vmlinuz-* in the Ubuntu image" >&2
-  exit 1
+reuse_kernel="${MATURANA_REUSE_KERNEL_IMAGE:-}"
+if [[ -z "$reuse_kernel" && -f ".maturana/images/firecracker/vmlinux.bin" && "$kernel_out" != ".maturana/images/firecracker/vmlinux.bin" ]]; then
+  reuse_kernel=".maturana/images/firecracker/vmlinux.bin"
 fi
-"$extract_vmlinux" "$kernel_candidate" > "$kernel_out"
+if [[ -n "$reuse_kernel" ]]; then
+  echo "Reusing Firecracker kernel: $reuse_kernel"
+  cp "$reuse_kernel" "$kernel_out"
+else
+  virt-copy-out -a "$work_img" /boot "$work_dir"
+  kernel_candidate="$(find "$work_dir/boot" -maxdepth 1 -type f -name 'vmlinuz-*' | sort -V | tail -n 1)"
+  if [[ -z "$kernel_candidate" ]]; then
+    echo "could not find vmlinuz-* in the Ubuntu image" >&2
+    exit 1
+  fi
+  "$extract_vmlinux" "$kernel_candidate" > "$kernel_out"
+fi
 if ! file "$kernel_out" | grep -q 'ELF'; then
   echo "failed to extract an ELF vmlinux from $kernel_candidate" >&2
   file "$kernel_out" >&2 || true
@@ -296,12 +230,14 @@ fi
 
 virt-customize -a "$work_img" \
   --run-command 'chmod 0600 /etc/netplan/50-maturana-firecracker.yaml' \
+  --run-command 'chmod 0600 /agent/sessiond.env' \
   --run-command 'chmod 0755 /opt/maturana/bin/run-agent.sh' \
+  --run-command 'chmod 0755 /tmp/install-harness.sh' \
+  --run-command '/tmp/install-harness.sh' \
   --run-command 'if [ -f /usr/local/share/ca-certificates/maturana-pipelock-ca.crt ]; then update-ca-certificates; fi' \
   --run-command 'chown -R ubuntu:ubuntu /agent /workspace /memory /wiki /var/log/maturana /home/ubuntu/.codex 2>/dev/null || true' \
   --run-command 'chmod -R go-rwx /home/ubuntu/.codex 2>/dev/null || true' \
   --run-command 'systemctl enable maturana-agent.service || true' \
-  --run-command 'npm install -g @openai/codex || true' \
   --run-command 'apt-get clean || true' \
   --run-command 'rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /root/.npm /home/ubuntu/.npm /tmp/* || true'
 
@@ -320,6 +256,29 @@ echo "kernel: $kernel_out"
 echo "rootfs: $rootfs_out"
 echo "ssh_key: $ssh_key_path"
 echo "ssh: ssh -i \"$ssh_key_path\" ubuntu@$guest_ip"
+
+kernel_sha256="$(sha256sum "$kernel_out" | awk '{print $1}')"
+rootfs_sha256="$(sha256sum "$rootfs_out" | awk '{print $1}')"
+kernel_bytes="$(wc -c < "$kernel_out" | tr -d ' ')"
+rootfs_bytes="$(wc -c < "$rootfs_out" | tr -d ' ')"
+mkdir -p "$(dirname "$asset_manifest_path")"
+cat > "$asset_manifest_path" <<EOF
+{
+  "agent_id": "$agent_id",
+  "kernel": "$kernel_out",
+  "rootfs": "$rootfs_out",
+  "ssh_key": "$ssh_key_path",
+  "guest_ip": "$guest_ip",
+  "host_ip": "$host_ip",
+  "guest_mac": "$guest_mac",
+  "tap_name": "$tap_name",
+  "kernel_sha256": "$kernel_sha256",
+  "rootfs_sha256": "$rootfs_sha256",
+  "kernel_bytes": $kernel_bytes,
+  "rootfs_bytes": $rootfs_bytes
+}
+EOF
+echo "manifest: $asset_manifest_path"
 
 if [[ "$(id -u)" -eq 0 && -n "${SUDO_UID:-}" && -n "${SUDO_GID:-}" ]]; then
   chown -R "$SUDO_UID:$SUDO_GID" "$output_dir"

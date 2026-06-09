@@ -19,7 +19,6 @@ harness_auth:
 agent_run:
   install_harness: true
   start_on_boot: false
-  prompt: Inspect /agent/MATURANA.md and report that the Claude Code guest harness is ready.
 filesystem:
   mounts:
     - host_path: .maturana/agents/claude-demo/workspace

@@ -12,10 +12,7 @@ use std::{
     collections::HashMap,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    path::{Path, PathBuf},
-    process::{Command as ProcessCommand, Stdio},
-    thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[derive(Debug, Args)]
@@ -50,20 +47,6 @@ pub enum SessionSubcommand {
         session_id: String,
         #[arg(long, default_value = "echo")]
         provider: String,
-        #[arg(long)]
-        ip: Option<String>,
-        #[arg(long, default_value = "ubuntu")]
-        ssh_user: String,
-        #[arg(
-            long,
-            env = "MATURANA_AGENT_SSH_KEY",
-            default_value = ".maturana/keys/maturana-agent-ed25519"
-        )]
-        ssh_key: PathBuf,
-        #[arg(long, default_value = "/workspace")]
-        guest_workspace: String,
-        #[arg(long, default_value_t = 600)]
-        timeout_seconds: u64,
     },
     Outbox {
         agent_id: String,
@@ -115,22 +98,10 @@ pub fn handle_session(command: SessionCommand, home: &MaturanaHome) -> anyhow::R
             agent_id,
             session_id,
             provider,
-            ip,
-            ssh_user,
-            ssh_key,
-            guest_workspace,
-            timeout_seconds,
         } => {
             let paths = session_paths(&home.agent_dir(&agent_id), &session_id);
             ensure_session(&paths)?;
-            let options = RunnerOptions {
-                provider,
-                ip,
-                ssh_user,
-                ssh_key,
-                guest_workspace,
-                timeout_seconds,
-            };
+            let options = RunnerOptions { provider };
             let processed = run_session_once(&paths, &options, 20)?;
             if processed == 0 {
                 println!("no pending messages");
@@ -402,11 +373,6 @@ fn write_worker_status(home: &MaturanaHome, body: &HeartbeatRequest) -> anyhow::
 #[derive(Debug, Clone)]
 pub struct RunnerOptions {
     pub provider: String,
-    pub ip: Option<String>,
-    pub ssh_user: String,
-    pub ssh_key: PathBuf,
-    pub guest_workspace: String,
-    pub timeout_seconds: u64,
 }
 
 pub fn run_session_once(
@@ -424,11 +390,9 @@ pub fn run_session_once(
         let text = message_text(&message.content)?;
         let response = match options.provider.as_str() {
             "echo" => format!("echo: {text}"),
-            "codex-ssh" => {
-                let prompt = message_prompt(&message.content)?;
-                run_codex_over_ssh(options, &prompt)?
-            }
-            other => anyhow::bail!("unsupported session provider for MVP: {other}"),
+            other => anyhow::bail!(
+                "unsupported local session provider: {other}; use echo for smoke tests or run the guest worker for real harness turns"
+            ),
         };
         write_outbound(
             paths,
@@ -454,128 +418,39 @@ pub fn message_text(content: &str) -> anyhow::Result<String> {
         .to_string())
 }
 
-fn message_prompt(content: &str) -> anyhow::Result<String> {
-    let value: serde_json::Value = serde_json::from_str(content)
-        .with_context(|| format!("invalid message json: {content}"))?;
-    Ok(value
-        .get("prompt")
-        .or_else(|| value.get("text"))
-        .and_then(|text| text.as_str())
-        .unwrap_or(content)
-        .to_string())
-}
-
-fn run_codex_over_ssh(options: &RunnerOptions, prompt: &str) -> anyhow::Result<String> {
-    let ip = options
-        .ip
-        .as_deref()
-        .context("codex-ssh provider requires --ip")?;
-    let prompt_path = "/tmp/maturana-session-prompt.txt";
-    let output_path = "/tmp/maturana-session-response.txt";
-    let stderr_path = "/tmp/maturana-session-codex.err";
-    let remote = format!(
-        "set -eu; cat > {prompt_path}; rm -f {output_path} {stderr_path}; codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C {} -o {output_path} \"$(cat {prompt_path})\" >/tmp/maturana-session-codex.out 2>{stderr_path}; cat {output_path}",
-        shell_quote(&options.guest_workspace)
-    );
-    run_ssh_with_stdin(
-        ip,
-        &options.ssh_user,
-        &options.ssh_key,
-        &remote,
-        Some(prompt),
-        options.timeout_seconds,
-    )
-}
-
-fn run_ssh_with_stdin(
-    ip: &str,
-    ssh_user: &str,
-    ssh_key: &Path,
-    remote_command: &str,
-    stdin_text: Option<&str>,
-    timeout_seconds: u64,
-) -> anyhow::Result<String> {
-    let mut command = ProcessCommand::new("ssh");
-    command
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("PreferredAuthentications=publickey")
-        .arg("-o")
-        .arg("NumberOfPasswordPrompts=0")
-        .arg("-o")
-        .arg(format!("UserKnownHostsFile={}", null_known_hosts()))
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg("-i")
-        .arg(ssh_key)
-        .arg(format!("{ssh_user}@{ip}"))
-        .arg(remote_command)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if stdin_text.is_some() {
-        command.stdin(Stdio::piped());
-    } else {
-        command.stdin(Stdio::null());
-    }
-
-    let mut child = command.spawn().context("failed to start ssh")?;
-    if let Some(stdin_text) = stdin_text {
-        let mut stdin = child.stdin.take().context("failed to open ssh stdin")?;
-        stdin.write_all(stdin_text.as_bytes())?;
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(timeout_seconds.max(1));
-    loop {
-        if child.try_wait()?.is_some() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!("ssh timed out after {} seconds", timeout_seconds.max(1));
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        anyhow::bail!("ssh failed: {}", String::from_utf8_lossy(&output.stderr));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
-fn null_known_hosts() -> &'static str {
-    if cfg!(windows) {
-        "NUL"
-    } else {
-        "/dev/null"
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn message_prompt_prefers_prebuilt_prompt() {
-        let content = serde_json::json!({
-            "text": "hello",
-            "prompt": "full context prompt"
-        })
-        .to_string();
-        assert_eq!(message_prompt(&content).unwrap(), "full context prompt");
-    }
+    fn run_once_rejects_host_side_codex_ssh_provider() {
+        let root = std::env::temp_dir().join(format!(
+            "maturana-session-provider-{}",
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let paths = session_paths(&root, "telegram-main");
+        ensure_session(&paths).unwrap();
+        insert_inbound(
+            &paths,
+            "chat",
+            "telegram",
+            "chat-1",
+            None,
+            &serde_json::json!({ "text": "hello" }).to_string(),
+        )
+        .unwrap();
 
-    #[test]
-    fn message_prompt_falls_back_to_text() {
-        let content = serde_json::json!({ "text": "hello" }).to_string();
-        assert_eq!(message_prompt(&content).unwrap(), "hello");
+        let error = run_session_once(
+            &paths,
+            &RunnerOptions {
+                provider: ["codex", "ssh"].join("-"),
+            },
+            1,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unsupported local session provider"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -5,10 +5,15 @@ pub mod pipelock_proxy;
 pub mod providers;
 pub mod secrets;
 pub mod session_db;
+pub mod snapshots;
 pub mod spec;
 pub mod state;
 pub mod validation;
+pub mod worker;
 
-pub use materialize::{materialize_agent, LaunchMode, MaterializedAgent};
+pub use materialize::{
+    inspect_agent, materialize_agent, stop_agent, LaunchMode, MaterializedAgent,
+};
+pub use providers::LiveAgentStatus;
 pub use spec::{AgentSpec, HarnessRuntime, HostProvider};
 pub use validation::{validate_spec, ValidationReport};
