@@ -158,10 +158,29 @@ Every agent turn is built from the current message plus:
 - `context/README.md`
 - `.maturana/wiki/INDEX.md`
 - the recent Telegram transcript
+- the top matching `.maturana/wiki/chunks/*.md` files selected from the current
+  message plus the recent transcript
 
 Messages containing `remember` are appended to `memory/MEMORY.md` before the
 agent turn, so the next turn sees the durable note even if the harness itself is
 stateless.
+
+Each turn writes the host context manifest to:
+
+```text
+.maturana/agents/<agent-id>/channels/telegram/<chat-id>.context.json
+```
+
+The manifest records which durable files and wiki chunks were loaded for that
+turn. It also records the host context policy, the terms used for wiki
+retrieval, whether each term came from the current message or recent
+transcript, and the matched terms that caused each chunk to load. This keeps
+context loading observable without making the guest harness own memory policy.
+
+Send `/new` in Telegram to start a fresh context window. Maturana archives the
+current transcript and context manifest under `channels/telegram/archive/`,
+writes a new session marker, and the next turn reloads durable memory plus
+relevant wiki chunks into a fresh manifest.
 
 Session CLI:
 
@@ -176,9 +195,9 @@ Session CLI:
 .\scripts\maturana.ps1 session outbox codex-demo --session-id telegram-main --mark-delivered
 ```
 
-`echo` is only a smoke-test provider. The real runner will be a long-lived guest
-process that claims inbound rows, calls Codex/Claude Code/OpenCode, and writes
-outbound rows.
+`echo` is only a smoke-test provider. Real turns are handled by the long-lived
+guest worker, which claims inbound rows from `sessiond`, calls
+Codex/Claude Code/OpenCode inside the VM, and writes outbound rows.
 
 Discord webhook:
 
@@ -190,11 +209,8 @@ Discord webhook:
 
 ## Current Boundary
 
-This MVP stores schedule definitions but does not yet run a scheduler loop.
-The next simple step is a hostd loop that periodically reads
-`schedules/schedules.json`, launches agent turns, writes run history, and sends
-channel messages through the existing notify commands.
-
 Do not add a general command queue. Use direct `agent run` for manual VM work,
 session DBs for channel turns, `deploy` for tool/skill installation, and
-schedule records for cron-like behavior.
+schedule records for cron-like behavior. `schedule run-due` and
+`schedule serve` enqueue normal session messages and record per-minute run
+history.

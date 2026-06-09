@@ -1,7 +1,8 @@
 use crate::{
     audit::{append_event, AuditEvent},
     providers::{
-        firecracker::FirecrackerProvider, hyperv::HyperVProvider, Provider, ProviderCommand,
+        firecracker::FirecrackerProvider, hyperv::HyperVProvider, LiveAgentStatus, Provider,
+        ProviderCommand,
     },
     spec::{AgentSpec, HostProvider},
     state::MaturanaHome,
@@ -80,6 +81,54 @@ pub fn materialize_agent(
         validation,
         provider_commands: commands,
     })
+}
+
+pub fn stop_agent(home: &MaturanaHome, agent_id: &str) -> anyhow::Result<()> {
+    let agent_dir = home.agent_dir(agent_id);
+    let spec_path = agent_dir.join("MATURANA.md");
+    if !spec_path.exists() {
+        anyhow::bail!("agent does not exist or has no MATURANA.md: {agent_id}");
+    }
+    let spec = AgentSpec::from_maturana_markdown(&spec_path)?;
+    let provider: Box<dyn Provider> = match spec.vm.provider {
+        HostProvider::HyperV => Box::new(HyperVProvider),
+        HostProvider::Firecracker => Box::new(FirecrackerProvider),
+    };
+    provider.stop(&spec, &agent_dir)?;
+    append_event(
+        home.audit_dir().join(format!("{agent_id}.jsonl")),
+        &AuditEvent {
+            at: Utc::now(),
+            agent_id: agent_id.to_string(),
+            action: "agent.stop.live".to_string(),
+            message: format!(
+                "stopped {} provider agent",
+                provider_name(&spec.vm.provider)
+            ),
+        },
+    )?;
+    Ok(())
+}
+
+pub fn inspect_agent(home: &MaturanaHome, agent_id: &str) -> anyhow::Result<LiveAgentStatus> {
+    let agent_dir = home.agent_dir(agent_id);
+    let spec_path = agent_dir.join("MATURANA.md");
+    if !spec_path.exists() {
+        anyhow::bail!("agent does not exist or has no MATURANA.md: {agent_id}");
+    }
+    let spec = AgentSpec::from_maturana_markdown(&spec_path)?;
+    let provider: Box<dyn Provider> = match spec.vm.provider {
+        HostProvider::HyperV => Box::new(HyperVProvider),
+        HostProvider::Firecracker => Box::new(FirecrackerProvider),
+    };
+    provider.inspect(&spec, &agent_dir)
+}
+
+fn provider_name(provider: &HostProvider) -> &'static str {
+    match provider {
+        HostProvider::HyperV => "Hyper-V",
+        HostProvider::Firecracker => "Firecracker",
+    }
 }
 
 fn render_guest_agents(spec: &AgentSpec) -> String {

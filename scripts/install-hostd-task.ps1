@@ -43,12 +43,22 @@ function Wait-HostdHealth {
 }
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
-$scriptPath = Join-Path $repoRoot "scripts\maturana-hostd.ps1"
+$exePath = Join-Path $repoRoot "target\x86_64-pc-windows-gnu\debug\maturana.exe"
 if ([string]::IsNullOrWhiteSpace($TokenPath)) {
     $TokenPath = Join-Path $repoRoot ".maturana\hostd\token"
 }
 if ([string]::IsNullOrWhiteSpace($LogPath)) {
     $LogPath = Join-Path $repoRoot ".maturana\logs\hostd.log"
+}
+if (!(Test-Path -LiteralPath $exePath)) {
+    $buildScript = Join-Path $repoRoot "scripts\build-windows-gnu.ps1"
+    if (!(Test-Path -LiteralPath $buildScript)) {
+        throw "maturana.exe is missing and $buildScript was not found."
+    }
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $buildScript
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to build maturana.exe before installing hostd."
+    }
 }
 
 if (-not (Test-Elevated)) {
@@ -93,15 +103,14 @@ if ($userId -notmatch '\\' -and ![string]::IsNullOrWhiteSpace($env:USERDOMAIN)) 
     $userId = "$env:USERDOMAIN\$env:USERNAME"
 }
 $argument = @(
-    "-NoProfile",
-    "-ExecutionPolicy", "Bypass",
-    "-File", (ConvertTo-ProcessArgument $scriptPath),
-    "-BindPrefix", (ConvertTo-ProcessArgument $BindPrefix),
-    "-TokenPath", (ConvertTo-ProcessArgument $TokenPath),
-    "-LogPath", (ConvertTo-ProcessArgument $LogPath)
+    "hostd",
+    "serve",
+    "--bind-prefix", (ConvertTo-ProcessArgument $BindPrefix),
+    "--token-path", (ConvertTo-ProcessArgument $TokenPath),
+    "--log-path", (ConvertTo-ProcessArgument $LogPath)
 ) -join " "
 
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $argument -WorkingDirectory $repoRoot
+$action = New-ScheduledTaskAction -Execute $exePath -Argument $argument -WorkingDirectory $repoRoot
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 $principal = New-ScheduledTaskPrincipal -UserId $userId -RunLevel Highest -LogonType Interactive
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)

@@ -6,7 +6,7 @@
 - Materialize agent directories and generated guest files.
 - Produce Hyper-V launch plans.
 - Support guarded real Hyper-V apply mode.
-- Store audit logs and snapshot markers.
+- Store audit logs, local snapshot markers, and provider-backed live snapshots.
 - Keep secrets out of specs and git.
 
 ## Milestone 2: Windows Demo Agent
@@ -28,3 +28,10 @@
 ## Milestone 4: OpenCode
 
 - Add OpenCode harness materialization after Codex and Claude Code are working.
+
+## Refactor Guardrails
+
+- `docs/skill-workflows.md` defines the required shape for Maturana skills:
+  grounding, preflight, decisions, evidence, recovery, and boundaries.
+- `docs/script-boundary.md` defines the Rust-owns-decisions rule and classifies
+  remaining scripts as leaf adapters, migration candidates, or tests.

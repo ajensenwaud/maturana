@@ -2,12 +2,7 @@ param(
     [string]$TaskName = "MaturanaTelegramChannel",
     [string]$AgentId = "codex-demo",
     [string]$SessionId = "telegram-main",
-    [string]$HostdUrl = "http://127.0.0.1:47832",
     [string]$TokenSource = "pipelock:telegram/bot-token",
-    [string]$Ip = "",
-    [string]$SshUser = "ubuntu",
-    [string]$SshKeyPath = ".\.maturana\keys\maturana-agent-ed25519",
-    [switch]$RunProviderInHost,
     [string]$LogPath = "",
     [string]$ErrPath = "",
     [switch]$StartOnly,
@@ -15,22 +10,6 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-
-function Resolve-AgentIp {
-    param([string]$AgentId, [string]$HostdUrl)
-
-    $headers = @{}
-    $tokenPath = Join-Path $script:RepoRoot ".maturana\hostd\token"
-    if (Test-Path -LiteralPath $tokenPath) {
-        $headers["X-Maturana-Hostd-Token"] = (Get-Content -LiteralPath $tokenPath -Raw).Trim()
-    }
-    $response = Invoke-RestMethod -Method Get -Uri "$($HostdUrl.TrimEnd('/'))/vms" -Headers $headers
-    $vm = @($response.vms | Where-Object { $_.name -eq "maturana-$AgentId" } | Select-Object -First 1)
-    if (!$vm -or [string]::IsNullOrWhiteSpace([string]$vm.ipv4)) {
-        throw "Could not discover IPv4 for maturana-$AgentId from hostd."
-    }
-    return [string]$vm.ipv4
-}
 
 function Quote-Argument {
     param([string]$Value)
@@ -115,26 +94,12 @@ New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ErrPath) | Out-Nu
 $pidPath = Join-Path $script:RepoRoot ".maturana\agents\$safeAgentId\channels\telegram\runner.pid"
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $pidPath) | Out-Null
 
-if ([string]::IsNullOrWhiteSpace($Ip)) {
-    $Ip = Resolve-AgentIp -AgentId $AgentId -HostdUrl $HostdUrl
-}
-
-$resolvedSshKeyPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($SshKeyPath)
 $channelArgs = @(
     "channel", "serve", "telegram",
     "--agent-id", $AgentId,
     "--session-id", $SessionId,
     "--token-source", $TokenSource
 )
-if ($RunProviderInHost) {
-    $channelArgs += @(
-        "--run-once-provider", "codex-ssh",
-        "--ip", $Ip,
-        "--ssh-user", $SshUser,
-        "--ssh-key", $resolvedSshKeyPath
-    )
-}
-
 if ($NoRegister) {
     & $exe @channelArgs
     exit $LASTEXITCODE
@@ -170,6 +135,8 @@ try {
 
 Write-Host "Installed and started $TaskName"
 Write-Host "Agent: $AgentId"
-Write-Host "VM IP: $Ip"
+if (![string]::IsNullOrWhiteSpace($Ip)) {
+    Write-Host "VM IP: $Ip"
+}
 Write-Host "Out log: $LogPath"
 Write-Host "Err log: $ErrPath"

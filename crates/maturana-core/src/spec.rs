@@ -77,10 +77,6 @@ pub struct AgentRun {
     pub install_harness: bool,
     #[serde(default)]
     pub start_on_boot: bool,
-    #[serde(default)]
-    pub prompt: Option<String>,
-    #[serde(default)]
-    pub command: Option<String>,
 }
 
 impl Default for AgentRun {
@@ -88,8 +84,6 @@ impl Default for AgentRun {
         Self {
             install_harness: true,
             start_on_boot: false,
-            prompt: None,
-            command: None,
         }
     }
 }
@@ -128,6 +122,10 @@ pub struct FirecrackerVm {
     pub rootfs_image: String,
     #[serde(default = "default_firecracker_tap")]
     pub tap_name: String,
+    #[serde(default = "default_firecracker_host_ip")]
+    pub host_ip: String,
+    #[serde(default = "default_firecracker_guest_ip")]
+    pub guest_ip: String,
     #[serde(default = "default_firecracker_guest_mac")]
     pub guest_mac: String,
     #[serde(default = "default_firecracker_kernel_args")]
@@ -302,6 +300,14 @@ fn default_memory_mib() -> u32 {
 
 fn default_firecracker_tap() -> String {
     "tap-maturana0".to_string()
+}
+
+fn default_firecracker_host_ip() -> String {
+    "172.30.0.1".to_string()
+}
+
+fn default_firecracker_guest_ip() -> String {
+    "172.30.0.2".to_string()
 }
 
 fn default_firecracker_guest_mac() -> String {

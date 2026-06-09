@@ -14,6 +14,8 @@ vm:
     kernel_image: .maturana/images/firecracker/vmlinux.bin
     rootfs_image: .maturana/images/firecracker/ubuntu-rootfs.ext4
     tap_name: tap-maturana0
+    host_ip: 172.30.0.1
+    guest_ip: 172.30.0.2
     guest_mac: AA:FC:00:00:00:01
     kernel_args: console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw virtio_mmio.device=4K@0xd0000000:5
 harness_auth:

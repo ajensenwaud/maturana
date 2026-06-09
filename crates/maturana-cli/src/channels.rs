@@ -11,6 +11,7 @@ use maturana_core::{
 use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -23,6 +24,15 @@ use crate::session::{message_text, run_session_once, RunnerOptions};
 const TELEGRAM_PAIR_CODE: &str = "telegram/pair-code";
 const TELEGRAM_CHAT_ID: &str = "telegram/chat-id";
 const MAX_RESPONSE_CHARS: usize = 3500;
+const IDENTITY_CONTEXT_CHARS: usize = 4000;
+const SOUL_CONTEXT_CHARS: usize = 4000;
+const CONTRACT_CONTEXT_CHARS: usize = 5000;
+const MEMORY_CONTEXT_CHARS: usize = 5000;
+const AGENT_CONTEXT_CHARS: usize = 3000;
+const WIKI_INDEX_CONTEXT_CHARS: usize = 5000;
+const WIKI_CHUNK_CONTEXT_CHARS: usize = 6000;
+const TRANSCRIPT_CONTEXT_CHARS: usize = 8000;
+const CONTEXT_WIKI_CHUNK_LIMIT: usize = 3;
 
 #[derive(Debug, Args)]
 pub struct ChannelCommand {
@@ -87,16 +97,6 @@ pub struct TelegramServe {
     #[arg(long, default_value = "pipelock:telegram/bot-token")]
     pub token_source: String,
     #[arg(long)]
-    pub ip: Option<String>,
-    #[arg(long, default_value = "ubuntu")]
-    pub ssh_user: String,
-    #[arg(
-        long,
-        env = "MATURANA_AGENT_SSH_KEY",
-        default_value = ".maturana/keys/maturana-agent-ed25519"
-    )]
-    pub ssh_key: PathBuf,
-    #[arg(long)]
     pub once: bool,
     #[arg(long)]
     pub run_once_provider: Option<String>,
@@ -110,6 +110,81 @@ pub struct TelegramServe {
 struct TelegramChannelState {
     offset: Option<i64>,
     last_seen_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChannelContextManifest {
+    at: DateTime<Utc>,
+    agent_id: String,
+    chat_id: i64,
+    source_files: Vec<LoadedContextFile>,
+    wiki_chunks: Vec<LoadedWikiChunkSummary>,
+    wiki_query_terms: Vec<String>,
+    wiki_term_sources: Vec<WikiTermSource>,
+    context_policy: ContextPolicySummary,
+    loaded_context_chars: usize,
+    transcript_path: String,
+    transcript_chars: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LoadedContextFile {
+    label: String,
+    path: String,
+    chars: usize,
+    missing: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ContextFile {
+    contents: String,
+    summary: LoadedContextFile,
+}
+
+#[derive(Debug)]
+struct ChannelContextBundle {
+    identity: ContextFile,
+    soul: ContextFile,
+    contract: ContextFile,
+    memory: ContextFile,
+    agent_context: ContextFile,
+    wiki_index: ContextFile,
+    wiki_chunks: Vec<LoadedWikiChunk>,
+    wiki_query_terms: Vec<String>,
+    wiki_term_sources: Vec<WikiTermSource>,
+    transcript: String,
+    transcript_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedWikiChunk {
+    score: usize,
+    matched_terms: Vec<String>,
+    path: PathBuf,
+    text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LoadedWikiChunkSummary {
+    score: usize,
+    matched_terms: Vec<String>,
+    path: String,
+    chars: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WikiTermSource {
+    term: String,
+    sources: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ContextPolicySummary {
+    strategy: String,
+    wiki_chunk_limit: usize,
+    wiki_char_budget: usize,
+    transcript_char_budget: usize,
+    excludes_reset_marker: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,11 +242,37 @@ struct TelegramChat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InboundAction {
     Ignore,
-    Pair { chat_id: i64 },
-    Help { chat_id: i64 },
-    Status { chat_id: i64 },
-    Prompt { chat_id: i64, text: String },
-    Deny { chat_id: i64 },
+    Pair {
+        chat_id: i64,
+    },
+    Help {
+        chat_id: i64,
+    },
+    Status {
+        chat_id: i64,
+    },
+    New {
+        chat_id: i64,
+    },
+    Spawn {
+        chat_id: i64,
+        mode: SpawnMode,
+        name: String,
+        prompt: String,
+    },
+    Prompt {
+        chat_id: i64,
+        text: String,
+    },
+    Deny {
+        chat_id: i64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SpawnMode {
+    Ephemeral,
+    Persistent,
 }
 
 pub fn handle_channel(command: ChannelCommand, home: &MaturanaHome) -> anyhow::Result<()> {
@@ -453,7 +554,7 @@ fn handle_telegram_update(
             send_telegram(
                 token,
                 &chat_id.to_string(),
-                "Commands: /status, /help. Any other message is sent to the agent.",
+                "Commands: /status, /new, /spawn, /help. Any other message is sent to the agent.",
                 reply_to_message_id,
             )?;
             Ok(())
@@ -469,6 +570,62 @@ fn handle_telegram_update(
                 token,
                 &chat_id.to_string(),
                 "Maturana channel is alive and paired.",
+                reply_to_message_id,
+            )?;
+            Ok(())
+        }
+        InboundAction::New { chat_id } => {
+            reset_channel_context(home, &config.agent_id, chat_id)?;
+            audit_channel_event(
+                home,
+                &config.agent_id,
+                "channel.telegram.new_session",
+                "reset telegram context window",
+            )?;
+            send_telegram(
+                token,
+                &chat_id.to_string(),
+                "New session started.",
+                reply_to_message_id,
+            )?;
+            Ok(())
+        }
+        InboundAction::Spawn {
+            chat_id,
+            mode,
+            name,
+            prompt,
+        } => {
+            let subagent_id = create_subagent(home, &config.agent_id, &name, mode, &prompt)?;
+            let paths = session_paths(
+                &home.agent_dir(&config.agent_id),
+                &format!("subagent-{subagent_id}"),
+            );
+            ensure_session(&paths)?;
+            insert_inbound(
+                &paths,
+                "spawn",
+                "subagent",
+                &subagent_id,
+                None,
+                &serde_json::json!({
+                    "text": prompt,
+                    "prompt": prompt,
+                    "subagent_id": subagent_id,
+                    "parent_agent_id": config.agent_id,
+                })
+                .to_string(),
+            )?;
+            audit_channel_event(
+                home,
+                &config.agent_id,
+                "channel.telegram.spawn",
+                "spawned sub-agent session",
+            )?;
+            send_telegram(
+                token,
+                &chat_id.to_string(),
+                &format!("Spawned sub-agent `{subagent_id}`."),
                 reply_to_message_id,
             )?;
             Ok(())
@@ -503,11 +660,6 @@ fn handle_telegram_update(
             if let Some(provider) = &config.run_once_provider {
                 let options = RunnerOptions {
                     provider: provider.to_string(),
-                    ip: config.ip.clone(),
-                    ssh_user: config.ssh_user.clone(),
-                    ssh_key: config.ssh_key.clone(),
-                    guest_workspace: "/workspace".to_string(),
-                    timeout_seconds: config.timeout_seconds,
                 };
                 run_session_once(&paths, &options, 20)?;
             }
@@ -583,11 +735,91 @@ fn classify_telegram_update(
     match command.as_str() {
         "/start" | "/help" => InboundAction::Help { chat_id },
         "/status" => InboundAction::Status { chat_id },
+        "/new" => InboundAction::New { chat_id },
+        _ if command.starts_with("/spawn ") => match parse_spawn_command(&command) {
+            Some((mode, name, prompt)) => InboundAction::Spawn {
+                chat_id,
+                mode,
+                name,
+                prompt,
+            },
+            None => InboundAction::Help { chat_id },
+        },
         _ if command.starts_with('/') => InboundAction::Help { chat_id },
         _ => InboundAction::Prompt {
             chat_id,
             text: text.to_string(),
         },
+    }
+}
+
+fn parse_spawn_command(command: &str) -> Option<(SpawnMode, String, String)> {
+    let rest = command.strip_prefix("/spawn")?.trim();
+    let (head, prompt) = rest.split_once("--")?;
+    let mut parts = head.split_whitespace();
+    let first = parts.next()?;
+    let (mode, name) = match first {
+        "ephemeral" => (SpawnMode::Ephemeral, parts.next()?),
+        "persistent" => (SpawnMode::Persistent, parts.next()?),
+        name => (SpawnMode::Ephemeral, name),
+    };
+    let prompt = prompt.trim();
+    if name.trim().is_empty() || prompt.is_empty() {
+        return None;
+    }
+    Some((mode, slugify_channel_id(name), prompt.to_string()))
+}
+
+fn create_subagent(
+    home: &MaturanaHome,
+    parent_agent_id: &str,
+    name: &str,
+    mode: SpawnMode,
+    prompt: &str,
+) -> anyhow::Result<String> {
+    let subagent_id = slugify_channel_id(name);
+    let path = home
+        .agent_dir(parent_agent_id)
+        .join("subagents")
+        .join(format!("{subagent_id}.json"));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "id": subagent_id,
+            "parent_agent_id": parent_agent_id,
+            "mode": match mode {
+                SpawnMode::Ephemeral => "ephemeral",
+                SpawnMode::Persistent => "persistent",
+            },
+            "prompt": prompt,
+            "created_at": Utc::now(),
+        }))?,
+    )?;
+    Ok(subagent_id)
+}
+
+fn slugify_channel_id(value: &str) -> String {
+    let slug = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if slug.is_empty() {
+        "subagent".to_string()
+    } else {
+        slug
     }
 }
 
@@ -710,16 +942,71 @@ fn build_channel_prompt(
     chat_id: i64,
     user_message: &str,
 ) -> anyhow::Result<String> {
-    let agent_dir = home.agent_dir(agent_id);
-    let identity = read_context_file(&agent_dir.join("AGENTS.md"), 4000)?;
-    let soul = read_context_file(&agent_dir.join("SOUL.md"), 4000)?;
-    let contract = read_context_file(&agent_dir.join("MATURANA.md"), 5000)?;
-    let memory = read_context_file(&agent_dir.join("memory/MEMORY.md"), 5000)?;
-    let agent_context = read_context_file(&agent_dir.join("context/README.md"), 3000)?;
-    let wiki_index = read_context_file(&home.root().join("wiki/INDEX.md"), 5000)?;
-    let transcript = tail_context_file(&channel_transcript_path(home, agent_id, chat_id), 8000)?;
+    let context = load_channel_context(home, agent_id, chat_id, user_message)?;
+    write_channel_context_manifest(home, agent_id, chat_id, &context)?;
+    Ok(render_channel_prompt(&context, user_message))
+}
 
-    Ok(format!(
+fn load_channel_context(
+    home: &MaturanaHome,
+    agent_id: &str,
+    chat_id: i64,
+    user_message: &str,
+) -> anyhow::Result<ChannelContextBundle> {
+    let agent_dir = home.agent_dir(agent_id);
+    let transcript_path = channel_transcript_path(home, agent_id, chat_id);
+    let transcript = tail_context_file(&transcript_path, TRANSCRIPT_CONTEXT_CHARS)?;
+    let wiki_query = build_wiki_query_policy(user_message, &transcript);
+    let wiki_query_terms = wiki_query
+        .term_sources
+        .iter()
+        .map(|term| term.term.clone())
+        .collect::<Vec<_>>();
+    let wiki_chunks = load_relevant_wiki_chunks_for_terms(
+        home,
+        &wiki_query_terms,
+        CONTEXT_WIKI_CHUNK_LIMIT,
+        WIKI_CHUNK_CONTEXT_CHARS,
+    )?;
+
+    Ok(ChannelContextBundle {
+        identity: read_context_file(
+            "AGENTS.md",
+            &agent_dir.join("AGENTS.md"),
+            IDENTITY_CONTEXT_CHARS,
+        )?,
+        soul: read_context_file("SOUL.md", &agent_dir.join("SOUL.md"), SOUL_CONTEXT_CHARS)?,
+        contract: read_context_file(
+            "MATURANA.md",
+            &agent_dir.join("MATURANA.md"),
+            CONTRACT_CONTEXT_CHARS,
+        )?,
+        memory: read_context_file(
+            "memory/MEMORY.md",
+            &agent_dir.join("memory/MEMORY.md"),
+            MEMORY_CONTEXT_CHARS,
+        )?,
+        agent_context: read_context_file(
+            "context/README.md",
+            &agent_dir.join("context/README.md"),
+            AGENT_CONTEXT_CHARS,
+        )?,
+        wiki_index: read_context_file(
+            "wiki/INDEX.md",
+            &home.root().join("wiki/INDEX.md"),
+            WIKI_INDEX_CONTEXT_CHARS,
+        )?,
+        wiki_chunks,
+        wiki_query_terms,
+        wiki_term_sources: wiki_query.term_sources,
+        transcript,
+        transcript_path,
+    })
+}
+
+fn render_channel_prompt(context: &ChannelContextBundle, user_message: &str) -> String {
+    let wiki_chunks = render_wiki_chunks(&context.wiki_chunks);
+    format!(
         r#"You are a Maturana personal agent running inside an isolated VM.
 
 Answer the current Telegram message directly and conversationally.
@@ -746,22 +1033,260 @@ Return only the message that should be sent back to Telegram.
 ## Shared Wiki Index
 {wiki_index}
 
+## Relevant Wiki Chunks
+{wiki_chunks}
+
 ## Recent Telegram Transcript
 {transcript}
 
 ## Current Telegram Message
 {user_message}
-"#
-    ))
+"#,
+        identity = context.identity.contents,
+        soul = context.soul.contents,
+        contract = context.contract.contents,
+        memory = context.memory.contents,
+        agent_context = context.agent_context.contents,
+        wiki_index = context.wiki_index.contents,
+        transcript = context.transcript,
+    )
 }
 
-fn read_context_file(path: &Path, limit: usize) -> anyhow::Result<String> {
+fn write_channel_context_manifest(
+    home: &MaturanaHome,
+    agent_id: &str,
+    chat_id: i64,
+    context: &ChannelContextBundle,
+) -> anyhow::Result<()> {
+    let path = channel_context_manifest_path(home, agent_id, chat_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let source_files = vec![
+        context.identity.summary.clone(),
+        context.soul.summary.clone(),
+        context.contract.summary.clone(),
+        context.memory.summary.clone(),
+        context.agent_context.summary.clone(),
+        context.wiki_index.summary.clone(),
+    ];
+    let wiki_chunks = context
+        .wiki_chunks
+        .iter()
+        .map(|chunk| LoadedWikiChunkSummary {
+            score: chunk.score,
+            matched_terms: chunk.matched_terms.clone(),
+            path: chunk.path.display().to_string(),
+            chars: chunk.text.chars().count(),
+        })
+        .collect();
+    let loaded_context_chars = source_files.iter().map(|file| file.chars).sum::<usize>()
+        + context
+            .wiki_chunks
+            .iter()
+            .map(|chunk| chunk.text.chars().count())
+            .sum::<usize>()
+        + context.transcript.chars().count();
+    let manifest = ChannelContextManifest {
+        at: Utc::now(),
+        agent_id: agent_id.to_string(),
+        chat_id,
+        source_files,
+        wiki_chunks,
+        wiki_query_terms: context.wiki_query_terms.clone(),
+        wiki_term_sources: context.wiki_term_sources.clone(),
+        context_policy: ContextPolicySummary {
+            strategy: "durable-files-plus-current-message-and-recent-transcript-wiki-terms"
+                .to_string(),
+            wiki_chunk_limit: CONTEXT_WIKI_CHUNK_LIMIT,
+            wiki_char_budget: WIKI_CHUNK_CONTEXT_CHARS,
+            transcript_char_budget: TRANSCRIPT_CONTEXT_CHARS,
+            excludes_reset_marker: true,
+        },
+        loaded_context_chars,
+        transcript_path: context.transcript_path.display().to_string(),
+        transcript_chars: context.transcript.chars().count(),
+    };
+    fs::write(path, serde_json::to_string_pretty(&manifest)?)?;
+    Ok(())
+}
+
+fn load_relevant_wiki_chunks_for_terms(
+    home: &MaturanaHome,
+    terms: &[String],
+    limit: usize,
+    char_budget: usize,
+) -> anyhow::Result<Vec<LoadedWikiChunk>> {
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let chunk_dir = home.root().join("wiki/chunks");
+    if !chunk_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut hits = Vec::new();
+    for entry in fs::read_dir(chunk_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let lower = raw.to_ascii_lowercase();
+        let matched_terms = terms
+            .iter()
+            .filter(|term| lower.contains(term.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let score = matched_terms.len();
+        if score > 0 {
+            hits.push((score, matched_terms, path, raw));
+        }
+    }
+    hits.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.2.cmp(&right.2)));
+    let mut chunks = Vec::new();
+    let mut used_chars = 0usize;
+    for (score, matched_terms, path, raw) in hits.into_iter().take(limit.max(1)) {
+        let remaining = char_budget.saturating_sub(used_chars);
+        if remaining == 0 {
+            break;
+        }
+        let text = truncate_chars(&raw, remaining.min(2000));
+        used_chars += text.chars().count();
+        chunks.push(LoadedWikiChunk {
+            score,
+            matched_terms,
+            path,
+            text,
+        });
+    }
+    Ok(chunks)
+}
+
+#[derive(Debug)]
+struct WikiQueryPolicy {
+    term_sources: Vec<WikiTermSource>,
+}
+
+fn build_wiki_query_policy(user_message: &str, transcript: &str) -> WikiQueryPolicy {
+    let mut terms = BTreeMap::<String, Vec<String>>::new();
+    collect_wiki_query_terms("current_message", user_message, &mut terms);
+    collect_wiki_query_terms(
+        "recent_transcript",
+        &transcript_for_wiki_query(transcript),
+        &mut terms,
+    );
+    WikiQueryPolicy {
+        term_sources: terms
+            .into_iter()
+            .map(|(term, sources)| WikiTermSource { term, sources })
+            .collect(),
+    }
+}
+
+fn collect_wiki_query_terms(source: &str, text: &str, terms: &mut BTreeMap<String, Vec<String>>) {
+    for term in extract_wiki_query_terms(text) {
+        let sources = terms.entry(term).or_default();
+        if !sources.iter().any(|existing| existing == source) {
+            sources.push(source.to_string());
+        }
+    }
+}
+
+fn extract_wiki_query_terms(query: &str) -> Vec<String> {
+    let mut terms = query
+        .split_whitespace()
+        .map(normalize_wiki_query_term)
+        .filter(|term| term.len() >= 3 && !is_wiki_query_stopword(term))
+        .collect::<Vec<_>>();
+    terms.sort();
+    terms.dedup();
+    terms
+}
+
+fn normalize_wiki_query_term(term: &str) -> String {
+    term.trim_matches(|ch: char| !ch.is_ascii_alphanumeric())
+        .to_ascii_lowercase()
+}
+
+fn is_wiki_query_stopword(term: &str) -> bool {
+    matches!(
+        term,
+        "about"
+            | "again"
+            | "agent"
+            | "context"
+            | "current"
+            | "durable"
+            | "hello"
+            | "memory"
+            | "maturana"
+            | "message"
+            | "please"
+            | "reload"
+            | "reloaded"
+            | "session"
+            | "should"
+            | "telegram"
+            | "transcript"
+            | "turn"
+            | "what"
+            | "wiki"
+            | "with"
+    )
+}
+
+fn transcript_for_wiki_query(transcript: &str) -> String {
+    let lines = transcript
+        .lines()
+        .filter(|line| !line.starts_with("# Telegram Session"))
+        .filter(|line| !line.starts_with("Started:"))
+        .filter(|line| !line.contains("Memory and wiki context will be reloaded"))
+        .collect::<Vec<_>>();
+    lines.join("\n")
+}
+
+fn render_wiki_chunks(chunks: &[LoadedWikiChunk]) -> String {
+    if chunks.is_empty() {
+        return "(no relevant wiki chunks found)".to_string();
+    }
+    let mut output = String::new();
+    for chunk in chunks {
+        output.push_str(&format!(
+            "\n### {} score={} matched_terms={}\n\n{}\n",
+            chunk.path.display(),
+            chunk.score,
+            chunk.matched_terms.join(","),
+            chunk.text.trim()
+        ));
+    }
+    output
+}
+
+fn read_context_file(label: &str, path: &Path, limit: usize) -> anyhow::Result<ContextFile> {
     if !path.exists() {
-        return Ok("(missing)".to_string());
+        return Ok(ContextFile {
+            contents: "(missing)".to_string(),
+            summary: LoadedContextFile {
+                label: label.to_string(),
+                path: path.display().to_string(),
+                chars: 0,
+                missing: true,
+            },
+        });
     }
     let contents =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(truncate_chars(&contents, limit))
+    let contents = truncate_chars(&contents, limit);
+    Ok(ContextFile {
+        summary: LoadedContextFile {
+            label: label.to_string(),
+            path: path.display().to_string(),
+            chars: contents.chars().count(),
+            missing: false,
+        },
+        contents,
+    })
 }
 
 fn tail_context_file(path: &Path, limit: usize) -> anyhow::Result<String> {
@@ -809,6 +1334,41 @@ fn append_channel_turn(
     Ok(())
 }
 
+fn reset_channel_context(home: &MaturanaHome, agent_id: &str, chat_id: i64) -> anyhow::Result<()> {
+    let path = channel_transcript_path(home, agent_id, chat_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let reset_id = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    if path.exists() {
+        let archive_dir = path
+            .parent()
+            .expect("transcript path always has a parent")
+            .join("archive");
+        fs::create_dir_all(&archive_dir)?;
+        let archive = archive_dir.join(format!("{chat_id}-{reset_id}.md"));
+        fs::rename(&path, archive)?;
+    }
+    let manifest_path = channel_context_manifest_path(home, agent_id, chat_id);
+    if manifest_path.exists() {
+        let archive_dir = manifest_path
+            .parent()
+            .expect("context manifest path always has a parent")
+            .join("archive");
+        fs::create_dir_all(&archive_dir)?;
+        let archive = archive_dir.join(format!("{chat_id}-{reset_id}.context.json"));
+        fs::rename(&manifest_path, archive)?;
+    }
+    fs::write(
+        &path,
+        format!(
+            "# Telegram Session\n\nStarted: {}\n\nMemory and wiki context will be reloaded on the next turn.\n",
+            Utc::now().to_rfc3339()
+        ),
+    )?;
+    Ok(())
+}
+
 fn maybe_remember_user_message(
     home: &MaturanaHome,
     agent_id: &str,
@@ -838,6 +1398,12 @@ fn channel_transcript_path(home: &MaturanaHome, agent_id: &str, chat_id: i64) ->
     home.agent_dir(agent_id)
         .join("channels/telegram")
         .join(format!("{chat_id}.md"))
+}
+
+fn channel_context_manifest_path(home: &MaturanaHome, agent_id: &str, chat_id: i64) -> PathBuf {
+    home.agent_dir(agent_id)
+        .join("channels/telegram")
+        .join(format!("{chat_id}.context.json"))
 }
 
 fn truncate_chars(value: &str, limit: usize) -> String {
@@ -990,10 +1556,31 @@ mod tests {
             InboundAction::Status { chat_id: 7 }
         );
         assert_eq!(
+            classify_telegram_update(&text_update(7, "/new"), Some(7), None),
+            InboundAction::New { chat_id: 7 }
+        );
+        assert_eq!(
             classify_telegram_update(&text_update(7, "hello"), Some(7), None),
             InboundAction::Prompt {
                 chat_id: 7,
                 text: "hello".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn routes_spawn_command() {
+        assert_eq!(
+            classify_telegram_update(
+                &text_update(7, "/spawn persistent Researcher -- find context"),
+                Some(7),
+                None
+            ),
+            InboundAction::Spawn {
+                chat_id: 7,
+                mode: SpawnMode::Persistent,
+                name: "researcher".to_string(),
+                prompt: "find context".to_string(),
             }
         );
     }
@@ -1016,12 +1603,197 @@ mod tests {
         fs::write(agent_dir.join("MATURANA.md"), "# Contract\n").unwrap();
         fs::write(agent_dir.join("memory/MEMORY.md"), "likes tea\n").unwrap();
         fs::write(agent_dir.join("context/README.md"), "local context\n").unwrap();
+        fs::create_dir_all(home.root().join("wiki/chunks")).unwrap();
+        fs::write(
+            home.root().join("wiki/chunks/tea-001.md"),
+            "Tea ceremonies are relevant shared context.\n",
+        )
+        .unwrap();
         append_channel_turn(&home, "agent", 42, "user", "my name is Anders").unwrap();
 
-        let prompt = build_channel_prompt(&home, "agent", 42, "what is my name?").unwrap();
+        let prompt =
+            build_channel_prompt(&home, "agent", 42, "what is my name and tea preference?")
+                .unwrap();
         assert!(prompt.contains("likes tea"));
+        assert!(prompt.contains("Tea ceremonies"));
         assert!(prompt.contains("my name is Anders"));
-        assert!(prompt.contains("what is my name?"));
+        assert!(prompt.contains("what is my name and tea preference?"));
+        let manifest_path = channel_context_manifest_path(&home, "agent", 42);
+        let manifest: ChannelContextManifest =
+            serde_json::from_str(&fs::read_to_string(manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.agent_id, "agent");
+        assert_eq!(manifest.chat_id, 42);
+        assert_eq!(manifest.wiki_chunks.len(), 1);
+        assert!(manifest.loaded_context_chars > 0);
+        assert!(manifest.wiki_query_terms.contains(&"name".to_string()));
+        assert_eq!(
+            manifest.context_policy.strategy,
+            "durable-files-plus-current-message-and-recent-transcript-wiki-terms"
+        );
+        assert!(manifest.context_policy.excludes_reset_marker);
+        assert!(manifest.wiki_chunks[0]
+            .matched_terms
+            .contains(&"tea".to_string()));
+        assert!(manifest.wiki_term_sources.iter().any(
+            |term| term.term == "tea" && term.sources.contains(&"current_message".to_string())
+        ));
+        assert!(manifest
+            .source_files
+            .iter()
+            .any(|file| file.label == "memory/MEMORY.md" && !file.missing));
+    }
+
+    #[test]
+    fn channel_context_selects_wiki_from_recent_transcript_for_followups() {
+        let temp = temp_dir("channel-followup-context");
+        let home = MaturanaHome::new(temp.path().join(".maturana"));
+        let agent_dir = home.agent_dir("agent");
+        fs::create_dir_all(agent_dir.join("memory")).unwrap();
+        fs::create_dir_all(agent_dir.join("context")).unwrap();
+        fs::write(agent_dir.join("AGENTS.md"), "# Agent\n").unwrap();
+        fs::write(agent_dir.join("SOUL.md"), "# Soul\n").unwrap();
+        fs::write(agent_dir.join("MATURANA.md"), "# Contract\n").unwrap();
+        fs::write(agent_dir.join("memory/MEMORY.md"), "# Memory\n").unwrap();
+        fs::write(agent_dir.join("context/README.md"), "# Context\n").unwrap();
+        fs::create_dir_all(home.root().join("wiki/chunks")).unwrap();
+        fs::write(
+            home.root().join("wiki/chunks/calendars-001.md"),
+            "Calendar planning context should be loaded for schedule follow-ups.\n",
+        )
+        .unwrap();
+        append_channel_turn(
+            &home,
+            "agent",
+            42,
+            "user",
+            "Please remember the calendar planning context.",
+        )
+        .unwrap();
+
+        let prompt = build_channel_prompt(&home, "agent", 42, "what about that?").unwrap();
+        assert!(prompt.contains("Calendar planning context"));
+        let manifest: ChannelContextManifest = serde_json::from_str(
+            &fs::read_to_string(channel_context_manifest_path(&home, "agent", 42)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.wiki_chunks.len(), 1);
+        assert!(manifest.wiki_chunks[0].path.contains("calendars-001.md"));
+        assert!(manifest.wiki_chunks[0]
+            .matched_terms
+            .contains(&"calendar".to_string()));
+        assert!(manifest.wiki_query_terms.contains(&"calendar".to_string()));
+        assert!(manifest
+            .wiki_term_sources
+            .iter()
+            .any(|term| term.term == "calendar"
+                && term.sources.contains(&"recent_transcript".to_string())));
+    }
+
+    #[test]
+    fn new_session_rotates_transcript_and_reloads_context_next_turn() {
+        let temp = temp_dir("channel-new-session");
+        let home = MaturanaHome::new(temp.path().join(".maturana"));
+        let agent_dir = home.agent_dir("agent");
+        fs::create_dir_all(agent_dir.join("memory")).unwrap();
+        fs::create_dir_all(agent_dir.join("context")).unwrap();
+        fs::write(agent_dir.join("AGENTS.md"), "# Agent\n").unwrap();
+        fs::write(agent_dir.join("SOUL.md"), "# Soul\n").unwrap();
+        fs::write(agent_dir.join("MATURANA.md"), "# Contract\n").unwrap();
+        fs::write(agent_dir.join("memory/MEMORY.md"), "prefers fresh starts\n").unwrap();
+        fs::write(agent_dir.join("context/README.md"), "local context\n").unwrap();
+        append_channel_turn(&home, "agent", 42, "user", "old context").unwrap();
+        fs::write(
+            channel_context_manifest_path(&home, "agent", 42),
+            r#"{"stale":true}"#,
+        )
+        .unwrap();
+
+        reset_channel_context(&home, "agent", 42).unwrap();
+
+        let transcript = fs::read_to_string(channel_transcript_path(&home, "agent", 42)).unwrap();
+        assert!(transcript.contains("Memory and wiki context will be reloaded"));
+        assert!(!transcript.contains("old context"));
+        let archive_dir = home.agent_dir("agent").join("channels/telegram/archive");
+        let archive_files = fs::read_dir(archive_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(archive_files.len(), 2);
+        assert!(archive_files.iter().any(|name| name.ends_with(".md")));
+        assert!(archive_files
+            .iter()
+            .any(|name| name.ends_with(".context.json")));
+        assert!(!channel_context_manifest_path(&home, "agent", 42).exists());
+        let prompt = build_channel_prompt(&home, "agent", 42, "hello again").unwrap();
+        assert!(prompt.contains("prefers fresh starts"));
+        assert!(!prompt.contains("old context"));
+        assert!(channel_context_manifest_path(&home, "agent", 42).exists());
+    }
+
+    #[test]
+    fn new_session_does_not_use_reset_marker_or_archived_transcript_for_wiki() {
+        let temp = temp_dir("channel-new-session-wiki-query");
+        let home = MaturanaHome::new(temp.path().join(".maturana"));
+        let agent_dir = home.agent_dir("agent");
+        fs::create_dir_all(agent_dir.join("memory")).unwrap();
+        fs::create_dir_all(agent_dir.join("context")).unwrap();
+        fs::write(agent_dir.join("AGENTS.md"), "# Agent\n").unwrap();
+        fs::write(agent_dir.join("SOUL.md"), "# Soul\n").unwrap();
+        fs::write(agent_dir.join("MATURANA.md"), "# Contract\n").unwrap();
+        fs::write(agent_dir.join("memory/MEMORY.md"), "# Memory\n").unwrap();
+        fs::write(agent_dir.join("context/README.md"), "# Context\n").unwrap();
+        fs::create_dir_all(home.root().join("wiki/chunks")).unwrap();
+        fs::write(
+            home.root().join("wiki/chunks/archived-001.md"),
+            "Archived topic oldcontext should not leak into a fresh session.\n",
+        )
+        .unwrap();
+        fs::write(
+            home.root().join("wiki/chunks/reset-marker-001.md"),
+            "Memory wiki context reloaded turn marker should never drive retrieval.\n",
+        )
+        .unwrap();
+        fs::write(
+            home.root().join("wiki/chunks/fresh-001.md"),
+            "Freshnote is the only relevant shared context for the new question.\n",
+        )
+        .unwrap();
+        append_channel_turn(
+            &home,
+            "agent",
+            42,
+            "user",
+            "Please use oldcontext next time.",
+        )
+        .unwrap();
+
+        reset_channel_context(&home, "agent", 42).unwrap();
+        let prompt = build_channel_prompt(&home, "agent", 42, "freshnote please").unwrap();
+
+        assert!(prompt.contains("Freshnote"));
+        assert!(!prompt.contains("oldcontext"));
+        assert!(!prompt.contains("reloaded turn marker"));
+        let manifest: ChannelContextManifest = serde_json::from_str(
+            &fs::read_to_string(channel_context_manifest_path(&home, "agent", 42)).unwrap(),
+        )
+        .unwrap();
+        assert!(manifest.wiki_query_terms.contains(&"freshnote".to_string()));
+        assert!(!manifest
+            .wiki_query_terms
+            .contains(&"oldcontext".to_string()));
+        assert!(!manifest.wiki_query_terms.contains(&"reloaded".to_string()));
+        assert_eq!(manifest.wiki_chunks.len(), 1);
+        assert!(manifest.wiki_chunks[0].path.contains("fresh-001.md"));
+        assert_eq!(
+            manifest.wiki_chunks[0].matched_terms,
+            vec!["freshnote".to_string()]
+        );
+        assert!(manifest
+            .wiki_term_sources
+            .iter()
+            .any(|term| term.term == "freshnote"
+                && term.sources.contains(&"current_message".to_string())));
     }
 
     #[test]

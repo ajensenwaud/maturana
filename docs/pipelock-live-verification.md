@@ -105,7 +105,7 @@ To confirm the existing VM is running:
 
 ```bash
 cd /var/tmp/maturana-aidev
-./scripts/firecracker-inspect.sh .maturana/agents/firecracker-demo
+target/debug/maturana agent inspect firecracker-demo --live
 ssh -i .maturana/images/firecracker/maturana-firecracker.id_rsa ubuntu@172.30.0.2 \
   'cat /workspace/firecracker-run.txt; date -Is'
 ```
@@ -127,5 +127,13 @@ ip addr show tap-maturana0
 ls -la /var/tmp/maturana-aidev/.maturana/images/firecracker
 ```
 
-Only run `scripts/firecracker-prepare-assets.sh` when the kernel or rootfs is
-actually missing or intentionally being refreshed.
+Only refresh Firecracker assets when the kernel or rootfs is actually missing
+or intentionally being rebuilt. Use the Rust-owned repair flow first:
+
+```bash
+target/debug/maturana repair firecracker-harnesses --agent-id codex-firecracker
+```
+
+Run `scripts/firecracker-prepare-assets.sh` directly only for adapter-level
+maintenance, and only with Rust-rendered `MATURANA_SESSIOND_ENV_PATH`,
+`MATURANA_RUN_AGENT_PATH`, and `MATURANA_AGENT_SERVICE_PATH` inputs.

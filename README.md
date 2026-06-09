@@ -3,18 +3,21 @@
 Secure agentic orchestration built around Codex skills and hardware-isolated
 worker agents.
 
-This repository is at MVP stage. The current implementation provides:
+This repository is at MVP stage, but the product path is Rust-owned and
+provider-aware. The current implementation provides:
 
 - a Rust CLI named `maturana`
 - `MATURANA.md` parsing with YAML front matter
 - spec validation for runtimes, mounts, egress, credentials, channels, and VM
   settings
-- Windows-first Hyper-V launch planning
-- dry-run agent materialization under `.maturana/agents/<agent-id>`
+- Windows Hyper-V launch planning and apply mode through fixed host adapters
+- dry-run and applied agent materialization under `.maturana/agents/<agent-id>`
 - generated guest `AGENTS.md`, `SOUL.md`, launch plan, audit log, workspace,
   memory, and snapshot directories
-- Firecracker provider planning for Linux work on `aidev`
-- Codex skill stubs that call the CLI
+- Linux Firecracker launch, stop, inspect, and snapshot/restore paths owned by
+  Rust, with shell scripts kept as image/TAP setup adapters
+- Maturana skills shaped as operational workflows with grounding, preflight,
+  evidence, recovery, and boundaries rather than thin CLI wrappers
 
 ## Secret Handling
 
@@ -30,7 +33,8 @@ copies under ignored paths such as:
 .maturana/host-auth/claude-code
 ```
 
-For the MVP, non-harness credentials use `env:`, `file:`, or `pipelock:`
+For the current local deployment path, non-harness credentials use `env:`,
+`file:`, or `pipelock:`
 references instead of raw secrets. `pipelock:` resolves from a local Maturana
 vault under `.maturana/pipelock`. It is for ordinary API tokens and bot tokens,
 not Codex or Claude OAuth state.
@@ -62,7 +66,7 @@ Basic pipelock use:
   --dry-run
 ```
 
-The MVP vault uses a local random key at `.maturana/pipelock/key` and encrypted
+The local pipelock vault uses a random key at `.maturana/pipelock/key` and encrypted
 entries in `.maturana/pipelock/vault.json`. Both files stay under ignored local
 runtime state. A future egress proxy can use the same source names without
 changing specs.
@@ -174,11 +178,11 @@ Deploy new skills and tools into a running guest:
 ```
 
 See `docs/personal-agent-mvp.md` for the personal-agent file layout and current
-MVP boundary.
+personal-agent boundary.
 
 Local runtime state is ignored in `.maturana/`.
 
-## Windows MVP
+## Windows Hyper-V
 
 Install Rust, then run:
 
@@ -196,7 +200,9 @@ If MSVC Build Tools are not available yet, use the GNU toolchain path:
 
 ```powershell
 .\scripts\build-windows-gnu.ps1
-.\scripts\demo-windows.ps1
+.\scripts\maturana.ps1 spec validate examples/MATURANA.codex-demo.md
+.\scripts\maturana.ps1 agent launch examples/MATURANA.codex-demo.md
+.\scripts\maturana.ps1 agent inspect codex-demo
 ```
 
 For day-to-day Windows commands, use the wrapper that builds/runs the GNU CLI
@@ -225,8 +231,14 @@ Run the full local repeatability check:
 .\scripts\ci.ps1
 ```
 
+Validate the bundled skill workflows directly:
+
+```powershell
+.\scripts\maturana.ps1 skill validate skills
+```
+
 Real Hyper-V launch is guarded behind `--apply`. On Windows, `maturana agent
-launch --apply` talks to the privileged localhost `maturana-hostd`, which then
+launch --apply` talks to the privileged localhost Rust hostd, which then
 runs the fixed Ubuntu cloud-image launcher. Codex remains non-elevated during
 normal operation.
 
@@ -241,8 +253,8 @@ Or run the steps separately. Prepare the official Ubuntu cloud image once:
 
 ```powershell
 winget install --id cloudbase.qemu-img --exact
-.\scripts\get-ubuntu-cloudimg.ps1
-.\scripts\init-agent-ssh-key.ps1
+.\scripts\maturana.ps1 repair ubuntu-cloudimg
+.\scripts\maturana.ps1 repair ssh-key
 ```
 
 Install the privileged host daemon once. From a normal shell this requests UAC;
@@ -273,13 +285,13 @@ $env:MATURANA_HYPERV_FORCE = "true" # only when replacing an existing demo VM
 .\scripts\maturana.ps1 agent launch .\examples\MATURANA.codex-hyperv.md --apply
 ```
 
-The CLI validates and materializes the agent, then hostd copies the prepared
-VHDX to the agent state directory, expands it, creates a NoCloud cloud-init seed
-disk, creates a Hyper-V Generation 2 VM, starts it, waits for IPv4 and SSH,
-injects agent files and OAuth auth state, installs Codex, and starts the systemd
-harness. It is synchronous and does not use a queue.
+The CLI validates and materializes the agent, renders the guest artifacts, asks
+hostd to create/start the Hyper-V VM, then provisions the guest over SSH from
+Rust. Hostd and PowerShell do not install harnesses or copy auth state.
 
-The direct launcher remains available for debugging from an elevated shell:
+The direct launcher is only a Hyper-V debugging adapter. It creates/starts the
+VM, waits for IPv4 and SSH, expands the root filesystem, and prints
+`MATURANA_RESULT_JSON` with the guest IP:
 
 ```powershell
 .\scripts\launch-ubuntu-cloudimg-hyperv.ps1 `
@@ -287,23 +299,18 @@ The direct launcher remains available for debugging from an elevated shell:
   -BaseVhdxPath .\.maturana\images\ubuntu-noble\noble-server-cloudimg-amd64.vhdx `
   -SshUser ubuntu `
   -SshKeyPath .\.maturana\keys\maturana-agent-ed25519 `
-  -Harness codex `
-  -HarnessAuthSource .\.maturana\host-auth\codex `
-  -HarnessAuthGuestPath /home/ubuntu/.codex `
-  -InstallHarness `
-  -StartHarness `
+  -CloudInitUserDataPath .\.maturana\agents\codex-demo\state\cloud-init\user-data `
+  -CloudInitMetaDataPath .\.maturana\agents\codex-demo\state\cloud-init\meta-data `
   -Force
 ```
 
-Verify the running guest:
+Verify the running VM and guest from the Rust CLI:
 
 ```powershell
-.\scripts\inspect-ubuntu-hyperv-agent.ps1 -AgentId codex-demo `
-  -SshUser ubuntu `
-  -SshKeyPath .\.maturana\keys\maturana-agent-ed25519
+.\scripts\maturana.ps1 agent inspect codex-demo --live --guest
 ```
 
-`maturana-hostd` exposes only narrow localhost operations such as health, VM
+Rust hostd exposes only narrow localhost operations such as health, VM
 inspection, fixed Ubuntu launch, stop, and Hyper-V checkpoint operations. It
 requires the local token in `.maturana/hostd/token` for privileged operations.
 It is not a general command runner and it does not use a queue.
@@ -311,16 +318,16 @@ It is not a general command runner and it does not use a queue.
 Check VM state later with:
 
 ```powershell
-.\scripts\hyperv-status.ps1 -AgentId codex-demo
 .\scripts\maturana.ps1 agent inspect codex-demo --live
 ```
 
 If the current shell cannot use Hyper-V cmdlets or hostd to discover VM state,
-inspect the guest directly over SSH:
+inspect the guest directly over SSH through the Rust CLI:
 
 ```powershell
 .\scripts\maturana.ps1 agent inspect codex-demo `
   --live `
+  --guest `
   --ip 172.26.183.108
 ```
 
@@ -337,8 +344,8 @@ Read known guest logs without arbitrary file access:
   --kind last-message
 ```
 
-Send another live task to the guest harness over SSH. This is a direct
-agent operation, not a hostd command queue:
+Send another live task to the guest harness through the session queue. This is
+a direct agent operation, not a hostd command queue:
 
 ```powershell
 .\scripts\maturana.ps1 agent run codex-demo `
@@ -346,12 +353,12 @@ agent operation, not a hostd command queue:
   --wait
 ```
 
-If hostd is not available for IP discovery in the current shell, pass the guest
-IP explicitly:
+`agent run` writes to the same `sessiond` queue used by Telegram/Discord and
+waits for a matching outbound response when `--wait` is set. It does not write
+ad hoc prompt files into the guest.
 
 ```powershell
 .\scripts\maturana.ps1 agent run codex-demo `
-  --ip 172.26.183.108 `
   --prompt "Write Maturana live run OK to /workspace/live-run.txt." `
   --wait
 ```
@@ -375,7 +382,7 @@ Fetch an artifact back from the guest workspace:
 ```
 
 Together, `agent push`, `agent run`, and `agent fetch` form the simple live
-guest work loop for the Windows MVP.
+guest work loop for the Windows Hyper-V path.
 
 Live file transfers are intentionally bounded to `/workspace`, `/memory`,
 `/wiki`, and declared `filesystem.mounts[*].guest_path` roots inside the guest.
@@ -411,7 +418,7 @@ Telegram notifications use secret references:
   --message "Maturana agent is alive"
 ```
 
-## Linux MVP on aidev
+## Linux Firecracker on aidev
 
 Use `vm.provider: firecracker` in the spec and run the same CLI on `aidev`.
 The Firecracker provider materializes a concrete config under
@@ -430,37 +437,43 @@ vm:
     tap_name: tap-maturana0
 ```
 
-Prepare the official Ubuntu cloud image on the Linux host:
+Prepare the standard harness image/assets through the Rust-owned repair path:
 
 ```bash
 sudo apt-get install -y qemu-utils libguestfs-tools
-sudo ./scripts/firecracker-prepare-assets.sh
+cargo build -p maturana-cli
+target/debug/maturana repair firecracker-harnesses --agent-id codex-firecracker
 ```
 
-Create the host tap device once:
+The repair command starts `sessiond`, creates the host TAP device, renders the
+guest worker artifacts in Rust, calls the image-prep adapter, materializes the
+spec, launches Firecracker, waits for SSH, and refreshes the guest worker. The
+image-prep and TAP scripts are leaf adapters; do not use them as the normal
+orchestration path.
 
-```bash
-sudo ./scripts/firecracker-setup-tap.sh tap-maturana0 172.30.0.1/30 172.30.0.0/30
-```
-
-Check the Linux host and declared assets:
-
-```bash
-./scripts/firecracker-doctor.sh \
-  .maturana/images/firecracker/vmlinux.bin \
-  .maturana/images/firecracker/ubuntu-rootfs.ext4 \
-  tap-maturana0
-```
-
-Materialize and launch:
+For a custom Firecracker spec, prepare matching image assets and TAP through a
+small Rust repair command or a one-off adapter invocation with Rust-rendered
+worker files, then launch from the spec:
 
 ```bash
 cargo run -p maturana-cli -- spec validate examples/MATURANA.firecracker-demo.md
 cargo run -p maturana-cli -- agent launch examples/MATURANA.firecracker-demo.md
 cargo run -p maturana-cli -- agent launch examples/MATURANA.firecracker-demo.md --apply
-./scripts/firecracker-inspect.sh .maturana/agents/firecracker-demo
+cargo run -p maturana-cli -- agent inspect firecracker-demo --live
 ```
 
-The Linux MVP image prep injects SSH, static guest networking, the Maturana
-agent files, optional Codex OAuth state from `.maturana/host-auth/codex`, and
-the same simple systemd runner used by the Hyper-V path.
+For the built-in aidev harnesses:
+
+```bash
+target/debug/maturana repair firecracker-harnesses
+```
+
+The Linux Firecracker image-prep adapter injects SSH, static guest networking,
+the Maturana agent files, harness auth state from `.maturana/host-auth/*`, and
+the Rust-rendered `sessiond.env`, `run-agent.sh`, and
+`maturana-agent.service`.
+
+Rust owns Firecracker lifecycle decisions: prerequisite checks, idempotent
+start, stop, live inspect, pid tracking, socket cleanup, and launch metadata.
+The remaining Firecracker scripts are host setup adapters for image prep and
+TAP creation only.
