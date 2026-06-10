@@ -267,7 +267,7 @@ print(c.get("prompt") or c.get("text") or "")
 PY
 
   response=""
-  harness_timeout="${MATURANA_HARNESS_TIMEOUT_SECONDS:-60}"
+  harness_timeout="${MATURANA_HARNESS_TIMEOUT_SECONDS:-240}"
   run_harness() {
     timeout --kill-after=10s "${harness_timeout}s" "$@"
   }

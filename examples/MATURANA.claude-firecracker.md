@@ -30,6 +30,7 @@ filesystem:
 network:
   egress_allowlist:
     - api.anthropic.com
+    - platform.claude.com
     - github.com
 memory:
   wiki_path: .maturana/wiki
