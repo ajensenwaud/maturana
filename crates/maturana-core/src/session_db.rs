@@ -83,12 +83,45 @@ pub fn insert_inbound(
     Ok(id)
 }
 
+/// Visibility / retry policy for the inbound work queue.
+///
+/// A claimed message is leased for `lease_seconds`. If the worker that claimed
+/// it does not mark it completed within the lease, the message is recovered:
+/// requeued (with backoff) when it still has retries left, or dead-lettered
+/// once it has been attempted `max_tries` times. This is what keeps a crashed
+/// guest turn from wedging a message in `processing` forever.
+#[derive(Debug, Clone, Copy)]
+pub struct ClaimPolicy {
+    pub lease_seconds: i64,
+    pub max_tries: i64,
+    pub backoff_seconds: i64,
+}
+
+impl Default for ClaimPolicy {
+    fn default() -> Self {
+        Self {
+            lease_seconds: 300,
+            max_tries: 5,
+            backoff_seconds: 15,
+        }
+    }
+}
+
 pub fn claim_pending_inbound(
     paths: &SessionPaths,
     limit: usize,
 ) -> anyhow::Result<Vec<InboundMessage>> {
+    claim_pending_inbound_with_policy(paths, limit, ClaimPolicy::default())
+}
+
+pub fn claim_pending_inbound_with_policy(
+    paths: &SessionPaths,
+    limit: usize,
+    policy: ClaimPolicy,
+) -> anyhow::Result<Vec<InboundMessage>> {
     let db = open_rw(&paths.inbound_db)?;
     ensure_inbound_schema(&db)?;
+    recover_stuck_inbound(&db, policy)?;
     let messages = {
         let mut stmt = db.prepare(
             r#"
@@ -113,6 +146,104 @@ pub fn claim_pending_inbound(
         stmt.execute(params![now, message.id])?;
     }
     Ok(messages)
+}
+
+/// Reclaim messages whose lease has expired. Messages still under their retry
+/// budget go back to `pending` with a backoff; messages that have exhausted
+/// `max_tries` are dead-lettered to `failed` so they stop blocking the queue
+/// and become visible to operators via [`queue_stats`] / [`list_dead_letters`].
+fn recover_stuck_inbound(db: &Connection, policy: ClaimPolicy) -> anyhow::Result<i64> {
+    let lease = policy.lease_seconds.max(0);
+    let backoff = policy.backoff_seconds.max(0);
+    let max_tries = policy.max_tries.max(1);
+    let now = Utc::now().to_rfc3339();
+    let requeued = db.execute(
+        &format!(
+            r#"
+            UPDATE messages_in
+            SET status = 'pending',
+                status_changed = ?1,
+                process_after = datetime('now', '+{backoff} seconds')
+            WHERE status = 'processing'
+              AND tries < ?2
+              AND datetime(status_changed, '+{lease} seconds') <= datetime('now')
+            "#
+        ),
+        params![now, max_tries],
+    )?;
+    db.execute(
+        &format!(
+            r#"
+            UPDATE messages_in
+            SET status = 'failed', status_changed = ?1
+            WHERE status = 'processing'
+              AND tries >= ?2
+              AND datetime(status_changed, '+{lease} seconds') <= datetime('now')
+            "#
+        ),
+        params![now, max_tries],
+    )?;
+    Ok(requeued as i64)
+}
+
+/// Aggregate counts per status, for `maturana doctor` / orchestrator health.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueueStats {
+    pub pending: i64,
+    pub processing: i64,
+    pub completed: i64,
+    pub failed: i64,
+}
+
+pub fn queue_stats(paths: &SessionPaths) -> anyhow::Result<QueueStats> {
+    let db = open_rw(&paths.inbound_db)?;
+    ensure_inbound_schema(&db)?;
+    let mut stats = QueueStats::default();
+    let mut stmt = db.prepare("SELECT status, COUNT(*) FROM messages_in GROUP BY status")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (status, count) = row?;
+        match status.as_str() {
+            "pending" => stats.pending = count,
+            "processing" => stats.processing = count,
+            "completed" => stats.completed = count,
+            "failed" => stats.failed = count,
+            _ => {}
+        }
+    }
+    Ok(stats)
+}
+
+/// Dead-lettered messages awaiting operator attention.
+pub fn list_dead_letters(paths: &SessionPaths) -> anyhow::Result<Vec<InboundMessage>> {
+    let db = open_rw(&paths.inbound_db)?;
+    ensure_inbound_schema(&db)?;
+    let mut stmt = db.prepare(
+        r#"
+        SELECT id, kind, channel, platform_id, thread_id, content, status, created_at
+        FROM messages_in
+        WHERE status = 'failed'
+        ORDER BY seq ASC
+        "#,
+    )?;
+    let rows = stmt
+        .query_map([], inbound_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Move a dead-lettered message back to `pending` with a fresh retry budget.
+pub fn requeue_inbound(paths: &SessionPaths, message_id: &str) -> anyhow::Result<bool> {
+    let db = open_rw(&paths.inbound_db)?;
+    ensure_inbound_schema(&db)?;
+    let now = Utc::now().to_rfc3339();
+    let changed = db.execute(
+        "UPDATE messages_in SET status = 'pending', tries = 0, process_after = NULL, status_changed = ?1 WHERE id = ?2",
+        params![now, message_id],
+    )?;
+    Ok(changed > 0)
 }
 
 pub fn mark_inbound_completed(paths: &SessionPaths, message_ids: &[String]) -> anyhow::Result<()> {
@@ -370,6 +501,67 @@ mod tests {
         assert_eq!(undelivered.len(), 1);
         mark_delivered(&paths, &undelivered[0].id, Some("telegram-1")).unwrap();
         assert!(list_undelivered(&paths).unwrap().is_empty());
+    }
+
+    #[test]
+    fn expired_lease_requeues_then_dead_letters_a_crashed_turn() {
+        let temp = temp_dir();
+        let paths = session_paths(&temp, "telegram-main");
+        ensure_session(&paths).unwrap();
+        insert_inbound(&paths, "chat", "telegram", "chat-1", None, r#"{"text":"x"}"#).unwrap();
+
+        // Lease 0 + max_tries 2 means: every claim that is not completed is
+        // immediately recoverable on the next claim, and the message is dead-
+        // lettered once it has been attempted twice.
+        let policy = ClaimPolicy {
+            lease_seconds: 0,
+            max_tries: 2,
+            backoff_seconds: 0,
+        };
+
+        // First claim leases the message (tries -> 1) but the "worker" crashes
+        // without completing it.
+        let first = claim_pending_inbound_with_policy(&paths, 1, policy).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(queue_stats(&paths).unwrap().processing, 1);
+
+        // Second claim recovers the expired lease and re-leases it (tries -> 2).
+        let second = claim_pending_inbound_with_policy(&paths, 1, policy).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].id, first[0].id);
+
+        // Third claim: retry budget is exhausted, so recovery dead-letters it
+        // instead of re-leasing. Nothing is handed out.
+        let third = claim_pending_inbound_with_policy(&paths, 1, policy).unwrap();
+        assert!(third.is_empty());
+        let stats = queue_stats(&paths).unwrap();
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.processing, 0);
+
+        let dead = list_dead_letters(&paths).unwrap();
+        assert_eq!(dead.len(), 1);
+        assert!(requeue_inbound(&paths, &dead[0].id).unwrap());
+        assert_eq!(queue_stats(&paths).unwrap().pending, 1);
+    }
+
+    #[test]
+    fn healthy_lease_is_not_reclaimed_while_in_flight() {
+        let temp = temp_dir();
+        let paths = session_paths(&temp, "telegram-main");
+        ensure_session(&paths).unwrap();
+        insert_inbound(&paths, "chat", "telegram", "chat-1", None, r#"{"text":"x"}"#).unwrap();
+
+        // A long lease means a still-running turn is never double-claimed.
+        let policy = ClaimPolicy {
+            lease_seconds: 300,
+            max_tries: 5,
+            backoff_seconds: 15,
+        };
+        let first = claim_pending_inbound_with_policy(&paths, 1, policy).unwrap();
+        assert_eq!(first.len(), 1);
+        let second = claim_pending_inbound_with_policy(&paths, 1, policy).unwrap();
+        assert!(second.is_empty(), "in-flight lease must not be re-handed-out");
+        assert_eq!(queue_stats(&paths).unwrap().processing, 1);
     }
 
     fn temp_dir() -> PathBuf {
