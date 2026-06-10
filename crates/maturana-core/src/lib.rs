@@ -8,6 +8,7 @@ pub mod pipelock_proxy;
 pub mod providers;
 pub mod secrets;
 pub mod session_db;
+pub mod ssh_pin;
 pub mod snapshots;
 pub mod spec;
 pub mod state;

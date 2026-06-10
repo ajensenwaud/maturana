@@ -2,6 +2,7 @@ use super::{LiveAgentStatus, Provider, ProviderCommand};
 use crate::{
     pipelock_proxy::ensure_mitm_ca_cert,
     spec::{AgentSpec, HarnessRuntime},
+    ssh_pin,
     worker::{
         render_guest_bootstrap, render_harness_install, render_run_agent, render_session_env,
         render_systemd_service, GuestWorkerConfig,
@@ -119,12 +120,18 @@ impl Provider for HyperVProvider {
         let cloud_init_user_data_path = cloud_init_dir.join("user-data");
         let cloud_init_meta_data_path = cloud_init_dir.join("meta-data");
         let public_key = read_ssh_public_key(&absolute_path(agent_ssh_key())?)?;
+        // Generate the guest's SSH *host* key on the host and install it via
+        // cloud-init so the provisioner can verify it instead of trusting any
+        // server that answers. The public key is recorded under state/ for later
+        // CLI connections (repair, inspect) to pin against.
+        let host_key = ssh_pin::generate_host_keypair(&state_dir)?;
         std::fs::write(
             &cloud_init_user_data_path,
             render_cloud_init_user_data(
                 "ubuntu",
                 &format!("maturana-{}", spec.identity.id),
                 &public_key,
+                &ssh_pin::cloud_init_ssh_keys_block(&host_key.private_pem, &host_key.public_line),
             ),
         )?;
         std::fs::write(
@@ -177,10 +184,17 @@ impl Provider for HyperVProvider {
                 anyhow::anyhow!("hostd launch succeeded but no guest IPv4 was reported")
             })?;
 
+        // Pin the just-generated host key to the discovered address; provisioning
+        // then verifies strictly from its first (secret-bearing) connection.
+        let known_hosts_path = state_dir.join(ssh_pin::KNOWN_HOSTS_FILE);
+        ssh_pin::write_known_hosts(&known_hosts_path, &ipv4, &host_key.public_line)?;
+
         provision_hyperv_guest(HyperVGuestProvision {
             ip: &ipv4,
             ssh_user: "ubuntu",
             ssh_key_path: &absolute_path(agent_ssh_key())?,
+            known_hosts: &known_hosts_path,
+            strict_host_key: true,
             agent_dir,
             bootstrap_path: &bootstrap_path,
             proxy_env_path: proxy_env_path.as_deref(),
@@ -314,6 +328,8 @@ struct HyperVGuestProvision<'a> {
     ip: &'a str,
     ssh_user: &'a str,
     ssh_key_path: &'a Path,
+    known_hosts: &'a Path,
+    strict_host_key: bool,
     agent_dir: &'a Path,
     bootstrap_path: &'a Path,
     proxy_env_path: Option<&'a Path>,
@@ -450,7 +466,7 @@ fn provision_hyperv_guest(config: HyperVGuestProvision<'_>) -> anyhow::Result<()
 fn invoke_guest(config: &HyperVGuestProvision<'_>, command: &str) -> anyhow::Result<()> {
     let destination = format!("{}@{}", config.ssh_user, config.ip);
     let status = Command::new("ssh")
-        .args(ssh_options(config.ssh_key_path))
+        .args(guest_ssh_options(config))
         .arg(destination)
         .arg(command)
         .status()
@@ -474,7 +490,7 @@ fn copy_to_guest(
     }
     let target = format!("{}@{}:{destination}", config.ssh_user, config.ip);
     let status = Command::new("scp")
-        .args(ssh_options(config.ssh_key_path))
+        .args(guest_ssh_options(config))
         .arg("-r")
         .arg(source)
         .arg(target)
@@ -494,17 +510,13 @@ fn copy_to_guest(
     Ok(())
 }
 
-fn ssh_options(ssh_key_path: &Path) -> Vec<String> {
-    vec![
-        "-o".to_string(),
-        "StrictHostKeyChecking=no".to_string(),
-        "-o".to_string(),
-        "UserKnownHostsFile=NUL".to_string(),
-        "-o".to_string(),
-        "ConnectTimeout=10".to_string(),
-        "-i".to_string(),
-        ssh_key_path.display().to_string(),
-    ]
+fn guest_ssh_options(config: &HyperVGuestProvision<'_>) -> Vec<String> {
+    let mut options = ssh_pin::ssh_host_key_options(config.known_hosts, config.strict_host_key);
+    options.push("-o".to_string());
+    options.push("ConnectTimeout=10".to_string());
+    options.push("-i".to_string());
+    options.push(config.ssh_key_path.display().to_string());
+    options
 }
 
 fn shell_quote(value: &str) -> String {
@@ -672,9 +684,14 @@ fn read_ssh_public_key(private_key_path: &Path) -> anyhow::Result<String> {
     Ok(public_key.to_string())
 }
 
-fn render_cloud_init_user_data(ssh_user: &str, hostname: &str, public_key: &str) -> String {
+fn render_cloud_init_user_data(
+    ssh_user: &str,
+    hostname: &str,
+    public_key: &str,
+    host_keys_block: &str,
+) -> String {
     format!(
-        "#cloud-config\nhostname: {hostname}\nmanage_etc_hosts: true\nssh_pwauth: false\ndisable_root: true\nusers:\n  - default\n  - name: {ssh_user}\n    gecos: Maturana Agent\n    groups: [adm, sudo]\n    shell: /bin/bash\n    sudo: ALL=(ALL) NOPASSWD:ALL\n    lock_passwd: true\n    ssh_authorized_keys:\n      - {public_key}\nruncmd:\n  - [ systemctl, enable, --now, ssh ]\n"
+        "#cloud-config\nhostname: {hostname}\nmanage_etc_hosts: true\nssh_pwauth: false\ndisable_root: true\n{host_keys_block}users:\n  - default\n  - name: {ssh_user}\n    gecos: Maturana Agent\n    groups: [adm, sudo]\n    shell: /bin/bash\n    sudo: ALL=(ALL) NOPASSWD:ALL\n    lock_passwd: true\n    ssh_authorized_keys:\n      - {public_key}\nruncmd:\n  - [ systemctl, enable, --now, ssh ]\n"
     )
 }
 
@@ -704,16 +721,24 @@ mod tests {
 
     #[test]
     fn renders_cloud_init_user_and_metadata() {
+        let host_keys = ssh_pin::cloud_init_ssh_keys_block(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nkeydata\n-----END OPENSSH PRIVATE KEY-----",
+            "ssh-ed25519 AAAAHOST maturana-host",
+        );
         let user_data = render_cloud_init_user_data(
             "ubuntu",
             "maturana-codex-demo",
             "ssh-ed25519 AAAA maturana-agent",
+            &host_keys,
         );
         assert!(user_data.contains("hostname: maturana-codex-demo"));
         assert!(user_data.contains("name: ubuntu"));
         assert!(user_data.contains("sudo: ALL=(ALL) NOPASSWD:ALL"));
         assert!(user_data.contains("ssh-ed25519 AAAA maturana-agent"));
         assert!(user_data.contains("[ systemctl, enable, --now, ssh ]"));
+        // The host key block is installed so the provisioner can pin it.
+        assert!(user_data.contains("ssh_keys:\n  ed25519_private: |"));
+        assert!(user_data.contains("ed25519_public: ssh-ed25519 AAAAHOST maturana-host"));
 
         let meta_data = render_cloud_init_meta_data("codex-demo", "maturana-codex-demo");
         assert!(meta_data.contains("instance-id: codex-demo"));

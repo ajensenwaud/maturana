@@ -710,16 +710,24 @@ fn deploy_item(home: &MaturanaHome, kind: DeployKind, item: DeployItem) -> anyho
         .map(|(parent, _)| parent)
         .filter(|parent| !parent.is_empty())
         .unwrap_or(base);
+    // Verify the guest host key (strict if pinned for this agent, else
+    // accept-new) so a deploy can't push skills/tools to an impostor.
+    let state_dir = home.agent_dir(&item.agent_id).join("state");
+    let (known_hosts, strict) =
+        maturana_core::ssh_pin::prepare_known_hosts(&state_dir, &item.ip)?;
+    let host_key_opts = maturana_core::ssh_pin::ssh_host_key_options(&known_hosts, strict);
     run_ssh(
         &item.ip,
         &item.ssh_user,
         &item.ssh_key,
+        &host_key_opts,
         &format!("mkdir -p {}", shell_quote(parent)),
     )?;
     run_scp(
         &item.ip,
         &item.ssh_user,
         &item.ssh_key,
+        &host_key_opts,
         &item.path,
         &guest_path,
     )?;
@@ -910,15 +918,13 @@ fn run_scp(
     ip: &str,
     ssh_user: &str,
     ssh_key: &Path,
+    host_key_opts: &[String],
     local_path: &Path,
     remote_path: &str,
 ) -> anyhow::Result<()> {
     let mut command = ProcessCommand::new("scp");
     command
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg(format!("UserKnownHostsFile={}", null_known_hosts()))
+        .args(host_key_opts)
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg("-i")
@@ -939,12 +945,15 @@ fn run_scp(
     Ok(())
 }
 
-fn run_ssh(ip: &str, ssh_user: &str, ssh_key: &Path, remote_command: &str) -> anyhow::Result<()> {
+fn run_ssh(
+    ip: &str,
+    ssh_user: &str,
+    ssh_key: &Path,
+    host_key_opts: &[String],
+    remote_command: &str,
+) -> anyhow::Result<()> {
     let output = ProcessCommand::new("ssh")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg(format!("UserKnownHostsFile={}", null_known_hosts()))
+        .args(host_key_opts)
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg("-i")
@@ -963,14 +972,6 @@ fn run_ssh(ip: &str, ssh_user: &str, ssh_key: &Path, remote_command: &str) -> an
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
-fn null_known_hosts() -> &'static str {
-    if cfg!(windows) {
-        "NUL"
-    } else {
-        "/dev/null"
-    }
 }
 
 #[cfg(test)]
