@@ -27,12 +27,9 @@ These scripts are acceptable as host setup or host primitive wrappers:
 - `scripts/install-windows.ps1`: one-shot Windows bootstrap aggregator.
 - `scripts/install-hostd-task.ps1`, `scripts/uninstall-hostd-task.ps1`:
   scheduled task registration for the Rust `maturana hostd serve` daemon.
-- `scripts/install-sessiond-task.ps1`,
-  `scripts/install-telegram-channel-task.ps1`: scheduled task registration for
-  fixed personal-agent daemons. Rust supplies token paths, log paths, agent IDs,
-  session IDs, and token sources; these scripts should only register or start
-  the exact command they were given. Telegram tasks must not discover guest IPs
-  or run harnesses from the host.
+- Windows session/channel runners are started and optionally registered by the
+  Rust CLI. Do not add PowerShell task helpers for these generic runner
+  lifecycles.
 - `scripts/run-elevated.ps1`: UAC helper for one-off host setup.
 - `scripts/firecracker-setup-tap.sh`: Linux TAP setup.
 - `scripts/firecracker-prepare-assets.sh`: Linux image/kernel/rootfs
@@ -96,9 +93,9 @@ Recently migrated:
   narrow browser smoke script. PowerShell and bash adapters must not decide
   browser packages or browser policy.
 - Windows personal-agent daemon repair: `maturana repair windows-harnesses`
-  now creates the sessiond token/log paths and passes them to the task adapter.
-  The Telegram task adapter no longer contacts hostd for an IP and cannot run a
-  host-side harness provider.
+  now creates sessiond/channel token, log, pid, process, and optional scheduled
+  task state directly in Rust. It does not call PowerShell for generic runner
+  lifecycles.
 - Hyper-V hostd launch queue removal: Rust hostd runs the fixed Ubuntu launcher
   synchronously and returns the launcher result directly. The previous launch
   job/status files and generated hostd runner scripts are not a product control

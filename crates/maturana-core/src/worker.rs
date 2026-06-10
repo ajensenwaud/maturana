@@ -187,6 +187,14 @@ if [ "$sessiond_url" = "__MATURANA_DEFAULT_SESSIOND_URL__" ]; then
   host_gateway="$(ip route | awk '/default/ {print $3; exit}')"
   sessiond_url="http://$host_gateway:47834"
 fi
+sessiond_host="${sessiond_url#http://}"
+sessiond_host="${sessiond_host#https://}"
+sessiond_host="${sessiond_host%%/*}"
+sessiond_host="${sessiond_host%%:*}"
+if [ -n "$sessiond_host" ]; then
+  export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1,::1},$sessiond_host"
+  export no_proxy="$NO_PROXY"
+fi
 
 headers=(-H "content-type: application/json")
 if [ -n "${MATURANA_SESSIOND_TOKEN:-}" ]; then
@@ -259,14 +267,18 @@ print(c.get("prompt") or c.get("text") or "")
 PY
 
   response=""
+  harness_timeout="${MATURANA_HARNESS_TIMEOUT_SECONDS:-60}"
+  run_harness() {
+    timeout --kill-after=10s "${harness_timeout}s" "$@"
+  }
   if [ "${MATURANA_HARNESS}" = "codex" ]; then
-    if codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C /workspace -o /tmp/maturana-session-response.txt "$(cat /tmp/maturana-session-prompt.txt)" >>/var/log/maturana/worker.out.log 2>>/var/log/maturana/worker.err.log; then
+    if run_harness codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C /workspace -o /tmp/maturana-session-response.txt "$(cat /tmp/maturana-session-prompt.txt)" >>/var/log/maturana/worker.out.log 2>>/var/log/maturana/worker.err.log; then
       response="$(cat /tmp/maturana-session-response.txt)"
     else
       response="I hit an error while processing that message."
     fi
   elif [ "${MATURANA_HARNESS}" = "claude-code" ]; then
-    if claude -p "$(cat /tmp/maturana-session-prompt.txt)" >/tmp/maturana-session-response.txt 2>>/var/log/maturana/worker.err.log; then
+    if run_harness claude -p "$(cat /tmp/maturana-session-prompt.txt)" >/tmp/maturana-session-response.txt 2>>/var/log/maturana/worker.err.log; then
       response="$(cat /tmp/maturana-session-response.txt)"
     else
       response="I hit an error while processing that message."
@@ -277,7 +289,7 @@ PY
       opencode_args+=(-m openrouter/anthropic/claude-sonnet-4.5)
     fi
     opencode_args+=("$(cat /tmp/maturana-session-prompt.txt)")
-    if opencode "${opencode_args[@]}" >/tmp/maturana-session-response.txt 2>>/var/log/maturana/worker.err.log; then
+    if run_harness opencode "${opencode_args[@]}" >/tmp/maturana-session-response.txt 2>>/var/log/maturana/worker.err.log; then
       response="$(cat /tmp/maturana-session-response.txt)"
       if [ -z "$response" ] && [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
         response="$(python3 - <<'PY'

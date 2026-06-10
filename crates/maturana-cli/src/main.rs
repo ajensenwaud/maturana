@@ -2376,10 +2376,7 @@ fn repair_windows_harnesses(
     stop_windows_harness_processes()?;
 
     let repo_root = std::env::current_dir()?;
-    let sessiond_script = repo_root.join("scripts/install-sessiond-task.ps1");
-    let telegram_script = repo_root.join("scripts/install-telegram-channel-task.ps1");
-    let sessiond_args = windows_sessiond_task_args(home, register_tasks)?;
-    run_powershell_script(&sessiond_script, &sessiond_args)?;
+    start_windows_sessiond(home, &repo_root, register_tasks)?;
 
     for index in 0..config.agent_ids.len() {
         let agent_id = &config.agent_ids[index];
@@ -2392,18 +2389,14 @@ fn repair_windows_harnesses(
             refresh_live_guest_worker(home, agent_id, session_id, harness, auth_path)?;
         }
 
-        let mut telegram_args = vec![
-            "-AgentId".to_string(),
-            agent_id.clone(),
-            "-SessionId".to_string(),
-            session_id.clone(),
-            "-TokenSource".to_string(),
-            token_source.clone(),
-        ];
-        if !register_tasks {
-            telegram_args.push("-StartOnly".to_string());
-        }
-        run_powershell_script(&telegram_script, &telegram_args)?;
+        start_windows_telegram_channel(
+            home,
+            &repo_root,
+            agent_id,
+            session_id,
+            token_source,
+            register_tasks,
+        )?;
     }
 
     run_doctor(
@@ -2416,27 +2409,97 @@ fn repair_windows_harnesses(
     )
 }
 
-fn windows_sessiond_task_args(
+fn start_windows_sessiond(
     home: &MaturanaHome,
-    register_tasks: bool,
-) -> anyhow::Result<Vec<String>> {
+    repo_root: &Path,
+    register_task: bool,
+) -> anyhow::Result<()> {
     let sessiond_token_path = home.root().join("sessiond/token");
-    ensure_sessiond_token(&sessiond_token_path)?;
+    let token = ensure_sessiond_token(&sessiond_token_path)?;
     let logs_dir = home.root().join("logs");
     fs::create_dir_all(&logs_dir)?;
-
-    let mut args = vec![
-        "-TokenPath".to_string(),
-        sessiond_token_path.display().to_string(),
-        "-LogPath".to_string(),
-        logs_dir.join("sessiond.out.log").display().to_string(),
-        "-ErrPath".to_string(),
-        logs_dir.join("sessiond.err.log").display().to_string(),
-    ];
-    if !register_tasks {
-        args.push("-StartOnly".to_string());
+    let pid_path = home.root().join("sessiond/runner.pid");
+    if let Some(parent) = pid_path.parent() {
+        fs::create_dir_all(parent)?;
     }
-    Ok(args)
+    let args = vec![
+        "session".to_string(),
+        "serve".to_string(),
+        "--bind".to_string(),
+        "0.0.0.0:47834".to_string(),
+        "--token".to_string(),
+        token,
+    ];
+    let exe = windows_maturana_exe(repo_root)?;
+    if register_task {
+        register_windows_task(
+            "MaturanaSessiond",
+            &exe,
+            &args,
+            repo_root,
+            &logs_dir.join("sessiond.out.log"),
+            &logs_dir.join("sessiond.err.log"),
+        )?;
+    }
+    start_windows_runner(
+        &exe,
+        &args,
+        repo_root,
+        &logs_dir.join("sessiond.out.log"),
+        &logs_dir.join("sessiond.err.log"),
+        &pid_path,
+        "sessiond",
+    )
+}
+
+fn start_windows_telegram_channel(
+    home: &MaturanaHome,
+    repo_root: &Path,
+    agent_id: &str,
+    session_id: &str,
+    token_source: &str,
+    register_task: bool,
+) -> anyhow::Result<()> {
+    let safe_agent_id = safe_windows_task_suffix(agent_id);
+    let logs_dir = home.root().join("logs");
+    fs::create_dir_all(&logs_dir)?;
+    let pid_path = home
+        .agent_dir(agent_id)
+        .join("channels/telegram/runner.pid");
+    if let Some(parent) = pid_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let args = vec![
+        "channel".to_string(),
+        "serve".to_string(),
+        "telegram".to_string(),
+        "--agent-id".to_string(),
+        agent_id.to_string(),
+        "--session-id".to_string(),
+        session_id.to_string(),
+        "--token-source".to_string(),
+        token_source.to_string(),
+    ];
+    let exe = windows_maturana_exe(repo_root)?;
+    if register_task {
+        register_windows_task(
+            &format!("MaturanaTelegramChannel-{safe_agent_id}"),
+            &exe,
+            &args,
+            repo_root,
+            &logs_dir.join(format!("telegram-channel-{safe_agent_id}.out.log")),
+            &logs_dir.join(format!("telegram-channel-{safe_agent_id}.err.log")),
+        )?;
+    }
+    start_windows_runner(
+        &exe,
+        &args,
+        repo_root,
+        &logs_dir.join(format!("telegram-channel-{safe_agent_id}.out.log")),
+        &logs_dir.join(format!("telegram-channel-{safe_agent_id}.err.log")),
+        &pid_path,
+        &format!("telegram channel {agent_id}"),
+    )
 }
 
 fn refresh_live_guest_worker(
@@ -2649,46 +2712,158 @@ fn absolute_or_cwd(path: PathBuf) -> anyhow::Result<PathBuf> {
 }
 
 fn stop_windows_harness_processes() -> anyhow::Result<()> {
-    let script = r#"
-$ErrorActionPreference = "Stop"
-Get-CimInstance Win32_Process |
-  Where-Object {
-    $_.CommandLine -like "*maturana.exe*session serve*" -or
-    $_.CommandLine -like "*maturana.exe*channel serve telegram*"
-  } |
-  ForEach-Object {
-    Write-Host "Stopping pid=$($_.ProcessId) $($_.CommandLine)"
-    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-  }
-"#;
-    let status = ProcessCommand::new("powershell")
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-Command")
-        .arg(script)
-        .status()
-        .context("failed to stop Windows harness processes")?;
-    if !status.success() {
-        anyhow::bail!("failed to stop Windows harness processes: {status}");
+    let home = MaturanaHome::default_for_cwd(&std::env::current_dir()?);
+    stop_windows_pid_file(&home.root().join("sessiond/runner.pid"), "sessiond")?;
+    let agents_dir = home.agents_dir();
+    if agents_dir.exists() {
+        for entry in fs::read_dir(agents_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                stop_windows_pid_file(
+                    &entry.path().join("channels/telegram/runner.pid"),
+                    &format!("telegram channel {}", entry.file_name().to_string_lossy()),
+                )?;
+            }
+        }
     }
     Ok(())
 }
 
-fn run_powershell_script(script: &PathBuf, args: &[String]) -> anyhow::Result<()> {
-    let status = ProcessCommand::new("powershell")
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-File")
-        .arg(script)
-        .args(args)
+fn stop_windows_pid_file(path: &Path, label: &str) -> anyhow::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let pid = fs::read_to_string(path)?.trim().to_string();
+    if pid.is_empty() {
+        return Ok(());
+    }
+    let status = ProcessCommand::new("taskkill")
+        .arg("/PID")
+        .arg(&pid)
+        .arg("/F")
         .status()
-        .with_context(|| format!("failed to run {}", script.display()))?;
+        .with_context(|| format!("failed to stop {label} pid {pid}"))?;
     if !status.success() {
-        anyhow::bail!("{} failed with {status}", script.display());
+        eprintln!("warning: failed to stop {label} pid {pid}: {status}");
+    } else {
+        println!("stopped {label} pid={pid}");
+    }
+    let _ = fs::remove_file(path);
+    Ok(())
+}
+
+fn start_windows_runner(
+    exe: &Path,
+    args: &[String],
+    repo_root: &Path,
+    log_path: &Path,
+    err_path: &Path,
+    pid_path: &Path,
+    label: &str,
+) -> anyhow::Result<()> {
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = err_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = pid_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let stdout = fs::File::create(log_path)?;
+    let stderr = fs::File::create(err_path)?;
+    let child = ProcessCommand::new(exe)
+        .args(args)
+        .current_dir(repo_root)
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .with_context(|| format!("failed to start {label}"))?;
+    fs::write(pid_path, child.id().to_string())?;
+    println!("started {label} pid={}", child.id());
+    Ok(())
+}
+
+fn register_windows_task(
+    task_name: &str,
+    exe: &Path,
+    args: &[String],
+    repo_root: &Path,
+    log_path: &Path,
+    err_path: &Path,
+) -> anyhow::Result<()> {
+    let mut command = format!(
+        "cmd.exe /c \"cd /d {} && {} {} >> {} 2>> {}\"",
+        quote_cmd_arg(repo_root),
+        quote_cmd_arg(exe),
+        args.iter()
+            .map(|arg| quote_cmd_arg(arg))
+            .collect::<Vec<_>>()
+            .join(" "),
+        quote_cmd_arg(log_path),
+        quote_cmd_arg(err_path)
+    );
+    if command.len() > 260 {
+        command = format!(
+            "{} {}",
+            quote_cmd_arg(exe),
+            args.iter()
+                .map(|arg| quote_cmd_arg(arg))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+    let status = ProcessCommand::new("schtasks")
+        .arg("/Create")
+        .arg("/TN")
+        .arg(task_name)
+        .arg("/SC")
+        .arg("ONLOGON")
+        .arg("/TR")
+        .arg(command)
+        .arg("/F")
+        .status()
+        .with_context(|| format!("failed to register Windows task {task_name}"))?;
+    if !status.success() {
+        eprintln!("warning: could not register Windows task {task_name}: {status}");
     }
     Ok(())
+}
+
+fn windows_maturana_exe(repo_root: &Path) -> anyhow::Result<PathBuf> {
+    let current = std::env::current_exe()?;
+    if current.exists() {
+        return Ok(current);
+    }
+    for path in [
+        repo_root.join("target/x86_64-pc-windows-msvc/debug/maturana.exe"),
+        repo_root.join("target/x86_64-pc-windows-gnu/debug/maturana.exe"),
+        repo_root.join("target/debug/maturana.exe"),
+    ] {
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    anyhow::bail!("maturana.exe not found; build the Windows binary first")
+}
+
+fn safe_windows_task_suffix(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn quote_cmd_arg(value: impl AsRef<Path>) -> String {
+    let raw = value.as_ref().display().to_string();
+    format!("\"{}\"", raw.replace('"', "\\\""))
 }
 
 fn print_doctor_check(label: &str, check: &DoctorCheck) {
@@ -4476,42 +4651,11 @@ mod tests {
     }
 
     #[test]
-    fn windows_sessiond_task_args_are_rust_owned() {
-        let temp = std::env::temp_dir().join(format!(
-            "maturana-sessiond-task-args-test-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&temp);
-        let home = MaturanaHome::new(&temp);
-
-        let args = windows_sessiond_task_args(&home, false).unwrap();
-        let token_path = temp.join("sessiond/token");
-        assert!(token_path.exists());
-        assert!(fs::read_to_string(&token_path).unwrap().trim().len() >= 32);
-        assert!(args.contains(&"-TokenPath".to_string()));
-        assert!(args.contains(&token_path.display().to_string()));
-        assert!(args.contains(&"-LogPath".to_string()));
-        assert!(args.contains(
-            &temp
-                .join("logs")
-                .join("sessiond.out.log")
-                .display()
-                .to_string()
-        ));
-        assert!(args.contains(&"-ErrPath".to_string()));
-        assert!(args.contains(
-            &temp
-                .join("logs")
-                .join("sessiond.err.log")
-                .display()
-                .to_string()
-        ));
-        assert!(args.contains(&"-StartOnly".to_string()));
-
-        let register_args = windows_sessiond_task_args(&home, true).unwrap();
-        assert!(!register_args.contains(&"-StartOnly".to_string()));
-
-        let _ = fs::remove_dir_all(&temp);
+    fn windows_runner_helpers_are_rust_owned() {
+        assert_eq!(safe_windows_task_suffix("codex-demo"), "codex-demo");
+        assert_eq!(safe_windows_task_suffix("../bad name"), "..-bad-name");
+        assert!(quote_cmd_arg("C:/Program Files/maturana/maturana.exe").starts_with('"'));
+        assert!(!quote_cmd_arg("maturana.exe").contains("powershell"));
     }
 
     #[test]
