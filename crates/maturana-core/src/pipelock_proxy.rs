@@ -17,6 +17,12 @@ use std::{
     time::Duration,
 };
 
+/// Idle bound for an established tunnel. Streaming model responses can sit
+/// silent for minutes while the model thinks, so this must be much larger than
+/// the 15s request-parse timeout, while still reclaiming threads whose peer
+/// vanished without closing the connection.
+const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
     pub home_root: PathBuf,
@@ -90,12 +96,20 @@ pub fn run_proxy(bind: &str, config: ProxyConfig) -> anyhow::Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = handle_proxy_stream(stream, &config) {
-                    let _ = append_audit(
-                        &config.audit_path,
-                        &ProxyAuditEvent::denied_raw(error.to_string()),
-                    );
-                }
+                // Handle each connection on its own thread: a CONNECT tunnel
+                // stays open for the whole upstream exchange (minutes for a
+                // streaming model response), and the harnesses open several
+                // connections at once. Serving inline on the accept thread
+                // serializes every guest connection behind the current tunnel.
+                let config = config.clone();
+                thread::spawn(move || {
+                    if let Err(error) = handle_proxy_stream(stream, &config) {
+                        let _ = append_audit(
+                            &config.audit_path,
+                            &ProxyAuditEvent::denied_raw(error.to_string()),
+                        );
+                    }
+                });
             }
             Err(error) => {
                 append_audit(
@@ -255,6 +269,17 @@ fn handle_connect(
     let mut upstream = connect_upstream(&parsed.host, parsed.port)?;
     client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
 
+    // The 15s socket timeouts exist to bound the initial request parse and the
+    // upstream connect. An established tunnel must tolerate long idle gaps
+    // (streaming model responses sit silent while the model thinks), so relax
+    // the timeouts to a generous idle bound before the blocking copy loops;
+    // otherwise the tunnel is torn down mid-response and the harness retries
+    // the whole request.
+    client.set_read_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
+    client.set_write_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
+    upstream.set_read_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
+    upstream.set_write_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
+
     let mut client_reader = client.try_clone()?;
     let mut upstream_writer = upstream.try_clone()?;
     let client_to_upstream =
@@ -295,6 +320,14 @@ fn handle_mitm_connect(
     let upstream_request = build_upstream_request(&tls_request, &request, &injected)?;
     upstream_tls.write_all(&upstream_request)?;
     upstream_tls.flush()?;
+
+    // As in handle_connect: the request is parsed and sent under the 15s
+    // timeouts, but the response may stream with long idle gaps, so relax the
+    // socket timeouts before relaying it.
+    client_tls.sock.set_read_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
+    client_tls.sock.set_write_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
+    upstream_tls.sock.set_read_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
+    upstream_tls.sock.set_write_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
 
     let mut total_bytes = 0u64;
     let mut buf = [0u8; 16 * 1024];

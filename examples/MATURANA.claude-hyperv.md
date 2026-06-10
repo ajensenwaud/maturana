@@ -27,6 +27,7 @@ filesystem:
 network:
   egress_allowlist:
     - api.anthropic.com
+    - platform.claude.com
     - github.com
     - api.telegram.org
   proxy:
