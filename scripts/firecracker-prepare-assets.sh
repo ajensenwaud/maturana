@@ -143,6 +143,15 @@ if [[ ! -f "$ssh_key_path" ]]; then
   ssh-keygen -t ed25519 -f "$ssh_key_path" -N ""
 fi
 
+# Bake a known SSH *host* key into the rootfs so the host can verify the guest's
+# identity instead of trusting whatever server answers (StrictHostKeyChecking).
+# Its public key is published in the asset manifest and pinned per agent.
+host_key_path="${MATURANA_FIRECRACKER_HOST_KEY_PATH:-$output_dir/maturana-firecracker-host.ed25519}"
+if [[ ! -f "$host_key_path" ]]; then
+  ssh-keygen -t ed25519 -f "$host_key_path" -N "" -C "maturana-host"
+fi
+host_pub_line="$(tr -d '\n' < "$host_key_path.pub")"
+
 echo "Expanding Ubuntu image to $disk_size..."
 source_root_partition="${MATURANA_UBUNTU_SOURCE_ROOT_PARTITION:-$(detect_root_partition "$image_path")}"
 qemu-img create -q -f qcow2 "$resized_img" "$disk_size"
@@ -180,6 +189,8 @@ cp "$run_agent_path" "$work_dir/run-agent.sh"
 cp "$agent_service_path" "$work_dir/maturana-agent.service"
 cp "$harness_install_path" "$work_dir/install-harness.sh"
 cp "$firecracker_bootstrap_path" "$work_dir/firecracker-bootstrap.sh"
+cp "$host_key_path" "$work_dir/ssh_host_ed25519_key"
+cp "$host_key_path.pub" "$work_dir/ssh_host_ed25519_key.pub"
 
 echo "Customizing Ubuntu image offline..."
 virt-copy-in -a "$work_img" "$work_dir/firecracker-bootstrap.sh" /tmp
@@ -195,6 +206,9 @@ virt-copy-in -a "$work_img" "$work_dir/sessiond.env" /agent
 virt-copy-in -a "$work_img" "$work_dir/run-agent.sh" /opt/maturana/bin
 virt-copy-in -a "$work_img" "$work_dir/maturana-agent.service" /etc/systemd/system
 virt-copy-in -a "$work_img" "$work_dir/install-harness.sh" /tmp
+# After firecracker-bootstrap.sh ran `ssh-keygen -A` (which created a fresh
+# ed25519 host key), overwrite it with the baked one so it matches the manifest.
+virt-copy-in -a "$work_img" "$work_dir/ssh_host_ed25519_key" "$work_dir/ssh_host_ed25519_key.pub" /etc/ssh
 
 if [[ -f "$work_dir/maturana-pipelock-ca.crt" ]]; then
   virt-copy-in -a "$work_img" "$work_dir/maturana-pipelock-ca.crt" /usr/local/share/ca-certificates
@@ -230,6 +244,9 @@ fi
 
 virt-customize -a "$work_img" \
   --run-command 'chmod 0600 /etc/netplan/50-maturana-firecracker.yaml' \
+  --run-command 'chmod 0600 /etc/ssh/ssh_host_ed25519_key' \
+  --run-command 'chmod 0644 /etc/ssh/ssh_host_ed25519_key.pub' \
+  --run-command 'chown root:root /etc/ssh/ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key.pub' \
   --run-command 'chmod 0600 /agent/sessiond.env' \
   --run-command 'chmod 0755 /opt/maturana/bin/run-agent.sh' \
   --run-command 'chmod 0755 /tmp/install-harness.sh' \
@@ -268,6 +285,7 @@ cat > "$asset_manifest_path" <<EOF
   "kernel": "$kernel_out",
   "rootfs": "$rootfs_out",
   "ssh_key": "$ssh_key_path",
+  "ssh_host_ed25519_pub": "$host_pub_line",
   "guest_ip": "$guest_ip",
   "host_ip": "$host_ip",
   "guest_mac": "$guest_mac",

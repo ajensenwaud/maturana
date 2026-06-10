@@ -716,10 +716,12 @@ fn main() -> anyhow::Result<()> {
                                 "could not discover live IP for {agent_id}; pass --ip explicitly"
                             )
                         })?;
+                        let host_key = GuestHostKey::resolve(&home, &agent_id, &guest_ip)?;
                         print_live_guest_state(
                             &guest_ip,
                             &ssh_user,
                             &ssh_key,
+                            &host_key,
                             spec.as_ref()
                                 .map(|spec| spec.browser.headless_chrome)
                                 .unwrap_or(false),
@@ -788,7 +790,8 @@ fn main() -> anyhow::Result<()> {
                         )
                     })?,
                 };
-                let output = read_live_log(&ip, &ssh_user, &ssh_key, kind, lines)?;
+                let host_key = GuestHostKey::resolve(&home, &agent_id, &ip)?;
+                let output = read_live_log(&ip, &ssh_user, &ssh_key, &host_key, kind, lines)?;
                 audit_agent_event(
                     &home,
                     &agent_id,
@@ -815,10 +818,12 @@ fn main() -> anyhow::Result<()> {
                     })?,
                 };
                 let transfer_roots = agent_transfer_roots(&home, &agent_id, false)?;
+                let host_key = GuestHostKey::resolve(&home, &agent_id, &ip)?;
                 fetch_live_path(
                     &ip,
                     &ssh_user,
                     &ssh_key,
+                    &host_key,
                     &remote_path,
                     &local_path,
                     &transfer_roots,
@@ -856,10 +861,12 @@ fn main() -> anyhow::Result<()> {
                     })?,
                 };
                 let transfer_roots = agent_transfer_roots(&home, &agent_id, true)?;
+                let host_key = GuestHostKey::resolve(&home, &agent_id, &ip)?;
                 push_live_path(
                     &ip,
                     &ssh_user,
                     &ssh_key,
+                    &host_key,
                     &local_path,
                     &remote_path,
                     &transfer_roots,
@@ -2248,10 +2255,15 @@ fn repair_firecracker_harnesses(
         validate_and_materialize_firecracker_spec(home, &spec_path, !repair.skip_launch)?;
 
         if !repair.skip_worker_refresh {
+            // Record the rootfs's baked host public key so SSH verifies the guest
+            // (falls back to accept-new if the image predates host-key pinning).
+            pin_firecracker_host_key(home, profile)?;
+            let host_key = GuestHostKey::resolve(home, profile.agent_id, profile.guest_ip)?;
             wait_for_guest_ssh(
                 profile.guest_ip,
                 "ubuntu",
                 &ssh_key,
+                &host_key,
                 Duration::from_secs(repair.ssh_wait_seconds),
             )?;
             install_guest_worker(
@@ -2449,6 +2461,35 @@ fn prepare_firecracker_assets(
     validate_firecracker_asset_manifest(profile, &asset_manifest_path, &image_dir, ssh_key)
 }
 
+/// Copy the image's baked SSH host public key (from the asset manifest) into the
+/// agent's state dir so SSH connections to the guest can pin it. No-op (leaving
+/// accept-new migration in effect) if the image predates host-key pinning.
+fn pin_firecracker_host_key(
+    home: &MaturanaHome,
+    profile: &FirecrackerHarnessProfile,
+) -> anyhow::Result<()> {
+    let manifest_path = PathBuf::from(format!(
+        ".maturana/images/firecracker/{}/asset-manifest.json",
+        profile.image_name
+    ));
+    if !manifest_path.exists() {
+        return Ok(());
+    }
+    let raw = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+    let manifest: FirecrackerAssetManifest =
+        serde_json::from_str(&raw).context("failed to parse Firecracker asset manifest")?;
+    if let Some(public_line) = manifest.ssh_host_ed25519_pub.as_deref() {
+        let state_dir = home.agent_dir(profile.agent_id).join("state");
+        fs::create_dir_all(&state_dir)?;
+        fs::write(
+            state_dir.join(maturana_core::ssh_pin::HOST_PUBLIC_KEY_FILE),
+            format!("{}\n", public_line.trim()),
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct FirecrackerGuestArtifacts {
     sessiond_env: PathBuf,
@@ -2475,6 +2516,10 @@ struct FirecrackerAssetManifest {
     rootfs_sha256: String,
     kernel_bytes: u64,
     rootfs_bytes: u64,
+    /// The baked guest SSH host public key, pinned per agent. Optional so images
+    /// built before host-key pinning still parse (they fall back to accept-new).
+    #[serde(default)]
+    ssh_host_ed25519_pub: Option<String>,
 }
 
 fn validate_firecracker_asset_manifest(
@@ -2712,11 +2757,12 @@ fn wait_for_guest_ssh(
     guest_ip: &str,
     ssh_user: &str,
     ssh_key: &PathBuf,
+    host_key: &GuestHostKey,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if run_ssh_with_stdin(guest_ip, ssh_user, ssh_key, "echo ok", None).is_ok() {
+        if run_ssh_with_stdin(guest_ip, ssh_user, ssh_key, host_key, "echo ok", None).is_ok() {
             return Ok(());
         }
         thread::sleep(Duration::from_secs(2));
@@ -3026,10 +3072,15 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
     )?;
     fs::write(&runner_path, render_run_agent())?;
 
+    // Verify the guest's host key (strict if pinned, else accept-new) before
+    // pushing the sessiond token and harness credentials over these connections.
+    let host_key = GuestHostKey::resolve(home, &install.agent_id, &install.guest_ip)?;
+
     copy_path_to_guest(
         &install.guest_ip,
         &install.ssh_user,
         &ssh_key,
+        &host_key,
         &env_path,
         "/tmp/sessiond.env",
         false,
@@ -3038,6 +3089,7 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
         &install.guest_ip,
         &install.ssh_user,
         &ssh_key,
+        &host_key,
         &runner_path,
         "/tmp/run-agent.sh",
         false,
@@ -3049,6 +3101,7 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
                 &install.guest_ip,
                 &install.ssh_user,
                 &ssh_key,
+                &host_key,
                 &auth_source,
                 "/tmp/maturana-harness-auth",
                 true,
@@ -3060,6 +3113,7 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
             &install.guest_ip,
             &install.ssh_user,
             &ssh_key,
+            &host_key,
             &render_harness_install(&install.harness, false),
             None,
         )?;
@@ -3069,6 +3123,7 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
             &install.guest_ip,
             &install.ssh_user,
             &ssh_key,
+            &host_key,
             &render_auth_install_command(
                 &install.harness,
                 &install.ssh_user,
@@ -3081,6 +3136,7 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
         &install.guest_ip,
         &install.ssh_user,
         &ssh_key,
+        &host_key,
         &format!(
             "sudo mkdir -p /agent /opt/maturana/bin /var/log/maturana /workspace /memory /wiki && sudo mv /tmp/sessiond.env /agent/sessiond.env && sudo mv /tmp/run-agent.sh /opt/maturana/bin/run-agent.sh && sudo chown {user}:{user} /agent/sessiond.env /opt/maturana/bin/run-agent.sh && sudo chmod 0600 /agent/sessiond.env && sudo chmod 0755 /opt/maturana/bin/run-agent.sh && sudo systemctl restart maturana-agent.service",
             user = shell_quote(&install.ssh_user)
@@ -3774,10 +3830,11 @@ fn print_live_guest_state(
     ip: &str,
     ssh_user: &str,
     ssh_key: &PathBuf,
+    host_key: &GuestHostKey,
     headless_chrome: bool,
 ) -> anyhow::Result<()> {
     let remote = render_live_guest_state_script(headless_chrome);
-    let output = run_ssh_with_stdin(ip, ssh_user, ssh_key, &remote, None)?;
+    let output = run_ssh_with_stdin(ip, ssh_user, ssh_key, host_key, &remote, None)?;
     print!("{output}");
     Ok(())
 }
@@ -3949,6 +4006,7 @@ fn read_live_log(
     ip: &str,
     ssh_user: &str,
     ssh_key: &PathBuf,
+    host_key: &GuestHostKey,
     kind: LogKind,
     lines: u16,
 ) -> anyhow::Result<String> {
@@ -3958,7 +4016,7 @@ fn read_live_log(
     } else {
         format!("test -f {path} && tail -n {} {path} || true", lines.max(1))
     };
-    run_ssh_with_stdin(ip, ssh_user, ssh_key, &command, None)
+    run_ssh_with_stdin(ip, ssh_user, ssh_key, host_key, &command, None)
 }
 
 impl LogKind {
@@ -3987,6 +4045,7 @@ fn fetch_live_path(
     ip: &str,
     ssh_user: &str,
     ssh_key: &PathBuf,
+    host_key: &GuestHostKey,
     remote_path: &str,
     local_path: &PathBuf,
     allowed_roots: &[String],
@@ -4001,16 +4060,13 @@ fn fetch_live_path(
 
     let mut command = ProcessCommand::new("scp");
     command
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
+        .args(host_key.options())
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("PreferredAuthentications=publickey")
         .arg("-o")
         .arg("NumberOfPasswordPrompts=0")
-        .arg("-o")
-        .arg(format!("UserKnownHostsFile={}", null_known_hosts()))
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg("-i")
@@ -4038,6 +4094,7 @@ fn push_live_path(
     ip: &str,
     ssh_user: &str,
     ssh_key: &PathBuf,
+    host_key: &GuestHostKey,
     local_path: &PathBuf,
     remote_path: &str,
     allowed_roots: &[String],
@@ -4050,15 +4107,12 @@ fn push_live_path(
 
     if let Some(parent) = remote_parent(remote_path) {
         let mkdir = format!("mkdir -p {}", shell_quote(&parent));
-        run_ssh_with_stdin(ip, ssh_user, ssh_key, &mkdir, None)?;
+        run_ssh_with_stdin(ip, ssh_user, ssh_key, host_key, &mkdir, None)?;
     }
 
     let mut command = ProcessCommand::new("scp");
     command
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg(format!("UserKnownHostsFile={}", null_known_hosts()))
+        .args(host_key.options())
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg("-i")
@@ -4169,15 +4223,13 @@ fn run_ssh_with_stdin(
     ip: &str,
     ssh_user: &str,
     ssh_key: &PathBuf,
+    host_key: &GuestHostKey,
     remote_command: &str,
     stdin_text: Option<&str>,
 ) -> anyhow::Result<String> {
     let mut command = ProcessCommand::new("ssh");
     command
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg(format!("UserKnownHostsFile={}", null_known_hosts()))
+        .args(host_key.options())
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg("-i")
@@ -4227,16 +4279,14 @@ fn copy_path_to_guest(
     ip: &str,
     ssh_user: &str,
     ssh_key: &PathBuf,
+    host_key: &GuestHostKey,
     local_path: &PathBuf,
     remote_path: &str,
     recursive: bool,
 ) -> anyhow::Result<()> {
     let mut command = ProcessCommand::new("scp");
     command
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg(format!("UserKnownHostsFile={}", null_known_hosts()))
+        .args(host_key.options())
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg("-i")
@@ -4260,11 +4310,26 @@ fn copy_path_to_guest(
     Ok(())
 }
 
-fn null_known_hosts() -> &'static str {
-    if cfg!(windows) {
-        "NUL"
-    } else {
-        "/dev/null"
+/// Per-agent SSH host-key verification material: which known_hosts file to use
+/// and whether to verify strictly (a pinned key is recorded) or `accept-new`
+/// (a guest provisioned before pinning existed — trust-on-first-use migration).
+struct GuestHostKey {
+    known_hosts: PathBuf,
+    strict: bool,
+}
+
+impl GuestHostKey {
+    fn resolve(home: &MaturanaHome, agent_id: &str, ip: &str) -> anyhow::Result<Self> {
+        let state_dir = home.agent_dir(agent_id).join("state");
+        let (known_hosts, strict) = maturana_core::ssh_pin::prepare_known_hosts(&state_dir, ip)?;
+        Ok(Self {
+            known_hosts,
+            strict,
+        })
+    }
+
+    fn options(&self) -> Vec<String> {
+        maturana_core::ssh_pin::ssh_host_key_options(&self.known_hosts, self.strict)
     }
 }
 
