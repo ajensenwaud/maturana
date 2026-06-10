@@ -35,6 +35,8 @@ pub struct AgentSpec {
     #[serde(default)]
     pub memory: Memory,
     #[serde(default)]
+    pub knowledge_graph: KnowledgeGraph,
+    #[serde(default)]
     pub browser: Browser,
     #[serde(default)]
     pub skills: Vec<String>,
@@ -210,6 +212,33 @@ pub struct Memory {
 pub struct Browser {
     #[serde(default)]
     pub headless_chrome: bool,
+}
+
+/// Opt-in MaturanaGraph (knowledge graph + GraphRAG) for the agent. When
+/// enabled the guest worker is given the graph service URL + token and the
+/// `maturana-graph` skill so the agent can read/write a knowledge graph.
+///
+/// `graph` names the graph to connect to. Multiple agents naming the **same**
+/// graph share it (multi-agent knowledge graph); omitting it gives the agent a
+/// private graph named after its id.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeGraph {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub graph: Option<String>,
+}
+
+impl KnowledgeGraph {
+    /// The graph name this agent connects to: the explicit `graph`, else the
+    /// agent's own id (a private-by-convention graph).
+    pub fn graph_name(&self, agent_id: &str) -> String {
+        self.graph
+            .as_deref()
+            .map(str::to_string)
+            .unwrap_or_else(|| agent_id.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

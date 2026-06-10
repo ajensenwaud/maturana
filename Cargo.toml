@@ -2,6 +2,8 @@
 members = [
     "crates/maturana-cli",
     "crates/maturana-core",
+    "crates/maturana-graph",
+    "crates/maturana-ingest",
 ]
 resolver = "2"
 
