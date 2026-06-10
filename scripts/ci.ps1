@@ -27,8 +27,6 @@ try {
         "firecracker-prepare-assets.sh",
         "firecracker-setup-tap.sh",
         "install-hostd-task.ps1",
-        "install-sessiond-task.ps1",
-        "install-telegram-channel-task.ps1",
         "install-windows.ps1",
         "launch-ubuntu-cloudimg-hyperv.ps1",
         "maturana.ps1",
@@ -183,8 +181,7 @@ try {
     }
     $sessionSource = Get-Content -LiteralPath crates\maturana-cli\src\session.rs -Raw
     $channelSource = Get-Content -LiteralPath crates\maturana-cli\src\channels.rs -Raw
-    $telegramTask = Get-Content -LiteralPath scripts\install-telegram-channel-task.ps1 -Raw
-    foreach ($source in @($sessionSource, $channelSource, $telegramTask)) {
+    foreach ($source in @($sessionSource, $channelSource)) {
         if ($source.Contains("codex-ssh")) {
             throw "host-side codex-ssh session provider is not allowed; harness turns must run inside the guest worker"
         }
