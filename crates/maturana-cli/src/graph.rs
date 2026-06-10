@@ -91,9 +91,51 @@ pub fn handle_graph(command: GraphCommand, home: &MaturanaHome) -> anyhow::Resul
     }
 }
 
-const SUPPORTED_EXTS: &[&str] = &[
+pub(crate) const SUPPORTED_EXTS: &[&str] = &[
     "pdf", "pptx", "docx", "md", "markdown", "txt", "text", "html", "htm", "json",
 ];
+
+/// Where co-located host processes (the Telegram bridge) reach the service.
+pub(crate) const DEFAULT_LOCAL_URL: &str = "http://127.0.0.1:47835";
+
+/// Parse + chunk one document and upsert it into a named graph via the running
+/// service (single-writer: all mutations go through the service, never a second
+/// `Store` on the same directory). Returns the chunk count.
+pub(crate) fn ingest_file_into_service(
+    url: &str,
+    token: &str,
+    graph: &str,
+    file: &std::path::Path,
+    chunk_chars: usize,
+) -> anyhow::Result<usize> {
+    let ingested = maturana_ingest::ingest(file, chunk_chars)?;
+    let body = serde_json::json!({
+        "graph": graph,
+        "nodes": ingested.nodes,
+        "edges": ingested.edges,
+    });
+    post_json(url, "/graph/upsert", token, &body)?;
+    Ok(ingested.chunks)
+}
+
+/// Run a keyword GraphRAG query via the running service and return the rendered
+/// context (host-side: no embedding, pure text seed + graph expansion).
+pub(crate) fn query_rendered_context(
+    url: &str,
+    token: &str,
+    graph: &str,
+    terms: &[String],
+    depth: usize,
+) -> anyhow::Result<String> {
+    let body = serde_json::json!({ "graph": graph, "query_terms": terms, "depth": depth });
+    let response = post_json(url, "/graph/query", token, &body)?;
+    Ok(response
+        .get("result")
+        .and_then(|r| r.get("rendered_context"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("(no result)")
+        .to_string())
+}
 
 fn ingest_documents(
     path: &std::path::Path,
@@ -111,17 +153,11 @@ fn ingest_documents(
     let mut total_chunks = 0usize;
     let mut ok = 0usize;
     for file in &files {
-        match maturana_ingest::ingest(file, chunk_chars) {
-            Ok(ingested) => {
-                let body = serde_json::json!({
-                    "graph": graph,
-                    "nodes": ingested.nodes,
-                    "edges": ingested.edges,
-                });
-                post_json(url, "/graph/upsert", &token, &body)?;
-                total_chunks += ingested.chunks;
+        match ingest_file_into_service(url, &token, graph, file, chunk_chars) {
+            Ok(chunks) => {
+                total_chunks += chunks;
                 ok += 1;
-                println!("ingested {} ({} chunks)", file.display(), ingested.chunks);
+                println!("ingested {} ({} chunks)", file.display(), chunks);
             }
             Err(error) => eprintln!("skipped {}: {error}", file.display()),
         }
@@ -141,13 +177,7 @@ fn query_graph(
     depth: usize,
 ) -> anyhow::Result<()> {
     let token = read_token(token_path)?;
-    let body = serde_json::json!({ "graph": graph, "query_terms": terms, "depth": depth });
-    let response = post_json(url, "/graph/query", &token, &body)?;
-    let rendered = response
-        .get("result")
-        .and_then(|r| r.get("rendered_context"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("(no result)");
+    let rendered = query_rendered_context(url, &token, graph, terms, depth)?;
     println!("{rendered}");
     Ok(())
 }
