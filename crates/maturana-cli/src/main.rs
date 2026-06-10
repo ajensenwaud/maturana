@@ -22,8 +22,8 @@ use maturana_core::{
     stop_agent, validate_spec,
     worker::{
         render_firecracker_bootstrap, render_firecracker_cloud_cfg, render_firecracker_netplan,
-        render_firecracker_proxy_env, render_harness_install, render_run_agent, render_session_env,
-        render_systemd_service, GuestWorkerConfig,
+        render_firecracker_proxy_env, render_harness_install, render_harness_install_service,
+        render_run_agent, render_session_env, render_systemd_service, GuestWorkerConfig,
     },
     LaunchMode, LiveAgentStatus,
 };
@@ -2419,6 +2419,10 @@ fn prepare_firecracker_assets(
             artifacts.harness_install.display()
         ))
         .arg(format!(
+            "MATURANA_HARNESS_INSTALL_SERVICE_PATH={}",
+            artifacts.harness_install_service.display()
+        ))
+        .arg(format!(
             "MATURANA_FIRECRACKER_BOOTSTRAP_PATH={}",
             artifacts.firecracker_bootstrap.display()
         ))
@@ -2496,6 +2500,7 @@ struct FirecrackerGuestArtifacts {
     runner: PathBuf,
     service: PathBuf,
     harness_install: PathBuf,
+    harness_install_service: PathBuf,
     firecracker_bootstrap: PathBuf,
     netplan: PathBuf,
     cloud_cfg: PathBuf,
@@ -2679,6 +2684,7 @@ fn render_firecracker_guest_artifacts(
     let runner = artifacts_dir.join("run-agent.sh");
     let service = artifacts_dir.join("maturana-agent.service");
     let harness_install = artifacts_dir.join("install-harness.sh");
+    let harness_install_service = artifacts_dir.join("maturana-harness-install.service");
     let firecracker_bootstrap = artifacts_dir.join("firecracker-bootstrap.sh");
     let netplan = artifacts_dir.join("50-maturana-firecracker.yaml");
     let cloud_cfg = artifacts_dir.join("99-disable-network-config.cfg");
@@ -2690,6 +2696,7 @@ fn render_firecracker_guest_artifacts(
         &harness_install,
         render_harness_install(&config.harness, config.headless_chrome),
     )?;
+    fs::write(&harness_install_service, render_harness_install_service())?;
     fs::write(&firecracker_bootstrap, render_firecracker_bootstrap())?;
     fs::write(
         &service,
@@ -2726,6 +2733,7 @@ fn render_firecracker_guest_artifacts(
         runner: absolute_or_cwd(runner)?,
         service: absolute_or_cwd(service)?,
         harness_install: absolute_or_cwd(harness_install)?,
+        harness_install_service: absolute_or_cwd(harness_install_service)?,
         firecracker_bootstrap: absolute_or_cwd(firecracker_bootstrap)?,
         netplan: absolute_or_cwd(netplan)?,
         cloud_cfg: absolute_or_cwd(cloud_cfg)?,
