@@ -218,13 +218,10 @@ fn parse_proxy_request(request: &[u8]) -> anyhow::Result<ParsedRequest> {
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = match target.rsplit_once(':') {
             Some((host, port)) if port.chars().all(|ch| ch.is_ascii_digit()) => {
-                (host.to_ascii_lowercase(), port.parse()?)
+                (normalize_host(host)?, port.parse()?)
             }
-            _ => (target.to_ascii_lowercase(), 443),
+            _ => (normalize_host(target)?, 443),
         };
-        if host.trim().is_empty() {
-            anyhow::bail!("proxy target host is empty");
-        }
         return Ok(ParsedRequest {
             method: method.to_string(),
             target: target.to_string(),
@@ -243,13 +240,10 @@ fn parse_proxy_request(request: &[u8]) -> anyhow::Result<ParsedRequest> {
     };
     let (host, port) = match authority.rsplit_once(':') {
         Some((host, port)) if port.chars().all(|ch| ch.is_ascii_digit()) => {
-            (host.to_ascii_lowercase(), port.parse()?)
+            (normalize_host(host)?, port.parse()?)
         }
-        _ => (authority.to_ascii_lowercase(), 80),
+        _ => (normalize_host(authority)?, 80),
     };
-    if host.trim().is_empty() {
-        anyhow::bail!("proxy target host is empty");
-    }
 
     Ok(ParsedRequest {
         method: method.to_string(),
@@ -353,9 +347,34 @@ fn handle_mitm_connect(
 
 fn host_allowed(host: &str, allowlist: &[String]) -> bool {
     allowlist.iter().any(|allowed| {
-        let allowed = allowed.to_ascii_lowercase();
+        let allowed = normalize_host_str(allowed);
         host == allowed || host.ends_with(&format!(".{allowed}"))
     })
+}
+
+/// Canonicalize a host before any allowlist or injection comparison so the two
+/// can never disagree and so common evasions are rejected: lowercase, strip a
+/// single trailing FQDN dot (`api.host.com.` == `api.host.com`), and reject
+/// any host carrying embedded credentials, ports-in-host, fragments, or control
+/// characters/whitespace that could split the comparison from what is dialed.
+fn normalize_host(raw: &str) -> anyhow::Result<String> {
+    let host = normalize_host_str(raw);
+    if host.is_empty() {
+        anyhow::bail!("proxy target host is empty");
+    }
+    if host
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '@' | '#' | '/' | '\\'))
+    {
+        anyhow::bail!("proxy target host contains an illegal character");
+    }
+    Ok(host)
+}
+
+fn normalize_host_str(raw: &str) -> String {
+    raw.trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
 }
 
 fn has_injections(host: &str, config: &ProxyConfig) -> bool {
@@ -370,13 +389,23 @@ fn injected_headers(host: &str, config: &ProxyConfig) -> anyhow::Result<Vec<(Str
     for injection in &config.injections {
         if injection.host == host {
             let secret = resolve_secret_source_with_home(&injection.source, &config.home_root)?;
-            headers.push((
-                injection.header.clone(),
-                secret.expose_for_runtime().to_string(),
-            ));
+            let value = secret.expose_for_runtime();
+            // A secret (or header name) containing CR/LF would let the value
+            // smuggle additional upstream headers (header splitting). Refuse it
+            // rather than emit a malformed/forgeable request.
+            if injection.header.bytes().any(is_header_control)
+                || value.bytes().any(is_header_control)
+            {
+                anyhow::bail!("injected header for {host} contains illegal control characters");
+            }
+            headers.push((injection.header.clone(), value.to_string()));
         }
     }
     Ok(headers)
+}
+
+fn is_header_control(byte: u8) -> bool {
+    byte == b'\r' || byte == b'\n' || byte == 0
 }
 
 fn parse_mitm_http_request(
@@ -439,10 +468,15 @@ fn build_upstream_request(
             continue;
         }
         let lower = line.to_ascii_lowercase();
-        if lower.starts_with("proxy-connection:") {
-            continue;
-        }
-        if lower.starts_with("connection:") {
+        // Drop hop-by-hop headers, the client-supplied Host (we pin it to the
+        // CONNECT target below so the injected secret can't be redirected to an
+        // arbitrary virtual host), and Transfer-Encoding (prevents TE/CL
+        // request smuggling since we forward with an explicit Content-Length).
+        if lower.starts_with("proxy-connection:")
+            || lower.starts_with("connection:")
+            || lower.starts_with("host:")
+            || lower.starts_with("transfer-encoding:")
+        {
             continue;
         }
         if injected
@@ -453,6 +487,7 @@ fn build_upstream_request(
         }
         writeln!(output, "{line}\r")?;
     }
+    writeln!(output, "Host: {}\r", parsed.host)?;
     output.extend_from_slice(b"Connection: close\r\n");
     for (header, value) in injected {
         writeln!(output, "{header}: {value}\r")?;
@@ -705,6 +740,27 @@ mod tests {
         thread,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn host_normalization_and_allowlist_boundaries() {
+        let allow = vec!["api.anthropic.com".to_string()];
+        // Trailing-dot FQDN form must not evade the allowlist or injection match.
+        assert_eq!(normalize_host("API.Anthropic.com.").unwrap(), "api.anthropic.com");
+        assert!(host_allowed(&normalize_host("api.anthropic.com.").unwrap(), &allow));
+        assert!(host_allowed(&normalize_host("v1.api.anthropic.com").unwrap(), &allow));
+        assert!(!host_allowed(&normalize_host("api.anthropic.com.evil.com").unwrap(), &allow));
+        assert!(!host_allowed(&normalize_host("evil.com").unwrap(), &allow));
+        // Embedded credentials / fragments / whitespace are rejected outright.
+        for bad in [
+            "evil.com@api.anthropic.com",
+            "api.anthropic.com#x",
+            "api.anthropic.com/path",
+            "bad host",
+            "",
+        ] {
+            assert!(normalize_host(bad).is_err(), "should reject {bad:?}");
+        }
+    }
 
     static TLS_ENV_LOCK: Mutex<()> = Mutex::new(());
 

@@ -1610,9 +1610,16 @@ fn build_orchestrator_config(
             schedules: !command.no_schedules,
         })
         .collect();
+    // sessiond now refuses to run unauthenticated, so default the token to the
+    // persistent per-home token file when the operator did not pass one. This
+    // keeps `up` secure-by-default without forcing a manual --sessiond-token.
+    let sessiond_token = match command.sessiond_token.clone() {
+        Some(token) => Some(token),
+        None => Some(ensure_sessiond_token(&home.root().join("sessiond/token"))?),
+    };
     Ok(OrchestratorConfig {
         sessiond_bind: command.sessiond_bind.clone(),
-        sessiond_token: command.sessiond_token.clone(),
+        sessiond_token,
         channel_poll_seconds: command.channel_poll_seconds,
         schedule_poll_seconds: command.schedule_poll_seconds,
         agents,
@@ -4722,6 +4729,11 @@ fn read_hostd_request(stream: &TcpStream) -> anyhow::Result<HostdHttpRequest> {
         .get("content-length")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
+    // Cap the pre-allocation so a forged Content-Length can't OOM the elevated
+    // daemon before any bytes arrive. hostd payloads are small JSON requests.
+    if content_length > 1024 * 1024 {
+        anyhow::bail!("hostd request body too large");
+    }
     let mut body = vec![0; content_length];
     if content_length > 0 {
         reader.read_exact(&mut body)?;

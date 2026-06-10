@@ -94,6 +94,14 @@ pub fn validate_spec(spec: &AgentSpec) -> ValidationReport {
         }
         if auth.guest_path.trim().is_empty() || !auth.guest_path.starts_with('/') {
             errors.push("harness_auth.guest_path must be an absolute guest path".to_string());
+        } else if !is_safe_guest_path(&auth.guest_path) {
+            // The provisioner runs `rm -rf <guest_path>` before staging creds,
+            // so an unconstrained value (`/`, `/etc`, `..`) would wipe a guest
+            // system directory. Confine it to the agent-owned subtrees.
+            errors.push(format!(
+                "harness_auth.guest_path '{}' must live under /home, /agent, or /opt/maturana and contain no '..'",
+                auth.guest_path
+            ));
         }
     }
 
@@ -195,6 +203,15 @@ pub fn validate_spec(spec: &AgentSpec) -> ValidationReport {
     }
 }
 
+fn is_safe_guest_path(path: &str) -> bool {
+    let allowed_root = ["/home/", "/agent/", "/opt/maturana/"]
+        .iter()
+        .any(|root| path.starts_with(root));
+    let allowed_exact = ["/agent", "/opt/maturana"].contains(&path);
+    (allowed_root || allowed_exact)
+        && !path.split('/').any(|seg| seg == "..")
+}
+
 fn validate_id(id: &str, errors: &mut Vec<String>) {
     if id.trim().is_empty() {
         errors.push("identity.id must not be empty".to_string());
@@ -222,6 +239,20 @@ fn validate_secret_source(source: &str, field: &str, errors: &mut Vec<String>) {
 mod tests {
     use super::*;
     use crate::spec::*;
+
+    #[test]
+    fn guest_path_safety() {
+        // The example specs must stay valid.
+        assert!(is_safe_guest_path("/home/ubuntu"));
+        assert!(is_safe_guest_path("/home/ubuntu/.codex"));
+        assert!(is_safe_guest_path("/home/ubuntu/.claude"));
+        assert!(is_safe_guest_path("/agent"));
+        assert!(is_safe_guest_path("/opt/maturana/bin"));
+        // Dangerous destinations that would be `rm -rf`'d during provisioning.
+        for bad in ["/", "/etc", "/usr/lib", "/home/ubuntu/../../etc", "/bin"] {
+            assert!(!is_safe_guest_path(bad), "should reject {bad:?}");
+        }
+    }
 
     #[test]
     fn rejects_raw_secret() {

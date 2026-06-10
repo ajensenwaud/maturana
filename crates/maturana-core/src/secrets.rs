@@ -1,12 +1,21 @@
 use crate::{pipelock::PipelockVault, state::MaturanaHome};
 use std::{env, fs, path::Path};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SecretValue(String);
 
 impl SecretValue {
     pub fn expose_for_runtime(&self) -> &str {
         &self.0
+    }
+}
+
+// Never render the plaintext through `{:?}`. A derived Debug would leak the
+// secret into any log line, panic message, or `.context(format!(..))` that
+// happens to capture the value.
+impl std::fmt::Debug for SecretValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretValue(***)")
     }
 }
 
