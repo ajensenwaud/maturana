@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     thread,
     time::Duration,
@@ -125,6 +125,10 @@ struct ChannelContextManifest {
     wiki_chunks: Vec<LoadedWikiChunkSummary>,
     wiki_query_terms: Vec<String>,
     wiki_term_sources: Vec<WikiTermSource>,
+    #[serde(default)]
+    graph_name: Option<String>,
+    #[serde(default)]
+    graph_context_chars: usize,
     context_policy: ContextPolicySummary,
     loaded_context_chars: usize,
     transcript_path: String,
@@ -156,8 +160,16 @@ struct ChannelContextBundle {
     wiki_chunks: Vec<LoadedWikiChunk>,
     wiki_query_terms: Vec<String>,
     wiki_term_sources: Vec<WikiTermSource>,
+    /// GraphRAG context from the agent's knowledge graph, when enabled.
+    graph_context: Option<GraphChannelContext>,
     transcript: String,
     transcript_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct GraphChannelContext {
+    graph: String,
+    rendered: String,
 }
 
 #[derive(Debug, Clone)]
@@ -219,7 +231,22 @@ struct TelegramUpdate {
 struct TelegramMessage {
     message_id: i64,
     text: Option<String>,
+    #[serde(default)]
+    caption: Option<String>,
+    #[serde(default)]
+    document: Option<TelegramDocument>,
     chat: TelegramChat,
+}
+
+/// A Telegram document attachment (file upload). The bot API caps `getFile`
+/// downloads at 20 MB, so anything larger is refused up front.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct TelegramDocument {
+    file_id: String,
+    #[serde(default)]
+    file_name: Option<String>,
+    #[serde(default)]
+    file_size: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -267,6 +294,11 @@ enum InboundAction {
     Prompt {
         chat_id: i64,
         text: String,
+    },
+    Document {
+        chat_id: i64,
+        document: TelegramDocument,
+        caption: Option<String>,
     },
     Tool {
         chat_id: i64,
@@ -670,6 +702,19 @@ fn handle_telegram_update(
             run_tool_with_animation(home, token, config, chat_id, &name, &input)?;
             Ok(())
         }
+        InboundAction::Document {
+            chat_id,
+            document,
+            caption,
+        } => handle_telegram_document(
+            home,
+            token,
+            config,
+            chat_id,
+            &document,
+            caption.as_deref(),
+            reply_to_message_id,
+        ),
         InboundAction::Prompt { chat_id, text } => {
             audit_channel_event(
                 home,
@@ -750,6 +795,205 @@ fn deliver_telegram_outbox(
     Ok(delivered)
 }
 
+/// Telegram bot API refuses `getFile` beyond 20 MB; stay under it.
+const MAX_TELEGRAM_DOCUMENT_BYTES: u64 = 19 * 1024 * 1024;
+
+/// A document uploaded to the paired chat: download it and ingest it into the
+/// agent's knowledge graph (via the running MaturanaGraph service, so this
+/// process never opens the store directly). The reply tells the user what
+/// landed where; follow-up questions hit the graph through the channel prompt's
+/// GraphRAG context.
+fn handle_telegram_document(
+    home: &MaturanaHome,
+    token: &str,
+    config: &TelegramServe,
+    chat_id: i64,
+    document: &TelegramDocument,
+    caption: Option<&str>,
+    reply_to_message_id: Option<i64>,
+) -> anyhow::Result<()> {
+    let file_name = sanitize_document_name(document.file_name.as_deref());
+    let knowledge_graph = agent_knowledge_graph(home, &config.agent_id);
+    let graph_token = maturana_core::worker::read_graph_token(home.root());
+    let (graph_token, graph_name) = match (graph_token, knowledge_graph.enabled) {
+        (Some(token), true) => (token, knowledge_graph.graph_name(&config.agent_id)),
+        _ => {
+            send_telegram(
+                token,
+                &chat_id.to_string(),
+                "I received the document, but my knowledge graph is not enabled, so I cannot store it. Enable `knowledge_graph` in MATURANA.md and set up the graph service.",
+                reply_to_message_id,
+            )?;
+            return Ok(());
+        }
+    };
+    if document.file_size.unwrap_or(0) > MAX_TELEGRAM_DOCUMENT_BYTES as i64 {
+        send_telegram(
+            token,
+            &chat_id.to_string(),
+            "That document is larger than 19 MB, which is more than I can pull from Telegram. Please send a smaller file.",
+            reply_to_message_id,
+        )?;
+        return Ok(());
+    }
+    let supported = file_name
+        .rsplit_once('.')
+        .map(|(_, ext)| crate::graph::SUPPORTED_EXTS.contains(&ext.to_ascii_lowercase().as_str()))
+        .unwrap_or(false);
+    if !supported {
+        send_telegram(
+            token,
+            &chat_id.to_string(),
+            &format!(
+                "I can ingest these document types: {}. `{file_name}` is not one of them.",
+                crate::graph::SUPPORTED_EXTS.join(", ")
+            ),
+            reply_to_message_id,
+        )?;
+        return Ok(());
+    }
+
+    send_telegram_chat_action(token, &chat_id.to_string(), "typing")?;
+    let inbox = home.agent_dir(&config.agent_id).join("inbox");
+    fs::create_dir_all(&inbox)?;
+    let dest = inbox.join(format!(
+        "{}-{file_name}",
+        Utc::now().format("%Y%m%dT%H%M%SZ")
+    ));
+    let result = download_telegram_document(token, &document.file_id, &dest)
+        .and_then(|_| {
+            crate::graph::ingest_file_into_service(
+                crate::graph::DEFAULT_LOCAL_URL,
+                &graph_token,
+                &graph_name,
+                &dest,
+                1800,
+            )
+        });
+    match result {
+        Ok(chunks) => {
+            audit_channel_event(
+                home,
+                &config.agent_id,
+                "channel.telegram.document",
+                &format!("ingested {file_name} into graph '{graph_name}' ({chunks} chunks)"),
+            )?;
+            // Record the upload in the transcript so follow-up questions carry
+            // the document's terms into wiki/graph retrieval.
+            let transcript_note = match caption {
+                Some(caption) if !caption.trim().is_empty() => {
+                    format!("[uploaded document: {file_name}] {}", caption.trim())
+                }
+                _ => format!("[uploaded document: {file_name}]"),
+            };
+            append_channel_turn(home, &config.agent_id, chat_id, "user", &transcript_note)?;
+            send_telegram(
+                token,
+                &chat_id.to_string(),
+                &format!(
+                    "Added `{file_name}` to my knowledge graph `{graph_name}` ({chunks} chunks). Ask me about it any time."
+                ),
+                reply_to_message_id,
+            )?;
+        }
+        Err(error) => {
+            audit_channel_event(
+                home,
+                &config.agent_id,
+                "channel.telegram.document_error",
+                &format!("failed to ingest {file_name}: {error:#}"),
+            )?;
+            send_telegram(
+                token,
+                &chat_id.to_string(),
+                &format!("I could not ingest `{file_name}`: {error:#}"),
+                reply_to_message_id,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramGetFileResponse {
+    ok: bool,
+    result: Option<TelegramFilePath>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramFilePath {
+    file_path: Option<String>,
+}
+
+fn download_telegram_document(
+    token: &str,
+    file_id: &str,
+    dest: &Path,
+) -> anyhow::Result<u64> {
+    let response: TelegramGetFileResponse = ureq::get(&format!(
+        "https://api.telegram.org/bot{token}/getFile?file_id={file_id}"
+    ))
+    .call()
+    .context("Telegram getFile failed")?
+    .into_json()
+    .context("failed to parse Telegram getFile response")?;
+    if !response.ok {
+        anyhow::bail!("Telegram getFile returned ok=false");
+    }
+    let file_path = response
+        .result
+        .and_then(|result| result.file_path)
+        .context("Telegram getFile returned no file_path")?;
+    let reader = ureq::get(&format!(
+        "https://api.telegram.org/file/bot{token}/{file_path}"
+    ))
+    .call()
+    .context("Telegram file download failed")?
+    .into_reader();
+    let mut bytes = Vec::new();
+    std::io::Read::take(reader, MAX_TELEGRAM_DOCUMENT_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_TELEGRAM_DOCUMENT_BYTES {
+        anyhow::bail!("document exceeds {MAX_TELEGRAM_DOCUMENT_BYTES} bytes");
+    }
+    fs::write(dest, &bytes)
+        .with_context(|| format!("failed to write {}", dest.display()))?;
+    Ok(bytes.len() as u64)
+}
+
+/// Keep only filesystem-safe filename characters; Telegram file names are
+/// attacker-controlled input that ends up in a path under the agent inbox.
+fn sanitize_document_name(name: Option<&str>) -> String {
+    let cleaned = name
+        .unwrap_or("document")
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ' ') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches(|ch: char| ch == '.' || ch.is_whitespace())
+        .to_string();
+    if cleaned.is_empty() {
+        "document".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// The agent's `knowledge_graph` opt-in, read from its materialized spec.
+/// Missing/unparseable spec means disabled (the default).
+fn agent_knowledge_graph(home: &MaturanaHome, agent_id: &str) -> maturana_core::spec::KnowledgeGraph {
+    maturana_core::spec::AgentSpec::from_maturana_markdown(
+        &home.agent_dir(agent_id).join("MATURANA.md"),
+    )
+    .ok()
+    .map(|spec| spec.knowledge_graph)
+    .unwrap_or_default()
+}
+
 fn classify_telegram_update(
     update: &TelegramUpdate,
     paired_chat_id: Option<i64>,
@@ -759,6 +1003,18 @@ fn classify_telegram_update(
         return InboundAction::Ignore;
     };
     let chat_id = message.chat.id;
+    // Document uploads have no `text`; route them before the text path. The
+    // pairing gate still applies — only the paired chat can feed the agent.
+    if let Some(document) = &message.document {
+        if paired_chat_id != Some(chat_id) {
+            return InboundAction::Deny { chat_id };
+        }
+        return InboundAction::Document {
+            chat_id,
+            document: document.clone(),
+            caption: message.caption.clone(),
+        };
+    }
     let text = message.text.as_deref().unwrap_or("").trim();
     if text.is_empty() {
         return InboundAction::Ignore;
@@ -1204,6 +1460,7 @@ fn load_channel_context(
         CONTEXT_WIKI_CHUNK_LIMIT,
         WIKI_CHUNK_CONTEXT_CHARS,
     )?;
+    let graph_context = load_graph_channel_context(home, agent_id, &wiki_query_terms);
 
     Ok(ChannelContextBundle {
         identity: read_context_file(
@@ -1235,13 +1492,49 @@ fn load_channel_context(
         wiki_chunks,
         wiki_query_terms,
         wiki_term_sources: wiki_query.term_sources,
+        graph_context,
         transcript,
         transcript_path,
     })
 }
 
+/// Retrieve GraphRAG context from the agent's knowledge graph for this turn.
+/// Host-side keyword retrieval only (the host never embeds); returns `None`
+/// when the graph is not enabled, and an explanatory placeholder when the
+/// service is unreachable so a graph outage never breaks the turn.
+fn load_graph_channel_context(
+    home: &MaturanaHome,
+    agent_id: &str,
+    terms: &[String],
+) -> Option<GraphChannelContext> {
+    let knowledge_graph = agent_knowledge_graph(home, agent_id);
+    if !knowledge_graph.enabled {
+        return None;
+    }
+    let token = maturana_core::worker::read_graph_token(home.root())?;
+    let graph = knowledge_graph.graph_name(agent_id);
+    let rendered = match crate::graph::query_rendered_context(
+        crate::graph::DEFAULT_LOCAL_URL,
+        &token,
+        &graph,
+        terms,
+        2,
+    ) {
+        Ok(rendered) => rendered,
+        Err(error) => format!("(knowledge graph unavailable: {error:#})"),
+    };
+    Some(GraphChannelContext { graph, rendered })
+}
+
 fn render_channel_prompt(context: &ChannelContextBundle, user_message: &str) -> String {
     let wiki_chunks = render_wiki_chunks(&context.wiki_chunks);
+    let graph_section = match &context.graph_context {
+        Some(graph) => format!(
+            "\n## Knowledge Graph Context (GraphRAG, graph `{}`)\n\nEntities and relationships retrieved from your knowledge graph for this message. Treat them as ground truth about ingested documents and recorded facts.\n\n{}\n",
+            graph.graph, graph.rendered
+        ),
+        None => String::new(),
+    };
     format!(
         r#"You are a Maturana personal agent running inside an isolated VM.
 
@@ -1271,7 +1564,7 @@ Return only the message that should be sent back to Telegram.
 
 ## Relevant Wiki Chunks
 {wiki_chunks}
-
+{graph_section}
 ## Recent Telegram Transcript
 {transcript}
 
@@ -1316,12 +1609,18 @@ fn write_channel_context_manifest(
             chars: chunk.text.chars().count(),
         })
         .collect();
+    let graph_context_chars = context
+        .graph_context
+        .as_ref()
+        .map(|graph| graph.rendered.chars().count())
+        .unwrap_or(0);
     let loaded_context_chars = source_files.iter().map(|file| file.chars).sum::<usize>()
         + context
             .wiki_chunks
             .iter()
             .map(|chunk| chunk.text.chars().count())
             .sum::<usize>()
+        + graph_context_chars
         + context.transcript.chars().count();
     let manifest = ChannelContextManifest {
         at: Utc::now(),
@@ -1331,6 +1630,11 @@ fn write_channel_context_manifest(
         wiki_chunks,
         wiki_query_terms: context.wiki_query_terms.clone(),
         wiki_term_sources: context.wiki_term_sources.clone(),
+        graph_name: context
+            .graph_context
+            .as_ref()
+            .map(|graph| graph.graph.clone()),
+        graph_context_chars,
         context_policy: ContextPolicySummary {
             strategy: "durable-files-plus-current-message-and-recent-transcript-wiki-terms"
                 .to_string(),
@@ -2088,10 +2392,68 @@ mod tests {
             message: Some(TelegramMessage {
                 message_id: 1,
                 text: Some(text.to_string()),
+                caption: None,
+                document: None,
                 chat: TelegramChat { id: chat_id },
             }),
             channel_post: None,
         }
+    }
+
+    fn document_update(chat_id: i64, file_name: &str, caption: Option<&str>) -> TelegramUpdate {
+        TelegramUpdate {
+            update_id: 1,
+            message: Some(TelegramMessage {
+                message_id: 1,
+                text: None,
+                caption: caption.map(str::to_string),
+                document: Some(TelegramDocument {
+                    file_id: "file-123".to_string(),
+                    file_name: Some(file_name.to_string()),
+                    file_size: Some(1024),
+                }),
+                chat: TelegramChat { id: chat_id },
+            }),
+            channel_post: None,
+        }
+    }
+
+    #[test]
+    fn routes_document_uploads_from_paired_chat_only() {
+        let update = document_update(7, "notes.pdf", Some("for the graph"));
+        assert_eq!(
+            classify_telegram_update(&update, Some(7), None),
+            InboundAction::Document {
+                chat_id: 7,
+                document: TelegramDocument {
+                    file_id: "file-123".to_string(),
+                    file_name: Some("notes.pdf".to_string()),
+                    file_size: Some(1024),
+                },
+                caption: Some("for the graph".to_string()),
+            }
+        );
+        // The pairing gate applies to documents exactly like text.
+        assert_eq!(
+            classify_telegram_update(&document_update(9, "notes.pdf", None), Some(7), None),
+            InboundAction::Deny { chat_id: 9 }
+        );
+        assert_eq!(
+            classify_telegram_update(&document_update(9, "notes.pdf", None), None, None),
+            InboundAction::Deny { chat_id: 9 }
+        );
+    }
+
+    #[test]
+    fn sanitizes_telegram_document_names() {
+        assert_eq!(sanitize_document_name(Some("Q3 Roadmap.pdf")), "Q3 Roadmap.pdf");
+        assert_eq!(
+            sanitize_document_name(Some("../../etc/passwd")),
+            "-..-etc-passwd"
+        );
+        assert_eq!(sanitize_document_name(Some("..")), "document");
+        assert_eq!(sanitize_document_name(None), "document");
+        assert_eq!(sanitize_document_name(Some("a/b\\c.md")), "a-b-c.md");
     }
 
     struct TempDir {
