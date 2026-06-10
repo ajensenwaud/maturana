@@ -52,6 +52,10 @@ impl Capabilities {
     }
 }
 
+/// Hard ceiling on a tool's declared linear-memory limit, so a manifest cannot
+/// request an absurd allocation that exhausts host memory at instantiation.
+pub const MAX_TOOL_MEMORY_MB: u32 = 4096;
+
 /// Resource ceilings applied to every invocation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -108,11 +112,29 @@ impl ToolManifest {
         if self.wasm.trim().is_empty() {
             anyhow::bail!("tool '{}' is missing a wasm module path", self.name);
         }
-        if self.wasm.contains("..") || self.wasm.starts_with('/') {
+        if self.wasm.contains("..") || self.wasm.starts_with('/') || self.wasm.contains('\\') {
             anyhow::bail!("tool '{}' wasm path must stay inside its directory", self.name);
         }
         if self.limits.timeout_ms == 0 {
             anyhow::bail!("tool '{}' timeout_ms must be greater than zero", self.name);
+        }
+        if self.limits.memory_mb == 0 || self.limits.memory_mb > MAX_TOOL_MEMORY_MB {
+            anyhow::bail!(
+                "tool '{}' memory_mb must be between 1 and {MAX_TOOL_MEMORY_MB}",
+                self.name
+            );
+        }
+        // A preopened directory is a real grant of host filesystem authority, so
+        // reject traversal sequences that would let a declared grant escape the
+        // directory it names. (Operators still vet the absolute roots a tool may
+        // request via the security-review skill.)
+        for dir in self.capabilities.fs_read.iter().chain(&self.capabilities.fs_write) {
+            if dir.split(|c| c == '/' || c == '\\').any(|seg| seg == "..") {
+                anyhow::bail!(
+                    "tool '{}' capability path '{dir}' must not contain '..'",
+                    self.name
+                );
+            }
         }
         Ok(())
     }
@@ -195,6 +217,15 @@ impl ToolRegistry {
     }
 
     pub fn load(&self, name: &str) -> anyhow::Result<ToolManifest> {
+        // `register` validates `manifest.name` before writing, but the read
+        // paths (`load`/`run_tool`/`wasm_bytes`) take a caller-supplied lookup
+        // name that is joined straight onto the registry root. Reject anything
+        // that is not a plain tool name so `tool run ../../secret` (or, on
+        // Windows, an absolute path that replaces the root entirely) cannot read
+        // outside the registry.
+        if !is_valid_tool_name(name) {
+            anyhow::bail!("invalid tool name '{name}'");
+        }
         let path = self.manifest_path(name);
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("tool '{name}' is not registered ({})", path.display()))?;
@@ -358,6 +389,46 @@ mod tests {
             output_schema: serde_json::Value::Null,
         };
         assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn load_rejects_traversal_name() {
+        let reg = registry();
+        // No registry on disk needed: the name guard must fire before any path
+        // is built, so a traversal/absolute lookup never touches the filesystem.
+        for bad in ["../secret", "..\\secret", "/etc/passwd", "a/b", "C:\\x"] {
+            let error = reg.load(bad).unwrap_err();
+            assert!(
+                error.to_string().contains("invalid tool name"),
+                "expected name rejection for {bad:?}, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_capability_traversal_and_bad_memory() {
+        let mut manifest = ToolManifest {
+            name: "ok".to_string(),
+            version: "1".to_string(),
+            description: String::new(),
+            wasm: "m.wasm".to_string(),
+            capabilities: Capabilities {
+                fs_read: vec!["../../etc".to_string()],
+                ..Default::default()
+            },
+            limits: ResourceLimits::default(),
+            input_schema: serde_json::Value::Null,
+            output_schema: serde_json::Value::Null,
+        };
+        assert!(manifest.validate().is_err());
+
+        manifest.capabilities = Capabilities::default();
+        manifest.limits.memory_mb = 0;
+        assert!(manifest.validate().is_err());
+        manifest.limits.memory_mb = MAX_TOOL_MEMORY_MB + 1;
+        assert!(manifest.validate().is_err());
+        manifest.limits.memory_mb = 64;
+        assert!(manifest.validate().is_ok());
     }
 
     #[cfg(not(feature = "wasm-runtime"))]

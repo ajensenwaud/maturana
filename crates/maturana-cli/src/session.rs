@@ -173,6 +173,15 @@ struct HeartbeatRequest {
 }
 
 fn serve_sessiond(home: &MaturanaHome, bind: &str, token: Option<&str>) -> anyhow::Result<()> {
+    // sessiond binds 0.0.0.0 by design (guest VMs reach it), so the token is the
+    // only thing standing between any guest/LAN host and every agent's queue.
+    // Refuse to start without one rather than silently serving unauthenticated.
+    let token = match token {
+        Some(token) if !token.is_empty() => Some(token),
+        _ => anyhow::bail!(
+            "sessiond requires a token; pass --token or set MATURANA_SESSIOND_TOKEN (it binds a public interface)"
+        ),
+    };
     let listener = TcpListener::bind(bind).with_context(|| format!("failed to bind {bind}"))?;
     println!("maturana sessiond listening on {bind}");
     for stream in listener.incoming() {
@@ -205,7 +214,7 @@ fn handle_sessiond_request(
                 .get("x-maturana-session-token")
                 .map(String::as_str)
                 .unwrap_or("");
-            if actual != expected {
+            if !constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
                 return write_json_response(
                     stream,
                     401,
@@ -219,6 +228,9 @@ fn handle_sessiond_request(
         ("GET", "/health") => write_json_response(stream, 200, &serde_json::json!({ "ok": true })),
         ("POST", "/session/claim") => {
             let body: ClaimRequest = serde_json::from_slice(&request.body)?;
+            if let Err(error) = check_identifiers(&body.agent_id, &body.session_id) {
+                return write_json_response(stream, 400, &error);
+            }
             let paths = session_paths(&home.agent_dir(&body.agent_id), &body.session_id);
             ensure_session(&paths)?;
             let messages = claim_pending_inbound(&paths, body.limit.unwrap_or(1).clamp(1, 20))?;
@@ -230,6 +242,9 @@ fn handle_sessiond_request(
         }
         ("POST", "/session/complete") => {
             let body: CompleteRequest = serde_json::from_slice(&request.body)?;
+            if let Err(error) = check_identifiers(&body.agent_id, &body.session_id) {
+                return write_json_response(stream, 400, &error);
+            }
             let paths = session_paths(&home.agent_dir(&body.agent_id), &body.session_id);
             ensure_session(&paths)?;
             mark_inbound_completed(&paths, &body.message_ids)?;
@@ -237,6 +252,9 @@ fn handle_sessiond_request(
         }
         ("POST", "/session/outbound") => {
             let body: OutboundRequest = serde_json::from_slice(&request.body)?;
+            if let Err(error) = check_identifiers(&body.agent_id, &body.session_id) {
+                return write_json_response(stream, 400, &error);
+            }
             let paths = session_paths(&home.agent_dir(&body.agent_id), &body.session_id);
             ensure_session(&paths)?;
             let id = write_outbound(
@@ -252,6 +270,9 @@ fn handle_sessiond_request(
         }
         ("POST", "/session/heartbeat") => {
             let body: HeartbeatRequest = serde_json::from_slice(&request.body)?;
+            if let Err(error) = check_identifiers(&body.agent_id, &body.session_id) {
+                return write_json_response(stream, 400, &error);
+            }
             write_worker_status(home, &body)?;
             write_json_response(stream, 200, &serde_json::json!({ "ok": true }))
         }
@@ -306,6 +327,9 @@ fn read_http_request(stream: &mut TcpStream) -> anyhow::Result<HttpRequest> {
         .get("content-length")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
+    if content_length > MAX_BODY_BYTES {
+        anyhow::bail!("request body too large");
+    }
     let body_start = header_end + 4;
     while data.len() < body_start + content_length {
         let read = stream.read(&mut buffer)?;
@@ -328,6 +352,51 @@ fn read_http_request(stream: &mut TcpStream) -> anyhow::Result<HttpRequest> {
 
 fn find_header_end(data: &[u8]) -> Option<usize> {
     data.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+/// Upper bound on a request body. sessiond payloads are small JSON control
+/// messages; this caps a malicious `Content-Length` from exhausting host memory
+/// on the public listener.
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// `agent_id` and `session_id` arrive in attacker-controllable request bodies
+/// and are joined into host filesystem paths (`agents/<id>/sessions/<id>/...`,
+/// `worker-status.json`). Without this they allow path traversal / arbitrary
+/// file writes (e.g. `../../..`, an absolute path, or a Windows drive prefix).
+fn check_identifiers(agent_id: &str, session_id: &str) -> Result<(), serde_json::Value> {
+    for (label, value) in [("agent_id", agent_id), ("session_id", session_id)] {
+        if !valid_identifier(value) {
+            return Err(serde_json::json!({
+                "ok": false,
+                "error": format!("invalid {label}"),
+            }));
+        }
+    }
+    Ok(())
+}
+
+fn valid_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value != "."
+        && value != ".."
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !value.contains("..")
+}
+
+/// Length-independent byte comparison to keep the session-token check from
+/// leaking the token through response timing on the public listener.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn write_json_response(
@@ -452,5 +521,36 @@ mod tests {
             .to_string()
             .contains("unsupported local session provider"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn identifiers_reject_path_traversal() {
+        assert!(valid_identifier("opencode-demo"));
+        assert!(valid_identifier("telegram-main"));
+        assert!(valid_identifier("codex-main"));
+        for bad in [
+            "..",
+            "../../etc",
+            "a/../b",
+            "a/b",
+            "a\\b",
+            "/abs",
+            "C:\\x",
+            "",
+        ] {
+            assert!(!valid_identifier(bad), "should reject {bad:?}");
+        }
+        assert!(check_identifiers("../../x", "ok").is_err());
+        assert!(check_identifiers("ok", "../../x").is_err());
+        assert!(check_identifiers("opencode-demo", "opencode-main").is_ok());
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_equal_slices() {
+        assert!(constant_time_eq(b"token", b"token"));
+        assert!(!constant_time_eq(b"token", b"tokeN"));
+        assert!(!constant_time_eq(b"token", b"tok"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
     }
 }
