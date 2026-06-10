@@ -2,12 +2,16 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand};
 use maturana_core::{
+    animation::{frame, is_terminal, Phase},
     audit::{append_event, AuditEvent},
+    improvement::{signals, TrajectoryStore},
     pipelock::PipelockVault,
     secrets::resolve_secret_source_with_home,
     session_db::{ensure_session, insert_inbound, list_undelivered, mark_delivered, session_paths},
     state::MaturanaHome,
+    tools::{run_tool, ToolRegistry},
 };
+use std::sync::mpsc;
 use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -239,7 +243,7 @@ struct TelegramChat {
     id: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum InboundAction {
     Ignore,
     Pair {
@@ -263,6 +267,15 @@ enum InboundAction {
     Prompt {
         chat_id: i64,
         text: String,
+    },
+    Tool {
+        chat_id: i64,
+        name: String,
+        input: String,
+    },
+    Feedback {
+        chat_id: i64,
+        value: f64,
     },
     Deny {
         chat_id: i64,
@@ -630,6 +643,33 @@ fn handle_telegram_update(
             )?;
             Ok(())
         }
+        InboundAction::Feedback { chat_id, value } => {
+            let store = TrajectoryStore::open(&TrajectoryStore::store_path(home.root()))?;
+            let source = "telegram";
+            let rewarded =
+                store.reward_latest(&config.agent_id, &config.session_id, source, value, None)?;
+            audit_channel_event(
+                home,
+                &config.agent_id,
+                "channel.telegram.feedback",
+                &format!("recorded reward {value:+} on {:?}", rewarded),
+            )?;
+            let reply = match rewarded {
+                Some(_) if value > 0.0 => "Thanks — logged 👍 for the last reply.",
+                Some(_) => "Noted — logged 👎 for the last reply.",
+                None => "No recent agent turn to rate yet.",
+            };
+            send_telegram(token, &chat_id.to_string(), reply, reply_to_message_id)?;
+            Ok(())
+        }
+        InboundAction::Tool {
+            chat_id,
+            name,
+            input,
+        } => {
+            run_tool_with_animation(home, token, config, chat_id, &name, &input)?;
+            Ok(())
+        }
         InboundAction::Prompt { chat_id, text } => {
             audit_channel_event(
                 home,
@@ -736,6 +776,22 @@ fn classify_telegram_update(
         "/start" | "/help" => InboundAction::Help { chat_id },
         "/status" => InboundAction::Status { chat_id },
         "/new" => InboundAction::New { chat_id },
+        "/good" => InboundAction::Feedback {
+            chat_id,
+            value: signals::THUMBS_UP,
+        },
+        "/bad" => InboundAction::Feedback {
+            chat_id,
+            value: signals::THUMBS_DOWN,
+        },
+        _ if command.starts_with("/tool ") => match parse_tool_command(&command) {
+            Some((name, input)) => InboundAction::Tool {
+                chat_id,
+                name,
+                input,
+            },
+            None => InboundAction::Help { chat_id },
+        },
         _ if command.starts_with("/spawn ") => match parse_spawn_command(&command) {
             Some((mode, name, prompt)) => InboundAction::Spawn {
                 chat_id,
@@ -751,6 +807,21 @@ fn classify_telegram_update(
             text: text.to_string(),
         },
     }
+}
+
+/// `/tool <name> [json-input]` — name plus an optional JSON argument. The
+/// input defaults to `{}` when omitted.
+fn parse_tool_command(command: &str) -> Option<(String, String)> {
+    let rest = command.strip_prefix("/tool")?.trim();
+    let (name, input) = match rest.split_once(char::is_whitespace) {
+        Some((name, input)) => (name.trim(), input.trim()),
+        None => (rest, ""),
+    };
+    if !maturana_core::tools::is_valid_tool_name(name) {
+        return None;
+    }
+    let input = if input.is_empty() { "{}" } else { input };
+    Some((name.to_string(), input.to_string()))
 }
 
 fn parse_spawn_command(command: &str) -> Option<(SpawnMode, String, String)> {
@@ -932,6 +1003,171 @@ fn send_telegram_chat_action(token: &str, chat_id: &str, action: &str) -> anyhow
     })?;
     if !response.ok {
         anyhow::bail!("Telegram sendChatAction returned ok=false");
+    }
+    Ok(())
+}
+
+/// Run a registered wasm tool from Telegram with an OpenClaw-style animated
+/// status message, post its output, and capture the run as a self-improvement
+/// trajectory (so `/good` / `/bad` can reward it afterwards).
+fn run_tool_with_animation(
+    home: &MaturanaHome,
+    token: &str,
+    config: &TelegramServe,
+    chat_id: i64,
+    name: &str,
+    input: &str,
+) -> anyhow::Result<()> {
+    let registry = ToolRegistry::new(home.root().join("tools"));
+    if registry.load(name).is_err() {
+        send_telegram(
+            token,
+            &chat_id.to_string(),
+            &format!("Tool `{name}` is not registered. Use `maturana tool register` first."),
+            None,
+        )?;
+        return Ok(());
+    }
+
+    let running = Phase::Running {
+        tool: name.to_string(),
+    };
+    let status_id = send_telegram(token, &chat_id.to_string(), &frame(&running, 0), None)?;
+
+    // Run the (bounded) tool off-thread so the main thread can keep editing the
+    // animation frame in place while it executes.
+    let (tx, rx) = mpsc::channel();
+    {
+        let registry = registry.clone();
+        let name = name.to_string();
+        let input = input.to_string();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_tool(&registry, &name, &input));
+        });
+    }
+
+    let mut tick = 1usize;
+    let result = loop {
+        match rx.recv_timeout(Duration::from_millis(700)) {
+            Ok(result) => break result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(message_id) = status_id {
+                    let _ = edit_telegram_message(
+                        token,
+                        chat_id,
+                        message_id,
+                        &frame(&running, tick),
+                    );
+                }
+                tick += 1;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(anyhow::anyhow!("tool worker thread disconnected"))
+            }
+        }
+    };
+
+    let store = TrajectoryStore::open(&TrajectoryStore::store_path(home.root()))?;
+    let trajectory_input = format!("/tool {name} {input}");
+    match result {
+        Ok(run) => {
+            let final_phase = if run.ok {
+                Phase::Done {
+                    detail: Some(format!("`{name}` in {}ms", run.duration_ms)),
+                }
+            } else {
+                Phase::Failed {
+                    detail: Some(truncate_chars(run.stderr.trim(), 80)),
+                }
+            };
+            if let Some(message_id) = status_id {
+                let _ = edit_telegram_message(token, chat_id, message_id, &frame(&final_phase, tick));
+            }
+            let body = if run.ok {
+                let out = truncate_for_telegram(&run.stdout);
+                if out.trim().is_empty() {
+                    "(tool produced no output)".to_string()
+                } else {
+                    out
+                }
+            } else {
+                format!("Tool failed: {}", truncate_for_telegram(run.stderr.trim()))
+            };
+            send_telegram(token, &chat_id.to_string(), &body, None)?;
+            store.record(
+                &config.agent_id,
+                &config.session_id,
+                "tool",
+                &trajectory_input,
+                &run.stdout,
+                "[]",
+            )?;
+            audit_channel_event(
+                home,
+                &config.agent_id,
+                "channel.telegram.tool",
+                &format!("ran tool {name} ok={}", run.ok),
+            )?;
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            if let Some(message_id) = status_id {
+                let _ = edit_telegram_message(
+                    token,
+                    chat_id,
+                    message_id,
+                    &frame(
+                        &Phase::Failed {
+                            detail: Some(truncate_chars(&message, 80)),
+                        },
+                        tick,
+                    ),
+                );
+            }
+            send_telegram(
+                token,
+                &chat_id.to_string(),
+                &format!("Tool error: {message}"),
+                None,
+            )?;
+            store.record(
+                &config.agent_id,
+                &config.session_id,
+                "tool",
+                &trajectory_input,
+                &message,
+                "[]",
+            )?;
+        }
+    }
+    debug_assert!(is_terminal(&Phase::Done { detail: None }));
+    Ok(())
+}
+
+fn edit_telegram_message(
+    token: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+) -> anyhow::Result<()> {
+    let body = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+    });
+    let response: TelegramOkResponse = ureq::post(&format!(
+        "https://api.telegram.org/bot{token}/editMessageText"
+    ))
+    .set("content-type", "application/json")
+    .send_string(&body.to_string())
+    .map_err(|error| anyhow::anyhow!("Telegram editMessageText failed: {error}"))
+    .and_then(|response| {
+        response.into_json().map_err(|error| {
+            anyhow::anyhow!("failed to parse Telegram editMessageText response: {error}")
+        })
+    })?;
+    if !response.ok {
+        anyhow::bail!("Telegram editMessageText returned ok=false");
     }
     Ok(())
 }
@@ -1565,6 +1801,45 @@ mod tests {
                 chat_id: 7,
                 text: "hello".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn routes_tool_and_feedback_commands() {
+        assert_eq!(
+            classify_telegram_update(&text_update(7, "/tool weather {\"city\":\"oslo\"}"), Some(7), None),
+            InboundAction::Tool {
+                chat_id: 7,
+                name: "weather".to_string(),
+                input: "{\"city\":\"oslo\"}".to_string(),
+            }
+        );
+        assert_eq!(
+            classify_telegram_update(&text_update(7, "/tool weather"), Some(7), None),
+            InboundAction::Tool {
+                chat_id: 7,
+                name: "weather".to_string(),
+                input: "{}".to_string(),
+            }
+        );
+        assert_eq!(
+            classify_telegram_update(&text_update(7, "/good"), Some(7), None),
+            InboundAction::Feedback {
+                chat_id: 7,
+                value: signals::THUMBS_UP,
+            }
+        );
+        assert_eq!(
+            classify_telegram_update(&text_update(7, "/bad"), Some(7), None),
+            InboundAction::Feedback {
+                chat_id: 7,
+                value: signals::THUMBS_DOWN,
+            }
+        );
+        // An invalid tool name falls back to help rather than crashing.
+        assert_eq!(
+            classify_telegram_update(&text_update(7, "/tool Bad_Name"), Some(7), None),
+            InboundAction::Help { chat_id: 7 }
         );
     }
 

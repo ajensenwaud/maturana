@@ -24,3 +24,15 @@ thiserror.workspace = true
 uuid.workspace = true
 rusqlite.workspace = true
 ureq = { version = "2.10.1", features = ["json"] }
+wasmtime = { version = "27", optional = true, default-features = false, features = ["cranelift", "runtime"] }
+wasmtime-wasi = { version = "27", optional = true }
+
+[features]
+default = []
+# Opt-in WebAssembly execution engine for the agent tool framework. Kept
+# behind a feature so the control plane stays dependency-light and fast to
+# build; enable with `--features wasm-runtime` to actually run tools.
+wasm-runtime = ["dep:wasmtime", "dep:wasmtime-wasi"]
+
+[dev-dependencies]
+wat = "1"
