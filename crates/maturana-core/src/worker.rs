@@ -1,6 +1,20 @@
 use crate::spec::HarnessRuntime;
 use anyhow::Context;
 
+/// Sentinel for the graph URL, resolved in the guest to `http://<gateway>:47835`
+/// just like the sessiond URL.
+pub const DEFAULT_GRAPH_URL_SENTINEL: &str = "__MATURANA_DEFAULT_GRAPH_URL__";
+
+/// Read the host MaturanaGraph token (`<home>/graph/token`) if the graph service
+/// is set up. Returns `None` when absent/empty, which keeps graph env out of the
+/// guest entirely.
+pub fn read_graph_token(home_root: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(home_root.join("graph").join("token"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
 #[derive(Debug, Clone)]
 pub struct GuestWorkerConfig {
     pub agent_id: String,
@@ -10,10 +24,15 @@ pub struct GuestWorkerConfig {
     pub harness: HarnessRuntime,
     pub harness_auth_guest_path: String,
     pub headless_chrome: bool,
+    /// Host MaturanaGraph token, present when the graph service is set up.
+    pub graph_token: Option<String>,
+    /// The named graph this agent connects to, present only when
+    /// `knowledge_graph.enabled`. Both this and the token gate graph access.
+    pub graph_name: Option<String>,
 }
 
 pub fn render_session_env(config: &GuestWorkerConfig) -> String {
-    format!(
+    let mut env = format!(
         "MATURANA_AGENT_ID={}\nMATURANA_SESSION_ID={}\nMATURANA_SESSIOND_URL={}\nMATURANA_SESSIOND_TOKEN={}\nMATURANA_HARNESS={}\nCODEX_HOME={}\nMATURANA_HEADLESS_CHROME={}\nPLAYWRIGHT_BROWSERS_PATH={}\n",
         shell_env_value(&config.agent_id),
         shell_env_value(&config.session_id),
@@ -23,7 +42,18 @@ pub fn render_session_env(config: &GuestWorkerConfig) -> String {
         shell_env_value(&config.harness_auth_guest_path),
         shell_env_value(if config.headless_chrome { "1" } else { "0" }),
         shell_env_value("/opt/maturana/browsers"),
-    )
+    );
+    // MaturanaGraph access: only when the agent opted in (graph_name) and the
+    // host has a graph token. The URL is a sentinel resolved at runtime.
+    if let (Some(token), Some(name)) = (&config.graph_token, &config.graph_name) {
+        env.push_str(&format!(
+            "MATURANA_GRAPH_URL={}\nMATURANA_GRAPH_TOKEN={}\nMATURANA_GRAPH_NAME={}\n",
+            shell_env_value(DEFAULT_GRAPH_URL_SENTINEL),
+            shell_env_value(token),
+            shell_env_value(name),
+        ));
+    }
+    env
 }
 
 pub fn render_run_agent() -> &'static str {
@@ -221,6 +251,13 @@ if [ -n "$sessiond_host" ]; then
   export no_proxy="$NO_PROXY"
 fi
 
+# Resolve the MaturanaGraph URL sentinel to the host gateway, like sessiond, so
+# the agent (and the maturana-graph skill) can reach the graph service.
+if [ "${MATURANA_GRAPH_URL:-}" = "__MATURANA_DEFAULT_GRAPH_URL__" ]; then
+  host_gateway="${host_gateway:-$(ip route | awk '/default/ {print $3; exit}')}"
+  export MATURANA_GRAPH_URL="http://$host_gateway:47835"
+fi
+
 headers=(-H "content-type: application/json")
 if [ -n "${MATURANA_SESSIOND_TOKEN:-}" ]; then
   headers+=(-H "x-maturana-session-token: ${MATURANA_SESSIOND_TOKEN}")
@@ -405,6 +442,8 @@ mod tests {
     #[test]
     fn session_env_quotes_values() {
         let env = render_session_env(&GuestWorkerConfig {
+            graph_token: None,
+            graph_name: None,
             agent_id: "demo".to_string(),
             session_id: "telegram-main".to_string(),
             sessiond_url: "__MATURANA_DEFAULT_SESSIOND_URL__".to_string(),

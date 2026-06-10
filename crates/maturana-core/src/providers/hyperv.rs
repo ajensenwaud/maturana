@@ -96,6 +96,13 @@ impl Provider for HyperVProvider {
                     || default_harness_auth_guest_path(&spec.runtime.harness).to_string(),
                 ),
                 headless_chrome: spec.browser.headless_chrome,
+                graph_token: home_root_from_agent_dir(agent_dir)
+                    .ok()
+                    .and_then(|root| crate::worker::read_graph_token(&root)),
+                graph_name: spec
+                    .knowledge_graph
+                    .enabled
+                    .then(|| spec.knowledge_graph.graph_name(&spec.identity.id)),
             }),
         )?;
         std::fs::write(&runner_path, render_run_agent())?;

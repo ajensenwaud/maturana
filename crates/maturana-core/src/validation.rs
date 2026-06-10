@@ -136,6 +136,24 @@ pub fn validate_spec(spec: &AgentSpec) -> ValidationReport {
             errors.push("memory.agent_memory_path must not be empty".to_string());
         }
     }
+    if spec.knowledge_graph.enabled {
+        if let Some(graph) = &spec.knowledge_graph.graph {
+            // The name becomes a directory under <home>/graphs/, so keep it a
+            // safe identifier (no traversal).
+            let ok = !graph.trim().is_empty()
+                && graph.len() <= 128
+                && !graph.contains("..")
+                && graph
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+            if !ok {
+                errors.push(
+                    "knowledge_graph.graph must be a safe name (letters, digits, -, _, .)"
+                        .to_string(),
+                );
+            }
+        }
+    }
     for skill in &spec.skills {
         if skill.trim().is_empty() {
             errors.push("skills entries must not be empty".to_string());
@@ -262,6 +280,7 @@ mod tests {
                 name: "Demo".to_string(),
                 purpose: "A demo agent with a boundary".to_string(),
             },
+            knowledge_graph: Default::default(),
             runtime: Runtime {
                 harness: HarnessRuntime::Codex,
             },

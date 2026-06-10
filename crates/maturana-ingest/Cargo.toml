@@ -1,0 +1,20 @@
+[package]
+name = "maturana-ingest"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Document ingestion for MaturanaGraph: parse PDF / PPTX / DOCX / MD / TXT / HTML
+# into chunked graph nodes. Parsing dependencies are isolated to this crate; the
+# graph engine stays pure. All deps are pure-Rust (no C toolchain needed).
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+maturana-graph = { path = "../maturana-graph" }
+pdf-extract = "0.7"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+quick-xml = "0.36"
