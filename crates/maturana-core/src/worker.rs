@@ -74,6 +74,7 @@ pub fn render_harness_install(harness: &HarnessRuntime, headless_chrome: bool) -
         HarnessRuntime::ClaudeCode => "@anthropic-ai/claude-code",
         HarnessRuntime::Opencode => "opencode-ai",
     };
+    let binary = harness_binary(harness);
     let browser_install = if headless_chrome {
         r#"
 $SUDO mkdir -p /opt/maturana/browsers /opt/maturana/bin
@@ -105,6 +106,12 @@ if [ "$(id -u)" -eq 0 ]; then
 else
   SUDO="sudo"
 fi
+# Idempotent: nothing to do if the harness is already present. This lets the
+# script run as a first-boot systemd one-shot that no-ops on later boots.
+if command -v {binary} >/dev/null 2>&1; then
+  echo "maturana: {binary} already installed"
+  exit 0
+fi
 if command -v cloud-init >/dev/null 2>&1; then
   $SUDO cloud-init status --wait || true
 fi
@@ -123,16 +130,34 @@ $SUDO npm install -g {npm_package}
 
 pub fn render_systemd_service(description: &str, user: &str) -> String {
     format!(
-        "[Unit]\nDescription={}\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nUser={}\nWorkingDirectory=/workspace\nExecStart=/opt/maturana/bin/run-agent.sh\nRestart=on-failure\nRestartSec=10\nStandardOutput=append:/var/log/maturana/agent.log\nStandardError=append:/var/log/maturana/agent.err.log\n\n[Install]\nWantedBy=multi-user.target\n",
+        "[Unit]\nDescription={}\nAfter=network-online.target maturana-harness-install.service\nWants=network-online.target\n\n[Service]\nUser={}\nWorkingDirectory=/workspace\nExecStart=/opt/maturana/bin/run-agent.sh\nRestart=on-failure\nRestartSec=10\nStandardOutput=append:/var/log/maturana/agent.log\nStandardError=append:/var/log/maturana/agent.err.log\n\n[Install]\nWantedBy=multi-user.target\n",
         systemd_value(description),
         systemd_value(user),
     )
+}
+
+/// First-boot one-shot that installs the harness inside the guest over its own
+/// network. Used by Firecracker, where running the install in the offline
+/// libguestfs build appliance is unreliable (no/blocked network on some hosts);
+/// the booted guest always has working egress. Ordered before the agent so the
+/// first turn has its harness, and bounded so a stuck install can't wedge boot.
+pub fn render_harness_install_service() -> &'static str {
+    "[Unit]\nDescription=Maturana harness install (first boot)\nAfter=network-online.target\nWants=network-online.target\nBefore=maturana-agent.service\nConditionPathExists=/opt/maturana/bin/install-harness.sh\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nTimeoutStartSec=900\nExecStart=/opt/maturana/bin/install-harness.sh\n\n[Install]\nWantedBy=multi-user.target\n"
 }
 
 pub fn harness_name(harness: &HarnessRuntime) -> &'static str {
     match harness {
         HarnessRuntime::Codex => "codex",
         HarnessRuntime::ClaudeCode => "claude-code",
+        HarnessRuntime::Opencode => "opencode",
+    }
+}
+
+/// The executable name each harness installs on PATH.
+pub fn harness_binary(harness: &HarnessRuntime) -> &'static str {
+    match harness {
+        HarnessRuntime::Codex => "codex",
+        HarnessRuntime::ClaudeCode => "claude",
         HarnessRuntime::Opencode => "opencode",
     }
 }
@@ -424,6 +449,31 @@ mod tests {
         let opencode = render_harness_install(&HarnessRuntime::Opencode, false);
         assert!(opencode.contains("npm install -g opencode-ai"));
         assert!(opencode.starts_with("#!/usr/bin/env bash\nset -euo pipefail"));
+    }
+
+    #[test]
+    fn harness_install_is_idempotent_and_wired_to_a_boot_service() {
+        // The install script no-ops if the harness is already present, so it can
+        // run as a first-boot one-shot that is harmless on later boots.
+        for (harness, bin) in [
+            (HarnessRuntime::Codex, "codex"),
+            (HarnessRuntime::ClaudeCode, "claude"),
+            (HarnessRuntime::Opencode, "opencode"),
+        ] {
+            let script = render_harness_install(&harness, false);
+            assert!(script.contains(&format!("command -v {bin} >/dev/null")));
+            assert!(script.contains("already installed"));
+        }
+
+        let unit = render_harness_install_service();
+        assert!(unit.contains("Type=oneshot"));
+        assert!(unit.contains("Before=maturana-agent.service"));
+        assert!(unit.contains("ExecStart=/opt/maturana/bin/install-harness.sh"));
+        assert!(unit.contains("ConditionPathExists=/opt/maturana/bin/install-harness.sh"));
+
+        // The agent waits for the install one-shot before its first turn.
+        let service = render_systemd_service("x", "ubuntu");
+        assert!(service.contains("After=network-online.target maturana-harness-install.service"));
     }
 
     #[test]

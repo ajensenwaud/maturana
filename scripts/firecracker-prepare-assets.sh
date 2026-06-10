@@ -24,6 +24,7 @@ sessiond_env_path="${MATURANA_SESSIOND_ENV_PATH:-}"
 run_agent_path="${MATURANA_RUN_AGENT_PATH:-}"
 agent_service_path="${MATURANA_AGENT_SERVICE_PATH:-}"
 harness_install_path="${MATURANA_HARNESS_INSTALL_PATH:-}"
+harness_install_service_path="${MATURANA_HARNESS_INSTALL_SERVICE_PATH:-}"
 firecracker_bootstrap_path="${MATURANA_FIRECRACKER_BOOTSTRAP_PATH:-}"
 netplan_path="${MATURANA_NETPLAN_PATH:-}"
 cloud_cfg_path="${MATURANA_CLOUD_CFG_PATH:-}"
@@ -188,6 +189,7 @@ cp "$sessiond_env_path" "$work_dir/sessiond.env"
 cp "$run_agent_path" "$work_dir/run-agent.sh"
 cp "$agent_service_path" "$work_dir/maturana-agent.service"
 cp "$harness_install_path" "$work_dir/install-harness.sh"
+cp "$harness_install_service_path" "$work_dir/maturana-harness-install.service"
 cp "$firecracker_bootstrap_path" "$work_dir/firecracker-bootstrap.sh"
 cp "$host_key_path" "$work_dir/ssh_host_ed25519_key"
 cp "$host_key_path.pub" "$work_dir/ssh_host_ed25519_key.pub"
@@ -205,7 +207,11 @@ virt-copy-in -a "$work_img" "$work_dir/agent" /
 virt-copy-in -a "$work_img" "$work_dir/sessiond.env" /agent
 virt-copy-in -a "$work_img" "$work_dir/run-agent.sh" /opt/maturana/bin
 virt-copy-in -a "$work_img" "$work_dir/maturana-agent.service" /etc/systemd/system
-virt-copy-in -a "$work_img" "$work_dir/install-harness.sh" /tmp
+# Install the harness via a first-boot one-shot in the guest (over its own
+# network) rather than in this offline build appliance, whose network is
+# unreliable on some hosts and can hang npm.
+virt-copy-in -a "$work_img" "$work_dir/install-harness.sh" /opt/maturana/bin
+virt-copy-in -a "$work_img" "$work_dir/maturana-harness-install.service" /etc/systemd/system
 # After firecracker-bootstrap.sh ran `ssh-keygen -A` (which created a fresh
 # ed25519 host key), overwrite it with the baked one so it matches the manifest.
 virt-copy-in -a "$work_img" "$work_dir/ssh_host_ed25519_key" "$work_dir/ssh_host_ed25519_key.pub" /etc/ssh
@@ -249,8 +255,8 @@ virt-customize -a "$work_img" \
   --run-command 'chown root:root /etc/ssh/ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key.pub' \
   --run-command 'chmod 0600 /agent/sessiond.env' \
   --run-command 'chmod 0755 /opt/maturana/bin/run-agent.sh' \
-  --run-command 'chmod 0755 /tmp/install-harness.sh' \
-  --run-command '/tmp/install-harness.sh' \
+  --run-command 'chmod 0755 /opt/maturana/bin/install-harness.sh' \
+  --run-command 'systemctl enable maturana-harness-install.service || true' \
   --run-command 'if [ -f /usr/local/share/ca-certificates/maturana-pipelock-ca.crt ]; then update-ca-certificates; fi' \
   --run-command 'chown -R ubuntu:ubuntu /agent /workspace /memory /wiki /var/log/maturana /home/ubuntu/.codex 2>/dev/null || true' \
   --run-command 'chmod -R go-rwx /home/ubuntu/.codex 2>/dev/null || true' \
