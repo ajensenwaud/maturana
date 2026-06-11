@@ -1712,12 +1712,32 @@ fn build_orchestrator_config(
         .collect::<Vec<_>>();
     let agents = agent_ids
         .into_iter()
-        .map(|agent_id| AgentRuntime {
-            agent_id,
-            session_id: command.session_id.clone(),
-            telegram: !command.no_telegram,
-            telegram_token_source: command.telegram_token_source.clone(),
-            schedules: !command.no_schedules,
+        .map(|agent_id| {
+            let spec =
+                AgentSpec::from_maturana_markdown(&home.agent_dir(&agent_id).join("MATURANA.md"))
+                    .ok();
+            let slack = spec.as_ref().and_then(|s| s.channels.slack.clone()).map(|s| {
+                maturana_core::orchestrator::SlackRuntime {
+                    bot_token_source: s.bot_token_source,
+                    app_token_source: s.app_token_source,
+                }
+            });
+            let agentmail = spec
+                .as_ref()
+                .and_then(|s| s.channels.agentmail.clone())
+                .map(|m| maturana_core::orchestrator::AgentMailRuntime {
+                    api_key_source: m.api_key_source,
+                    inbox: m.inbox,
+                });
+            AgentRuntime {
+                agent_id,
+                session_id: command.session_id.clone(),
+                telegram: !command.no_telegram,
+                telegram_token_source: command.telegram_token_source.clone(),
+                schedules: !command.no_schedules,
+                slack,
+                agentmail,
+            }
         })
         .collect();
     // sessiond now refuses to run unauthenticated, so default the token to the
