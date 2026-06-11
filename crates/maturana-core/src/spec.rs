@@ -38,6 +38,13 @@ pub struct AgentSpec {
     pub knowledge_graph: KnowledgeGraph,
     #[serde(default)]
     pub browser: Browser,
+    /// Model-Context-Protocol servers the guest harness should connect to.
+    /// Rendered into the harness's native config and shipped with auth.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServer>,
+    /// Opt-in agent capabilities that gate egress defaults + skills.
+    #[serde(default)]
+    pub capabilities: Capabilities,
     #[serde(default)]
     pub skills: Vec<String>,
     #[serde(default)]
@@ -260,6 +267,83 @@ pub struct Channels {
     pub telegram: Option<TelegramChannel>,
     #[serde(default)]
     pub discord: Option<DiscordChannel>,
+    #[serde(default)]
+    pub slack: Option<SlackChannel>,
+    #[serde(default)]
+    pub agentmail: Option<AgentMailChannel>,
+}
+
+/// Slack via Socket Mode: a bot token (`xoxb-…`) for posting and an app-level
+/// token (`xapp-…`) for the events WebSocket. Both resolved host-side.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SlackChannel {
+    pub bot_token_source: String,
+    pub app_token_source: String,
+}
+
+/// AgentMail (agentmail.to) inbox polled via its REST API. `inbox` selects a
+/// specific inbox id; omitted uses the account's default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentMailChannel {
+    pub api_key_source: String,
+    #[serde(default)]
+    pub inbox: Option<String>,
+}
+
+/// A Model-Context-Protocol server the guest harness connects to. Rendered
+/// into the harness's native MCP config (codex `config.toml`, claude
+/// `.mcp.json`, …) at install time. Secrets in `env` are resolved host-side so
+/// they never live in the spec.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpServer {
+    pub name: String,
+    #[serde(default)]
+    pub transport: McpTransport,
+    /// Program to spawn for a stdio server (e.g. `npx`).
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Endpoint for an http/sse server.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Environment for the server process; each value resolved host-side from a
+    /// `pipelock:`/`env:`/path source.
+    #[serde(default)]
+    pub env: Vec<McpEnvVar>,
+    /// Hosts this server reaches; folded into the egress allowlist so the
+    /// proxy permits them without a separate spec edit.
+    #[serde(default)]
+    pub egress_hosts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    #[default]
+    Stdio,
+    Http,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpEnvVar {
+    pub name: String,
+    pub source: String,
+}
+
+/// Opt-in agent capabilities. Each gates an egress default + a deployed skill
+/// so the agent can call the relevant provider through the pipelock proxy.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Capabilities {
+    #[serde(default)]
+    pub image_gen: bool,
+    #[serde(default)]
+    pub voice: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -370,5 +454,56 @@ mod tests {
         let spec: AgentSpec = serde_yaml::from_str(frontmatter).unwrap();
         assert_eq!(spec.identity.id, "demo");
         assert_eq!(spec.runtime.harness, HarnessRuntime::Codex);
+    }
+
+    #[test]
+    fn mcp_servers_parse_stdio_and_http() {
+        let yaml = r#"
+identity: { id: demo, name: Demo, purpose: Test agent for MCP. }
+runtime: { harness: claude-code }
+vm: { provider: firecracker, guest_os: linux }
+mcp_servers:
+  - name: notion
+    transport: stdio
+    command: npx
+    args: ["-y", "@notionhq/notion-mcp-server"]
+    env: [{ name: NOTION_TOKEN, source: "pipelock:notion/integration-token" }]
+    egress_hosts: ["api.notion.com"]
+  - name: remote
+    transport: http
+    url: "https://mcp.example.com/sse"
+"#;
+        let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.mcp_servers.len(), 2);
+        let notion = &spec.mcp_servers[0];
+        assert_eq!(notion.name, "notion");
+        assert_eq!(notion.transport, McpTransport::Stdio);
+        assert_eq!(notion.command.as_deref(), Some("npx"));
+        assert_eq!(notion.env[0].source, "pipelock:notion/integration-token");
+        assert_eq!(notion.egress_hosts, vec!["api.notion.com"]);
+        assert_eq!(spec.mcp_servers[1].transport, McpTransport::Http);
+        // Transport defaults to stdio when omitted.
+        let bare: McpServer =
+            serde_yaml::from_str("name: x\ncommand: run").unwrap();
+        assert_eq!(bare.transport, McpTransport::Stdio);
+    }
+
+    #[test]
+    fn channels_parse_slack_and_agentmail_and_capabilities() {
+        let yaml = r#"
+identity: { id: demo, name: Demo, purpose: Test agent for channels. }
+runtime: { harness: codex }
+vm: { provider: firecracker, guest_os: linux }
+capabilities: { image_gen: true, voice: true }
+channels:
+  slack: { bot_token_source: "pipelock:slack/bot-token", app_token_source: "pipelock:slack/app-token" }
+  agentmail: { api_key_source: "pipelock:agentmail/api-key", inbox: "agent@agentmail.to" }
+"#;
+        let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(spec.capabilities.image_gen && spec.capabilities.voice);
+        let slack = spec.channels.slack.unwrap();
+        assert_eq!(slack.bot_token_source, "pipelock:slack/bot-token");
+        let mail = spec.channels.agentmail.unwrap();
+        assert_eq!(mail.inbox.as_deref(), Some("agent@agentmail.to"));
     }
 }
