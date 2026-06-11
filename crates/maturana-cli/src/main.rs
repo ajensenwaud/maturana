@@ -77,6 +77,9 @@ enum Command {
     Session(SessionCommand),
     Graph(graph::GraphCommand),
     Up(UpCommand),
+    /// Serve the web cockpit: a browser control surface complementing the
+    /// Codex CLI control plane.
+    Web(WebCommand),
     Tool(ToolCommand),
     Improve(ImproveCommand),
     Doctor(DoctorCommand),
@@ -177,6 +180,14 @@ enum ToolSubcommand {
         #[arg(long)]
         agent_id: Option<String>,
     },
+}
+
+/// Web cockpit server. Binds a LAN-reachable port; access is gated by the
+/// token at `<home>/web/token` exchanged for a session cookie at /login.
+#[derive(Debug, Args)]
+struct WebCommand {
+    #[arg(long, default_value = "0.0.0.0:47836")]
+    bind: String,
 }
 
 /// Supervise the host runtime plane (sessiond + per-agent channel bridges and
@@ -1167,6 +1178,9 @@ fn main() -> anyhow::Result<()> {
         Command::Session(command) => handle_session(command, &home)?,
         Command::Graph(command) => graph::handle_graph(command, &home)?,
         Command::Up(command) => run_up(&home, command)?,
+        Command::Web(command) => {
+            maturana_web::run_web(home.root().to_path_buf(), &command.bind)?
+        }
         Command::Tool(command) => run_tool_command(&home, command)?,
         Command::Improve(command) => run_improve_command(&home, command)?,
         Command::Doctor(command) => run_doctor(&home, command)?,
