@@ -7,6 +7,7 @@ pub mod agents;
 pub mod graph;
 pub mod pipelock;
 pub mod runtime;
+pub mod search;
 pub mod sessions;
 pub mod skills;
 pub mod tools;
@@ -37,6 +38,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/graph/ingest", post(graph::ingest))
         .route("/api/pipelock/secrets", get(pipelock::list).post(pipelock::set))
         .route("/api/pipelock/secrets/:name", axum::routing::delete(pipelock::delete))
+        .route("/api/search", post(search::search))
         .route("/api/tools", get(tools::list))
         .route("/api/skills", get(skills::list))
         .route("/api/skills/:name", get(skills::detail))

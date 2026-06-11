@@ -189,6 +189,9 @@ pub struct NetworkProxyHeader {
     pub host: String,
     pub header: String,
     pub source: String,
+    /// Optional literal prepended to the injected secret (e.g. `"Bearer "`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -361,6 +361,7 @@ body text stays put
             host: "api.search.brave.com".into(),
             header: "X-Subscription-Token".into(),
             source: "pipelock:brave/api-key".into(),
+            prefix: None,
         }];
         let allowlist = vec!["api.openai.com".to_string(), "api.search.brave.com".to_string()];
         let updated = update_network_block(SPEC, &allowlist, &headers).unwrap();

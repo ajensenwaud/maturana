@@ -80,6 +80,8 @@ enum Command {
     /// Serve the web cockpit: a browser control surface complementing the
     /// Codex CLI control plane.
     Web(WebCommand),
+    /// Web search via Brave or Tavily (API keys from pipelock).
+    Search(SearchCommand),
     Tool(ToolCommand),
     Improve(ImproveCommand),
     Doctor(DoctorCommand),
@@ -188,6 +190,20 @@ enum ToolSubcommand {
 struct WebCommand {
     #[arg(long, default_value = "0.0.0.0:47836")]
     bind: String,
+}
+
+/// Host-side web search: `maturana search "query" --provider brave|tavily`.
+/// Keys live in pipelock (`brave/api-key`, `tavily/api-key`). Guests use the
+/// maturana-web-search skill (proxy header injection) instead.
+#[derive(Debug, Args)]
+struct SearchCommand {
+    query: Vec<String>,
+    #[arg(long, default_value = "brave")]
+    provider: String,
+    #[arg(long, default_value_t = 5)]
+    count: usize,
+    #[arg(long)]
+    json: bool,
 }
 
 /// Supervise the host runtime plane (sessiond + per-agent channel bridges and
@@ -1181,6 +1197,7 @@ fn main() -> anyhow::Result<()> {
         Command::Web(command) => {
             maturana_web::run_web(home.root().to_path_buf(), &command.bind)?
         }
+        Command::Search(command) => run_search(&home, command)?,
         Command::Tool(command) => run_tool_command(&home, command)?,
         Command::Improve(command) => run_improve_command(&home, command)?,
         Command::Doctor(command) => run_doctor(&home, command)?,
@@ -1764,6 +1781,32 @@ fn supervise_plan(home: &MaturanaHome, plan: &[SupervisedProcess]) -> anyhow::Re
         }
         thread::sleep(Duration::from_secs(2));
     }
+}
+
+fn run_search(home: &MaturanaHome, command: SearchCommand) -> anyhow::Result<()> {
+    let query = command.query.join(" ");
+    if query.trim().is_empty() {
+        anyhow::bail!("search query is empty");
+    }
+    let provider: maturana_core::search::SearchProviderKind = command.provider.parse()?;
+    let results = maturana_core::search::search(
+        home.root(),
+        provider,
+        &maturana_core::search::SearchRequest {
+            query,
+            count: command.count,
+        },
+    )?;
+    if command.json {
+        println!("{}", serde_json::to_string_pretty(&results)?);
+    } else if results.is_empty() {
+        println!("(no results)");
+    } else {
+        for result in &results {
+            println!("{}\n  {}\n  {}\n", result.title, result.url, result.snippet);
+        }
+    }
+    Ok(())
 }
 
 fn run_doctor(home: &MaturanaHome, command: DoctorCommand) -> anyhow::Result<()> {
