@@ -3,6 +3,28 @@
 Secure agentic orchestration built around Codex skills and hardware-isolated
 worker agents.
 
+## Install
+
+One-liners (idempotent: bootstrap toolchain, clone/update, build, register
+the `maturana up` runtime plane and `maturana web` cockpit as services):
+
+```sh
+# Linux
+curl -fsSL https://raw.githubusercontent.com/ajensenwaud/maturana/main/scripts/install.sh | bash
+```
+
+```powershell
+# Windows
+irm https://raw.githubusercontent.com/ajensenwaud/maturana/main/scripts/install.ps1 | iex
+```
+
+Or clone this repo and run `scripts/install.sh` / `scripts/install.ps1`
+directly. Afterwards there are two equal control surfaces: run `codex` in the
+repo (AGENTS.md + skills/ orient it) or open the web cockpit at
+`http://<host>:47836` (token at `.maturana/web/token`; see
+[docs/web-cockpit.md](docs/web-cockpit.md)). Manage services with
+`maturana service install|uninstall|status|restart [up|web]`.
+
 This repository is at MVP stage, but the product path is Rust-owned and
 provider-aware. The current implementation provides:
 

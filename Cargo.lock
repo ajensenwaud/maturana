@@ -1430,6 +1430,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "dirs 5.0.1",
  "maturana-core",
  "maturana-graph",
  "maturana-ingest",
