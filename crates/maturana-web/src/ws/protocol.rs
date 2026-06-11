@@ -26,6 +26,8 @@ pub enum Topic {
     Pipelock,
     Tools,
     Skills,
+    /// Live pipelock proxy audit feed (allowed/denied egress).
+    Egress,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

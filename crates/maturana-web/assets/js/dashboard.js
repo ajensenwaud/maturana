@@ -454,6 +454,65 @@ export async function renderTools(panel) {
   panel.replaceChildren(wrap);
 }
 
+// ---- egress (live governance) ----
+
+export async function renderEgress(panel, socket) {
+  const wrap = section("Egress feed (live)");
+  const note = el("div", "label", "[ proxy audit — allowed/denied egress as it happens ]");
+  const feed = el("div", "session-log");
+  feed.style.maxHeight = "70vh";
+  wrap.append(note, feed);
+  panel.replaceChildren(wrap);
+
+  socket.subscribe(["egress"]);
+
+  const seen = new Set(); // de-dupe approved denials so the button disappears
+  socket.on("dash_update", (msg) => {
+    if (msg.topic !== "egress" || !panel.contains(wrap)) return;
+    const e = msg.data;
+    const denied = e.action === "pipelock.proxy.denied";
+    const row = el("div", `session-msg ${denied ? "out" : "in"}`);
+    const badge = denied ? "DENY" : `OK·${e.grant_source ?? "spec"}`;
+    const when = (e.at ?? "").slice(11, 19);
+    row.append(
+      el("span", denied ? "status-bad" : "status-ok", `[${badge}] `),
+      el("span", "status-dim", `${when} `),
+      el("span", undefined, `${e.agent_id ?? "—"}  ${e.method ?? ""} ${e.host ?? ""}`),
+    );
+    if (denied && e.host && !seen.has(e.host)) {
+      const perm = document.createElement("input");
+      perm.type = "checkbox";
+      perm.title = "make permanent (write to spec)";
+      const approve = button("approve", async () => {
+        try {
+          await api("/api/egress/approve", {
+            method: "POST",
+            body: JSON.stringify({
+              host: e.host,
+              permanent: perm.checked,
+              agent_id: e.agent_id ?? null,
+            }),
+          });
+          seen.add(e.host);
+          row.append(el("span", "status-ok", "  [granted]"));
+          approve.remove();
+          perm.remove();
+        } catch (error) {
+          row.append(el("span", "status-bad", `  [${error}]`));
+        }
+      });
+      approve.style.marginLeft = "10px";
+      const permLabel = el("label", "label");
+      permLabel.style.marginLeft = "8px";
+      permLabel.append(perm, document.createTextNode(" perm"));
+      row.append(approve, permLabel);
+    }
+    feed.append(row);
+    while (feed.childElementCount > 300) feed.firstChild.remove();
+    feed.scrollTop = feed.scrollHeight;
+  });
+}
+
 export async function renderSkills(panel) {
   const wrap = section("Skill catalog");
   const detail = el("div", "turn-output");
