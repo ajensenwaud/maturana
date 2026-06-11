@@ -65,6 +65,22 @@ pub struct AgentRuntime {
     pub telegram: bool,
     pub telegram_token_source: String,
     pub schedules: bool,
+    #[serde(default)]
+    pub slack: Option<SlackRuntime>,
+    #[serde(default)]
+    pub agentmail: Option<AgentMailRuntime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SlackRuntime {
+    pub bot_token_source: String,
+    pub app_token_source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentMailRuntime {
+    pub api_key_source: String,
+    pub inbox: Option<String>,
 }
 
 impl AgentRuntime {
@@ -73,6 +89,8 @@ impl AgentRuntime {
             agent_id: agent_id.into(),
             session_id: "telegram-main".to_string(),
             telegram: true,
+            slack: None,
+            agentmail: None,
             telegram_token_source: "pipelock:telegram/bot-token".to_string(),
             schedules: true,
         }
@@ -162,6 +180,49 @@ pub fn plan_processes(config: &OrchestratorConfig) -> Vec<SupervisedProcess> {
                 critical: false,
             });
         }
+        if let Some(slack) = &agent.slack {
+            processes.push(SupervisedProcess {
+                name: format!("channel:slack:{}", agent.agent_id),
+                args: vec![
+                    "channel".to_string(),
+                    "serve".to_string(),
+                    "slack".to_string(),
+                    "--agent-id".to_string(),
+                    agent.agent_id.clone(),
+                    "--session-id".to_string(),
+                    agent.session_id.clone(),
+                    "--bot-token-source".to_string(),
+                    slack.bot_token_source.clone(),
+                    "--app-token-source".to_string(),
+                    slack.app_token_source.clone(),
+                ],
+                critical: false,
+            });
+        }
+        if let Some(mail) = &agent.agentmail {
+            let mut args = vec![
+                "channel".to_string(),
+                "serve".to_string(),
+                "agentmail".to_string(),
+                "--agent-id".to_string(),
+                agent.agent_id.clone(),
+                "--session-id".to_string(),
+                agent.session_id.clone(),
+                "--api-key-source".to_string(),
+                mail.api_key_source.clone(),
+                "--poll-seconds".to_string(),
+                config.channel_poll_seconds.to_string(),
+            ];
+            if let Some(inbox) = &mail.inbox {
+                args.push("--inbox".to_string());
+                args.push(inbox.clone());
+            }
+            processes.push(SupervisedProcess {
+                name: format!("channel:agentmail:{}", agent.agent_id),
+                args,
+                critical: false,
+            });
+        }
         if agent.schedules {
             processes.push(SupervisedProcess {
                 name: format!("schedule:{}", agent.agent_id),
@@ -209,6 +270,35 @@ mod tests {
         assert_eq!(channel_session, schedule_session);
         assert_eq!(channel_session.as_deref(), Some("telegram-main"));
         assert_eq!(guest_session_id(&agent), "telegram-main");
+    }
+
+    #[test]
+    fn slack_and_agentmail_channels_emitted() {
+        let mut config = OrchestratorConfig::default();
+        let mut agent = AgentRuntime::new("personal");
+        agent.telegram = false;
+        agent.schedules = false;
+        agent.slack = Some(SlackRuntime {
+            bot_token_source: "pipelock:slack/bot-token".into(),
+            app_token_source: "pipelock:slack/app-token".into(),
+        });
+        agent.agentmail = Some(AgentMailRuntime {
+            api_key_source: "pipelock:agentmail/api-key".into(),
+            inbox: Some("box-1".into()),
+        });
+        config.agents.push(agent);
+        let processes = plan_processes(&config);
+        let slack = processes
+            .iter()
+            .find(|p| p.name == "channel:slack:personal")
+            .expect("slack channel");
+        assert!(slack.args.windows(2).any(|w| w == ["--bot-token-source", "pipelock:slack/bot-token"]));
+        let mail = processes
+            .iter()
+            .find(|p| p.name == "channel:agentmail:personal")
+            .expect("agentmail channel");
+        assert!(mail.args.windows(2).any(|w| w == ["--inbox", "box-1"]));
+        assert!(mail.args.windows(2).any(|w| w == ["--api-key-source", "pipelock:agentmail/api-key"]));
     }
 
     #[test]
