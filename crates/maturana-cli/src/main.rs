@@ -1,5 +1,6 @@
 mod channels;
 mod graph;
+mod service;
 mod personal;
 mod session;
 
@@ -77,6 +78,13 @@ enum Command {
     Session(SessionCommand),
     Graph(graph::GraphCommand),
     Up(UpCommand),
+    /// Serve the web cockpit: a browser control surface complementing the
+    /// Codex CLI control plane.
+    Web(WebCommand),
+    /// Web search via Brave or Tavily (API keys from pipelock).
+    Search(SearchCommand),
+    /// Register/manage host services (systemd user units / scheduled tasks).
+    Service(service::ServiceCommand),
     Tool(ToolCommand),
     Improve(ImproveCommand),
     Doctor(DoctorCommand),
@@ -177,6 +185,36 @@ enum ToolSubcommand {
         #[arg(long)]
         agent_id: Option<String>,
     },
+}
+
+/// Web cockpit server. Binds a LAN-reachable port; access is gated by the
+/// token at `<home>/web/token` exchanged for a session cookie at /login.
+#[derive(Debug, Args)]
+struct WebCommand {
+    #[command(subcommand)]
+    command: Option<WebSubcommand>,
+    #[arg(long, default_value = "0.0.0.0:47836")]
+    bind: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum WebSubcommand {
+    /// Print the cockpit login token (creating it if absent).
+    Token,
+}
+
+/// Host-side web search: `maturana search "query" --provider brave|tavily`.
+/// Keys live in pipelock (`brave/api-key`, `tavily/api-key`). Guests use the
+/// maturana-web-search skill (proxy header injection) instead.
+#[derive(Debug, Args)]
+struct SearchCommand {
+    query: Vec<String>,
+    #[arg(long, default_value = "brave")]
+    provider: String,
+    #[arg(long, default_value_t = 5)]
+    count: usize,
+    #[arg(long)]
+    json: bool,
 }
 
 /// Supervise the host runtime plane (sessiond + per-agent channel bridges and
@@ -1167,6 +1205,14 @@ fn main() -> anyhow::Result<()> {
         Command::Session(command) => handle_session(command, &home)?,
         Command::Graph(command) => graph::handle_graph(command, &home)?,
         Command::Up(command) => run_up(&home, command)?,
+        Command::Web(command) => match command.command {
+            Some(WebSubcommand::Token) => {
+                println!("{}", maturana_web::login_token(home.root())?);
+            }
+            None => maturana_web::run_web(home.root().to_path_buf(), &command.bind)?,
+        },
+        Command::Search(command) => run_search(&home, command)?,
+        Command::Service(command) => service::handle_service(command, &home)?,
         Command::Tool(command) => run_tool_command(&home, command)?,
         Command::Improve(command) => run_improve_command(&home, command)?,
         Command::Doctor(command) => run_doctor(&home, command)?,
@@ -1662,6 +1708,29 @@ struct Supervised {
     restarts: u32,
 }
 
+/// Write the supervisor heartbeat (`<home>/up/state.json`, schema v1). Best
+/// effort: supervision must never die because an observer file write failed.
+fn write_up_state(home: &MaturanaHome, supervised: &[Supervised]) {
+    let state = serde_json::json!({
+        "v": 1,
+        "pid": std::process::id(),
+        "at": chrono::Utc::now(),
+        "processes": supervised.iter().map(|slot| serde_json::json!({
+            "name": slot.process.name,
+            "pid": slot.child.id(),
+            "critical": slot.process.critical,
+            "restarts": slot.restarts,
+            "uptime_seconds": slot.started_at.elapsed().as_secs(),
+        })).collect::<Vec<_>>(),
+    });
+    let dir = home.root().join("up");
+    let _ = fs::create_dir_all(&dir);
+    let _ = fs::write(
+        dir.join("state.json"),
+        serde_json::to_vec_pretty(&state).unwrap_or_default(),
+    );
+}
+
 fn spawn_supervised(
     home: &MaturanaHome,
     process: &SupervisedProcess,
@@ -1690,6 +1759,9 @@ fn supervise_plan(home: &MaturanaHome, plan: &[SupervisedProcess]) -> anyhow::Re
     }
 
     loop {
+        // Versioned heartbeat for out-of-process observers (the web cockpit's
+        // runtime panel reads this file; there is deliberately no IPC).
+        write_up_state(home, &supervised);
         for slot in supervised.iter_mut() {
             match slot.child.try_wait() {
                 Ok(Some(status)) => {
@@ -1724,6 +1796,32 @@ fn supervise_plan(home: &MaturanaHome, plan: &[SupervisedProcess]) -> anyhow::Re
         }
         thread::sleep(Duration::from_secs(2));
     }
+}
+
+fn run_search(home: &MaturanaHome, command: SearchCommand) -> anyhow::Result<()> {
+    let query = command.query.join(" ");
+    if query.trim().is_empty() {
+        anyhow::bail!("search query is empty");
+    }
+    let provider: maturana_core::search::SearchProviderKind = command.provider.parse()?;
+    let results = maturana_core::search::search(
+        home.root(),
+        provider,
+        &maturana_core::search::SearchRequest {
+            query,
+            count: command.count,
+        },
+    )?;
+    if command.json {
+        println!("{}", serde_json::to_string_pretty(&results)?);
+    } else if results.is_empty() {
+        println!("(no results)");
+    } else {
+        for result in &results {
+            println!("{}\n  {}\n  {}\n", result.title, result.url, result.snippet);
+        }
+    }
+    Ok(())
 }
 
 fn run_doctor(home: &MaturanaHome, command: DoctorCommand) -> anyhow::Result<()> {

@@ -1,0 +1,71 @@
+/* Maturana cockpit design tokens — the Recursant trademark language.
+   Extracted from recursant.ai/pitch: #0C1117 ground, #E0E8F0 ink, #1DB4B0
+   teal accent with a soft 60px glow, #5a6877 dim, JetBrains Mono, wide
+   letter-spaced all-caps labels, hairline progress bars, [000%] counters. */
+
+:root {
+  --bg: #0c1117;
+  --bg-raised: #111823;
+  --bg-inset: #080c11;
+  --ink: #e0e8f0;
+  --dim: #5a6877;
+  --accent: #1db4b0;
+  --accent-glow: rgba(29, 180, 176, 0.55);
+  --danger: #e0635a;
+  --ok: #1db4b0;
+  --hairline: rgba(224, 232, 240, 0.08);
+  --track: rgba(255, 255, 255, 0.05);
+  --mono: "JetBrains Mono", "Cascadia Code", ui-monospace, "SF Mono",
+    Menlo, Consolas, monospace;
+  --track-spacing-wide: 0.4em;
+  --track-spacing: 0.3em;
+}
+
+/* All-caps tracked labels — the signature. */
+.label {
+  font-family: var(--mono);
+  text-transform: uppercase;
+  letter-spacing: var(--track-spacing);
+  color: var(--dim);
+  font-size: 0.7rem;
+}
+
+.label-lg {
+  font-family: var(--mono);
+  text-transform: uppercase;
+  letter-spacing: var(--track-spacing-wide);
+  color: var(--ink);
+  font-weight: 300;
+  font-size: 1.25rem;
+}
+
+/* [042%]-style bracket counter. */
+.bracket {
+  color: var(--dim);
+  letter-spacing: var(--track-spacing);
+}
+.bracket .value {
+  color: var(--accent);
+}
+
+/* Hairline progress bar: 2px track + accent fill. */
+.bar {
+  height: 2px;
+  width: 100%;
+  overflow: hidden;
+  border-radius: 9999px;
+  background: var(--track);
+}
+.bar > .fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 240ms ease;
+}
+
+.glow {
+  filter: drop-shadow(0 0 60px var(--accent-glow));
+}
+
+.status-ok { color: var(--ok); }
+.status-bad { color: var(--danger); }
+.status-dim { color: var(--dim); }

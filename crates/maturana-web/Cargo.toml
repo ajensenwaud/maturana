@@ -1,0 +1,22 @@
+[package]
+name = "maturana-web"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+include_dir = { workspace = true }
+maturana-core = { path = "../maturana-core" }
+maturana-ingest = { path = "../maturana-ingest" }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+ureq = { version = "2.10.1", features = ["json"] }
+uuid = { workspace = true }

@@ -123,6 +123,56 @@ const { chromium } = require('playwright');
 JS
 $SUDO mv /tmp/maturana-browser-smoke.js /opt/maturana/bin/browser-smoke.js
 $SUDO chmod 0755 /opt/maturana/bin/browser-smoke.js
+cat > /tmp/maturana-browse.js <<'JS'
+// Maturana browse driver: stateless single-shot Playwright commands.
+// Usage: node /opt/maturana/bin/browse.js '{"cmd":"text","url":"https://..."}'
+// Commands:
+//   {"cmd":"navigate","url"}                       -> {ok,status,url,title}
+//   {"cmd":"text","url","selector"?}               -> {ok,...,text}
+//   {"cmd":"screenshot","url","out"?}              -> {ok,...,screenshot}
+//   {"cmd":"click","url","selector"}               -> {ok,...,text} (after click)
+const { chromium } = require('playwright');
+(async () => {
+  const cmd = JSON.parse(process.argv[2] || '{}');
+  const out = { ok: false };
+  if (!cmd.url) {
+    console.log(JSON.stringify({ ok: false, error: 'missing url' }));
+    process.exit(1);
+  }
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    const response = await page.goto(cmd.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    out.status = response ? response.status() : null;
+    if (cmd.cmd === 'click' && cmd.selector) {
+      await page.click(cmd.selector, { timeout: 10000 });
+      await page.waitForLoadState('domcontentloaded');
+    }
+    out.url = page.url();
+    out.title = await page.title();
+    if (cmd.cmd === 'screenshot') {
+      const dest = cmd.out || '/workspace/screenshot.png';
+      await page.screenshot({ path: dest, fullPage: true });
+      out.screenshot = dest;
+    }
+    if (cmd.cmd === 'text' || cmd.cmd === 'click') {
+      const target = cmd.cmd === 'text' && cmd.selector
+        ? page.locator(cmd.selector).first()
+        : page.locator('body');
+      out.text = (await target.innerText()).slice(0, 20000);
+    }
+    out.ok = true;
+  } catch (error) {
+    out.error = String(error);
+  } finally {
+    await browser.close();
+  }
+  console.log(JSON.stringify(out));
+  process.exit(out.ok ? 0 : 1);
+})();
+JS
+$SUDO mv /tmp/maturana-browse.js /opt/maturana/bin/browse.js
+$SUDO chmod 0755 /opt/maturana/bin/browse.js
 "#
     } else {
         ""
@@ -484,6 +534,10 @@ mod tests {
         assert!(claude.contains("npm install -g playwright"));
         assert!(claude.contains("playwright install --with-deps chromium"));
         assert!(claude.contains("/opt/maturana/bin/browser-smoke.js"));
+        // The browse driver ships with the browser, and only with it.
+        assert!(claude.contains("/opt/maturana/bin/browse.js"));
+        assert!(claude.contains(r#""cmd":"screenshot""#));
+        assert!(!codex.contains("browse.js"));
 
         let opencode = render_harness_install(&HarnessRuntime::Opencode, false);
         assert!(opencode.contains("npm install -g opencode-ai"));
