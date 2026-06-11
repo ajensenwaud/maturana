@@ -3,6 +3,7 @@
 
 import { CockpitSocket } from "/assets/js/ws.js";
 import { Console } from "/assets/js/console.js";
+import * as dashboard from "/assets/js/dashboard.js";
 
 const socket = new CockpitSocket();
 const linkStatus = document.getElementById("link-status");
@@ -27,14 +28,14 @@ const panel = document.getElementById("panel");
 const nav = document.getElementById("nav");
 const consoleView = new Console(socket);
 
-const placeholders = {
-  agents: "Agent fleet — phase 3",
-  runtime: "Runtime plane — phase 3",
-  sessions: "Sessions — phase 3",
-  graph: "Knowledge graph — phase 3",
-  pipelock: "Pipelock — phase 3",
-  tools: "Tools — phase 3",
-  skills: "Skills — phase 3",
+const views = {
+  agents: dashboard.renderAgents,
+  runtime: dashboard.renderRuntime,
+  sessions: dashboard.renderSessions,
+  graph: dashboard.renderGraph,
+  pipelock: dashboard.renderPipelock,
+  tools: dashboard.renderTools,
+  skills: dashboard.renderSkills,
 };
 
 nav.addEventListener("click", (event) => {
@@ -46,22 +47,27 @@ nav.addEventListener("click", (event) => {
   renderView(button.dataset.view);
 });
 
-function renderView(name) {
+async function renderView(name) {
   if (name === "console") {
     consoleView.mount(panel);
     return;
   }
+  const render = views[name];
+  if (!render) return;
   panel.innerHTML = "";
-  const wrap = document.createElement("div");
-  wrap.className = "placeholder";
-  const title = document.createElement("div");
-  title.className = "label-lg";
-  title.textContent = name;
   const note = document.createElement("div");
   note.className = "label";
-  note.textContent = `[ ${placeholders[name] ?? "unknown view"} ]`;
-  wrap.append(title, note);
-  panel.append(wrap);
+  note.textContent = "[ loading… ]";
+  panel.append(note);
+  try {
+    await render(panel, socket);
+  } catch (error) {
+    panel.innerHTML = "";
+    const fail = document.createElement("div");
+    fail.className = "status-bad";
+    fail.textContent = `[ ${error} ]`;
+    panel.append(fail);
+  }
 }
 
 renderView("console");

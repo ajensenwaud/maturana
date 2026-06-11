@@ -82,16 +82,19 @@ async fn handle_socket(state: AppState, mut socket: WebSocket) {
             }
             event = dash_rx.recv() => {
                 match event {
-                    Ok(event) if topics.contains(&event.topic) => {
-                        let update = ServerMsg::DashUpdate {
-                            topic: event.topic,
-                            data: event.data,
-                        };
-                        if send(&mut socket, &update).await.is_err() {
+                    Ok(crate::state::Broadcast::Dash(topic, data)) => {
+                        if topics.contains(&topic) {
+                            let update = ServerMsg::DashUpdate { topic, data };
+                            if send(&mut socket, &update).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(crate::state::Broadcast::Session(message)) => {
+                        if send(&mut socket, &message).await.is_err() {
                             break;
                         }
                     }
-                    Ok(_) => {}
                     // Lagged: drop missed updates; pollers re-publish shortly.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -187,11 +190,40 @@ fn handle_client_msg(
                 turn_id: Some(turn_id),
             }),
         },
-        ClientMsg::SessionSend { .. } => Some(ServerMsg::Error {
-            code: "not_implemented".to_string(),
-            message: "session sends land in phase 3".to_string(),
-            turn_id: None,
-        }),
+        ClientMsg::SessionSend {
+            agent_id,
+            session_id,
+            text,
+        } => {
+            // Enqueue through the same queue the Telegram bridge feeds; the
+            // guest worker claims it like any other channel message. The
+            // outbound poller in server.rs delivers the reply back over WS.
+            let agent_dir = state.home_root.join("agents").join(&agent_id);
+            let result = (|| -> anyhow::Result<String> {
+                let paths = maturana_core::session_db::session_paths(&agent_dir, &session_id);
+                maturana_core::session_db::ensure_session(&paths)?;
+                maturana_core::session_db::insert_inbound(
+                    &paths,
+                    "chat",
+                    "web",
+                    "web",
+                    None,
+                    &serde_json::json!({ "text": text, "prompt": text }).to_string(),
+                )
+            })();
+            match result {
+                Ok(message_id) => Some(ServerMsg::SessionOutbound {
+                    agent_id,
+                    session_id,
+                    message: serde_json::json!({ "queued": message_id }),
+                }),
+                Err(error) => Some(ServerMsg::Error {
+                    code: "session_send_failed".to_string(),
+                    message: format!("{error:#}"),
+                    turn_id: None,
+                }),
+            }
+        }
     }
 }
 

@@ -295,6 +295,49 @@ pub fn write_outbound(
     Ok(id)
 }
 
+/// Most recent inbound messages (any status), newest first. Read-only view
+/// for observers like the web cockpit's sessions panel.
+pub fn list_recent_inbound(
+    paths: &SessionPaths,
+    limit: usize,
+) -> anyhow::Result<Vec<InboundMessage>> {
+    let db = open_rw(&paths.inbound_db)?;
+    ensure_inbound_schema(&db)?;
+    let mut stmt = db.prepare(
+        r#"
+        SELECT id, kind, channel, platform_id, thread_id, content, status, created_at
+        FROM messages_in
+        ORDER BY seq DESC
+        LIMIT ?1
+        "#,
+    )?;
+    let messages = stmt
+        .query_map(params![limit as i64], inbound_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(messages)
+}
+
+/// Most recent outbound messages, newest first. Read-only observer view.
+pub fn list_recent_outbound(
+    paths: &SessionPaths,
+    limit: usize,
+) -> anyhow::Result<Vec<OutboundMessage>> {
+    let db = open_rw(&paths.outbound_db)?;
+    ensure_outbound_schema(&db)?;
+    let mut stmt = db.prepare(
+        r#"
+        SELECT id, in_reply_to, kind, channel, platform_id, thread_id, content, created_at
+        FROM messages_out
+        ORDER BY seq DESC
+        LIMIT ?1
+        "#,
+    )?;
+    let messages = stmt
+        .query_map(params![limit as i64], outbound_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(messages)
+}
+
 pub fn list_undelivered(paths: &SessionPaths) -> anyhow::Result<Vec<OutboundMessage>> {
     let inbound = open_rw(&paths.inbound_db)?;
     ensure_inbound_schema(&inbound)?;

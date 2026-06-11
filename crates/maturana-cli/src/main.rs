@@ -1676,6 +1676,29 @@ struct Supervised {
     restarts: u32,
 }
 
+/// Write the supervisor heartbeat (`<home>/up/state.json`, schema v1). Best
+/// effort: supervision must never die because an observer file write failed.
+fn write_up_state(home: &MaturanaHome, supervised: &[Supervised]) {
+    let state = serde_json::json!({
+        "v": 1,
+        "pid": std::process::id(),
+        "at": chrono::Utc::now(),
+        "processes": supervised.iter().map(|slot| serde_json::json!({
+            "name": slot.process.name,
+            "pid": slot.child.id(),
+            "critical": slot.process.critical,
+            "restarts": slot.restarts,
+            "uptime_seconds": slot.started_at.elapsed().as_secs(),
+        })).collect::<Vec<_>>(),
+    });
+    let dir = home.root().join("up");
+    let _ = fs::create_dir_all(&dir);
+    let _ = fs::write(
+        dir.join("state.json"),
+        serde_json::to_vec_pretty(&state).unwrap_or_default(),
+    );
+}
+
 fn spawn_supervised(
     home: &MaturanaHome,
     process: &SupervisedProcess,
@@ -1704,6 +1727,9 @@ fn supervise_plan(home: &MaturanaHome, plan: &[SupervisedProcess]) -> anyhow::Re
     }
 
     loop {
+        // Versioned heartbeat for out-of-process observers (the web cockpit's
+        // runtime panel reads this file; there is deliberately no IPC).
+        write_up_state(home, &supervised);
         for slot in supervised.iter_mut() {
             match slot.child.try_wait() {
                 Ok(Some(status)) => {

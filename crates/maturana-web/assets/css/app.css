@@ -270,3 +270,60 @@ button.primary:hover {
   opacity: 0.4;
   cursor: default;
 }
+
+/* ---- dashboard ---- */
+
+.dash-section { margin-bottom: 26px; display: flex; flex-direction: column; gap: 12px; }
+.dash-title { font-size: 0.78rem; color: var(--accent); }
+
+.dash-table { border-collapse: collapse; width: 100%; font-size: 0.8rem; }
+.dash-table th {
+  text-align: left;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--hairline);
+}
+.dash-table td {
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--hairline);
+  vertical-align: top;
+}
+.dash-table tr:hover td { background: var(--bg-raised); }
+
+.dash-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.dash-actions .primary { padding: 5px 10px; font-size: 0.65rem; }
+
+.dash-json {
+  background: var(--bg-inset);
+  border: 1px solid var(--hairline);
+  padding: 12px;
+  overflow: auto;
+  max-height: 360px;
+  font-size: 0.75rem;
+  white-space: pre-wrap;
+}
+
+.spec-editor {
+  width: 100%;
+  min-height: 280px;
+  background: var(--bg-inset);
+  border: 1px solid var(--hairline);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  padding: 10px 12px;
+  resize: vertical;
+}
+.spec-editor:focus { outline: none; border-color: var(--accent); }
+
+.session-log {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 380px;
+  overflow-y: auto;
+  border: 1px solid var(--hairline);
+  padding: 12px;
+  margin: 10px 0;
+}
+.session-msg.in { color: var(--ink); }
+.session-msg.out { color: var(--accent); }
