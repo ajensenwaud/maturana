@@ -177,27 +177,26 @@ fn task_name(service: &HostService) -> String {
     format!("Maturana{capitalized}")
 }
 
+/// PowerShell command that registers the logon task. Register-ScheduledTask
+/// (unlike `schtasks /Create /SC ONLOGON`) works WITHOUT elevation when the
+/// trigger is scoped to the calling user; the privileged hostd keeps its
+/// dedicated elevated installer.
+pub fn windows_register_command(service: &HostService, exe: &str, home_root: &str) -> String {
+    let task = task_name(service);
+    let exe = exe.replace('\'', "''");
+    let argument = format!("--home \"{home_root}\" {}", service.args.join(" ")).replace('\'', "''");
+    format!(
+        "$a = New-ScheduledTaskAction -Execute '{exe}' -Argument '{argument}'; \
+         $t = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME; \
+         Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t -Force | Out-Null"
+    )
+}
+
 /// Argv for schtasks (after the program name); split out for testing.
-pub fn schtasks_args(
-    action: &str,
-    service: &HostService,
-    exe: &str,
-    home_root: &str,
-) -> Vec<String> {
+/// Install goes through [`windows_register_command`] instead.
+pub fn schtasks_args(action: &str, service: &HostService) -> Vec<String> {
     let task = task_name(service);
     match action {
-        "install" => vec![
-            "/Create".into(),
-            "/F".into(),
-            "/TN".into(),
-            task,
-            "/SC".into(),
-            "ONLOGON".into(),
-            "/RL".into(),
-            "LIMITED".into(),
-            "/TR".into(),
-            format!("\"{exe}\" --home \"{home_root}\" {}", service.args.join(" ")),
-        ],
         "uninstall" => vec!["/Delete".into(), "/F".into(), "/TN".into(), task],
         "status" => vec!["/Query".into(), "/TN".into(), task],
         "restart" => vec!["/Run".into(), "/TN".into(), task],
@@ -211,31 +210,42 @@ fn windows_service(
     exe: &std::path::Path,
     home: &MaturanaHome,
 ) -> anyhow::Result<()> {
+    if action == "install" {
+        let command = windows_register_command(
+            service,
+            &exe.display().to_string(),
+            &home.root().display().to_string(),
+        );
+        let status = ProcessCommand::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &command])
+            .status()
+            .context("failed to run powershell")?;
+        if !status.success() {
+            anyhow::bail!("Register-ScheduledTask failed with {status}");
+        }
+        // Start it now rather than waiting for the next logon.
+        let _ = ProcessCommand::new("schtasks")
+            .args(["/Run", "/TN", &task_name(service)])
+            .status();
+        println!("registered + started task {}", task_name(service));
+        return Ok(());
+    }
     if action == "restart" {
-        // End first; ignore failure (task may not be running).
+        // End first; ignore failure (task may not be running). Give the old
+        // instance a moment to release its port or /Run races the teardown
+        // and the task lands back in Ready without a live process.
         let _ = ProcessCommand::new("schtasks")
             .args(["/End", "/TN", &task_name(service)])
             .status();
+        std::thread::sleep(std::time::Duration::from_secs(2));
     }
-    let args = schtasks_args(
-        action,
-        service,
-        &exe.display().to_string(),
-        &home.root().display().to_string(),
-    );
+    let args = schtasks_args(action, service);
     let status = ProcessCommand::new("schtasks")
         .args(&args)
         .status()
         .context("failed to run schtasks")?;
     if !status.success() && action != "status" {
         anyhow::bail!("schtasks {} failed with {status}", args.join(" "));
-    }
-    if action == "install" {
-        // Start it now rather than waiting for the next logon.
-        let _ = ProcessCommand::new("schtasks")
-            .args(["/Run", "/TN", &task_name(service)])
-            .status();
-        println!("registered + started task {}", task_name(service));
     }
     Ok(())
 }
@@ -265,23 +275,25 @@ mod tests {
     }
 
     #[test]
-    fn schtasks_argv_golden() {
+    fn windows_commands_golden() {
         let service = known_service("up").unwrap();
-        let args = schtasks_args("install", &service, r"C:\m\maturana.exe", r"C:\m\.maturana");
-        assert_eq!(args[0], "/Create");
-        assert!(args.contains(&"MaturanaUp".to_string()));
-        assert!(args.contains(&"ONLOGON".to_string()));
+        let register =
+            windows_register_command(&service, r"C:\m\maturana.exe", r"C:\m\.maturana");
+        assert!(register.contains("New-ScheduledTaskAction -Execute 'C:\\m\\maturana.exe'"));
+        assert!(register.contains(r#"-Argument '--home "C:\m\.maturana" up'"#));
+        assert!(register.contains("-AtLogOn -User $env:USERNAME"));
+        assert!(register.contains("-TaskName 'MaturanaUp'"));
         assert_eq!(
-            args.last().unwrap(),
-            "\"C:\\m\\maturana.exe\" --home \"C:\\m\\.maturana\" up"
-        );
-        assert_eq!(
-            schtasks_args("uninstall", &service, "x", "y"),
+            schtasks_args("uninstall", &service),
             vec!["/Delete", "/F", "/TN", "MaturanaUp"]
         );
         assert_eq!(
-            schtasks_args("restart", &service, "x", "y"),
+            schtasks_args("restart", &service),
             vec!["/Run", "/TN", "MaturanaUp"]
+        );
+        assert_eq!(
+            schtasks_args("status", &service),
+            vec!["/Query", "/TN", "MaturanaUp"]
         );
     }
 
