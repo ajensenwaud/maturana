@@ -17,10 +17,15 @@ use crate::{api, assets, auth, ws};
 
 pub async fn serve(home_root: PathBuf, bind: &str) -> anyhow::Result<()> {
     let login_token = auth::ensure_web_token(&home_root)?;
-    // The Hyper-V provider resolves the hostd token cwd-relative by default,
-    // which breaks when the cockpit runs as a service (cwd = System32 under a
-    // Scheduled Task). Anchor it to the home explicitly via the provider's
-    // documented override. Set once here, before any task spawns.
+    // Providers resolve several conventional paths (.maturana/keys, images,
+    // host-auth, hostd token) relative to the repo root. Under a service the
+    // cwd is somewhere else entirely (System32 for Scheduled Tasks), so
+    // anchor the process cwd to the home's parent — the same position every
+    // interactive CLI invocation runs from.
+    if let Some(repo_root) = home_root.parent() {
+        let _ = std::env::set_current_dir(repo_root);
+    }
+    // Belt-and-braces for the hostd token specifically (documented override).
     if std::env::var("MATURANA_HOSTD_TOKEN_PATH").is_err() {
         let hostd_token = home_root.join("hostd").join("token");
         if hostd_token.exists() {

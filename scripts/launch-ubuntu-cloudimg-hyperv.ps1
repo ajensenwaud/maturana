@@ -82,8 +82,14 @@ function New-SeedVhdx {
     if (!(Test-Path -LiteralPath $CloudInitMetaDataPath)) {
         throw "CloudInitMetaDataPath does not exist: $CloudInitMetaDataPath"
     }
-    Copy-Item -LiteralPath $CloudInitUserDataPath -Destination $userDataPath -Force
-    Copy-Item -LiteralPath $CloudInitMetaDataPath -Destination $metaDataPath -Force
+    # The caller may already have rendered the files in place (source ==
+    # destination); Copy-Item refuses to overwrite an item with itself.
+    if ([IO.Path]::GetFullPath($CloudInitUserDataPath) -ne [IO.Path]::GetFullPath($userDataPath)) {
+        Copy-Item -LiteralPath $CloudInitUserDataPath -Destination $userDataPath -Force
+    }
+    if ([IO.Path]::GetFullPath($CloudInitMetaDataPath) -ne [IO.Path]::GetFullPath($metaDataPath)) {
+        Copy-Item -LiteralPath $CloudInitMetaDataPath -Destination $metaDataPath -Force
+    }
 
     Write-Log "Creating cloud-init seed VHDX..."
     New-VHD -Path $Path -SizeBytes 64MB -Dynamic | Out-Null
