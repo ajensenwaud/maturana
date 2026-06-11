@@ -1,5 +1,6 @@
 pub mod animation;
 pub mod audit;
+pub mod claude_refresh;
 pub mod improvement;
 pub mod materialize;
 pub mod mcp;

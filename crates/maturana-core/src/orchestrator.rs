@@ -36,6 +36,10 @@ pub struct OrchestratorConfig {
     /// gateway IP). Only supervised when `graph_token` is set (opt-in).
     pub graph_bind: String,
     pub graph_token: Option<String>,
+    /// claude-code agent ids whose OAuth tokens the host refresh daemon keeps
+    /// fresh + re-pushes. Empty → no daemon.
+    #[serde(default)]
+    pub claude_refresh_agents: Vec<String>,
 }
 
 impl Default for OrchestratorConfig {
@@ -48,6 +52,7 @@ impl Default for OrchestratorConfig {
             agents: Vec::new(),
             graph_bind: "0.0.0.0:47835".to_string(),
             graph_token: None,
+            claude_refresh_agents: Vec::new(),
         }
     }
 }
@@ -123,6 +128,20 @@ pub fn plan_processes(config: &OrchestratorConfig) -> Vec<SupervisedProcess> {
         });
     }
 
+    // Host-owned Claude OAuth refresh: one daemon for all claude-code agents.
+    if !config.claude_refresh_agents.is_empty() {
+        let mut args = vec!["claude-refresh".to_string(), "serve".to_string()];
+        for agent_id in &config.claude_refresh_agents {
+            args.push("--agent-id".to_string());
+            args.push(agent_id.clone());
+        }
+        processes.push(SupervisedProcess {
+            name: "claude-refresh".to_string(),
+            args,
+            critical: false,
+        });
+    }
+
     for agent in &config.agents {
         if agent.telegram {
             processes.push(SupervisedProcess {
@@ -190,6 +209,25 @@ mod tests {
         assert_eq!(channel_session, schedule_session);
         assert_eq!(channel_session.as_deref(), Some("telegram-main"));
         assert_eq!(guest_session_id(&agent), "telegram-main");
+    }
+
+    #[test]
+    fn claude_refresh_daemon_emitted_for_claude_agents() {
+        let mut config = OrchestratorConfig::default();
+        config.claude_refresh_agents = vec!["claude-a".to_string(), "claude-b".to_string()];
+        let processes = plan_processes(&config);
+        let daemon = processes
+            .iter()
+            .find(|p| p.name == "claude-refresh")
+            .expect("claude-refresh process present");
+        assert!(!daemon.critical);
+        assert_eq!(daemon.args[0], "claude-refresh");
+        assert_eq!(daemon.args[1], "serve");
+        assert!(daemon.args.windows(2).any(|w| w == ["--agent-id", "claude-a"]));
+        assert!(daemon.args.windows(2).any(|w| w == ["--agent-id", "claude-b"]));
+        // No claude agents → no daemon.
+        let bare = OrchestratorConfig::default();
+        assert!(plan_processes(&bare).iter().all(|p| p.name != "claude-refresh"));
     }
 
     #[test]
