@@ -1,5 +1,6 @@
 mod channels;
 mod graph;
+mod service;
 mod personal;
 mod session;
 
@@ -82,6 +83,8 @@ enum Command {
     Web(WebCommand),
     /// Web search via Brave or Tavily (API keys from pipelock).
     Search(SearchCommand),
+    /// Register/manage host services (systemd user units / scheduled tasks).
+    Service(service::ServiceCommand),
     Tool(ToolCommand),
     Improve(ImproveCommand),
     Doctor(DoctorCommand),
@@ -1198,6 +1201,7 @@ fn main() -> anyhow::Result<()> {
             maturana_web::run_web(home.root().to_path_buf(), &command.bind)?
         }
         Command::Search(command) => run_search(&home, command)?,
+        Command::Service(command) => service::handle_service(command, &home)?,
         Command::Tool(command) => run_tool_command(&home, command)?,
         Command::Improve(command) => run_improve_command(&home, command)?,
         Command::Doctor(command) => run_doctor(&home, command)?,
