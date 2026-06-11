@@ -214,6 +214,42 @@ impl TrajectoryStore {
         Ok(examples)
     }
 
+    /// Render the top-`n` highest-reward chat turns for `agent_id` as few-shot
+    /// "learned examples" markdown, injected into later prompts. This is the
+    /// in-context consumer that closes the loop without any fine-tuning: a
+    /// rewarded turn shapes the next turn's context. Empty string when there is
+    /// nothing above `min_reward`.
+    pub fn learned_examples_markdown(
+        &self,
+        agent_id: &str,
+        n: usize,
+        min_reward: f64,
+    ) -> anyhow::Result<String> {
+        let examples: Vec<_> = self
+            .curate(min_reward)?
+            .into_iter()
+            .filter(|e| e.trajectory.agent_id == agent_id && e.trajectory.kind == "chat")
+            .filter(|e| !e.trajectory.input.trim().is_empty())
+            .take(n)
+            .collect();
+        if examples.is_empty() {
+            return Ok(String::new());
+        }
+        let mut out = String::from(
+            "These past exchanges were rated positively; match their style and substance.\n",
+        );
+        for (i, ex) in examples.iter().enumerate() {
+            out.push_str(&format!(
+                "\n### Example {} (reward {:+.0})\nUser: {}\nYou: {}\n",
+                i + 1,
+                ex.reward.total,
+                truncate(&ex.trajectory.input, 400),
+                truncate(&ex.trajectory.output, 800),
+            ));
+        }
+        Ok(out)
+    }
+
     /// Export curated examples as chat-style SFT JSONL (one record per line).
     pub fn export_sft_jsonl(&self, min_reward: f64) -> anyhow::Result<String> {
         let mut out = String::new();
@@ -312,6 +348,16 @@ pub mod signals {
     pub const SNAPSHOT_ROLLBACK: f64 = -5.0;
 }
 
+fn truncate(text: &str, max: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,6 +382,26 @@ mod tests {
         let summary = store.reward_summary(&id).unwrap();
         assert_eq!(summary.count, 2);
         assert!((summary.total - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn learned_examples_ranks_rewarded_turns_for_the_agent() {
+        let store = store();
+        let good = store.record("a", "s", "chat", "what is X?", "X is the answer", "[]").unwrap();
+        store.attach_reward(&good, "user", signals::THUMBS_UP, None).unwrap();
+        // Unrewarded + other-agent + tool turns are excluded.
+        store.record("a", "s", "chat", "meh", "whatever", "[]").unwrap();
+        store.record("b", "s", "chat", "other agent", "nope", "[]").unwrap();
+        let other = store.record("a", "s", "tool", "ran", "out", "[]").unwrap();
+        store.attach_reward(&other, "user", signals::THUMBS_UP, None).unwrap();
+
+        let md = store.learned_examples_markdown("a", 5, 0.5).unwrap();
+        assert!(md.contains("what is X?"));
+        assert!(md.contains("X is the answer"));
+        assert!(!md.contains("other agent"));
+        assert!(!md.contains("ran")); // tool kind excluded
+        // Nothing above a high bar → empty.
+        assert!(store.learned_examples_markdown("a", 5, 99.0).unwrap().is_empty());
     }
 
     #[test]

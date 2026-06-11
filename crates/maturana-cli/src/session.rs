@@ -2,9 +2,11 @@ use anyhow::Context;
 use chrono::Utc;
 use clap::{Args, Subcommand};
 use maturana_core::{
+    improvement::TrajectoryStore,
     session_db::{
-        claim_pending_inbound, ensure_session, insert_inbound, list_undelivered, mark_delivered,
-        mark_inbound_completed, session_paths, write_outbound, SessionPaths,
+        claim_pending_inbound, ensure_session, insert_inbound, list_recent_inbound,
+        list_undelivered, mark_delivered, mark_inbound_completed, session_paths, write_outbound,
+        SessionPaths,
     },
     state::MaturanaHome,
 };
@@ -266,6 +268,16 @@ fn handle_sessiond_request(
                 body.thread_id.as_deref(),
                 &body.content,
             )?;
+            // Record every chat turn as a self-improvement trajectory so /good
+            // /bad can reward it and high-reward turns can feed back into
+            // context. Harness-agnostic: this is the one seam every guest
+            // worker posts its reply through. Best-effort — never fail the
+            // reply because the trajectory store hiccupped.
+            if body.kind == "chat" {
+                if let Err(error) = record_chat_trajectory(home, &paths, &body) {
+                    eprintln!("trajectory record failed: {error:#}");
+                }
+            }
             write_json_response(stream, 200, &serde_json::json!({ "ok": true, "id": id }))
         }
         ("POST", "/session/heartbeat") => {
@@ -417,6 +429,28 @@ fn write_json_response(
         body.len()
     )?;
     stream.write_all(&body)?;
+    Ok(())
+}
+
+/// Record a completed chat turn (user input → agent reply) as a trajectory.
+/// The input is recovered from the inbound the reply answers; the output is the
+/// reply text. Missing input is tolerated (recorded empty) rather than dropped.
+fn record_chat_trajectory(
+    home: &MaturanaHome,
+    paths: &SessionPaths,
+    body: &OutboundRequest,
+) -> anyhow::Result<()> {
+    let input = match body.in_reply_to.as_deref() {
+        Some(reply_to) => list_recent_inbound(paths, 50)?
+            .into_iter()
+            .find(|m| m.id == reply_to)
+            .and_then(|m| message_text(&m.content).ok())
+            .unwrap_or_default(),
+        None => String::new(),
+    };
+    let output = message_text(&body.content).unwrap_or_default();
+    let store = TrajectoryStore::open(&TrajectoryStore::store_path(home.root()))?;
+    store.record(&body.agent_id, &body.session_id, "chat", &input, &output, "[]")?;
     Ok(())
 }
 
