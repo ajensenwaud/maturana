@@ -30,6 +30,14 @@ impl MaturanaHome {
         self.root.join("audit")
     }
 
+    pub fn rooms_dir(&self) -> PathBuf {
+        self.root.join("rooms")
+    }
+
+    pub fn room_dir(&self, id: &str) -> PathBuf {
+        self.rooms_dir().join(id)
+    }
+
     pub fn pipelock_dir(&self) -> PathBuf {
         self.root.join("pipelock")
     }

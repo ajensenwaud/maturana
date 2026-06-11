@@ -145,6 +145,27 @@ Smoke-test the session layer without a real harness:
 The NanoClaw reference used for this design is kept locally at
 `.maturana/reference/nanoclaw`.
 
+## A2A Rooms (Multi-Agent Group Chat)
+
+Rooms connect several agents into one shared conversation so they can
+self-organise on a goal, mirrored bidirectionally to a Discord channel and/or
+Telegram group where you watch and steer:
+
+```powershell
+.\scripts\maturana.ps1 room init launch `
+  --goal "Develop and market a new website" `
+  --member "planner:room-main:project lead" `
+  --member "builder:room-main:engineer" `
+  --telegram-chat-id -1001234567890
+.\scripts\maturana.ps1 room serve launch
+```
+
+The room store is the agent-to-agent transport (host-side SQLite log fanned
+into the members' session queues); the chat platforms are live mirrors.
+Runaway agent loops are prevented by hop budgets, `PASS` turns, cooldowns,
+and one-digest-in-flight pacing. `maturana up` auto-supervises every room
+under `.maturana/rooms/`. See `docs/a2a-rooms.md`.
+
 ## Personal Agent Layer
 
 Initialize durable personal-agent files:

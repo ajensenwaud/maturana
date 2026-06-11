@@ -1,5 +1,6 @@
 mod channels;
 mod personal;
+mod rooms;
 mod session;
 
 use anyhow::Context;
@@ -9,7 +10,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use maturana_core::{
     audit::{append_event, AuditEvent},
     inspect_agent, materialize_agent,
-    orchestrator::{plan_processes, AgentRuntime, OrchestratorConfig, SupervisedProcess},
+    orchestrator::{plan_processes, AgentRuntime, OrchestratorConfig, RoomRuntime, SupervisedProcess},
+    room::RoomConfig,
     pipelock::PipelockVault,
     improvement::TrajectoryStore,
     tools::{run_tool, Capabilities, ResourceLimits, ToolManifest, ToolRegistry},
@@ -32,6 +34,7 @@ use personal::{
     DeployCommand, DevelopCommand, HeartbeatCommand, PersonalCommand, ScheduleCommand, WikiCommand,
 };
 use rand::{distributions::Alphanumeric, Rng};
+use rooms::{handle_room, RoomCommand};
 use session::{handle_session, SessionCommand};
 use sha2::{Digest, Sha256};
 use std::{
@@ -74,6 +77,7 @@ enum Command {
     Skill(SkillCommand),
     Channel(ChannelCommand),
     Session(SessionCommand),
+    Room(RoomCommand),
     Up(UpCommand),
     Tool(ToolCommand),
     Improve(ImproveCommand),
@@ -196,6 +200,9 @@ struct UpCommand {
     no_telegram: bool,
     #[arg(long)]
     no_schedules: bool,
+    /// Skip the A2A room runners discovered under `<home>/rooms/`.
+    #[arg(long)]
+    no_rooms: bool,
     #[arg(long, default_value_t = 5)]
     channel_poll_seconds: u64,
     #[arg(long, default_value_t = 60)]
@@ -1163,6 +1170,7 @@ fn main() -> anyhow::Result<()> {
         Command::Skill(command) => handle_skill(command)?,
         Command::Channel(command) => handle_channel(command, &home)?,
         Command::Session(command) => handle_session(command, &home)?,
+        Command::Room(command) => handle_room(command, &home)?,
         Command::Up(command) => run_up(&home, command)?,
         Command::Tool(command) => run_tool_command(&home, command)?,
         Command::Improve(command) => run_improve_command(&home, command)?,
@@ -1624,13 +1632,47 @@ fn build_orchestrator_config(
         Some(token) => Some(token),
         None => Some(ensure_sessiond_token(&home.root().join("sessiond/token"))?),
     };
+    let rooms = if command.no_rooms {
+        Vec::new()
+    } else {
+        discover_rooms(home)?
+    };
     Ok(OrchestratorConfig {
         sessiond_bind: command.sessiond_bind.clone(),
         sessiond_token,
         channel_poll_seconds: command.channel_poll_seconds,
         schedule_poll_seconds: command.schedule_poll_seconds,
         agents,
+        rooms,
     })
+}
+
+/// Every directory under `<home>/rooms/` with a valid `room.json` becomes a
+/// supervised `room serve` process.
+fn discover_rooms(home: &MaturanaHome) -> anyhow::Result<Vec<RoomRuntime>> {
+    let rooms_dir = home.rooms_dir();
+    if !rooms_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut rooms = Vec::new();
+    for entry in fs::read_dir(&rooms_dir)? {
+        let path = entry?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        match RoomConfig::load(&path) {
+            Ok(config) => rooms.push(RoomRuntime {
+                room_id: config.room_id,
+                poll_seconds: None,
+            }),
+            Err(error) => eprintln!(
+                "up: skipping room at {} (invalid config: {error:#})",
+                path.display()
+            ),
+        }
+    }
+    rooms.sort_by(|left, right| left.room_id.cmp(&right.room_id));
+    Ok(rooms)
 }
 
 fn run_up(home: &MaturanaHome, command: UpCommand) -> anyhow::Result<()> {

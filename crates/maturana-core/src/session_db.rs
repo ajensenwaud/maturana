@@ -246,6 +246,25 @@ pub fn requeue_inbound(paths: &SessionPaths, message_id: &str) -> anyhow::Result
     Ok(changed > 0)
 }
 
+/// Messages for one channel/platform pair that are still pending or leased.
+/// The room runner uses this to keep at most one digest in flight per member.
+pub fn count_open_inbound(
+    paths: &SessionPaths,
+    channel: &str,
+    platform_id: &str,
+) -> anyhow::Result<i64> {
+    let db = open_rw(&paths.inbound_db)?;
+    ensure_inbound_schema(&db)?;
+    Ok(db.query_row(
+        r#"
+        SELECT COUNT(*) FROM messages_in
+        WHERE channel = ?1 AND platform_id = ?2 AND status IN ('pending', 'processing')
+        "#,
+        params![channel, platform_id],
+        |row| row.get(0),
+    )?)
+}
+
 pub fn mark_inbound_completed(paths: &SessionPaths, message_ids: &[String]) -> anyhow::Result<()> {
     let db = open_rw(&paths.inbound_db)?;
     ensure_inbound_schema(&db)?;

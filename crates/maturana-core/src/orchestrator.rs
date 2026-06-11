@@ -32,6 +32,9 @@ pub struct OrchestratorConfig {
     pub channel_poll_seconds: u64,
     pub schedule_poll_seconds: u64,
     pub agents: Vec<AgentRuntime>,
+    /// Multi-agent rooms to run (`maturana room serve <room-id>` each).
+    #[serde(default)]
+    pub rooms: Vec<RoomRuntime>,
 }
 
 impl Default for OrchestratorConfig {
@@ -42,8 +45,18 @@ impl Default for OrchestratorConfig {
             channel_poll_seconds: 5,
             schedule_poll_seconds: 60,
             agents: Vec::new(),
+            rooms: Vec::new(),
         }
     }
+}
+
+/// One A2A room supervised by the plane. The room's members, bridges, and
+/// policy live in its own `room.json`; the orchestrator only needs the id.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoomRuntime {
+    pub room_id: String,
+    #[serde(default)]
+    pub poll_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,6 +151,22 @@ pub fn plan_processes(config: &OrchestratorConfig) -> Vec<SupervisedProcess> {
         }
     }
 
+    for room in &config.rooms {
+        processes.push(SupervisedProcess {
+            name: format!("room:{}", room.room_id),
+            args: vec![
+                "room".to_string(),
+                "serve".to_string(),
+                room.room_id.clone(),
+                "--poll-seconds".to_string(),
+                room.poll_seconds
+                    .unwrap_or(config.channel_poll_seconds)
+                    .to_string(),
+            ],
+            critical: false,
+        });
+    }
+
     processes
 }
 
@@ -182,6 +211,29 @@ mod tests {
         assert_eq!(processes.len(), 2);
         assert!(processes.iter().all(|p| !p.name.starts_with("channel:")));
         assert!(processes.iter().any(|p| p.name == "schedule:worker"));
+    }
+
+    #[test]
+    fn rooms_are_planned_as_noncritical_room_serve_processes() {
+        let mut config = OrchestratorConfig::default();
+        config.rooms.push(RoomRuntime {
+            room_id: "launch".to_string(),
+            poll_seconds: None,
+        });
+        config.rooms.push(RoomRuntime {
+            room_id: "ops".to_string(),
+            poll_seconds: Some(11),
+        });
+
+        let processes = plan_processes(&config);
+        let launch = processes.iter().find(|p| p.name == "room:launch").unwrap();
+        assert!(!launch.critical);
+        assert_eq!(
+            launch.args,
+            vec!["room", "serve", "launch", "--poll-seconds", "5"]
+        );
+        let ops = processes.iter().find(|p| p.name == "room:ops").unwrap();
+        assert!(ops.args.contains(&"11".to_string()));
     }
 
     fn session_id_arg(args: &[String]) -> Option<String> {
