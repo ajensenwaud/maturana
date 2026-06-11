@@ -55,6 +55,7 @@ impl ProxyConfig {
                     host: injection.host.trim().to_ascii_lowercase(),
                     header: injection.header.trim().to_string(),
                     source: injection.source.trim().to_string(),
+                    prefix: injection.prefix.clone(),
                 })
                 .collect(),
             audit_path: audit_path.into(),
@@ -67,6 +68,9 @@ pub struct HeaderInjection {
     pub host: String,
     pub header: String,
     pub source: String,
+    /// Literal prepended to the resolved secret (e.g. `"Bearer "` so one
+    /// stored API key serves both direct calls and proxy injection).
+    pub prefix: Option<String>,
 }
 
 impl HeaderInjection {
@@ -87,6 +91,7 @@ impl HeaderInjection {
             host: host.trim().to_ascii_lowercase(),
             header: header.trim().to_string(),
             source: source.trim().to_string(),
+            prefix: None,
         })
     }
 }
@@ -389,16 +394,19 @@ fn injected_headers(host: &str, config: &ProxyConfig) -> anyhow::Result<Vec<(Str
     for injection in &config.injections {
         if injection.host == host {
             let secret = resolve_secret_source_with_home(&injection.source, &config.home_root)?;
-            let value = secret.expose_for_runtime();
-            // A secret (or header name) containing CR/LF would let the value
-            // smuggle additional upstream headers (header splitting). Refuse it
-            // rather than emit a malformed/forgeable request.
+            let value = match injection.prefix.as_deref() {
+                Some(prefix) => format!("{prefix}{}", secret.expose_for_runtime()),
+                None => secret.expose_for_runtime().to_string(),
+            };
+            // A secret (or header name/prefix) containing CR/LF would let the
+            // value smuggle additional upstream headers (header splitting).
+            // Refuse it rather than emit a malformed/forgeable request.
             if injection.header.bytes().any(is_header_control)
                 || value.bytes().any(is_header_control)
             {
                 anyhow::bail!("injected header for {host} contains illegal control characters");
             }
-            headers.push((injection.header.clone(), value.to_string()));
+            headers.push((injection.header.clone(), value));
         }
     }
     Ok(headers)
@@ -806,9 +814,53 @@ network:
                 host: "api.example.test".to_string(),
                 header: "Authorization".to_string(),
                 source: "pipelock:api/token".to_string(),
+                prefix: None,
             }]
         );
         assert_eq!(config.audit_path, audit_path);
+    }
+
+    #[test]
+    fn injection_prefix_flows_from_spec_and_prepends_to_secret() {
+        // Spec → config: the prefix survives the mapping.
+        let raw = r#"
+identity:
+  id: demo
+  name: Demo
+  purpose: prefix test
+runtime:
+  harness: codex
+vm:
+  provider: firecracker
+  guest_os: linux
+network:
+  egress_allowlist:
+    - api.tavily.com
+  proxy:
+    enabled: true
+    bind: 0.0.0.0:47833
+    inject_headers:
+      - host: api.tavily.com
+        header: Authorization
+        source: pipelock:tavily/api-key
+        prefix: "Bearer "
+"#;
+        let spec: AgentSpec = serde_yaml::from_str(raw).unwrap();
+        let home = std::env::temp_dir().join(format!("maturana-proxy-{}", Uuid::new_v4()));
+        let config = ProxyConfig::from_spec(&home, &spec, home.join("a.jsonl")).unwrap();
+        assert_eq!(config.injections[0].prefix.as_deref(), Some("Bearer "));
+
+        // Config → wire: the resolved secret gets the literal prefix.
+        std::fs::create_dir_all(home.join("pipelock")).unwrap();
+        let vault = PipelockVault::new(home.join("pipelock"));
+        vault.init().unwrap();
+        vault.set("tavily/api-key", "tvly-secret").unwrap();
+        let headers = injected_headers("api.tavily.com", &config).unwrap();
+        assert_eq!(
+            headers,
+            vec![("Authorization".to_string(), "Bearer tvly-secret".to_string())]
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -848,6 +900,7 @@ network:
                 host: "127.0.0.1".to_string(),
                 header: "Authorization".to_string(),
                 source: "pipelock:api/token".to_string(),
+                prefix: None,
             }],
             audit_path: audit_path.clone(),
         };
@@ -1015,6 +1068,7 @@ network:
                 host: "localhost".to_string(),
                 header: "Authorization".to_string(),
                 source: "pipelock:api/token".to_string(),
+                prefix: None,
             }],
             audit_path: audit_path.clone(),
         };
