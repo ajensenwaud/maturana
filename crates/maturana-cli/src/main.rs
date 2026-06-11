@@ -3252,13 +3252,15 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
     let env_path = state_dir.join("sessiond.env");
     let runner_path = state_dir.join("run-agent.sh");
     // The post-boot re-render also carries the graph env so it isn't lost when a
-    // worker is refreshed. Read the agent's materialized spec for its opt-in.
-    let knowledge_graph = AgentSpec::from_maturana_markdown(
-        &home.agent_dir(&install.agent_id).join("MATURANA.md"),
-    )
-    .ok()
-    .map(|spec| spec.knowledge_graph)
-    .unwrap_or_default();
+    // worker is refreshed. Read the agent's materialized spec for its opt-in
+    // (graph) and its MCP servers.
+    let agent_spec =
+        AgentSpec::from_maturana_markdown(&home.agent_dir(&install.agent_id).join("MATURANA.md"))
+            .ok();
+    let knowledge_graph = agent_spec
+        .as_ref()
+        .map(|spec| spec.knowledge_graph.clone())
+        .unwrap_or_default();
     fs::write(
         &env_path,
         render_session_env(&GuestWorkerConfig {
@@ -3337,6 +3339,57 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
             None,
         )?;
     }
+    // MCP config: render the harness-native file (secrets resolved host-side)
+    // and place it where the in-guest harness reads it.
+    if let Some(spec) = agent_spec.as_ref() {
+        if !spec.mcp_servers.is_empty() {
+            let host_auth_dir = install
+                .auth_source
+                .as_ref()
+                .map(|p| absolute_or_cwd(p.clone()))
+                .transpose()?
+                .unwrap_or_else(|| {
+                    home.root()
+                        .join("host-auth")
+                        .join(maturana_core::worker::harness_name(&install.harness))
+                });
+            if let Some(rendered) = maturana_core::mcp::render_mcp_config(
+                &install.harness,
+                &spec.mcp_servers,
+                home.root(),
+                &host_auth_dir,
+            )? {
+                let mcp_path = state_dir.join("mcp-config");
+                fs::write(&mcp_path, &rendered.contents)?;
+                copy_path_to_guest(
+                    &install.guest_ip,
+                    &install.ssh_user,
+                    &ssh_key,
+                    &host_key,
+                    &mcp_path,
+                    "/tmp/maturana-mcp-config",
+                    false,
+                )?;
+                let guest_path = &rendered.guest_path;
+                let parent = posix_parent(guest_path);
+                run_ssh_with_stdin(
+                    &install.guest_ip,
+                    &install.ssh_user,
+                    &ssh_key,
+                    &host_key,
+                    &format!(
+                        "sudo mkdir -p {parent} && sudo mv /tmp/maturana-mcp-config {path} && sudo chown -R {user}:{user} {parent} && sudo chmod 0600 {path}",
+                        parent = shell_quote(parent),
+                        path = shell_quote(guest_path),
+                        user = shell_quote(&install.ssh_user),
+                    ),
+                    None,
+                )?;
+                println!("installed MCP config ({} servers) at {guest_path}", spec.mcp_servers.len());
+            }
+        }
+    }
+
     run_ssh_with_stdin(
         &install.guest_ip,
         &install.ssh_user,

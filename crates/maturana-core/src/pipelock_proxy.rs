@@ -45,9 +45,19 @@ impl ProxyConfig {
         if !proxy.enabled {
             anyhow::bail!("network.proxy is disabled");
         }
+        // MCP servers run in-guest and make their own outbound calls; permit
+        // their declared hosts without a separate allowlist edit.
+        let mut allowlist = spec.network.egress_allowlist.clone();
+        for server in &spec.mcp_servers {
+            for host in &server.egress_hosts {
+                if !allowlist.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+                    allowlist.push(host.clone());
+                }
+            }
+        }
         Ok(Self {
             home_root: home_root.into(),
-            allowlist: spec.network.egress_allowlist.clone(),
+            allowlist,
             injections: proxy
                 .inject_headers
                 .iter()
@@ -818,6 +828,28 @@ network:
             }]
         );
         assert_eq!(config.audit_path, audit_path);
+    }
+
+    #[test]
+    fn from_spec_folds_mcp_egress_hosts_into_allowlist() {
+        let raw = r#"
+identity: { id: demo, name: Demo, purpose: Demo agent with an MCP server. }
+runtime: { harness: codex }
+vm: { provider: firecracker, guest_os: linux }
+network:
+  egress_allowlist: [api.example.test]
+  proxy: { enabled: true, bind: 0.0.0.0:47833 }
+mcp_servers:
+  - name: notion
+    transport: stdio
+    command: npx
+    egress_hosts: [api.notion.com, api.example.test]
+"#;
+        let spec: AgentSpec = serde_yaml::from_str(raw).unwrap();
+        let home = std::env::temp_dir().join(format!("maturana-proxy-{}", Uuid::new_v4()));
+        let config = ProxyConfig::from_spec(&home, &spec, home.join("a.jsonl")).unwrap();
+        // api.notion.com is added; api.example.test is not duplicated.
+        assert_eq!(config.allowlist, vec!["api.example.test", "api.notion.com"]);
     }
 
     #[test]
