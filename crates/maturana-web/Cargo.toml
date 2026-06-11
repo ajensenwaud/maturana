@@ -12,8 +12,11 @@ axum = { workspace = true }
 chrono = { workspace = true }
 include_dir = { workspace = true }
 maturana-core = { path = "../maturana-core" }
+maturana-ingest = { path = "../maturana-ingest" }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 tokio = { workspace = true }
+ureq = { version = "2.10.1", features = ["json"] }
 uuid = { workspace = true }

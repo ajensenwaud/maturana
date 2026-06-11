@@ -8,6 +8,7 @@
 //! invariant applies to platform services — the cockpit is the *operator's*
 //! seat, so spawning `codex exec` here automates the existing human workflow.
 
+mod api;
 mod assets;
 mod auth;
 mod harness;

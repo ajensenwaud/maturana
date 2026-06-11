@@ -4,7 +4,15 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::auth::SessionStore;
-use crate::ws::protocol::Topic;
+use crate::ws::protocol::{ServerMsg, Topic};
+
+/// Server-side fan-out to every connected socket. Dash updates are filtered
+/// by each socket's topic subscriptions; session events always forward.
+#[derive(Debug, Clone)]
+pub enum Broadcast {
+    Dash(Topic, serde_json::Value),
+    Session(ServerMsg),
+}
 
 /// Shared application state. Cheap to clone (everything is Arc'd or a handle).
 #[derive(Clone)]
@@ -13,15 +21,7 @@ pub struct AppState {
     /// The login token loaded at startup from `<home>/web/token`.
     pub login_token: Arc<String>,
     pub sessions: SessionStore,
-    /// Dashboard fan-out: background pollers publish topic updates; each
-    /// socket forwards only the topics it subscribed to.
-    pub dash_tx: broadcast::Sender<DashEvent>,
-}
-
-#[derive(Debug, Clone)]
-pub struct DashEvent {
-    pub topic: Topic,
-    pub data: serde_json::Value,
+    pub dash_tx: broadcast::Sender<Broadcast>,
 }
 
 impl AppState {

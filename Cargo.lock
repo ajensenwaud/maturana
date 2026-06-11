@@ -1501,10 +1501,13 @@ dependencies = [
  "chrono",
  "include_dir",
  "maturana-core",
+ "maturana-ingest",
  "rand",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tokio",
+ "ureq",
  "uuid",
 ]
 

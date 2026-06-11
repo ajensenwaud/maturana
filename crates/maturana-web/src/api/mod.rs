@@ -1,0 +1,73 @@
+//! Dashboard REST API: thin `spawn_blocking` wrappers over the sync
+//! maturana-core functions. Auth + the mutating-CSRF header are enforced by
+//! the middleware in `auth.rs`; everything here can assume an authenticated
+//! operator.
+
+pub mod agents;
+pub mod graph;
+pub mod pipelock;
+pub mod runtime;
+pub mod sessions;
+pub mod skills;
+pub mod tools;
+
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Json, Response};
+use axum::routing::{get, post, put};
+use axum::Router;
+
+use crate::state::AppState;
+
+pub fn router() -> Router<AppState> {
+    Router::new()
+        .route("/api/agents", get(agents::list))
+        .route("/api/agents/:id/status", get(agents::status))
+        .route("/api/agents/:id/stop", post(agents::stop))
+        .route("/api/agents/:id/spec", get(agents::spec_get).put(agents::spec_put))
+        .route("/api/agents/:id/spec/validate", post(agents::spec_validate))
+        .route("/api/agents/:id/apply", post(agents::apply))
+        .route("/api/agents/:id/egress", get(agents::egress_get).put(agents::egress_put))
+        .route("/api/runtime/plan", get(runtime::plan))
+        .route("/api/runtime/up", get(runtime::up_state))
+        .route("/api/doctor", get(runtime::doctor))
+        .route("/api/sessions", get(sessions::list))
+        .route("/api/sessions/:agent/:session/messages", get(sessions::messages))
+        .route("/api/graph/stats", post(graph::stats))
+        .route("/api/graph/query", post(graph::query))
+        .route("/api/graph/ingest", post(graph::ingest))
+        .route("/api/pipelock/secrets", get(pipelock::list).post(pipelock::set))
+        .route("/api/pipelock/secrets/:name", axum::routing::delete(pipelock::delete))
+        .route("/api/tools", get(tools::list))
+        .route("/api/skills", get(skills::list))
+        .route("/api/skills/:name", get(skills::detail))
+        // PUT routes share the same mutating-CSRF gate as POST/DELETE.
+        .route("/api/_csrf_probe", put(|| async { ok(serde_json::json!({})) }))
+}
+
+/// Run sync core code off the async runtime, flattening join + app errors.
+pub async fn blocking<T, F>(work: F) -> Result<T, Response>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(err(StatusCode::BAD_REQUEST, &format!("{error:#}"))),
+        Err(join_error) => Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("task panicked: {join_error}"),
+        )),
+    }
+}
+
+pub fn ok(data: serde_json::Value) -> Response {
+    Json(serde_json::json!({ "ok": true, "data": data })).into_response()
+}
+
+pub fn err(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({ "ok": false, "error": message })),
+    )
+        .into_response()
+}
