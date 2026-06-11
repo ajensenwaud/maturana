@@ -34,6 +34,9 @@ network:
 memory:
   wiki_path: .maturana/wiki
   agent_memory_path: .maturana/agents/codex-firecracker/memory
+knowledge_graph:
+  enabled: true
+  graph: personal
 channels:
   tui: true
 snapshots:
