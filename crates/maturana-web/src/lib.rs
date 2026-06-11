@@ -10,6 +10,7 @@
 
 mod assets;
 mod auth;
+mod harness;
 mod server;
 mod state;
 mod ws;

@@ -1,0 +1,7 @@
+codemirror@6.0.2
+@codemirror/lang-markdown@6.5.0
+@codemirror/state@6.6.0
+@replit/codemirror-vim@6.3.0
+marked@18.0.5
+rollup@4.61.1 (build tool only)
+@rollup/plugin-node-resolve@16.0.3 (build tool only)
