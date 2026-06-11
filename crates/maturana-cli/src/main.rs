@@ -191,8 +191,16 @@ enum ToolSubcommand {
 /// token at `<home>/web/token` exchanged for a session cookie at /login.
 #[derive(Debug, Args)]
 struct WebCommand {
+    #[command(subcommand)]
+    command: Option<WebSubcommand>,
     #[arg(long, default_value = "0.0.0.0:47836")]
     bind: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum WebSubcommand {
+    /// Print the cockpit login token (creating it if absent).
+    Token,
 }
 
 /// Host-side web search: `maturana search "query" --provider brave|tavily`.
@@ -1197,9 +1205,12 @@ fn main() -> anyhow::Result<()> {
         Command::Session(command) => handle_session(command, &home)?,
         Command::Graph(command) => graph::handle_graph(command, &home)?,
         Command::Up(command) => run_up(&home, command)?,
-        Command::Web(command) => {
-            maturana_web::run_web(home.root().to_path_buf(), &command.bind)?
-        }
+        Command::Web(command) => match command.command {
+            Some(WebSubcommand::Token) => {
+                println!("{}", maturana_web::login_token(home.root())?);
+            }
+            None => maturana_web::run_web(home.root().to_path_buf(), &command.bind)?,
+        },
         Command::Search(command) => run_search(&home, command)?,
         Command::Service(command) => service::handle_service(command, &home)?,
         Command::Tool(command) => run_tool_command(&home, command)?,
