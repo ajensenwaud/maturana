@@ -6,6 +6,7 @@ pub mod orchestrator;
 pub mod pipelock;
 pub mod pipelock_proxy;
 pub mod providers;
+pub mod search;
 pub mod secrets;
 pub mod session_db;
 pub mod ssh_pin;

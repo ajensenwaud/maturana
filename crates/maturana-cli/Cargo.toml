@@ -14,9 +14,11 @@ path = "src/main.rs"
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+dirs.workspace = true
 maturana-core = { path = "../maturana-core" }
 maturana-graph = { path = "../maturana-graph" }
 maturana-ingest = { path = "../maturana-ingest" }
+maturana-web = { path = "../maturana-web" }
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

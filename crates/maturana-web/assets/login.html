@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Maturana — Login</title>
+  <link rel="stylesheet" href="/assets/css/tokens.css" />
+  <link rel="stylesheet" href="/assets/css/app.css" />
+</head>
+<body>
+  <div class="login-wrap">
+    <div class="label-lg glow">Maturana</div>
+    <div class="label">[ access token required ]</div>
+    <form class="login-card" id="login-form">
+      <input type="password" id="token" placeholder="paste token from .maturana/web/token" autocomplete="off" autofocus />
+      <button class="primary" type="submit">Authenticate</button>
+      <div id="login-error"></div>
+    </form>
+  </div>
+  <script>
+    document.getElementById("login-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const error = document.getElementById("login-error");
+      error.textContent = "";
+      const token = document.getElementById("token").value.trim();
+      const response = await fetch("/login", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token }),
+      });
+      if (response.ok) {
+        window.location.href = "/";
+      } else {
+        error.textContent = "[ invalid token ]";
+      }
+    });
+  </script>
+</body>
+</html>

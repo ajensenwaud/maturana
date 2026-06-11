@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Maturana — Control Plane</title>
+  <link rel="stylesheet" href="/assets/css/tokens.css" />
+  <link rel="stylesheet" href="/assets/css/app.css" />
+</head>
+<body>
+  <div class="shell">
+    <header class="top">
+      <div class="brand">Maturana <span class="accent">/</span> <span class="status-dim">control plane</span></div>
+      <div id="link-status" class="status-dim">[link --]</div>
+    </header>
+    <nav class="side" id="nav">
+      <button data-view="console" class="active">Console</button>
+      <button data-view="agents">Agents</button>
+      <button data-view="runtime">Runtime</button>
+      <button data-view="sessions">Sessions</button>
+      <button data-view="graph">Graph</button>
+      <button data-view="pipelock">Pipelock</button>
+      <button data-view="tools">Tools</button>
+      <button data-view="skills">Skills</button>
+    </nav>
+    <main class="panel" id="panel">
+      <div class="placeholder">
+        <div class="label-lg">Initializing control plane</div>
+        <div class="bar" style="width: 288px"><div class="fill" id="boot-fill" style="width: 0%"></div></div>
+        <div class="bracket">[<span class="value" id="boot-pct">000</span>%] establishing link</div>
+      </div>
+    </main>
+  </div>
+  <script type="module" src="/assets/js/app.js"></script>
+</body>
+</html>
