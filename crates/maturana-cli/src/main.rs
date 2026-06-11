@@ -1131,6 +1131,7 @@ fn main() -> anyhow::Result<()> {
                                     allowlist: Vec::new(),
                                     injections: Vec::new(),
                                     audit_path,
+                                    runtime_allow: Default::default(),
                                 },
                             )
                         }
