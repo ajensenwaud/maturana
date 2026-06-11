@@ -48,7 +48,9 @@ impl HarnessAdapter for OpencodeAdapter {
                 "OpenRouter key missing: `maturana pipelock set {API_KEY_SECRET} <key>` first"
             )
         })?;
-        let mut command = Command::new("opencode");
+        // Same Windows shim consideration as codex: spawn the .cmd by name.
+        let program = if cfg!(windows) { "opencode.cmd" } else { "opencode" };
+        let mut command = Command::new(program);
         command
             .args(Self::args(&request))
             .current_dir(&request.cwd)

@@ -17,6 +17,16 @@ use crate::{api, assets, auth, ws};
 
 pub async fn serve(home_root: PathBuf, bind: &str) -> anyhow::Result<()> {
     let login_token = auth::ensure_web_token(&home_root)?;
+    // The Hyper-V provider resolves the hostd token cwd-relative by default,
+    // which breaks when the cockpit runs as a service (cwd = System32 under a
+    // Scheduled Task). Anchor it to the home explicitly via the provider's
+    // documented override. Set once here, before any task spawns.
+    if std::env::var("MATURANA_HOSTD_TOKEN_PATH").is_err() {
+        let hostd_token = home_root.join("hostd").join("token");
+        if hostd_token.exists() {
+            std::env::set_var("MATURANA_HOSTD_TOKEN_PATH", &hostd_token);
+        }
+    }
     let state = AppState::new(home_root, login_token);
 
     tokio::spawn(dashboard_poller(state.clone()));

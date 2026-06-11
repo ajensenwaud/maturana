@@ -10,6 +10,38 @@ use crate::ws::protocol::HarnessKind;
 
 pub struct CodexExecAdapter;
 
+/// Resolve the codex program. On Windows the npm `codex` command is a
+/// PowerShell/cmd shim that `CreateProcess` cannot spawn directly; prefer the
+/// native exe the npm package vendors, then the `.cmd` shim (which Rust can
+/// spawn when named with its extension).
+pub fn codex_program() -> String {
+    #[cfg(windows)]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let npm = std::path::Path::new(&appdata).join("npm");
+            for arch_pkg in ["codex-win32-x64", "codex-win32-arm64"] {
+                let vendor = npm
+                    .join("node_modules/@openai/codex/node_modules/@openai")
+                    .join(arch_pkg)
+                    .join("vendor");
+                if let Ok(entries) = std::fs::read_dir(&vendor) {
+                    for entry in entries.flatten() {
+                        let native = entry.path().join("bin").join("codex.exe");
+                        if native.exists() {
+                            return native.display().to_string();
+                        }
+                    }
+                }
+            }
+        }
+        "codex.cmd".to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        "codex".to_string()
+    }
+}
+
 impl CodexExecAdapter {
     /// The argv after the program name; split out for testing.
     pub fn args(request: &TurnRequest) -> Vec<String> {
@@ -37,7 +69,7 @@ impl HarnessAdapter for CodexExecAdapter {
         request: TurnRequest,
         tx: mpsc::Sender<TurnEvent>,
     ) -> anyhow::Result<TurnHandle> {
-        let mut command = Command::new("codex");
+        let mut command = Command::new(codex_program());
         command.args(Self::args(&request)).current_dir(&request.cwd);
         spawn_streaming(command, request.turn_id, tx, parse::parse_codex_line)
     }
