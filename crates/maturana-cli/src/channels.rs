@@ -162,6 +162,8 @@ struct ChannelContextBundle {
     wiki_term_sources: Vec<WikiTermSource>,
     /// GraphRAG context from the agent's knowledge graph, when enabled.
     graph_context: Option<GraphChannelContext>,
+    /// Few-shot examples from past positively-rewarded turns (self-improvement).
+    learned_examples: String,
     transcript: String,
     transcript_path: PathBuf,
 }
@@ -1461,6 +1463,12 @@ fn load_channel_context(
         WIKI_CHUNK_CONTEXT_CHARS,
     )?;
     let graph_context = load_graph_channel_context(home, agent_id, &wiki_query_terms);
+    // High-reward past turns shape this prompt (self-improvement, in-context).
+    let learned_examples = maturana_core::improvement::TrajectoryStore::open(
+        &maturana_core::improvement::TrajectoryStore::store_path(home.root()),
+    )
+    .and_then(|store| store.learned_examples_markdown(agent_id, 3, 0.5))
+    .unwrap_or_default();
 
     Ok(ChannelContextBundle {
         identity: read_context_file(
@@ -1493,6 +1501,7 @@ fn load_channel_context(
         wiki_query_terms,
         wiki_term_sources: wiki_query.term_sources,
         graph_context,
+        learned_examples,
         transcript,
         transcript_path,
     })
@@ -1535,6 +1544,14 @@ fn render_channel_prompt(context: &ChannelContextBundle, user_message: &str) -> 
         ),
         None => String::new(),
     };
+    let learned_section = if context.learned_examples.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n## Learned Examples (positively rated)\n\n{}\n",
+            context.learned_examples
+        )
+    };
     format!(
         r#"You are a Maturana personal agent running inside an isolated VM.
 
@@ -1564,7 +1581,7 @@ Return only the message that should be sent back to Telegram.
 
 ## Relevant Wiki Chunks
 {wiki_chunks}
-{graph_section}
+{graph_section}{learned_section}
 ## Recent Telegram Transcript
 {transcript}
 

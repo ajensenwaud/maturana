@@ -1029,6 +1029,19 @@ fn main() -> anyhow::Result<()> {
                     snapshot_audit_event("restore", live, false),
                     format!("restored {:?} snapshot {name}", snapshot.kind),
                 )?;
+                // A rollback is a negative training signal: the turn(s) since the
+                // snapshot were bad enough to undo. Penalize the latest turn.
+                if let Ok(store) = maturana_core::improvement::TrajectoryStore::open(
+                    &maturana_core::improvement::TrajectoryStore::store_path(home.root()),
+                ) {
+                    let _ = store.reward_latest(
+                        &agent_id,
+                        &format!("{agent_id}-main"),
+                        "snapshot",
+                        maturana_core::improvement::signals::SNAPSHOT_ROLLBACK,
+                        Some(&format!("rollback to {name}")),
+                    );
+                }
             }
         },
         Command::Audit(command) => match command.command {
