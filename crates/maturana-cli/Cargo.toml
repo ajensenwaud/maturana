@@ -15,6 +15,8 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 maturana-core = { path = "../maturana-core" }
+maturana-graph = { path = "../maturana-graph" }
+maturana-ingest = { path = "../maturana-ingest" }
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

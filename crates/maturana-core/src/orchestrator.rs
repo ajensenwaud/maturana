@@ -32,6 +32,10 @@ pub struct OrchestratorConfig {
     pub channel_poll_seconds: u64,
     pub schedule_poll_seconds: u64,
     pub agents: Vec<AgentRuntime>,
+    /// Address the MaturanaGraph service binds to (guests reach it on the host
+    /// gateway IP). Only supervised when `graph_token` is set (opt-in).
+    pub graph_bind: String,
+    pub graph_token: Option<String>,
 }
 
 impl Default for OrchestratorConfig {
@@ -42,6 +46,8 @@ impl Default for OrchestratorConfig {
             channel_poll_seconds: 5,
             schedule_poll_seconds: 60,
             agents: Vec::new(),
+            graph_bind: "0.0.0.0:47835".to_string(),
+            graph_token: None,
         }
     }
 }
@@ -100,6 +106,22 @@ pub fn plan_processes(config: &OrchestratorConfig) -> Vec<SupervisedProcess> {
         args: sessiond_args,
         critical: true,
     });
+
+    // MaturanaGraph service, opt-in: supervised only when a graph token exists.
+    if let Some(token) = &config.graph_token {
+        processes.push(SupervisedProcess {
+            name: "graph".to_string(),
+            args: vec![
+                "graph".to_string(),
+                "serve".to_string(),
+                "--bind".to_string(),
+                config.graph_bind.clone(),
+                "--token".to_string(),
+                token.clone(),
+            ],
+            critical: false,
+        });
+    }
 
     for agent in &config.agents {
         if agent.telegram {

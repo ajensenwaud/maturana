@@ -1069,6 +1069,7 @@ mod tests {
                 name: "Codex Firecracker".to_string(),
                 purpose: "test".to_string(),
             },
+            knowledge_graph: Default::default(),
             runtime: Runtime {
                 harness: HarnessRuntime::Codex,
             },

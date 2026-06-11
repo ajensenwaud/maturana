@@ -1,4 +1,5 @@
 mod channels;
+mod graph;
 mod personal;
 mod session;
 
@@ -74,6 +75,7 @@ enum Command {
     Skill(SkillCommand),
     Channel(ChannelCommand),
     Session(SessionCommand),
+    Graph(graph::GraphCommand),
     Up(UpCommand),
     Tool(ToolCommand),
     Improve(ImproveCommand),
@@ -1163,6 +1165,7 @@ fn main() -> anyhow::Result<()> {
         Command::Skill(command) => handle_skill(command)?,
         Command::Channel(command) => handle_channel(command, &home)?,
         Command::Session(command) => handle_session(command, &home)?,
+        Command::Graph(command) => graph::handle_graph(command, &home)?,
         Command::Up(command) => run_up(&home, command)?,
         Command::Tool(command) => run_tool_command(&home, command)?,
         Command::Improve(command) => run_improve_command(&home, command)?,
@@ -1630,6 +1633,9 @@ fn build_orchestrator_config(
         channel_poll_seconds: command.channel_poll_seconds,
         schedule_poll_seconds: command.schedule_poll_seconds,
         agents,
+        graph_bind: "0.0.0.0:47835".to_string(),
+        // Supervise the graph service only if it's been set up (token present).
+        graph_token: maturana_core::worker::read_graph_token(home.root()),
     })
 }
 
@@ -2235,6 +2241,20 @@ fn repair_firecracker_harnesses(
         &sessiond_token_path,
     )?;
 
+    // MaturanaGraph is opt-in: only stand up the host graph service when at
+    // least one selected agent enabled `knowledge_graph`. Ensuring the token
+    // before rendering guest artifacts is what makes `read_graph_token` inject
+    // the graph env into those agents' guests.
+    let graph_opt_in = selected.iter().any(|profile| {
+        AgentSpec::from_maturana_markdown(&PathBuf::from(profile.spec_path))
+            .map(|spec| spec.knowledge_graph.enabled)
+            .unwrap_or(false)
+    });
+    if graph_opt_in {
+        let graph_token = ensure_graph_token(home)?;
+        start_linux_graph(home, GRAPH_BIND, &graph_token)?;
+    }
+
     for profile in selected {
         println!("=== {} ===", profile.agent_id);
         if !repair.skip_launch {
@@ -2363,6 +2383,68 @@ fn start_linux_sessiond(
     )?;
     thread::sleep(Duration::from_secs(1));
     println!("sessiond pid={} bind={bind}", child.id());
+    Ok(())
+}
+
+/// Address the MaturanaGraph service binds to on the Linux host. Guests resolve
+/// the URL sentinel to `http://<host-gateway>:47835`, so the port is fixed.
+const GRAPH_BIND: &str = "0.0.0.0:47835";
+
+/// Ensure the host MaturanaGraph token (`<home>/graph/token`) exists, generating
+/// one on first use. Mirrors [`ensure_sessiond_token`]; `read_graph_token` reads
+/// the same path to decide whether to inject graph env into guests.
+fn ensure_graph_token(home: &MaturanaHome) -> anyhow::Result<String> {
+    let path = home.root().join("graph").join("token");
+    if let Ok(existing) = fs::read_to_string(&path) {
+        let existing = existing.trim().to_string();
+        if !existing.is_empty() {
+            return Ok(existing);
+        }
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let token: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(43)
+        .map(char::from)
+        .collect();
+    fs::write(&path, format!("{token}\n"))?;
+    Ok(token)
+}
+
+/// Start the MaturanaGraph host service on Linux, mirroring
+/// [`start_linux_sessiond`]: kill any prior instance, bind the fixed port, and
+/// record the pid. The service fails closed without a token, so we always pass
+/// one.
+fn start_linux_graph(home: &MaturanaHome, bind: &str, token: &str) -> anyhow::Result<()> {
+    let _ = ProcessCommand::new("pkill")
+        .arg("-f")
+        .arg("maturana graph serve")
+        .status();
+    let logs_dir = home.root().join("logs");
+    fs::create_dir_all(&logs_dir)?;
+    let stdout = fs::File::create(logs_dir.join("graph-linux.out.log"))?;
+    let stderr = fs::File::create(logs_dir.join("graph-linux.err.log"))?;
+    let child = ProcessCommand::new(std::env::current_exe()?)
+        .arg("--home")
+        .arg(home.root())
+        .arg("graph")
+        .arg("serve")
+        .arg("--bind")
+        .arg(bind)
+        .arg("--token")
+        .arg(token)
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .context("failed to start graph service")?;
+    let graph_dir = home.root().join("graph");
+    fs::create_dir_all(&graph_dir)?;
+    fs::write(graph_dir.join("runner.pid"), child.id().to_string())?;
+    thread::sleep(Duration::from_secs(1));
+    println!("graph pid={} bind={bind}", child.id());
     Ok(())
 }
 
@@ -2678,6 +2760,11 @@ fn render_firecracker_guest_artifacts(
         harness: parse_harness_runtime(profile.harness_arg)?,
         harness_auth_guest_path: profile.auth_guest_path.to_string(),
         headless_chrome: spec.browser.headless_chrome,
+        graph_token: maturana_core::worker::read_graph_token(home.root()),
+        graph_name: spec
+            .knowledge_graph
+            .enabled
+            .then(|| spec.knowledge_graph.graph_name(profile.agent_id)),
     };
 
     let sessiond_env = artifacts_dir.join("sessiond.env");
@@ -3066,6 +3153,14 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
     fs::create_dir_all(&state_dir)?;
     let env_path = state_dir.join("sessiond.env");
     let runner_path = state_dir.join("run-agent.sh");
+    // The post-boot re-render also carries the graph env so it isn't lost when a
+    // worker is refreshed. Read the agent's materialized spec for its opt-in.
+    let knowledge_graph = AgentSpec::from_maturana_markdown(
+        &home.agent_dir(&install.agent_id).join("MATURANA.md"),
+    )
+    .ok()
+    .map(|spec| spec.knowledge_graph)
+    .unwrap_or_default();
     fs::write(
         &env_path,
         render_session_env(&GuestWorkerConfig {
@@ -3076,6 +3171,10 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
             harness: install.harness.clone(),
             harness_auth_guest_path: install.harness_auth_guest_path.clone(),
             headless_chrome: false,
+            graph_token: maturana_core::worker::read_graph_token(home.root()),
+            graph_name: knowledge_graph
+                .enabled
+                .then(|| knowledge_graph.graph_name(&install.agent_id)),
         }),
     )?;
     fs::write(&runner_path, render_run_agent())?;
