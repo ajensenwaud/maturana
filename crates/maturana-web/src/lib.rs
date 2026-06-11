@@ -16,6 +16,7 @@ mod server;
 mod state;
 mod ws;
 
+use std::path::Path;
 use std::path::PathBuf;
 
 /// Run the cockpit server, blocking the calling (sync) thread. The CLI calls
@@ -23,4 +24,11 @@ use std::path::PathBuf;
 pub fn run_web(home_root: PathBuf, bind: &str) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(server::serve(home_root, bind))
+}
+
+/// Read the cockpit login token (`<home>/web/token`), generating it on first
+/// use. Exposed so `maturana web token` can print it without starting the
+/// server.
+pub fn login_token(home_root: &Path) -> anyhow::Result<String> {
+    auth::ensure_web_token(home_root)
 }
