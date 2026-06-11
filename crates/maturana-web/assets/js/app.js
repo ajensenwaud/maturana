@@ -1,7 +1,8 @@
-// Cockpit shell: nav switching + link status. Views fill in across phases
-// (console: phase 2; dashboards: phase 3).
+// Cockpit shell: nav switching, link status, view mounting.
+// Console (phase 2) is live; dashboards land in phase 3.
 
 import { CockpitSocket } from "/assets/js/ws.js";
+import { Console } from "/assets/js/console.js";
 
 const socket = new CockpitSocket();
 const linkStatus = document.getElementById("link-status");
@@ -10,11 +11,9 @@ socket.onStatus((status) => {
   if (status === "open") {
     linkStatus.textContent = "[link ok]";
     linkStatus.className = "status-ok";
-    bootProgress(100);
   } else if (status === "connecting") {
     linkStatus.textContent = "[link ..]";
     linkStatus.className = "status-dim";
-    bootProgress(60);
   } else if (status === "version-mismatch") {
     linkStatus.textContent = "[link v!]";
     linkStatus.className = "status-bad";
@@ -24,17 +23,11 @@ socket.onStatus((status) => {
   }
 });
 
-function bootProgress(pct) {
-  const fill = document.getElementById("boot-fill");
-  const counter = document.getElementById("boot-pct");
-  if (fill) fill.style.width = `${pct}%`;
-  if (counter) counter.textContent = String(pct).padStart(3, "0");
-}
+const panel = document.getElementById("panel");
+const nav = document.getElementById("nav");
+const consoleView = new Console(socket);
 
-// ---- nav ----
-
-const views = {
-  console: "Prompt console — phase 2",
+const placeholders = {
   agents: "Agent fleet — phase 3",
   runtime: "Runtime plane — phase 3",
   sessions: "Sessions — phase 3",
@@ -43,9 +36,6 @@ const views = {
   tools: "Tools — phase 3",
   skills: "Skills — phase 3",
 };
-
-const panel = document.getElementById("panel");
-const nav = document.getElementById("nav");
 
 nav.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-view]");
@@ -57,6 +47,10 @@ nav.addEventListener("click", (event) => {
 });
 
 function renderView(name) {
+  if (name === "console") {
+    consoleView.mount(panel);
+    return;
+  }
   panel.innerHTML = "";
   const wrap = document.createElement("div");
   wrap.className = "placeholder";
@@ -65,9 +59,10 @@ function renderView(name) {
   title.textContent = name;
   const note = document.createElement("div");
   note.className = "label";
-  note.textContent = `[ ${views[name] ?? "unknown view"} ]`;
+  note.textContent = `[ ${placeholders[name] ?? "unknown view"} ]`;
   wrap.append(title, note);
   panel.append(wrap);
 }
 
+renderView("console");
 socket.subscribe(["agents", "runtime"]);

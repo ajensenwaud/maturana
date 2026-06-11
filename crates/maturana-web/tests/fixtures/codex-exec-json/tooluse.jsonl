@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"019eb58c-0af1-7b62-ac60-af9f80f0c1f1"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"/usr/bin/zsh -lc 'echo maturana-fixture-ok && date'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"/usr/bin/zsh -lc 'echo maturana-fixture-ok && date'","aggregated_output":"maturana-fixture-ok\nThu Jun 11 17:18:40 AEST 2026\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"The command printed `maturana-fixture-ok` and the date `Thu Jun 11 17:18:40 AEST 2026`."}}
+{"type":"turn.completed","usage":{"input_tokens":65769,"cached_input_tokens":35072,"output_tokens":151,"reasoning_output_tokens":64}}
