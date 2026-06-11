@@ -126,6 +126,64 @@ pub fn validate_spec(spec: &AgentSpec) -> ValidationReport {
             &mut errors,
         );
     }
+    if let Some(slack) = &spec.channels.slack {
+        validate_secret_source(
+            &slack.bot_token_source,
+            "channels.slack.bot_token_source",
+            &mut errors,
+        );
+        validate_secret_source(
+            &slack.app_token_source,
+            "channels.slack.app_token_source",
+            &mut errors,
+        );
+        if !host_allowlisted(spec, "api.slack.com") {
+            warnings.push(
+                "channels.slack: add api.slack.com to network.egress_allowlist".to_string(),
+            );
+        }
+    }
+    if let Some(agentmail) = &spec.channels.agentmail {
+        validate_secret_source(
+            &agentmail.api_key_source,
+            "channels.agentmail.api_key_source",
+            &mut errors,
+        );
+        if !host_allowlisted(spec, "api.agentmail.to") {
+            warnings.push(
+                "channels.agentmail: add api.agentmail.to to network.egress_allowlist".to_string(),
+            );
+        }
+    }
+
+    for (i, server) in spec.mcp_servers.iter().enumerate() {
+        let label = format!("mcp_servers[{i}] ({})", server.name);
+        if server.name.trim().is_empty() {
+            errors.push("mcp_servers entries require a name".to_string());
+        }
+        match server.transport {
+            crate::spec::McpTransport::Stdio => {
+                if server.command.as_deref().unwrap_or("").trim().is_empty() {
+                    errors.push(format!("{label}: stdio transport requires a command"));
+                }
+            }
+            crate::spec::McpTransport::Http => {
+                if server.url.as_deref().unwrap_or("").trim().is_empty() {
+                    errors.push(format!("{label}: http transport requires a url"));
+                }
+            }
+        }
+        for env in &server.env {
+            validate_secret_source(&env.source, &format!("{label}.env.{}", env.name), &mut errors);
+        }
+        for host in &server.egress_hosts {
+            if !host_allowlisted(spec, host) {
+                warnings.push(format!(
+                    "{label}: egress host '{host}' is auto-allowed by the proxy but not in network.egress_allowlist"
+                ));
+            }
+        }
+    }
     if let Some(wiki_path) = &spec.memory.wiki_path {
         if wiki_path.trim().is_empty() {
             errors.push("memory.wiki_path must not be empty".to_string());
@@ -221,6 +279,16 @@ pub fn validate_spec(spec: &AgentSpec) -> ValidationReport {
     }
 }
 
+/// Whether `host` is already covered by the spec's egress allowlist (exact or
+/// suffix match, matching the proxy's `host_allowed`).
+fn host_allowlisted(spec: &AgentSpec, host: &str) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    spec.network.egress_allowlist.iter().any(|allowed| {
+        let allowed = allowed.trim().to_ascii_lowercase();
+        host == allowed || host.ends_with(&format!(".{allowed}"))
+    })
+}
+
 fn is_safe_guest_path(path: &str) -> bool {
     let allowed_root = ["/home/", "/agent/", "/opt/maturana/"]
         .iter()
@@ -281,6 +349,8 @@ mod tests {
                 purpose: "A demo agent with a boundary".to_string(),
             },
             knowledge_graph: Default::default(),
+            mcp_servers: Default::default(),
+            capabilities: Default::default(),
             runtime: Runtime {
                 harness: HarnessRuntime::Codex,
             },
