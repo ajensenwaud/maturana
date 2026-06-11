@@ -12,7 +12,7 @@ use std::{
     io::{Read, Write},
     net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
-    sync::{Arc, Once},
+    sync::{Arc, Once, RwLock},
     thread,
     time::Duration,
 };
@@ -26,9 +26,33 @@ const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
     pub home_root: PathBuf,
+    /// Durable allowlist from the spec (+ MCP egress hosts). Never revoked at
+    /// runtime.
     pub allowlist: Vec<String>,
     pub injections: Vec<HeaderInjection>,
     pub audit_path: PathBuf,
+    /// Live, additive grants reloaded from `<home>/pipelock/runtime-allow.json`
+    /// by a watcher thread — lets the cockpit approve a host without a restart.
+    /// Shared (Arc) so every per-connection clone sees the same set.
+    pub runtime_allow: Arc<RwLock<Vec<String>>>,
+}
+
+/// Where a request's host was permitted (drives the audit `grant_source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllowSource {
+    Spec,
+    Runtime,
+    Denied,
+}
+
+impl AllowSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            AllowSource::Spec => "spec",
+            AllowSource::Runtime => "runtime",
+            AllowSource::Denied => "denied",
+        }
+    }
 }
 
 impl ProxyConfig {
@@ -69,7 +93,26 @@ impl ProxyConfig {
                 })
                 .collect(),
             audit_path: audit_path.into(),
+            runtime_allow: Arc::new(RwLock::new(Vec::new())),
         })
+    }
+
+    /// File the watcher reloads live grants from.
+    pub fn runtime_allow_path(&self) -> PathBuf {
+        self.home_root.join("pipelock").join("runtime-allow.json")
+    }
+
+    /// Classify a (already normalized) host against the durable allowlist then
+    /// the live runtime grants.
+    fn classify_host(&self, host: &str) -> AllowSource {
+        if host_allowed(host, &self.allowlist) {
+            return AllowSource::Spec;
+        }
+        let runtime = self.runtime_allow.read().expect("runtime_allow poisoned");
+        if host_allowed(host, &runtime) {
+            return AllowSource::Runtime;
+        }
+        AllowSource::Denied
     }
 }
 
@@ -107,6 +150,10 @@ impl HeaderInjection {
 }
 
 pub fn run_proxy(bind: &str, config: ProxyConfig) -> anyhow::Result<()> {
+    // Seed live grants from disk and keep them current via a watcher, so the
+    // cockpit can approve a host into the running proxy without a restart.
+    load_runtime_allow(&config.runtime_allow_path(), &config.runtime_allow);
+    spawn_runtime_allow_watcher(config.runtime_allow_path(), config.runtime_allow.clone());
     let listener = TcpListener::bind(bind).with_context(|| format!("failed to bind {bind}"))?;
     for stream in listener.incoming() {
         match stream {
@@ -143,7 +190,7 @@ pub fn handle_proxy_stream(mut client: TcpStream, config: &ProxyConfig) -> anyho
 
     let request = read_http_request(&mut client)?;
     let parsed = parse_proxy_request(&request)?;
-    if !host_allowed(&parsed.host, &config.allowlist) {
+    if config.classify_host(&parsed.host) == AllowSource::Denied {
         write_proxy_error(&mut client, 403, "forbidden")?;
         append_audit(
             &config.audit_path,
@@ -176,7 +223,13 @@ pub fn handle_proxy_stream(mut client: TcpStream, config: &ProxyConfig) -> anyho
     }
     append_audit(
         &config.audit_path,
-        &ProxyAuditEvent::allowed(&parsed, injected.len(), total_bytes, false),
+        &ProxyAuditEvent::allowed(
+            &parsed,
+            injected.len(),
+            total_bytes,
+            false,
+            config.classify_host(&parsed.host).label(),
+        ),
     )?;
     Ok(())
 }
@@ -300,7 +353,13 @@ fn handle_connect(
     let total_bytes = upstream_to_client + client_to_upstream;
     append_audit(
         &config.audit_path,
-        &ProxyAuditEvent::allowed(parsed, 0, total_bytes, false),
+        &ProxyAuditEvent::allowed(
+            parsed,
+            0,
+            total_bytes,
+            false,
+            config.classify_host(&parsed.host).label(),
+        ),
     )?;
     Ok(())
 }
@@ -355,7 +414,13 @@ fn handle_mitm_connect(
     let _ = client_tls.flush();
     append_audit(
         &config.audit_path,
-        &ProxyAuditEvent::allowed(&tls_request, injected.len(), total_bytes, true),
+        &ProxyAuditEvent::allowed(
+            &tls_request,
+            injected.len(),
+            total_bytes,
+            true,
+            config.classify_host(&tls_request.host).label(),
+        ),
     )?;
     Ok(())
 }
@@ -691,6 +756,9 @@ struct ProxyAuditEvent {
     tls_intercepted: bool,
     bytes: u64,
     reason: Option<String>,
+    /// "spec" (durable allowlist) or "runtime" (live cockpit grant) for allowed
+    /// events; "denied" otherwise. Lets the cockpit badge each row.
+    grant_source: &'static str,
 }
 
 impl ProxyAuditEvent {
@@ -699,6 +767,7 @@ impl ProxyAuditEvent {
         injected_headers: usize,
         bytes: u64,
         tls_intercepted: bool,
+        grant_source: &'static str,
     ) -> Self {
         Self {
             at: Utc::now(),
@@ -711,6 +780,7 @@ impl ProxyAuditEvent {
             tls_intercepted,
             bytes,
             reason: None,
+            grant_source,
         }
     }
 
@@ -726,6 +796,7 @@ impl ProxyAuditEvent {
             tls_intercepted: false,
             bytes: 0,
             reason: Some(reason.into()),
+            grant_source: "denied",
         }
     }
 
@@ -741,8 +812,39 @@ impl ProxyAuditEvent {
             tls_intercepted: false,
             bytes: 0,
             reason: Some(reason.into()),
+            grant_source: "denied",
         }
     }
+}
+
+/// Load `runtime-allow.json` (a JSON array of hosts) into the live grant set.
+/// Missing/invalid file → empty grants (fail closed, never panic).
+fn load_runtime_allow(path: &Path, grants: &Arc<RwLock<Vec<String>>>) {
+    let hosts = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())
+        .unwrap_or_default();
+    if let Ok(mut g) = grants.write() {
+        *g = hosts;
+    }
+}
+
+/// Poll the runtime-allow file's mtime once a second and reload on change, so a
+/// cockpit approval reaches the running proxy within ~1s without a restart.
+fn spawn_runtime_allow_watcher(path: PathBuf, grants: Arc<RwLock<Vec<String>>>) {
+    thread::spawn(move || {
+        let mut last: Option<std::time::SystemTime> = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        loop {
+            thread::sleep(Duration::from_secs(1));
+            let current = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+            if current != last {
+                last = current;
+                load_runtime_allow(&path, &grants);
+            }
+        }
+    });
 }
 
 #[allow(dead_code)]
@@ -828,6 +930,46 @@ network:
             }]
         );
         assert_eq!(config.audit_path, audit_path);
+    }
+
+    #[test]
+    fn classify_host_uses_spec_then_runtime_then_denied() {
+        let config = ProxyConfig {
+            home_root: std::env::temp_dir(),
+            allowlist: vec!["api.example.test".to_string()],
+            injections: vec![],
+            audit_path: std::env::temp_dir().join("a.jsonl"),
+            runtime_allow: Default::default(),
+        };
+        assert_eq!(config.classify_host("api.example.test"), AllowSource::Spec);
+        assert_eq!(config.classify_host("api.notion.com"), AllowSource::Denied);
+        // A live grant flips it to Runtime without touching the spec allowlist.
+        config
+            .runtime_allow
+            .write()
+            .unwrap()
+            .push("api.notion.com".to_string());
+        assert_eq!(config.classify_host("api.notion.com"), AllowSource::Runtime);
+        assert_eq!(config.classify_host("api.example.test"), AllowSource::Spec);
+    }
+
+    #[test]
+    fn runtime_allow_file_loads_and_reloads() {
+        let dir = std::env::temp_dir().join(format!("rt-allow-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("pipelock")).unwrap();
+        let path = dir.join("pipelock").join("runtime-allow.json");
+        let grants: Arc<RwLock<Vec<String>>> = Default::default();
+        // Missing file → empty (fail closed).
+        load_runtime_allow(&path, &grants);
+        assert!(grants.read().unwrap().is_empty());
+        std::fs::write(&path, r#"["api.notion.com","api.openai.com"]"#).unwrap();
+        load_runtime_allow(&path, &grants);
+        assert_eq!(grants.read().unwrap().len(), 2);
+        // Garbage → empty, never panics.
+        std::fs::write(&path, "not json").unwrap();
+        load_runtime_allow(&path, &grants);
+        assert!(grants.read().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -935,6 +1077,7 @@ network:
                 prefix: None,
             }],
             audit_path: audit_path.clone(),
+            runtime_allow: Default::default(),
         };
         let proxy_thread = thread::spawn(move || {
             let (stream, _) = proxy.accept().unwrap();
@@ -972,6 +1115,7 @@ network:
             allowlist: vec!["allowed.example".to_string()],
             injections: vec![],
             audit_path: audit_path.clone(),
+            runtime_allow: Default::default(),
         };
         let proxy_thread = thread::spawn(move || {
             let (stream, _) = proxy.accept().unwrap();
@@ -1014,6 +1158,7 @@ network:
             allowlist: vec!["127.0.0.1".to_string()],
             injections: vec![],
             audit_path: audit_path.clone(),
+            runtime_allow: Default::default(),
         };
         let proxy_thread = thread::spawn(move || {
             let (stream, _) = proxy.accept().unwrap();
@@ -1103,6 +1248,7 @@ network:
                 prefix: None,
             }],
             audit_path: audit_path.clone(),
+            runtime_allow: Default::default(),
         };
         ensure_mitm_ca_cert(&home).unwrap();
         let proxy_ca = fs::read(mitm_ca_cert_path(&home)).unwrap();
