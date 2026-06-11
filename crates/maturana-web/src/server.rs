@@ -32,6 +32,7 @@ pub async fn serve(home_root: PathBuf, bind: &str) -> anyhow::Result<()> {
             std::env::set_var("MATURANA_HOSTD_TOKEN_PATH", &hostd_token);
         }
     }
+    let token_for_banner = login_token.clone();
     let state = AppState::new(home_root, login_token);
 
     tokio::spawn(dashboard_poller(state.clone()));
@@ -54,7 +55,9 @@ pub async fn serve(home_root: PathBuf, bind: &str) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("failed to bind {bind}"))?;
-    println!("maturana web cockpit on http://{bind} (token: <home>/web/token)");
+    println!("maturana web cockpit on http://{bind}");
+    println!("  login token: {token_for_banner}");
+    println!("  (also at <home>/web/token)");
     axum::serve(listener, app).await.context("web server exited")
 }
 
