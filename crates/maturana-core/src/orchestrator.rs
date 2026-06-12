@@ -36,6 +36,10 @@ pub struct OrchestratorConfig {
     /// gateway IP). Only supervised when `graph_token` is set (opt-in).
     pub graph_bind: String,
     pub graph_token: Option<String>,
+    /// claude-code agent ids whose OAuth tokens the host refresh daemon keeps
+    /// fresh + re-pushes. Empty → no daemon.
+    #[serde(default)]
+    pub claude_refresh_agents: Vec<String>,
 }
 
 impl Default for OrchestratorConfig {
@@ -48,6 +52,7 @@ impl Default for OrchestratorConfig {
             agents: Vec::new(),
             graph_bind: "0.0.0.0:47835".to_string(),
             graph_token: None,
+            claude_refresh_agents: Vec::new(),
         }
     }
 }
@@ -60,6 +65,22 @@ pub struct AgentRuntime {
     pub telegram: bool,
     pub telegram_token_source: String,
     pub schedules: bool,
+    #[serde(default)]
+    pub slack: Option<SlackRuntime>,
+    #[serde(default)]
+    pub agentmail: Option<AgentMailRuntime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SlackRuntime {
+    pub bot_token_source: String,
+    pub app_token_source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentMailRuntime {
+    pub api_key_source: String,
+    pub inbox: Option<String>,
 }
 
 impl AgentRuntime {
@@ -68,6 +89,8 @@ impl AgentRuntime {
             agent_id: agent_id.into(),
             session_id: "telegram-main".to_string(),
             telegram: true,
+            slack: None,
+            agentmail: None,
             telegram_token_source: "pipelock:telegram/bot-token".to_string(),
             schedules: true,
         }
@@ -123,6 +146,20 @@ pub fn plan_processes(config: &OrchestratorConfig) -> Vec<SupervisedProcess> {
         });
     }
 
+    // Host-owned Claude OAuth refresh: one daemon for all claude-code agents.
+    if !config.claude_refresh_agents.is_empty() {
+        let mut args = vec!["claude-refresh".to_string(), "serve".to_string()];
+        for agent_id in &config.claude_refresh_agents {
+            args.push("--agent-id".to_string());
+            args.push(agent_id.clone());
+        }
+        processes.push(SupervisedProcess {
+            name: "claude-refresh".to_string(),
+            args,
+            critical: false,
+        });
+    }
+
     for agent in &config.agents {
         if agent.telegram {
             processes.push(SupervisedProcess {
@@ -140,6 +177,49 @@ pub fn plan_processes(config: &OrchestratorConfig) -> Vec<SupervisedProcess> {
                     "--poll-seconds".to_string(),
                     config.channel_poll_seconds.to_string(),
                 ],
+                critical: false,
+            });
+        }
+        if let Some(slack) = &agent.slack {
+            processes.push(SupervisedProcess {
+                name: format!("channel:slack:{}", agent.agent_id),
+                args: vec![
+                    "channel".to_string(),
+                    "serve".to_string(),
+                    "slack".to_string(),
+                    "--agent-id".to_string(),
+                    agent.agent_id.clone(),
+                    "--session-id".to_string(),
+                    agent.session_id.clone(),
+                    "--bot-token-source".to_string(),
+                    slack.bot_token_source.clone(),
+                    "--app-token-source".to_string(),
+                    slack.app_token_source.clone(),
+                ],
+                critical: false,
+            });
+        }
+        if let Some(mail) = &agent.agentmail {
+            let mut args = vec![
+                "channel".to_string(),
+                "serve".to_string(),
+                "agentmail".to_string(),
+                "--agent-id".to_string(),
+                agent.agent_id.clone(),
+                "--session-id".to_string(),
+                agent.session_id.clone(),
+                "--api-key-source".to_string(),
+                mail.api_key_source.clone(),
+                "--poll-seconds".to_string(),
+                config.channel_poll_seconds.to_string(),
+            ];
+            if let Some(inbox) = &mail.inbox {
+                args.push("--inbox".to_string());
+                args.push(inbox.clone());
+            }
+            processes.push(SupervisedProcess {
+                name: format!("channel:agentmail:{}", agent.agent_id),
+                args,
                 critical: false,
             });
         }
@@ -190,6 +270,54 @@ mod tests {
         assert_eq!(channel_session, schedule_session);
         assert_eq!(channel_session.as_deref(), Some("telegram-main"));
         assert_eq!(guest_session_id(&agent), "telegram-main");
+    }
+
+    #[test]
+    fn slack_and_agentmail_channels_emitted() {
+        let mut config = OrchestratorConfig::default();
+        let mut agent = AgentRuntime::new("personal");
+        agent.telegram = false;
+        agent.schedules = false;
+        agent.slack = Some(SlackRuntime {
+            bot_token_source: "pipelock:slack/bot-token".into(),
+            app_token_source: "pipelock:slack/app-token".into(),
+        });
+        agent.agentmail = Some(AgentMailRuntime {
+            api_key_source: "pipelock:agentmail/api-key".into(),
+            inbox: Some("box-1".into()),
+        });
+        config.agents.push(agent);
+        let processes = plan_processes(&config);
+        let slack = processes
+            .iter()
+            .find(|p| p.name == "channel:slack:personal")
+            .expect("slack channel");
+        assert!(slack.args.windows(2).any(|w| w == ["--bot-token-source", "pipelock:slack/bot-token"]));
+        let mail = processes
+            .iter()
+            .find(|p| p.name == "channel:agentmail:personal")
+            .expect("agentmail channel");
+        assert!(mail.args.windows(2).any(|w| w == ["--inbox", "box-1"]));
+        assert!(mail.args.windows(2).any(|w| w == ["--api-key-source", "pipelock:agentmail/api-key"]));
+    }
+
+    #[test]
+    fn claude_refresh_daemon_emitted_for_claude_agents() {
+        let mut config = OrchestratorConfig::default();
+        config.claude_refresh_agents = vec!["claude-a".to_string(), "claude-b".to_string()];
+        let processes = plan_processes(&config);
+        let daemon = processes
+            .iter()
+            .find(|p| p.name == "claude-refresh")
+            .expect("claude-refresh process present");
+        assert!(!daemon.critical);
+        assert_eq!(daemon.args[0], "claude-refresh");
+        assert_eq!(daemon.args[1], "serve");
+        assert!(daemon.args.windows(2).any(|w| w == ["--agent-id", "claude-a"]));
+        assert!(daemon.args.windows(2).any(|w| w == ["--agent-id", "claude-b"]));
+        // No claude agents → no daemon.
+        let bare = OrchestratorConfig::default();
+        assert!(plan_processes(&bare).iter().all(|p| p.name != "claude-refresh"));
     }
 
     #[test]

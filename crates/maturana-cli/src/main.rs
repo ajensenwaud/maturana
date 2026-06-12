@@ -85,6 +85,8 @@ enum Command {
     Search(SearchCommand),
     /// Register/manage host services (systemd user units / scheduled tasks).
     Service(service::ServiceCommand),
+    /// Host-owned Claude OAuth refresh (probe the endpoint, or run the daemon).
+    ClaudeRefresh(ClaudeRefreshCommand),
     Tool(ToolCommand),
     Improve(ImproveCommand),
     Doctor(DoctorCommand),
@@ -201,6 +203,33 @@ struct WebCommand {
 enum WebSubcommand {
     /// Print the cockpit login token (creating it if absent).
     Token,
+}
+
+/// Keep claude-code OAuth tokens fresh host-side.
+#[derive(Debug, Args)]
+struct ClaudeRefreshCommand {
+    #[command(subcommand)]
+    command: ClaudeRefreshSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ClaudeRefreshSubcommand {
+    /// Do ONE real refresh against the host-auth creds to verify the endpoint,
+    /// rotating + writing the result. Prints success/expiry only, never tokens.
+    Probe {
+        #[arg(long, default_value = ".maturana/host-auth/claude-code/.credentials.json")]
+        creds: PathBuf,
+    },
+    /// Run the refresh daemon: watch host-auth creds and refresh before expiry.
+    Serve {
+        /// claude-code agent ids to keep refreshed + re-pushed. Empty = all.
+        #[arg(long = "agent-id")]
+        agent_ids: Vec<String>,
+        #[arg(long, default_value = ".maturana/host-auth/claude-code/.credentials.json")]
+        creds: PathBuf,
+        #[arg(long, default_value_t = 300)]
+        poll_seconds: u64,
+    },
 }
 
 /// Host-side web search: `maturana search "query" --provider brave|tavily`.
@@ -1000,6 +1029,19 @@ fn main() -> anyhow::Result<()> {
                     snapshot_audit_event("restore", live, false),
                     format!("restored {:?} snapshot {name}", snapshot.kind),
                 )?;
+                // A rollback is a negative training signal: the turn(s) since the
+                // snapshot were bad enough to undo. Penalize the latest turn.
+                if let Ok(store) = maturana_core::improvement::TrajectoryStore::open(
+                    &maturana_core::improvement::TrajectoryStore::store_path(home.root()),
+                ) {
+                    let _ = store.reward_latest(
+                        &agent_id,
+                        &format!("{agent_id}-main"),
+                        "snapshot",
+                        maturana_core::improvement::signals::SNAPSHOT_ROLLBACK,
+                        Some(&format!("rollback to {name}")),
+                    );
+                }
             }
         },
         Command::Audit(command) => match command.command {
@@ -1131,6 +1173,7 @@ fn main() -> anyhow::Result<()> {
                                     allowlist: Vec::new(),
                                     injections: Vec::new(),
                                     audit_path,
+                                    runtime_allow: Default::default(),
                                 },
                             )
                         }
@@ -1213,6 +1256,7 @@ fn main() -> anyhow::Result<()> {
         },
         Command::Search(command) => run_search(&home, command)?,
         Command::Service(command) => service::handle_service(command, &home)?,
+        Command::ClaudeRefresh(command) => run_claude_refresh(&home, command)?,
         Command::Tool(command) => run_tool_command(&home, command)?,
         Command::Improve(command) => run_improve_command(&home, command)?,
         Command::Doctor(command) => run_doctor(&home, command)?,
@@ -1656,14 +1700,44 @@ fn build_orchestrator_config(
             "no agents to supervise; launch one with `maturana agent launch` or pass --agent-id"
         );
     }
+    // claude-code agents get the host-owned OAuth refresh daemon.
+    let claude_refresh_agents = agent_ids
+        .iter()
+        .filter(|id| {
+            AgentSpec::from_maturana_markdown(&home.agent_dir(id).join("MATURANA.md"))
+                .map(|spec| spec.runtime.harness == HarnessRuntime::ClaudeCode)
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let agents = agent_ids
         .into_iter()
-        .map(|agent_id| AgentRuntime {
-            agent_id,
-            session_id: command.session_id.clone(),
-            telegram: !command.no_telegram,
-            telegram_token_source: command.telegram_token_source.clone(),
-            schedules: !command.no_schedules,
+        .map(|agent_id| {
+            let spec =
+                AgentSpec::from_maturana_markdown(&home.agent_dir(&agent_id).join("MATURANA.md"))
+                    .ok();
+            let slack = spec.as_ref().and_then(|s| s.channels.slack.clone()).map(|s| {
+                maturana_core::orchestrator::SlackRuntime {
+                    bot_token_source: s.bot_token_source,
+                    app_token_source: s.app_token_source,
+                }
+            });
+            let agentmail = spec
+                .as_ref()
+                .and_then(|s| s.channels.agentmail.clone())
+                .map(|m| maturana_core::orchestrator::AgentMailRuntime {
+                    api_key_source: m.api_key_source,
+                    inbox: m.inbox,
+                });
+            AgentRuntime {
+                agent_id,
+                session_id: command.session_id.clone(),
+                telegram: !command.no_telegram,
+                telegram_token_source: command.telegram_token_source.clone(),
+                schedules: !command.no_schedules,
+                slack,
+                agentmail,
+            }
         })
         .collect();
     // sessiond now refuses to run unauthenticated, so default the token to the
@@ -1682,6 +1756,7 @@ fn build_orchestrator_config(
         graph_bind: "0.0.0.0:47835".to_string(),
         // Supervise the graph service only if it's been set up (token present).
         graph_token: maturana_core::worker::read_graph_token(home.root()),
+        claude_refresh_agents,
     })
 }
 
@@ -1796,6 +1871,107 @@ fn supervise_plan(home: &MaturanaHome, plan: &[SupervisedProcess]) -> anyhow::Re
         }
         thread::sleep(Duration::from_secs(2));
     }
+}
+
+fn run_claude_refresh(home: &MaturanaHome, command: ClaudeRefreshCommand) -> anyhow::Result<()> {
+    use maturana_core::claude_refresh as cr;
+    match command.command {
+        ClaudeRefreshSubcommand::Probe { creds } => {
+            let creds_path = absolute_or_cwd(creds)?;
+            let current = cr::read_claude_creds(&creds_path)?;
+            let now = chrono::Utc::now().timestamp_millis();
+            let mins = (current.expires_at_ms - now) / 60000;
+            println!("current token expires in {mins} min; attempting one refresh…");
+            let rotated = cr::refresh_claude_token(&current)?;
+            cr::write_claude_creds(&creds_path, &rotated)?;
+            let new_mins = (rotated.expires_at_ms - chrono::Utc::now().timestamp_millis()) / 60000;
+            println!("refresh OK — endpoint verified; new token expires in {new_mins} min");
+            println!("(rotated creds written to {})", creds_path.display());
+            Ok(())
+        }
+        ClaudeRefreshSubcommand::Serve {
+            agent_ids,
+            creds,
+            poll_seconds,
+        } => {
+            let creds_path = absolute_or_cwd(creds)?;
+            println!("claude-refresh daemon: watching {}", creds_path.display());
+            loop {
+                if let Err(error) = claude_refresh_tick(home, &creds_path, &agent_ids) {
+                    eprintln!("claude-refresh: {error:#}");
+                }
+                thread::sleep(Duration::from_secs(poll_seconds.max(30)));
+            }
+        }
+    }
+}
+
+/// One daemon cycle: refresh the host token if near expiry, then re-push to any
+/// idle named claude agents (skips busy ones; the wide pre-expiry window means
+/// the next cycle catches them).
+fn claude_refresh_tick(
+    home: &MaturanaHome,
+    creds_path: &Path,
+    agent_ids: &[String],
+) -> anyhow::Result<()> {
+    use maturana_core::claude_refresh as cr;
+    let creds = cr::read_claude_creds(creds_path)?;
+    let now = chrono::Utc::now().timestamp_millis();
+    if !cr::needs_refresh(&creds, now, cr::REFRESH_SKEW) {
+        return Ok(());
+    }
+    let rotated = cr::refresh_claude_token(&creds)?;
+    cr::write_claude_creds(creds_path, &rotated)?;
+    let mins = (rotated.expires_at_ms - chrono::Utc::now().timestamp_millis()) / 60000;
+    println!("claude-refresh: rotated host token (expires in {mins} min)");
+    for agent_id in agent_ids {
+        match worker_is_idle(home, agent_id) {
+            true => {
+                if let Err(error) = repush_claude_auth(home, agent_id) {
+                    eprintln!("claude-refresh: re-push {agent_id} failed: {error:#}");
+                } else {
+                    println!("claude-refresh: re-pushed fresh creds to {agent_id}");
+                }
+            }
+            false => println!("claude-refresh: {agent_id} busy; will re-push next cycle"),
+        }
+    }
+    Ok(())
+}
+
+fn worker_is_idle(home: &MaturanaHome, agent_id: &str) -> bool {
+    let path = home.agent_dir(agent_id).join("worker-status.json");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string))
+        .map(|s| s == "idle" || s == "polling")
+        .unwrap_or(true) // unknown status → assume safe to push
+}
+
+/// Re-push fresh claude creds to a running guest via the existing auth install
+/// path (resolves the guest IP from the live provider status).
+fn repush_claude_auth(home: &MaturanaHome, agent_id: &str) -> anyhow::Result<()> {
+    let status = maturana_core::inspect_agent(home, agent_id)?;
+    let ip = status
+        .ipv4
+        .ok_or_else(|| anyhow::anyhow!("{agent_id} has no IPv4 yet"))?;
+    install_guest_worker(
+        home,
+        GuestWorkerInstall {
+            agent_id: agent_id.to_string(),
+            session_id: format!("{agent_id}-main"),
+            harness: HarnessRuntime::ClaudeCode,
+            guest_ip: ip,
+            ssh_user: "ubuntu".to_string(),
+            ssh_key: PathBuf::from(".maturana/keys/maturana-firecracker.id_rsa"),
+            harness_auth_guest_path: "/home/ubuntu/.claude".to_string(),
+            sessiond_url: "__MATURANA_DEFAULT_SESSIOND_URL__".to_string(),
+            sessiond_token_path: home.root().join("sessiond/token"),
+            auth_source: Some(PathBuf::from(".maturana/host-auth/claude-code")),
+            install_harness: false,
+        },
+    )
 }
 
 fn run_search(home: &MaturanaHome, command: SearchCommand) -> anyhow::Result<()> {
@@ -3252,13 +3428,15 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
     let env_path = state_dir.join("sessiond.env");
     let runner_path = state_dir.join("run-agent.sh");
     // The post-boot re-render also carries the graph env so it isn't lost when a
-    // worker is refreshed. Read the agent's materialized spec for its opt-in.
-    let knowledge_graph = AgentSpec::from_maturana_markdown(
-        &home.agent_dir(&install.agent_id).join("MATURANA.md"),
-    )
-    .ok()
-    .map(|spec| spec.knowledge_graph)
-    .unwrap_or_default();
+    // worker is refreshed. Read the agent's materialized spec for its opt-in
+    // (graph) and its MCP servers.
+    let agent_spec =
+        AgentSpec::from_maturana_markdown(&home.agent_dir(&install.agent_id).join("MATURANA.md"))
+            .ok();
+    let knowledge_graph = agent_spec
+        .as_ref()
+        .map(|spec| spec.knowledge_graph.clone())
+        .unwrap_or_default();
     fs::write(
         &env_path,
         render_session_env(&GuestWorkerConfig {
@@ -3337,6 +3515,57 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
             None,
         )?;
     }
+    // MCP config: render the harness-native file (secrets resolved host-side)
+    // and place it where the in-guest harness reads it.
+    if let Some(spec) = agent_spec.as_ref() {
+        if !spec.mcp_servers.is_empty() {
+            let host_auth_dir = install
+                .auth_source
+                .as_ref()
+                .map(|p| absolute_or_cwd(p.clone()))
+                .transpose()?
+                .unwrap_or_else(|| {
+                    home.root()
+                        .join("host-auth")
+                        .join(maturana_core::worker::harness_name(&install.harness))
+                });
+            if let Some(rendered) = maturana_core::mcp::render_mcp_config(
+                &install.harness,
+                &spec.mcp_servers,
+                home.root(),
+                &host_auth_dir,
+            )? {
+                let mcp_path = state_dir.join("mcp-config");
+                fs::write(&mcp_path, &rendered.contents)?;
+                copy_path_to_guest(
+                    &install.guest_ip,
+                    &install.ssh_user,
+                    &ssh_key,
+                    &host_key,
+                    &mcp_path,
+                    "/tmp/maturana-mcp-config",
+                    false,
+                )?;
+                let guest_path = &rendered.guest_path;
+                let parent = posix_parent(guest_path);
+                run_ssh_with_stdin(
+                    &install.guest_ip,
+                    &install.ssh_user,
+                    &ssh_key,
+                    &host_key,
+                    &format!(
+                        "sudo mkdir -p {parent} && sudo mv /tmp/maturana-mcp-config {path} && sudo chown -R {user}:{user} {parent} && sudo chmod 0600 {path}",
+                        parent = shell_quote(parent),
+                        path = shell_quote(guest_path),
+                        user = shell_quote(&install.ssh_user),
+                    ),
+                    None,
+                )?;
+                println!("installed MCP config ({} servers) at {guest_path}", spec.mcp_servers.len());
+            }
+        }
+    }
+
     run_ssh_with_stdin(
         &install.guest_ip,
         &install.ssh_user,

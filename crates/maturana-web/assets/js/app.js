@@ -34,6 +34,7 @@ const views = {
   sessions: dashboard.renderSessions,
   graph: dashboard.renderGraph,
   pipelock: dashboard.renderPipelock,
+  egress: dashboard.renderEgress,
   tools: dashboard.renderTools,
   skills: dashboard.renderSkills,
 };

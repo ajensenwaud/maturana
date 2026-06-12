@@ -7,7 +7,10 @@ use maturana_core::{
     improvement::{signals, TrajectoryStore},
     pipelock::PipelockVault,
     secrets::resolve_secret_source_with_home,
-    session_db::{ensure_session, insert_inbound, list_undelivered, mark_delivered, session_paths},
+    session_db::{
+        ensure_session, insert_inbound, list_undelivered, mark_delivered, session_paths,
+        SessionPaths,
+    },
     state::MaturanaHome,
     tools::{run_tool, ToolRegistry},
 };
@@ -90,6 +93,43 @@ pub enum TelegramPairSubcommand {
 #[derive(Debug, Subcommand)]
 pub enum ChannelServeSubcommand {
     Telegram(TelegramServe),
+    Slack(SlackServe),
+    Agentmail(AgentMailServe),
+}
+
+#[derive(Debug, Args)]
+pub struct SlackServe {
+    #[arg(long)]
+    pub agent_id: String,
+    #[arg(long, default_value = "slack-main")]
+    pub session_id: String,
+    #[arg(long, default_value = "pipelock:slack/bot-token")]
+    pub bot_token_source: String,
+    #[arg(long, default_value = "pipelock:slack/app-token")]
+    pub app_token_source: String,
+    #[arg(long)]
+    pub once: bool,
+    #[arg(long)]
+    pub run_once_provider: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct AgentMailServe {
+    #[arg(long)]
+    pub agent_id: String,
+    #[arg(long, default_value = "agentmail-main")]
+    pub session_id: String,
+    #[arg(long, default_value = "pipelock:agentmail/api-key")]
+    pub api_key_source: String,
+    /// Inbox id; omitted uses the account default inbox.
+    #[arg(long)]
+    pub inbox: Option<String>,
+    #[arg(long)]
+    pub once: bool,
+    #[arg(long)]
+    pub run_once_provider: Option<String>,
+    #[arg(long, default_value_t = 10)]
+    pub poll_seconds: u64,
 }
 
 #[derive(Debug, Args)]
@@ -162,6 +202,8 @@ struct ChannelContextBundle {
     wiki_term_sources: Vec<WikiTermSource>,
     /// GraphRAG context from the agent's knowledge graph, when enabled.
     graph_context: Option<GraphChannelContext>,
+    /// Few-shot examples from past positively-rewarded turns (self-improvement).
+    learned_examples: String,
     transcript: String,
     transcript_path: PathBuf,
 }
@@ -340,6 +382,8 @@ pub fn handle_channel(command: ChannelCommand, home: &MaturanaHome) -> anyhow::R
         },
         ChannelSubcommand::Serve { command } => match command {
             ChannelServeSubcommand::Telegram(config) => serve_telegram(home, config),
+            ChannelServeSubcommand::Slack(config) => serve_slack(home, config),
+            ChannelServeSubcommand::Agentmail(config) => serve_agentmail(home, config),
         },
         ChannelSubcommand::Status => channel_status(home),
     }
@@ -1461,6 +1505,12 @@ fn load_channel_context(
         WIKI_CHUNK_CONTEXT_CHARS,
     )?;
     let graph_context = load_graph_channel_context(home, agent_id, &wiki_query_terms);
+    // High-reward past turns shape this prompt (self-improvement, in-context).
+    let learned_examples = maturana_core::improvement::TrajectoryStore::open(
+        &maturana_core::improvement::TrajectoryStore::store_path(home.root()),
+    )
+    .and_then(|store| store.learned_examples_markdown(agent_id, 3, 0.5))
+    .unwrap_or_default();
 
     Ok(ChannelContextBundle {
         identity: read_context_file(
@@ -1493,6 +1543,7 @@ fn load_channel_context(
         wiki_query_terms,
         wiki_term_sources: wiki_query.term_sources,
         graph_context,
+        learned_examples,
         transcript,
         transcript_path,
     })
@@ -1535,6 +1586,14 @@ fn render_channel_prompt(context: &ChannelContextBundle, user_message: &str) -> 
         ),
         None => String::new(),
     };
+    let learned_section = if context.learned_examples.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n## Learned Examples (positively rated)\n\n{}\n",
+            context.learned_examples
+        )
+    };
     format!(
         r#"You are a Maturana personal agent running inside an isolated VM.
 
@@ -1564,7 +1623,7 @@ Return only the message that should be sent back to Telegram.
 
 ## Relevant Wiki Chunks
 {wiki_chunks}
-{graph_section}
+{graph_section}{learned_section}
 ## Recent Telegram Transcript
 {transcript}
 
@@ -2058,6 +2117,429 @@ fn truncate_for_telegram(value: &str) -> String {
     value.chars().take(MAX_RESPONSE_CHARS).collect::<String>() + "\n...[truncated]"
 }
 
+// ===================== AgentMail (HTTP poll) =====================
+
+const AGENTMAIL_BASE: &str = "https://api.agentmail.to/v0";
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct AgentMailState {
+    /// Highest message timestamp seen, so we only enqueue newer mail.
+    last_seen: Option<String>,
+}
+
+fn serve_agentmail(home: &MaturanaHome, config: AgentMailServe) -> anyhow::Result<()> {
+    let key = resolve_secret_source_with_home(&config.api_key_source, home.root())?;
+    let key = key.expose_for_runtime().to_string();
+    let inbox = config
+        .inbox
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| agentmail_default_inbox(&key))?;
+    let paths = session_paths(&home.agent_dir(&config.agent_id), &config.session_id);
+    ensure_session(&paths)?;
+    println!("agentmail channel serving agent {} inbox {inbox}", config.agent_id);
+    let mut state: AgentMailState = read_channel_state(home, &config.agent_id, "agentmail")?;
+    loop {
+        match agentmail_poll(&key, &inbox, state.last_seen.as_deref()) {
+            Ok(messages) => {
+                for msg in &messages {
+                    enqueue_channel_prompt(
+                        home,
+                        &config.agent_id,
+                        &config.session_id,
+                        "agentmail",
+                        &msg.thread_id,
+                        Some(&msg.message_id),
+                        &msg.text,
+                    )?;
+                    state.last_seen = Some(msg.timestamp.clone());
+                }
+                write_channel_state(home, &config.agent_id, "agentmail", &state)?;
+                if let Some(provider) = &config.run_once_provider {
+                    let options = RunnerOptions { provider: provider.to_string() };
+                    run_session_once(&paths, &options, 20)?;
+                }
+                // Deliver replies for each thread we know about.
+                for msg in &messages {
+                    let key2 = key.clone();
+                    let inbox2 = inbox.clone();
+                    let thread = msg.thread_id.clone();
+                    deliver_channel_outbox(
+                        home,
+                        &config.agent_id,
+                        &config.session_id,
+                        "agentmail",
+                        &msg.thread_id,
+                        |text, reply_to| {
+                            agentmail_send(&key2, &inbox2, &thread, reply_to, text)
+                        },
+                    )?;
+                }
+            }
+            Err(error) => eprintln!("agentmail poll error: {error}"),
+        }
+        if config.once {
+            break;
+        }
+        thread::sleep(Duration::from_secs(config.poll_seconds.max(2)));
+    }
+    Ok(())
+}
+
+struct AgentMailMessage {
+    message_id: String,
+    thread_id: String,
+    timestamp: String,
+    text: String,
+}
+
+fn agentmail_default_inbox(key: &str) -> anyhow::Result<String> {
+    let resp: serde_json::Value = ureq::get(&format!("{AGENTMAIL_BASE}/inboxes"))
+        .set("authorization", &format!("Bearer {key}"))
+        .call()
+        .map_err(|e| anyhow::anyhow!("agentmail list inboxes failed: {e}"))?
+        .into_json()?;
+    resp.get("inboxes")
+        .and_then(|a| a.as_array())
+        .and_then(|a| a.first())
+        .and_then(|i| i.get("inbox_id").or_else(|| i.get("id")))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("agentmail account has no inbox; pass --inbox"))
+}
+
+fn agentmail_poll(
+    key: &str,
+    inbox: &str,
+    since: Option<&str>,
+) -> anyhow::Result<Vec<AgentMailMessage>> {
+    let mut url = format!("{AGENTMAIL_BASE}/inboxes/{inbox}/messages?limit=20");
+    if let Some(since) = since {
+        url.push_str(&format!("&after={since}"));
+    }
+    let resp: serde_json::Value = ureq::get(&url)
+        .set("authorization", &format!("Bearer {key}"))
+        .call()
+        .map_err(|e| anyhow::anyhow!("agentmail list messages failed: {e}"))?
+        .into_json()?;
+    let mut out = Vec::new();
+    let items = resp
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for m in items {
+        // Skip our own sent mail.
+        if m.get("type").and_then(|t| t.as_str()) == Some("sent") {
+            continue;
+        }
+        let text = m
+            .get("text")
+            .or_else(|| m.get("preview"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(AgentMailMessage {
+            message_id: m.get("message_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            thread_id: m
+                .get("thread_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| m.get("message_id").and_then(|v| v.as_str()).unwrap_or(""))
+                .to_string(),
+            timestamp: m
+                .get("timestamp")
+                .or_else(|| m.get("created_at"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            text,
+        });
+    }
+    Ok(out)
+}
+
+fn agentmail_send(
+    key: &str,
+    inbox: &str,
+    thread_id: &str,
+    reply_to: Option<&str>,
+    text: &str,
+) -> anyhow::Result<Option<String>> {
+    let body = serde_json::json!({
+        "text": text,
+        "thread_id": thread_id,
+        "in_reply_to": reply_to,
+    });
+    let resp: serde_json::Value = ureq::post(&format!("{AGENTMAIL_BASE}/inboxes/{inbox}/messages/send"))
+        .set("authorization", &format!("Bearer {key}"))
+        .send_json(body)
+        .map_err(|e| anyhow::anyhow!("agentmail send failed: {e}"))?
+        .into_json()?;
+    Ok(resp.get("message_id").and_then(|v| v.as_str()).map(str::to_string))
+}
+
+// ===================== Slack (Socket Mode) =====================
+
+fn serve_slack(home: &MaturanaHome, config: SlackServe) -> anyhow::Result<()> {
+    let bot = resolve_secret_source_with_home(&config.bot_token_source, home.root())?;
+    let bot = bot.expose_for_runtime().to_string();
+    let app = resolve_secret_source_with_home(&config.app_token_source, home.root())?;
+    let app = app.expose_for_runtime().to_string();
+    let paths = session_paths(&home.agent_dir(&config.agent_id), &config.session_id);
+    ensure_session(&paths)?;
+    println!("slack channel serving agent {}", config.agent_id);
+    loop {
+        if let Err(error) = slack_socket_session(home, &config, &bot, &app, &paths) {
+            eprintln!("slack socket error: {error}");
+        }
+        if config.once {
+            break;
+        }
+        thread::sleep(Duration::from_secs(5));
+    }
+    Ok(())
+}
+
+/// Open a Socket Mode WebSocket and process events until it drops.
+fn slack_socket_session(
+    home: &MaturanaHome,
+    config: &SlackServe,
+    bot_token: &str,
+    app_token: &str,
+    paths: &SessionPaths,
+) -> anyhow::Result<()> {
+    let ws_url = slack_open_connection(app_token)?;
+    let (mut socket, _) = tungstenite::connect(&ws_url)
+        .map_err(|e| anyhow::anyhow!("slack socket connect failed: {e}"))?;
+    loop {
+        let msg = socket.read().map_err(|e| anyhow::anyhow!("slack read: {e}"))?;
+        let tungstenite::Message::Text(text) = msg else {
+            continue;
+        };
+        let envelope: serde_json::Value = serde_json::from_str(&text)?;
+        let envelope_type = envelope.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        // Ack every envelope that carries one (Slack requires it within 3s).
+        if let Some(envelope_id) = envelope.get("envelope_id").and_then(|v| v.as_str()) {
+            let ack = serde_json::json!({ "envelope_id": envelope_id }).to_string();
+            let _ = socket.send(tungstenite::Message::Text(ack));
+        }
+        if envelope_type != "events_api" {
+            continue; // hello / disconnect handled by the outer reconnect loop
+        }
+        if let Some((channel, text, thread)) = slack_extract_prompt(&envelope) {
+            enqueue_channel_prompt(
+                home,
+                &config.agent_id,
+                &config.session_id,
+                "slack",
+                &channel,
+                thread.as_deref(),
+                &text,
+            )?;
+            if let Some(provider) = &config.run_once_provider {
+                let options = RunnerOptions { provider: provider.to_string() };
+                run_session_once(paths, &options, 20)?;
+            }
+            let bot = bot_token.to_string();
+            let thread_for_send = thread.clone();
+            deliver_channel_outbox(
+                home,
+                &config.agent_id,
+                &config.session_id,
+                "slack",
+                &channel,
+                |reply, _| slack_post_message(&bot, &channel, thread_for_send.as_deref(), reply),
+            )?;
+        }
+    }
+}
+
+fn slack_open_connection(app_token: &str) -> anyhow::Result<String> {
+    let resp: serde_json::Value = ureq::post("https://slack.com/api/apps.connections.open")
+        .set("authorization", &format!("Bearer {app_token}"))
+        .call()
+        .map_err(|e| anyhow::anyhow!("slack apps.connections.open failed: {e}"))?
+        .into_json()?;
+    if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        anyhow::bail!("slack apps.connections.open returned not-ok: {resp}");
+    }
+    resp.get("url")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("slack response missing url"))
+}
+
+/// Pull (channel, text, thread_ts) from an events_api envelope for a user
+/// message / app_mention; returns None for bot messages and non-message events.
+fn slack_extract_prompt(envelope: &serde_json::Value) -> Option<(String, String, Option<String>)> {
+    let event = envelope.pointer("/payload/event")?;
+    let kind = event.get("type").and_then(|t| t.as_str())?;
+    if kind != "message" && kind != "app_mention" {
+        return None;
+    }
+    // Ignore bot/our-own messages and edits.
+    if event.get("bot_id").is_some() || event.get("subtype").is_some() {
+        return None;
+    }
+    let text = event.get("text").and_then(|t| t.as_str())?.trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    let channel = event.get("channel").and_then(|c| c.as_str())?.to_string();
+    let thread = event
+        .get("thread_ts")
+        .or_else(|| event.get("ts"))
+        .and_then(|t| t.as_str())
+        .map(str::to_string);
+    Some((channel, strip_slack_mention(&text), thread))
+}
+
+/// Remove a leading `<@U…>` bot mention so the prompt is clean.
+fn strip_slack_mention(text: &str) -> String {
+    let trimmed = text.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('<') {
+        if let Some(close) = rest.find('>') {
+            if rest.starts_with('@') {
+                return rest[close + 1..].trim().to_string();
+            }
+        }
+    }
+    text.to_string()
+}
+
+fn slack_post_message(
+    bot_token: &str,
+    channel: &str,
+    thread_ts: Option<&str>,
+    text: &str,
+) -> anyhow::Result<Option<String>> {
+    let mut body = serde_json::json!({ "channel": channel, "text": text });
+    if let Some(thread) = thread_ts {
+        body["thread_ts"] = serde_json::json!(thread);
+    }
+    let resp: serde_json::Value = ureq::post("https://slack.com/api/chat.postMessage")
+        .set("authorization", &format!("Bearer {bot_token}"))
+        .send_json(body)
+        .map_err(|e| anyhow::anyhow!("slack chat.postMessage failed: {e}"))?
+        .into_json()?;
+    if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        anyhow::bail!("slack chat.postMessage not-ok: {resp}");
+    }
+    Ok(resp.get("ts").and_then(|v| v.as_str()).map(str::to_string))
+}
+
+// ---- shared channel-state persistence (generic over channel name) ----
+
+fn read_channel_state<T: serde::de::DeserializeOwned + Default>(
+    home: &MaturanaHome,
+    agent_id: &str,
+    channel: &str,
+) -> anyhow::Result<T> {
+    let path = home
+        .agent_dir(agent_id)
+        .join("channels")
+        .join(channel)
+        .join("state.json");
+    if !path.exists() {
+        return Ok(T::default());
+    }
+    Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
+}
+
+fn write_channel_state<T: Serialize>(
+    home: &MaturanaHome,
+    agent_id: &str,
+    channel: &str,
+    state: &T,
+) -> anyhow::Result<()> {
+    let path = home
+        .agent_dir(agent_id)
+        .join("channels")
+        .join(channel)
+        .join("state.json");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_string_pretty(state)?)?;
+    Ok(())
+}
+
+/// Stable per-conversation key for channels whose platform id is a string
+/// (Slack channel, AgentMail thread). Reuses all the i64-keyed transcript /
+/// context machinery without changing the Telegram signatures.
+pub(crate) fn stable_chat_key(platform_id: &str) -> i64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    platform_id.hash(&mut hasher);
+    (hasher.finish() >> 1) as i64 // positive
+}
+
+/// Enqueue a user message as a chat prompt for the guest worker, building the
+/// full channel context exactly like the Telegram path. Shared by Slack and
+/// AgentMail.
+pub(crate) fn enqueue_channel_prompt(
+    home: &MaturanaHome,
+    agent_id: &str,
+    session_id: &str,
+    channel: &str,
+    platform_id: &str,
+    thread_id: Option<&str>,
+    text: &str,
+) -> anyhow::Result<()> {
+    let key = stable_chat_key(platform_id);
+    append_channel_turn(home, agent_id, key, "user", text)?;
+    maybe_remember_user_message(home, agent_id, text)?;
+    let prompt = build_channel_prompt(home, agent_id, key, text)?;
+    let paths = session_paths(&home.agent_dir(agent_id), session_id);
+    ensure_session(&paths)?;
+    insert_inbound(
+        &paths,
+        "chat",
+        channel,
+        platform_id,
+        thread_id,
+        &serde_json::json!({ "text": text, "prompt": prompt }).to_string(),
+    )?;
+    Ok(())
+}
+
+/// Deliver undelivered outbound rows for `channel`+`platform_id` using a
+/// channel-specific `send` closure (returns the platform message id). Mirrors
+/// `deliver_telegram_outbox` generically.
+pub(crate) fn deliver_channel_outbox<F>(
+    home: &MaturanaHome,
+    agent_id: &str,
+    session_id: &str,
+    channel: &str,
+    platform_id: &str,
+    mut send: F,
+) -> anyhow::Result<usize>
+where
+    F: FnMut(&str, Option<&str>) -> anyhow::Result<Option<String>>,
+{
+    let paths = session_paths(&home.agent_dir(agent_id), session_id);
+    ensure_session(&paths)?;
+    let key = stable_chat_key(platform_id);
+    let mut delivered = 0;
+    for message in list_undelivered(&paths)? {
+        if message.channel != channel || message.platform_id != platform_id {
+            continue;
+        }
+        let response = truncate_for_telegram(&message_text(&message.content)?);
+        let platform_message_id = send(&response, message.thread_id.as_deref())?;
+        append_channel_turn(home, agent_id, key, "assistant", &response)?;
+        mark_delivered(&paths, &message.id, platform_message_id.as_deref())?;
+        audit_channel_event(
+            home,
+            agent_id,
+            &format!("channel.{channel}.outbound"),
+            "sent channel response",
+        )?;
+        delivered += 1;
+    }
+    Ok(delivered)
+}
+
 fn generate_pair_code() -> String {
     rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -2384,6 +2866,51 @@ mod tests {
 
         let memory = fs::read_to_string(home.agent_dir("agent").join("memory/MEMORY.md")).unwrap();
         assert!(memory.contains("remember that I prefer short replies"));
+    }
+
+    #[test]
+    fn slack_extracts_user_message_and_strips_mention() {
+        let envelope = serde_json::json!({
+            "type": "events_api",
+            "envelope_id": "env-1",
+            "payload": { "event": {
+                "type": "app_mention",
+                "channel": "C123",
+                "ts": "1700.1",
+                "text": "<@U0BOT> what is the roadmap?"
+            }}
+        });
+        let (channel, text, thread) = slack_extract_prompt(&envelope).unwrap();
+        assert_eq!(channel, "C123");
+        assert_eq!(text, "what is the roadmap?");
+        assert_eq!(thread.as_deref(), Some("1700.1"));
+    }
+
+    #[test]
+    fn slack_ignores_bot_and_non_message_events() {
+        let bot = serde_json::json!({
+            "type": "events_api",
+            "payload": { "event": { "type": "message", "channel": "C1", "text": "hi", "bot_id": "B1" }}
+        });
+        assert!(slack_extract_prompt(&bot).is_none());
+        let edit = serde_json::json!({
+            "type": "events_api",
+            "payload": { "event": { "type": "message", "channel": "C1", "text": "hi", "subtype": "message_changed" }}
+        });
+        assert!(slack_extract_prompt(&edit).is_none());
+        let reaction = serde_json::json!({
+            "type": "events_api",
+            "payload": { "event": { "type": "reaction_added" }}
+        });
+        assert!(slack_extract_prompt(&reaction).is_none());
+    }
+
+    #[test]
+    fn stable_chat_key_is_deterministic_and_positive() {
+        let a = stable_chat_key("C123");
+        assert_eq!(a, stable_chat_key("C123"));
+        assert!(a >= 0);
+        assert_ne!(a, stable_chat_key("C124"));
     }
 
     fn text_update(chat_id: i64, text: &str) -> TelegramUpdate {

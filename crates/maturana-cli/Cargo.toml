@@ -24,6 +24,8 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 ureq = { version = "2.10.1", features = ["json"] }
+# Slack Socket Mode is a client WebSocket (Telegram/AgentMail are HTTP-pollable).
+tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
 
 [features]
 default = []

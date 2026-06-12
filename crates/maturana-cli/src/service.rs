@@ -5,7 +5,6 @@
 //! (mention `loginctl enable-linger` for boot-time start); Windows registers
 //! Scheduled Tasks following the hostd pattern.
 
-use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 
 use anyhow::Context;

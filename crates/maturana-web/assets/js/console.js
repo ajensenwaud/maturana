@@ -111,10 +111,19 @@ export class Console {
     this.cancelButton.style.display = "none";
     this.cancelButton.addEventListener("click", () => this.cancel());
 
+    // Voice dictation: hold-to-record, transcribe via /api/voice/stt, insert.
+    this.micButton = document.createElement("button");
+    this.micButton.className = "primary";
+    this.micButton.textContent = "🎙 dictate";
+    this.micButton.title = "record, then transcribe into the editor (needs pipelock:openai/api-key)";
+    this.recording = false;
+    this.micButton.addEventListener("click", () => this.toggleDictation());
+
     toolbar.append(
       this.harnessSelect,
       this.modelInput,
       vimToggle,
+      this.micButton,
       this.sendButton,
       this.cancelButton,
     );
@@ -220,6 +229,46 @@ export class Console {
     if (this.activeTurnId) {
       this.socket.send({ type: "prompt_cancel", turn_id: this.activeTurnId });
     }
+  }
+
+  async toggleDictation() {
+    if (this.recording) {
+      this.recorder?.stop();
+      return;
+    }
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+      this.micButton.textContent = "🎙 (no mic)";
+      return;
+    }
+    const chunks = [];
+    this.recorder = new MediaRecorder(stream);
+    this.recorder.ondataavailable = (e) => chunks.push(e.data);
+    this.recorder.onstop = async () => {
+      stream.getTracks().forEach((t) => t.stop());
+      this.recording = false;
+      this.micButton.textContent = "🎙 …";
+      try {
+        const blob = new Blob(chunks, { type: "audio/webm" });
+        const res = await fetch("/api/voice/stt", {
+          method: "POST",
+          headers: { "x-maturana-web": "1", "x-maturana-filename": "dictation.webm" },
+          body: blob,
+        });
+        const payload = await res.json();
+        if (payload.ok && payload.data.text) {
+          const pos = this.editor.state.doc.length;
+          this.editor.dispatch({ changes: { from: pos, insert: payload.data.text } });
+        }
+      } finally {
+        this.micButton.textContent = "🎙 dictate";
+      }
+    };
+    this.recorder.start();
+    this.recording = true;
+    this.micButton.textContent = "⏺ stop";
   }
 
   setBusy(busy) {
