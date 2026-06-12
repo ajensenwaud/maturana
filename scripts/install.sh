@@ -10,6 +10,15 @@ set -euo pipefail
 REPO_URL="${MATURANA_REPO_URL:-https://github.com/ajensenwaud/maturana.git}"
 DEST="${MATURANA_DIR:-$HOME/maturana}"
 
+# --firecracker also provisions the Linux microVM agent-host substrate
+# (firecracker binary, KVM, libguestfs/qemu, NAT) via install-firecracker-host.sh.
+WITH_FIRECRACKER=0
+for arg in "$@"; do
+  case "$arg" in
+    --firecracker) WITH_FIRECRACKER=1 ;;
+  esac
+done
+
 say() { printf '\033[36m[maturana]\033[0m %s\n' "$*"; }
 
 # 1. Base dependencies.
@@ -59,13 +68,23 @@ case ":$PATH:" in
   *) say "add ~/.local/bin to PATH" ;;
 esac
 
-# 5. Initialize + register services (Rust owns the logic).
+# 5. Optional: provision the Linux Firecracker agent-host substrate.
+if [ "$WITH_FIRECRACKER" = "1" ]; then
+  if [ "$(uname -s)" = "Linux" ]; then
+    say "provisioning Firecracker agent host"
+    bash "$DEST/scripts/install-firecracker-host.sh"
+  else
+    say "--firecracker ignored: not a Linux host"
+  fi
+fi
+
+# 6. Initialize + register services (Rust owns the logic).
 cd "$DEST"
 "$DEST/target/release/maturana" pipelock init >/dev/null 2>&1 || true
 say "registering services (maturana up + maturana web)"
 "$DEST/target/release/maturana" service install up web
 
-# 6. Orientation: both control surfaces are equals.
+# 7. Orientation: both control surfaces are equals.
 say "install complete"
 echo
 echo "  Two ways to drive Maturana (pick either, or both):"
@@ -76,5 +95,9 @@ echo "       token: $DEST/.maturana/web/token"
 echo
 if ! command -v codex >/dev/null 2>&1; then
   echo "  note: codex CLI not found - install with: npm install -g @openai/codex"
+fi
+if [ "$WITH_FIRECRACKER" = "1" ]; then
+  echo "    3. Launch isolated agents:   maturana repair firecracker-harnesses"
+  echo "       (stage creds under .maturana/host-auth/<harness>/ first)"
 fi
 echo "  boot-time start: loginctl enable-linger \$USER"
