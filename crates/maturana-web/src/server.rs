@@ -37,6 +37,7 @@ pub async fn serve(home_root: PathBuf, bind: &str) -> anyhow::Result<()> {
 
     tokio::spawn(dashboard_poller(state.clone()));
     tokio::spawn(web_outbound_poller(state.clone()));
+    tokio::spawn(egress_poller(state.clone()));
 
     let app = Router::new()
         .route("/", get(assets::index))
@@ -124,6 +125,87 @@ async fn web_outbound_poller(state: AppState) {
             }
         }
     }
+}
+
+/// Tail the pipelock proxy audit JSONL files and stream new lines to
+/// subscribers on the Egress topic. Tracks a byte offset per file so each line
+/// is emitted once; a shrunk file (rotation/truncation) resets its offset.
+async fn egress_poller(state: AppState) {
+    use std::collections::HashMap;
+    let mut offsets: HashMap<PathBuf, u64> = HashMap::new();
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if state.dash_tx.receiver_count() == 0 {
+            continue;
+        }
+        let audit_dir = state.home_root.join("audit");
+        let known = offsets.clone();
+        let (events, new_offsets) =
+            tokio::task::spawn_blocking(move || read_new_egress(&audit_dir, known))
+                .await
+                .unwrap_or_default();
+        offsets = new_offsets;
+        for event in events {
+            let _ = state.dash_tx.send(Broadcast::Dash(Topic::Egress, event));
+        }
+    }
+}
+
+/// Read newly-appended audit lines across all `*-pipelock-proxy.jsonl` files,
+/// returning the parsed JSON objects (with the agent id derived from the file
+/// name) and the updated offset map.
+fn read_new_egress(
+    audit_dir: &std::path::Path,
+    mut offsets: std::collections::HashMap<PathBuf, u64>,
+) -> (Vec<serde_json::Value>, std::collections::HashMap<PathBuf, u64>) {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut events = Vec::new();
+    let Ok(entries) = std::fs::read_dir(audit_dir) else {
+        return (events, offsets);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with("pipelock-proxy.jsonl") {
+            continue;
+        }
+        let agent = name
+            .strip_suffix("-pipelock-proxy.jsonl")
+            .filter(|a| *a != "pipelock")
+            .map(str::to_string);
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        // First sight: start at the current end so the feed shows only egress
+        // that happens while the cockpit is open (avoids replaying history and
+        // mid-line parsing). A shrunk file (rotation) resets to its start.
+        let start = match offsets.get(&path).copied() {
+            Some(prev) if prev <= len => prev,
+            Some(_) => 0,
+            None => len,
+        };
+        if file.seek(SeekFrom::Start(start)).is_err() {
+            continue;
+        }
+        let mut buf = String::new();
+        if file.read_to_string(&mut buf).is_err() {
+            continue;
+        }
+        offsets.insert(path.clone(), start + buf.len() as u64);
+        for line in buf.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) {
+                if let (Some(obj), Some(agent)) = (value.as_object_mut(), agent.as_ref()) {
+                    obj.insert("agent_id".into(), serde_json::json!(agent));
+                }
+                events.push(value);
+            }
+        }
+    }
+    (events, offsets)
 }
 
 fn collect_web_outbound(

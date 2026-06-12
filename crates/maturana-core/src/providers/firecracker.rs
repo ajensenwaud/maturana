@@ -1070,6 +1070,8 @@ mod tests {
                 purpose: "test".to_string(),
             },
             knowledge_graph: Default::default(),
+            mcp_servers: Default::default(),
+            capabilities: Default::default(),
             runtime: Runtime {
                 harness: HarnessRuntime::Codex,
             },

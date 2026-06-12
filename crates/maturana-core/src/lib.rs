@@ -1,7 +1,9 @@
 pub mod animation;
 pub mod audit;
+pub mod claude_refresh;
 pub mod improvement;
 pub mod materialize;
+pub mod mcp;
 pub mod orchestrator;
 pub mod pipelock;
 pub mod pipelock_proxy;

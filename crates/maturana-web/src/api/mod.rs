@@ -4,6 +4,7 @@
 //! operator.
 
 pub mod agents;
+pub mod egress;
 pub mod graph;
 pub mod pipelock;
 pub mod runtime;
@@ -11,6 +12,7 @@ pub mod search;
 pub mod sessions;
 pub mod skills;
 pub mod tools;
+pub mod voice;
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
@@ -28,6 +30,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/agents/:id/spec/validate", post(agents::spec_validate))
         .route("/api/agents/:id/apply", post(agents::apply))
         .route("/api/agents/:id/egress", get(agents::egress_get).put(agents::egress_put))
+        .route("/api/egress/approve", post(egress::approve))
         .route("/api/runtime/plan", get(runtime::plan))
         .route("/api/runtime/up", get(runtime::up_state))
         .route("/api/doctor", get(runtime::doctor))
@@ -39,6 +42,8 @@ pub fn router() -> Router<AppState> {
         .route("/api/pipelock/secrets", get(pipelock::list).post(pipelock::set))
         .route("/api/pipelock/secrets/:name", axum::routing::delete(pipelock::delete))
         .route("/api/search", post(search::search))
+        .route("/api/voice/tts", post(voice::tts))
+        .route("/api/voice/stt", post(voice::stt))
         .route("/api/tools", get(tools::list))
         .route("/api/skills", get(skills::list))
         .route("/api/skills/:name", get(skills::detail))
