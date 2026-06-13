@@ -71,7 +71,10 @@ pub fn known_service(name: &str) -> anyhow::Result<HostService> {
         // Opt-in (not in the default install vec): relaunches the Firecracker
         // microVMs at boot. --skip-services because the systemd `maturana-up`
         // unit owns sessiond/graph; --skip-assets to reuse the baked rootfs
-        // (no libguestfs rebuild). The TAP is recreated regardless (it's
+        // (no libguestfs rebuild); --skip-worker-refresh because the guest's
+        // baked, enabled maturana-agent.service self-recovers the worker, so
+        // there's no need to SSH in and reinstall it (which would also block
+        // boot on a slow guest). The TAP is recreated regardless (it's
         // ephemeral), and the un-baked guard makes this a clean no-op on hosts
         // with no images yet.
         "fleet" => Ok(HostService {
@@ -81,6 +84,7 @@ pub fn known_service(name: &str) -> anyhow::Result<HostService> {
                 "firecracker-harnesses".to_string(),
                 "--skip-services".to_string(),
                 "--skip-assets".to_string(),
+                "--skip-worker-refresh".to_string(),
             ],
             description: "Maturana Firecracker fleet (relaunch microVMs at boot)",
         }),
@@ -442,7 +446,8 @@ mod tests {
                 "repair",
                 "firecracker-harnesses",
                 "--skip-services",
-                "--skip-assets"
+                "--skip-assets",
+                "--skip-worker-refresh"
             ]
         );
     }
@@ -462,7 +467,7 @@ mod tests {
         assert!(unit.contains("WorkingDirectory=/home/aj/maturana"));
         assert!(unit.contains(
             "ExecStart=/usr/local/bin/maturana --home /home/aj/maturana/.maturana \
-             repair firecracker-harnesses --skip-services --skip-assets"
+             repair firecracker-harnesses --skip-services --skip-assets --skip-worker-refresh"
         ));
         assert!(!unit.contains("Restart="));
         assert!(unit.contains("WantedBy=default.target"));

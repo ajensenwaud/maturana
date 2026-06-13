@@ -2590,6 +2590,10 @@ fn repair_firecracker_harnesses(
         }
     }
 
+    // One agent's failure must not block the rest — this is the boot-recovery
+    // path, so a single slow/dead guest can't be allowed to strand the others.
+    // Collect per-agent errors and surface them all at the end.
+    let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
     for profile in selected {
         println!("=== {} ===", profile.agent_id);
 
@@ -2612,64 +2616,79 @@ fn repair_firecracker_harnesses(
             }
         }
 
-        if !repair.skip_launch {
-            let _ = stop_agent(home, profile.agent_id);
-        }
-        // The TAP device + NAT rule are ephemeral (gone after a host reboot) and
-        // cheap to recreate, so they're decoupled from the slow libguestfs asset
-        // build: recreated unless --skip-net, even with --skip-assets. The setup
-        // script is idempotent (guards on `ip link show`).
-        if !repair.skip_net {
-            setup_firecracker_tap(profile)?;
-        }
-        if !repair.skip_assets {
-            prepare_firecracker_assets(
-                home,
-                profile,
-                &ssh_key,
-                &sessiond_token,
-                bind_port(&repair.sessiond_bind)?,
-            )?;
-        }
+        let result = (|| -> anyhow::Result<()> {
+            if !repair.skip_launch {
+                let _ = stop_agent(home, profile.agent_id);
+            }
+            // The TAP device + NAT rule are ephemeral (gone after a host reboot)
+            // and cheap to recreate, so they're decoupled from the slow
+            // libguestfs asset build: recreated unless --skip-net, even with
+            // --skip-assets. The setup script is idempotent (`ip link show`).
+            if !repair.skip_net {
+                setup_firecracker_tap(profile)?;
+            }
+            if !repair.skip_assets {
+                prepare_firecracker_assets(
+                    home,
+                    profile,
+                    &ssh_key,
+                    &sessiond_token,
+                    bind_port(&repair.sessiond_bind)?,
+                )?;
+            }
 
-        let spec_path = PathBuf::from(profile.spec_path);
-        validate_and_materialize_firecracker_spec(home, &spec_path, !repair.skip_launch)?;
+            let spec_path = PathBuf::from(profile.spec_path);
+            validate_and_materialize_firecracker_spec(home, &spec_path, !repair.skip_launch)?;
 
-        if !repair.skip_worker_refresh {
-            // Record the rootfs's baked host public key so SSH verifies the guest
-            // (falls back to accept-new if the image predates host-key pinning).
-            pin_firecracker_host_key(home, profile)?;
-            let host_key = GuestHostKey::resolve(home, profile.agent_id, profile.guest_ip)?;
-            wait_for_guest_ssh(
-                profile.guest_ip,
-                "ubuntu",
-                &ssh_key,
-                &host_key,
-                Duration::from_secs(repair.ssh_wait_seconds),
-            )?;
-            install_guest_worker(
-                home,
-                GuestWorkerInstall {
-                    agent_id: profile.agent_id.to_string(),
-                    session_id: profile.session_id.to_string(),
-                    harness: parse_harness_runtime(profile.harness_arg)?,
-                    guest_ip: profile.guest_ip.to_string(),
-                    ssh_user: "ubuntu".to_string(),
-                    ssh_key: ssh_key.clone(),
-                    harness_auth_guest_path: profile.auth_guest_path.to_string(),
-                    sessiond_url: format!(
-                        "http://{}:{}",
-                        profile.host_ip,
-                        bind_port(&repair.sessiond_bind)?
-                    ),
-                    sessiond_token_path: sessiond_token_path.clone(),
-                    auth_source: Some(PathBuf::from(profile.auth_source)),
-                    install_harness: repair.install_harness,
-                },
-            )?;
+            if !repair.skip_worker_refresh {
+                // Record the rootfs's baked host public key so SSH verifies the
+                // guest (falls back to accept-new if the image predates pinning).
+                pin_firecracker_host_key(home, profile)?;
+                let host_key = GuestHostKey::resolve(home, profile.agent_id, profile.guest_ip)?;
+                wait_for_guest_ssh(
+                    profile.guest_ip,
+                    "ubuntu",
+                    &ssh_key,
+                    &host_key,
+                    Duration::from_secs(repair.ssh_wait_seconds),
+                )?;
+                install_guest_worker(
+                    home,
+                    GuestWorkerInstall {
+                        agent_id: profile.agent_id.to_string(),
+                        session_id: profile.session_id.to_string(),
+                        harness: parse_harness_runtime(profile.harness_arg)?,
+                        guest_ip: profile.guest_ip.to_string(),
+                        ssh_user: "ubuntu".to_string(),
+                        ssh_key: ssh_key.clone(),
+                        harness_auth_guest_path: profile.auth_guest_path.to_string(),
+                        sessiond_url: format!(
+                            "http://{}:{}",
+                            profile.host_ip,
+                            bind_port(&repair.sessiond_bind)?
+                        ),
+                        sessiond_token_path: sessiond_token_path.clone(),
+                        auth_source: Some(PathBuf::from(profile.auth_source)),
+                        install_harness: repair.install_harness,
+                    },
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            eprintln!("  {} failed: {err:#}", profile.agent_id);
+            failures.push((profile.agent_id.to_string(), err));
         }
     }
 
+    if !failures.is_empty() {
+        let names = failures
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!("Firecracker harness repair failed for: {names}");
+    }
     println!("Firecracker harness repair complete.");
     Ok(())
 }
@@ -2810,8 +2829,13 @@ fn start_linux_graph(home: &MaturanaHome, bind: &str, token: &str) -> anyhow::Re
 }
 
 fn setup_firecracker_tap(profile: &FirecrackerHarnessProfile) -> anyhow::Result<()> {
+    // Invoke through `bash` rather than executing the script directly: the repo
+    // is often checked out from Windows (no +x bit tracked), so a direct
+    // `sudo ./script.sh` fails with EACCES — and this is exactly the boot-
+    // recovery path that must work unattended.
     run_checked_process(
         ProcessCommand::new("sudo")
+            .arg("bash")
             .arg("./scripts/firecracker-setup-tap.sh")
             .arg(profile.tap_name)
             .arg(format!("{}/30", profile.host_ip))
@@ -2900,6 +2924,8 @@ fn prepare_firecracker_assets(
         command.arg(format!("MATURANA_PROXY_CA_CERT_PATH={}", ca_cert.display()));
     }
     command
+        // `bash <script>` so a Windows-checked-out repo (no +x bit) still runs.
+        .arg("bash")
         .arg("./scripts/firecracker-prepare-assets.sh")
         .arg(&image_dir)
         .arg(ssh_key)
