@@ -1,0 +1,4 @@
+# Shell scripts run on Linux (including fetched via `curl | bash`); CRLF would
+# break the shebang (`bad interpreter: bash\r`). Pin them to LF regardless of the
+# committer's platform / core.autocrlf.
+*.sh text eol=lf
