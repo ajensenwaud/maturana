@@ -64,11 +64,36 @@ sha256sum -c --ignore-missing SHA256SUMS         # Linux
 > The public site will live at **www.maturana.sh**; the install URLs will move
 > there once it's up. For now they point at GitHub.
 
-Afterwards there are two equal control surfaces: run `codex` in the repo
-(AGENTS.md + skills/ orient it) or open the web cockpit at
+Maturana is **Codex-native** — everything flows from Codex. After installing,
+start building agents from Codex (it's oriented by the repo's `AGENTS.md` +
+`skills/`):
+
+```sh
+cd <install-dir> && codex      # then ask it to create + launch your first agent
+```
+
+`codex login` authenticates your subscription on first run. The web cockpit at
 `http://<host>:47836` (token via `maturana web token`; see
-[docs/web-cockpit.md](docs/web-cockpit.md)). Manage services with
-`maturana service install|uninstall|status|restart [up|web]`.
+[docs/web-cockpit.md](docs/web-cockpit.md)) is an optional, complementary
+surface. Manage services with `maturana service install|uninstall|status|restart
+[up|web|fleet]`.
+
+### Uninstall
+
+Removes the services, running processes, and agent VMs. By default it **keeps
+your data** (the repo + `.maturana`, which holds credentials/agents); add
+`--purge` / `-Purge` to remove everything:
+
+```sh
+# Linux
+curl -fsSL https://raw.githubusercontent.com/ajensenwaud/maturana/main/scripts/uninstall.sh | bash
+curl -fsSL .../scripts/uninstall.sh | bash -s -- --purge
+```
+```powershell
+# Windows (self-elevates)
+irm https://raw.githubusercontent.com/ajensenwaud/maturana/main/scripts/uninstall-windows.ps1 | iex
+# from a clone, to also delete data:  .\scripts\uninstall-windows.ps1 -Purge
+```
 
 This repository is at MVP stage, but the product path is Rust-owned and
 provider-aware. The current implementation provides:
