@@ -138,21 +138,28 @@ if [ "$WITH_FIRECRACKER" = "1" ] && [ "$(uname -s)" = "Linux" ]; then
   "$BIN" service install fleet
 fi
 
-# 7. Orientation: both control surfaces are equals.
+# 7. Orientation: Codex-native. Everything flows from Codex; the cockpit is secondary.
 say "install complete"
 echo
-echo "  Two ways to drive Maturana (pick either, or both):"
-echo "    1. Codex CLI control plane:  cd $DEST && codex"
-echo "       (AGENTS.md + skills/ are the contract that orients it)"
-echo "    2. Web cockpit:              http://$(hostname):47836"
-echo "       token: $DEST/.maturana/web/token"
+echo "  Maturana is Codex-native - you build and run agents from Codex, which is"
+echo "  oriented by this repo's AGENTS.md + skills/."
 echo
+echo "  NEXT STEP - start building agents:"
+echo "      cd $DEST"
+echo "      codex"
+echo "    then ask Codex to create and launch your first agent."
 if ! command -v codex >/dev/null 2>&1; then
-  echo "  note: codex CLI not found - install with: npm install -g @openai/codex"
+  echo
+  echo "    ! codex CLI not found - install it first: npm install -g @openai/codex"
 fi
+echo
+echo "    first run? authenticate your subscription once:  codex login"
+echo
+echo "  Optional web cockpit (nice-to-have):  http://$(hostname):47836"
+echo "      token: $DEST/.maturana/web/token"
 if [ "$WITH_FIRECRACKER" = "1" ]; then
-  echo "    3. Launch isolated agents:   maturana repair firecracker-harnesses"
-  echo "       (stage creds under .maturana/host-auth/<harness>/ first)"
-  echo "       microVMs relaunch automatically after a reboot (fleet service)"
+  echo
+  echo "  Firecracker microVM host ready; isolated agents relaunch after reboot"
+  echo "  (fleet service). Ask Codex to launch one, or: maturana repair firecracker-harnesses"
 fi
 echo "  boot-time start: linger enabled automatically (zero-touch reboot recovery)"

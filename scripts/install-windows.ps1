@@ -120,8 +120,28 @@ try {
         & .\scripts\set-vm-autostart.ps1
     }
 
-    Write-Host "Windows install complete."
-    Write-Host "Check hostd with: .\scripts\maturana.ps1 hostd status"
+    # Codex-native: everything flows from Codex. Point the user straight in.
+    Write-Host ""
+    Write-Host "============================================================"
+    Write-Host " Maturana is installed. It is Codex-native - you build and"
+    Write-Host " run agents from Codex, which is oriented by this repo's"
+    Write-Host " AGENTS.md + skills/."
+    Write-Host ""
+    Write-Host " NEXT STEP - start building agents:"
+    Write-Host "     cd `"$repoRoot`""
+    Write-Host "     codex"
+    Write-Host "   then ask Codex to create and launch your first agent."
+    if (-not (Get-Command codex -ErrorAction SilentlyContinue)) {
+        Write-Host ""
+        Write-Host "   ! codex CLI not found. Install it first:"
+        Write-Host "       npm install -g @openai/codex"
+    }
+    Write-Host ""
+    Write-Host "   First run? authenticate your subscription once:  codex login"
+    Write-Host ""
+    Write-Host " Optional web cockpit (nice-to-have):  http://localhost:47836"
+    Write-Host "     token:  .\scripts\maturana.ps1 web token"
+    Write-Host "============================================================"
 }
 finally {
     Pop-Location
