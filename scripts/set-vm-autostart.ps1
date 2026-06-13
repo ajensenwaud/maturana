@@ -12,7 +12,7 @@ $ErrorActionPreference = "Stop"
 
 $vms = @(Get-VM -Name $NamePattern -ErrorAction SilentlyContinue)
 if ($vms.Count -eq 0) {
-    Write-Host "No VMs matched '$NamePattern' — nothing to do."
+    Write-Host "No VMs matched '$NamePattern' - nothing to do."
     return
 }
 
