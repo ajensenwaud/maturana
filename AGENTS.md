@@ -80,6 +80,11 @@ action; prefer them over improvising. When unsure where to start, read
 `skills/maturana-cli-actions/SKILL.md` (general host operations) and
 `skills/maturana-agent-create/SKILL.md` (the usual first task).
 
+The installer also registers each skill as a Codex **slash command**
+(`/maturana-<name>`, written to `~/.codex/prompts/`); invoking one tells Codex to
+load and follow that skill. Regenerate them after adding/editing skills with
+`maturana skill codex-prompts`.
+
 **Available skills** (read `skills/<name>/SKILL.md` to load the procedure):
 
 Agent lifecycle
