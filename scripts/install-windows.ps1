@@ -12,6 +12,36 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Registering the up/web boot tasks (logon type Password, -AtStartup, -RunLevel
+# Highest) writes a credential into the LSA vault and therefore REQUIRES an
+# elevated session - as does the Hyper-V VM autostart step (Get-VM/Set-VM). Rather
+# than make the user open an admin shell, self-elevate once via UAC up front. This
+# also covers hostd (its installer's own elevation becomes a no-op), so the whole
+# install needs a single UAC prompt. (On Win11 you could equivalently run
+# `sudo .\scripts\install-windows.ps1`; self-elevation makes that optional.)
+if (-not $SkipServices) {
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdmin) {
+        Write-Host "This installer needs admin to register the boot tasks + Hyper-V VM autostart."
+        Write-Host "Requesting elevation (UAC). The password prompt will be in the new window..."
+        # Re-launch elevated. The password is prompted inside the elevated window
+        # (a SecureString can't safely cross the UAC process boundary), so we
+        # forward only the switches. -NoExit keeps the window open to read output.
+        $fwd = @()
+        if ($SkipImage)  { $fwd += '-SkipImage' }
+        if ($ForceImage) { $fwd += '-ForceImage' }
+        if ($SkipHostd)  { $fwd += '-SkipHostd' }
+        $launchArgs = @('-NoExit','-NoProfile','-ExecutionPolicy','Bypass','-File', $PSCommandPath) + $fwd
+        try {
+            Start-Process powershell.exe -Verb RunAs -ArgumentList $launchArgs | Out-Null
+        } catch {
+            throw "Elevation was declined. Re-run from an elevated PowerShell, run 'sudo .\scripts\install-windows.ps1', or pass -SkipServices."
+        }
+        Write-Host "Elevated installer launched in a new window - finish the password prompt there. You can close this window."
+        return
+    }
+}
+
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $imagePath = Join-Path $repoRoot ".maturana\images\ubuntu-noble\noble-server-cloudimg-amd64.vhdx"
 
