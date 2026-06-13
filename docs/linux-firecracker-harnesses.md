@@ -30,6 +30,56 @@ Agents:
 - `opencode-firecracker`: `172.30.10.6`, TAP `tap-mat-open`, session `opencode-main`
 - `claude-firecracker`: `172.30.10.10`, TAP `tap-mat-claude`, session `claude-main`
 
+## Systemd-managed plane
+
+For a fleet that survives reboots, let the `maturana up` systemd service own the
+runtime plane (sessiond, the MaturanaGraph service, and the per-agent channel +
+schedule runners) and let `repair` only build assets, launch VMs, and install
+guest workers:
+
+```bash
+target/debug/maturana service install up web
+target/debug/maturana repair firecracker-harnesses --skip-services
+```
+
+`--skip-services` keeps `repair` from starting its own sessiond/graph (which
+would collide on ports `47834`/`47835` with the `maturana up` service). It still
+ensures the sessiond and graph tokens exist, so guest artifacts embed them and
+`maturana up` knows to supervise the graph service.
+
+`maturana up` derives each agent's `--session-id` from that agent's materialized
+spec / Firecracker profile (so the supervised channel writes to the same queue
+the guest worker claims from): `codex-firecracker` → `codex-main`,
+`claude-firecracker` → `claude-main`, etc. Pass `maturana up --session-id <id>`
+only when you want to force every agent onto one shared queue.
+
+### Zero-touch reboot recovery
+
+The `up`/`web` units only bring back the host plane and cockpit — not the
+microVMs, whose TAP devices are wiped on reboot. Register the boot-time fleet
+relauncher so the VMs come back too, with no interactive login:
+
+```bash
+target/debug/maturana service install fleet
+```
+
+This installs a systemd **oneshot** (`maturana-fleet.service`) ordered
+`After=maturana-up.service` that runs `repair firecracker-harnesses
+--skip-services --skip-assets --skip-worker-refresh`: it recreates each agent's
+TAP + NAT rule and relaunches the VM from the baked rootfs (no libguestfs
+rebuild, no sessiond, no SSH-in). The enabled in-guest `maturana-agent.service`
++ stable sessiond token let the worker self-recover, so there's no need to SSH
+in and reinstall it — which also means one slow guest can't block the others
+(the relaunch loop is per-agent resilient and reports any failures at the end).
+`service install` also runs `loginctl enable-linger` so the user manager (and
+its units) start at boot without a login. `install.sh --firecracker` registers
+`fleet` automatically.
+
+Two flags make this idempotent: `--skip-net` (leave it OFF for boot — the TAP is
+ephemeral and must be recreated) and the un-baked guard (a profile with no
+`.maturana/images/firecracker/<image>/ubuntu-rootfs.ext4` is skipped, so the
+boot unit no-ops cleanly on a host that hasn't built images yet).
+
 ## Lifecycle
 
 Firecracker lifecycle is Rust-owned. Use the CLI for launch and stop:

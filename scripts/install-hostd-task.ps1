@@ -97,11 +97,6 @@ if (-not (Test-Elevated)) {
     return
 }
 
-$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$userId = $identity.Name
-if ($userId -notmatch '\\' -and ![string]::IsNullOrWhiteSpace($env:USERDOMAIN)) {
-    $userId = "$env:USERDOMAIN\$env:USERNAME"
-}
 $argument = @(
     "hostd",
     "serve",
@@ -111,12 +106,32 @@ $argument = @(
 ) -join " "
 
 $action = New-ScheduledTaskAction -Execute $exePath -Argument $argument -WorkingDirectory $repoRoot
-$trigger = New-ScheduledTaskTrigger -AtLogOn
-$principal = New-ScheduledTaskPrincipal -UserId $userId -RunLevel Highest -LogonType Interactive
+# Zero-touch reboot recovery: hostd starts at boot as SYSTEM (no stored password
+# needed - it binds 127.0.0.1 and reads its own token), so it's up before any
+# interactive login.
+$trigger = New-ScheduledTaskTrigger -AtStartup
+$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest -LogonType ServiceAccount
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
 
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+
+# hostd now runs as SYSTEM, but the hostd token is a shared secret: the
+# user-context cockpit (maturana up/web, running as the installing user) also
+# reads it to authenticate to hostd. The token may have been created with an
+# ACL restricted to a single identity (older builds did `icacls /inheritance:r`
+# granting only the user) - which would deny SYSTEM and make hostd exit before
+# it can even log. Grant read to BOTH SYSTEM (*S-1-5-18, locale-independent)
+# and the installing user so either side can read it. New ACEs are added, not
+# replaced, so this is safe and idempotent.
+$tokenDir = Split-Path -Parent $TokenPath
+if (Test-Path -LiteralPath $tokenDir) {
+    & icacls $tokenDir /grant "*S-1-5-18:(OI)(CI)R" "${env:USERNAME}:(OI)(CI)R" 2>&1 | Out-Null
+}
+if (Test-Path -LiteralPath $TokenPath) {
+    & icacls $TokenPath /grant "*S-1-5-18:R" "${env:USERNAME}:R" 2>&1 | Out-Null
+}
+
 Start-ScheduledTask -TaskName $TaskName
 
 if (!(Wait-HostdHealth -Url $BindPrefix -TimeoutSeconds 30)) {
