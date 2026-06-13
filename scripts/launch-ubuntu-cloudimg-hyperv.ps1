@@ -12,6 +12,7 @@ param(
     [int]$DiskSizeGB = 24,
     [int]$Vcpu = 2,
     [int]$MemoryMiB = 2048,
+    [int]$AutomaticStartDelaySeconds = 30,
     [switch]$ProvisionExisting,
     [switch]$Force
 )
@@ -243,7 +244,10 @@ if (!$usingExistingVm) {
     Set-VMFirmware -VMName $VmName -EnableSecureBoot Off
     Set-VMProcessor -VMName $VmName -Count $Vcpu
     Set-VMMemory -VMName $VmName -DynamicMemoryEnabled $false -StartupBytes $memoryBytes
-    Set-VM -Name $VmName -AutomaticCheckpointsEnabled $false
+    # Zero-touch reboot recovery: the VM auto-boots with the host (staggered
+    # delay to avoid a thundering herd of microVMs starting at once).
+    Set-VM -Name $VmName -AutomaticCheckpointsEnabled $false `
+        -AutomaticStartAction Start -AutomaticStartDelay $AutomaticStartDelaySeconds
     Add-VMHardDiskDrive -VMName $VmName -ControllerType SCSI -Path $seedDisk
 }
 

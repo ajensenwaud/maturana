@@ -97,11 +97,6 @@ if (-not (Test-Elevated)) {
     return
 }
 
-$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$userId = $identity.Name
-if ($userId -notmatch '\\' -and ![string]::IsNullOrWhiteSpace($env:USERDOMAIN)) {
-    $userId = "$env:USERDOMAIN\$env:USERNAME"
-}
 $argument = @(
     "hostd",
     "serve",
@@ -111,8 +106,11 @@ $argument = @(
 ) -join " "
 
 $action = New-ScheduledTaskAction -Execute $exePath -Argument $argument -WorkingDirectory $repoRoot
-$trigger = New-ScheduledTaskTrigger -AtLogOn
-$principal = New-ScheduledTaskPrincipal -UserId $userId -RunLevel Highest -LogonType Interactive
+# Zero-touch reboot recovery: hostd starts at boot as SYSTEM (no stored password
+# needed — it binds 127.0.0.1 and reads its own token), so it's up before any
+# interactive login.
+$trigger = New-ScheduledTaskTrigger -AtStartup
+$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest -LogonType ServiceAccount
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
 
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue

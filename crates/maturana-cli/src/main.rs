@@ -664,6 +664,12 @@ enum RepairSubcommand {
         sessiond_token_path: PathBuf,
         #[arg(long)]
         skip_assets: bool,
+        /// Skip recreating the per-agent TAP device + NAT rule. The TAP is
+        /// ephemeral (gone after a host reboot) and cheap to recreate, so boot
+        /// recovery wants it ON even with --skip-assets. Only set this when the
+        /// networking is known-good and you want a pure no-op relaunch.
+        #[arg(long)]
+        skip_net: bool,
         #[arg(long)]
         skip_launch: bool,
         #[arg(long)]
@@ -2149,6 +2155,7 @@ fn run_repair(home: &MaturanaHome, command: RepairCommand) -> anyhow::Result<()>
             sessiond_bind,
             sessiond_token_path,
             skip_assets,
+            skip_net,
             skip_launch,
             skip_worker_refresh,
             skip_services,
@@ -2162,6 +2169,7 @@ fn run_repair(home: &MaturanaHome, command: RepairCommand) -> anyhow::Result<()>
                 sessiond_bind,
                 sessiond_token_path,
                 skip_assets,
+                skip_net,
                 skip_launch,
                 skip_worker_refresh,
                 skip_services,
@@ -2457,6 +2465,7 @@ struct FirecrackerHarnessRepair {
     sessiond_bind: String,
     sessiond_token_path: PathBuf,
     skip_assets: bool,
+    skip_net: bool,
     skip_launch: bool,
     skip_worker_refresh: bool,
     skip_services: bool,
@@ -2583,11 +2592,37 @@ fn repair_firecracker_harnesses(
 
     for profile in selected {
         println!("=== {} ===", profile.agent_id);
+
+        // Un-baked guard: boot recovery (`service install fleet` →
+        // `--skip-assets`) must no-op cleanly on a host that has never built
+        // this agent's rootfs, instead of failing the launch on a missing
+        // image. With --skip-assets we reuse the baked rootfs, so if it's not
+        // there yet, skip the whole agent.
+        if repair.skip_assets {
+            let expected_rootfs = PathBuf::from(format!(
+                ".maturana/images/firecracker/{}/ubuntu-rootfs.ext4",
+                profile.image_name
+            ));
+            if !expected_rootfs.exists() {
+                println!(
+                    "  no baked rootfs at {} — skipping (run without --skip-assets to build it)",
+                    expected_rootfs.display()
+                );
+                continue;
+            }
+        }
+
         if !repair.skip_launch {
             let _ = stop_agent(home, profile.agent_id);
         }
-        if !repair.skip_assets {
+        // The TAP device + NAT rule are ephemeral (gone after a host reboot) and
+        // cheap to recreate, so they're decoupled from the slow libguestfs asset
+        // build: recreated unless --skip-net, even with --skip-assets. The setup
+        // script is idempotent (guards on `ip link show`).
+        if !repair.skip_net {
             setup_firecracker_tap(profile)?;
+        }
+        if !repair.skip_assets {
             prepare_firecracker_assets(
                 home,
                 profile,
@@ -5827,6 +5862,7 @@ mod tests {
                         sessiond_bind,
                         sessiond_token_path,
                         skip_assets,
+                        skip_net,
                         skip_launch,
                         skip_worker_refresh,
                         skip_services,
@@ -5839,6 +5875,7 @@ mod tests {
                 sessiond_bind,
                 sessiond_token_path,
                 skip_assets,
+                skip_net,
                 skip_launch,
                 skip_worker_refresh,
                 skip_services,
@@ -5864,6 +5901,23 @@ mod tests {
             "--skip-services",
         ]);
         assert!(with.skip_services);
+    }
+
+    #[test]
+    fn skip_net_flag_defaults_false_and_parses() {
+        let without = parse_firecracker_repair(&["maturana", "repair", "firecracker-harnesses"]);
+        assert!(
+            !without.skip_net,
+            "--skip-net must default to false so boot recovery recreates the ephemeral TAP"
+        );
+
+        let with = parse_firecracker_repair(&[
+            "maturana",
+            "repair",
+            "firecracker-harnesses",
+            "--skip-net",
+        ]);
+        assert!(with.skip_net);
     }
 
     #[test]
