@@ -273,6 +273,43 @@ mod tests {
     }
 
     #[test]
+    fn each_agent_keeps_its_own_session_id() {
+        // The Firecracker fleet runs several agents at once, each with a
+        // distinct profile session id. plan_processes must pin every agent's
+        // channel + schedule to *that agent's* session id — never collapse them
+        // onto a single shared queue, which would route messages to the wrong
+        // guest worker.
+        let mut config = OrchestratorConfig::default();
+        for (agent_id, session_id) in [
+            ("codex-firecracker", "codex-main"),
+            ("claude-firecracker", "claude-main"),
+            ("opencode-firecracker", "opencode-main"),
+        ] {
+            let mut agent = AgentRuntime::new(agent_id);
+            agent.session_id = session_id.to_string();
+            config.agents.push(agent);
+        }
+
+        let processes = plan_processes(&config);
+        for (agent_id, expected) in [
+            ("codex-firecracker", "codex-main"),
+            ("claude-firecracker", "claude-main"),
+            ("opencode-firecracker", "opencode-main"),
+        ] {
+            let channel = processes
+                .iter()
+                .find(|p| p.name == format!("channel:telegram:{agent_id}"))
+                .expect("telegram channel");
+            let schedule = processes
+                .iter()
+                .find(|p| p.name == format!("schedule:{agent_id}"))
+                .expect("schedule runner");
+            assert_eq!(session_id_arg(&channel.args).as_deref(), Some(expected));
+            assert_eq!(session_id_arg(&schedule.args).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
     fn slack_and_agentmail_channels_emitted() {
         let mut config = OrchestratorConfig::default();
         let mut agent = AgentRuntime::new("personal");
