@@ -6,11 +6,23 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+
+# Prebuilt-binary fast path: when MATURANA_BIN points at a maturana.exe (the
+# signed release the installers download), run it directly and skip the local
+# build entirely - no Rust/MSYS2 toolchain required.
+if ($env:MATURANA_BIN -and (Test-Path -LiteralPath $env:MATURANA_BIN)) {
+    & $env:MATURANA_BIN @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "maturana exited with code $LASTEXITCODE"
+    }
+    return
+}
+
 $cargo = Join-Path $env:USERPROFILE ".cargo\bin\cargo.exe"
 $exe = Join-Path $repoRoot "target\x86_64-pc-windows-gnu\debug\maturana.exe"
 
 if (!(Test-Path -LiteralPath $cargo)) {
-    throw "cargo.exe not found. Install Rust with: winget install --id Rustlang.Rustup -e"
+    throw "cargo.exe not found. Install Rust with: winget install --id Rustlang.Rustup -e (or use the prebuilt installer: irm https://raw.githubusercontent.com/ajensenwaud/maturana/main/scripts/bootstrap.ps1 | iex)"
 }
 
 $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"

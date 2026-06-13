@@ -43,7 +43,13 @@ function Wait-HostdHealth {
 }
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
-$exePath = Join-Path $repoRoot "target\x86_64-pc-windows-gnu\debug\maturana.exe"
+# Prefer a prebuilt binary (MATURANA_BIN, set by the download-based installer);
+# otherwise fall back to the locally built GNU debug binary (built below if absent).
+if ($env:MATURANA_BIN -and (Test-Path -LiteralPath $env:MATURANA_BIN)) {
+    $exePath = (Resolve-Path -LiteralPath $env:MATURANA_BIN).Path
+} else {
+    $exePath = Join-Path $repoRoot "target\x86_64-pc-windows-gnu\debug\maturana.exe"
+}
 if ([string]::IsNullOrWhiteSpace($TokenPath)) {
     $TokenPath = Join-Path $repoRoot ".maturana\hostd\token"
 }
