@@ -120,28 +120,51 @@ try {
         & .\scripts\set-vm-autostart.ps1
     }
 
-    # Codex-native: everything flows from Codex. Point the user straight in.
+    # Put `maturana` on PATH (prebuilt-binary install) so `maturana --help` works.
+    if ($env:MATURANA_BIN) {
+        $binDir = Split-Path -Parent $env:MATURANA_BIN
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        if (($userPath -split ';') -notcontains $binDir) {
+            [Environment]::SetEnvironmentVariable('Path', (($userPath.TrimEnd(';')) + ';' + $binDir), 'User')
+        }
+        $env:Path = "$binDir;$env:Path"
+    }
+
+    # Harness credential pre-check: agents can't run without an authenticated
+    # harness, so check codex + claude (CLI present? logged in?) and guide.
+    function Test-Harness($cli, $authPath, $loginHint, $installHint) {
+        if ((Get-Command $cli -ErrorAction SilentlyContinue) -and (Test-Path -LiteralPath $authPath)) {
+            return "ready"
+        } elseif (Get-Command $cli -ErrorAction SilentlyContinue) {
+            return "installed, NOT logged in -> run: $loginHint"
+        } else {
+            return "missing -> install: $installHint  then: $loginHint"
+        }
+    }
+    $codexStatus  = Test-Harness 'codex'  "$env:USERPROFILE\.codex\auth.json" 'codex login' 'npm install -g @openai/codex'
+    $claudeStatus = Test-Harness 'claude' "$env:USERPROFILE\.claude\.credentials.json" 'claude (then /login)' 'npm install -g @anthropic-ai/claude-code'
+    $token = Get-Content (Join-Path $repoRoot ".maturana\web\token") -ErrorAction SilentlyContinue | Select-Object -First 1
+
     Write-Host ""
-    Write-Host "============================================================"
-    Write-Host " Maturana is installed. It is Codex-native - you build and"
-    Write-Host " run agents from Codex, which is oriented by this repo's"
-    Write-Host " AGENTS.md + skills/."
+    Write-Host "==================== Maturana ready ===================="
+    Write-Host "A Codex-native agent framework. Build agents from Codex,"
+    Write-Host "which is oriented by this repo's AGENTS.md + skills/."
     Write-Host ""
-    Write-Host " NEXT STEP - start building agents:"
+    Write-Host "1) Authenticate a harness (agents need at least one):"
+    Write-Host "     codex  : $codexStatus"
+    Write-Host "     claude : $claudeStatus"
+    Write-Host ""
+    Write-Host "2) Build your first agent:"
     Write-Host "     cd `"$repoRoot`""
     Write-Host "     codex"
-    Write-Host "   then ask Codex to create and launch your first agent."
-    if (-not (Get-Command codex -ErrorAction SilentlyContinue)) {
-        Write-Host ""
-        Write-Host "   ! codex CLI not found. Install it first:"
-        Write-Host "       npm install -g @openai/codex"
-    }
+    Write-Host "   then ask Codex: ""create and launch a new agent""."
     Write-Host ""
-    Write-Host "   First run? authenticate your subscription once:  codex login"
+    Write-Host "Web cockpit:  http://localhost:47836"
+    if ($token) { Write-Host "     token:  $token" } else { Write-Host "     token:  (run: maturana web token)" }
     Write-Host ""
-    Write-Host " Optional web cockpit (nice-to-have):  http://localhost:47836"
-    Write-Host "     token:  .\scripts\maturana.ps1 web token"
-    Write-Host "============================================================"
+    Write-Host "Help:  maturana --help        (open a new terminal first)"
+    Write-Host "Docs:  $repoRoot\docs"
+    Write-Host "========================================================"
 }
 finally {
     Pop-Location
