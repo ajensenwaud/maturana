@@ -45,7 +45,6 @@ pub struct TurnRequest {
 /// Handle to a running turn: dropping it does nothing; call `cancel()` to
 /// kill the child's process tree.
 pub struct TurnHandle {
-    pub turn_id: String,
     pub(crate) pid: Option<u32>,
     pub(crate) child_kill: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -64,7 +63,6 @@ impl TurnHandle {
 }
 
 pub trait HarnessAdapter: Send + Sync {
-    fn kind(&self) -> HarnessKind;
     fn start_turn(
         &self,
         request: TurnRequest,
@@ -84,7 +82,7 @@ pub fn adapter_for(kind: &HarnessKind) -> Box<dyn HarnessAdapter> {
 /// completion if the parser never produced one. Shared by both adapters.
 pub(crate) fn spawn_streaming(
     mut command: Command,
-    turn_id: String,
+    _turn_id: String,
     tx: mpsc::Sender<TurnEvent>,
     map_line: fn(&str) -> Vec<TurnEvent>,
 ) -> anyhow::Result<TurnHandle> {
@@ -160,7 +158,6 @@ pub(crate) fn spawn_streaming(
     });
 
     Ok(TurnHandle {
-        turn_id,
         pid,
         child_kill: Some(kill_tx),
     })
