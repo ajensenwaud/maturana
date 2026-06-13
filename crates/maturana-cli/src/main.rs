@@ -299,6 +299,15 @@ enum SkillSubcommand {
         #[arg(long)]
         json: bool,
     },
+    /// Install each skill as a Codex custom prompt so it's a `/maturana-<name>`
+    /// slash command in Codex (writes ~/.codex/prompts/maturana-<name>.md).
+    CodexPrompts {
+        #[arg(default_value = "skills")]
+        root: PathBuf,
+        /// Override the Codex prompts directory (default ~/.codex/prompts).
+        #[arg(long)]
+        prompts_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1337,7 +1346,60 @@ fn handle_skill(command: SkillCommand) -> anyhow::Result<()> {
                 )
             }
         }
+        SkillSubcommand::CodexPrompts { root, prompts_dir } => {
+            let count = sync_codex_prompts(&root, prompts_dir.as_deref())?;
+            println!("installed {count} Codex prompt(s) (/maturana-<name>)");
+            Ok(())
+        }
     }
+}
+
+/// Mirror each `skills/<name>/SKILL.md` into a Codex custom prompt at
+/// `<prompts_dir>/maturana-<name>.md`, so Codex exposes a `/maturana-<name>`
+/// slash command that loads + follows the canonical skill. The prompt points at
+/// the absolute SKILL.md (single source of truth, never stale) rather than
+/// copying its body. Idempotent.
+fn sync_codex_prompts(root: &Path, prompts_dir: Option<&Path>) -> anyhow::Result<usize> {
+    let skills_root = absolute_or_cwd(root.to_path_buf())?;
+    if !skills_root.is_dir() {
+        anyhow::bail!("skills directory not found: {}", skills_root.display());
+    }
+    let repo_root = skills_root.parent().unwrap_or(&skills_root).to_path_buf();
+    let prompts = match prompts_dir {
+        Some(p) => p.to_path_buf(),
+        None => dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory"))?
+            .join(".codex")
+            .join("prompts"),
+    };
+    fs::create_dir_all(&prompts)?;
+
+    let mut names: Vec<String> = Vec::new();
+    for entry in fs::read_dir(&skills_root)? {
+        let dir = entry?.path();
+        let skill_md = dir.join("SKILL.md");
+        if dir.is_dir() && skill_md.exists() {
+            if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names.sort();
+
+    for name in &names {
+        let skill_md = skills_root.join(name).join("SKILL.md");
+        let body = format!(
+            "You are running the Maturana skill `{name}`.\n\n\
+             Read the full skill definition and follow it exactly:\n  {skill}\n\n\
+             Repo root: {repo}\n  (skills/, examples/, and the `maturana` CLI live here).\n\n\
+             Load the skill, then carry out the user's request below.\n\n$ARGUMENTS\n",
+            name = name,
+            skill = skill_md.display(),
+            repo = repo_root.display(),
+        );
+        fs::write(prompts.join(format!("{name}.md")), body)?;
+    }
+    Ok(names.len())
 }
 
 fn validate_skill_pack(root: &Path) -> anyhow::Result<SkillValidationReport> {

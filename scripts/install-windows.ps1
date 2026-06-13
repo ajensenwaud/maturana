@@ -120,6 +120,9 @@ try {
         & .\scripts\set-vm-autostart.ps1
     }
 
+    # Expose every skill as a Codex /maturana-<name> slash command (best-effort).
+    try { & .\scripts\maturana.ps1 skill codex-prompts (Join-Path $repoRoot 'skills') 2>$null | Out-Null } catch {}
+
     # Put `maturana` on PATH (prebuilt-binary install) so `maturana --help` works.
     if ($env:MATURANA_BIN) {
         $binDir = Split-Path -Parent $env:MATURANA_BIN
@@ -157,7 +160,9 @@ try {
     Write-Host "2) Build your first agent:"
     Write-Host "     cd `"$repoRoot`""
     Write-Host "     codex"
-    Write-Host "   then ask Codex: ""create and launch a new agent""."
+    Write-Host "   then ask Codex: ""create and launch a new agent"", or use a"
+    Write-Host "   skill directly, e.g.  /maturana-agent-create"
+    Write-Host "   (all 31 skills are installed as /maturana-<name> slash commands)."
     Write-Host ""
     Write-Host "Web cockpit:  http://localhost:47836"
     if ($token) { Write-Host "     token:  $token" } else { Write-Host "     token:  (run: maturana web token)" }
