@@ -65,28 +65,68 @@ Codex is the product surface for defining, configuring, building, and running th
 
 ## Architecture
 
-### Codex skills framework
-Maturana ships a set of Codex skill. The skill pack is the main product
-interface. It gives Codex procedures, templates, validations, and tool
-bindings for agent engineering.
+### Codex skills framework — how to load and use skills
 
-Initial skills:
+Maturana's capabilities are exposed to Codex as **skills**: one folder per skill
+at `skills/<name>/SKILL.md`. Codex does **not** auto-load them — *you* load a
+skill by **reading its `skills/<name>/SKILL.md` when the task matches it**, then
+following that procedure exactly.
 
-- `maturana-agent-create`: turn a user goal into a `MATURANA.md` spec.
-- `maturana-agent-validate`: check capabilities, runtime, mounts,
-  egress, secrets, channels, and schedules with `maturana spec validate`.
-- `maturana-agent-launch`: materialize a spec as a Firecracker or Hyper-V agent.
-- `maturana-agent-inspect`: read materialized spec readiness, health,
-  logs, audit entries, and runtime status.
-- `maturana-agent-update`: modify an agent spec and apply the change.
-- `maturana-skill-create`: create a new Codex skill for an agent or the
-  Maturana framework.
-- `maturana-tool-create`: create a host or guest tool.
-- `maturana-skill-deploy`: install skills and tools into a target
-  agent.
-- `maturana-security-review`: review a spec, skill, or tool before it
-  is launched.
-- `maturana-snapshot`: take, list, and rewind agent snapshots.
+**Loading rule (do this every time):** before any Maturana action — creating,
+launching, inspecting, or governing agents; handling secrets; wiring channels;
+taking snapshots; building skills/tools — scan the index below, open the matching
+`skills/<name>/SKILL.md`, and follow it. Skills are the contract for every
+action; prefer them over improvising. When unsure where to start, read
+`skills/maturana-cli-actions/SKILL.md` (general host operations) and
+`skills/maturana-agent-create/SKILL.md` (the usual first task).
+
+**Available skills** (read `skills/<name>/SKILL.md` to load the procedure):
+
+Agent lifecycle
+- `maturana-agent-create` — turn an agent goal into a durable `MATURANA.md` spec
+- `maturana-agent-validate` — validate a `MATURANA.md` spec before launch
+- `maturana-agent-launch` — materialize/launch an agent (Firecracker or Hyper-V)
+- `maturana-agent-inspect` — inspect a live agent: health, logs, audit, status
+- `maturana-agent-update` — modify an existing agent contract and apply it
+- `maturana-snapshot` — take, list, or restore agent snapshots
+- `maturana-spawn` — spawn a sub-agent from a channel command or the host
+
+Host runtime & operations
+- `maturana-cli-actions` — operate Maturana from Codex on the host (start here)
+- `maturana-orchestrate` — bring an agent's host runtime plane online / diagnose it
+- `maturana-hostd` — check/install/diagnose the privileged host daemon (Windows)
+- `maturana-schedule` — add/list/test/debug/run agent schedules
+- `maturana-personal-agent` — turn a VM-backed agent into a personal assistant
+
+Security & secrets
+- `maturana-pipelock` — store/list/read/inject/audit secrets + egress governance
+- `maturana-security-review` — review a spec/skill/tool/provider change before launch
+
+Knowledge & memory
+- `maturana-graph` — read/write MaturanaGraph (shared LLM-wiki knowledge graph)
+- `maturana-wiki` — add shared markdown context to the LLM-wiki store
+
+Agent capabilities & integrations
+- `maturana-browse` — read/screenshot/interact with web pages (headless Chrome)
+- `maturana-web-search` — current info from the public web (Brave/Tavily)
+- `maturana-image-gen` — generate an image from a text prompt
+- `maturana-voice` — transcribe audio to text / synthesize text to speech
+- `maturana-github` — work with GitHub repositories from an agent
+- `maturana-notion` — read/write Notion (search, pages)
+- `maturana-slack` — integrate an agent with Slack
+- `maturana-agentmail` — give an agent an email address (AgentMail)
+- `maturana-self-improve` — run the self-improvement flywheel over trajectories
+
+Building & extending Maturana
+- `maturana-develop` — develop a new skill, guest tool, or MCP bundle
+- `maturana-skill-create` — create a new Codex skill (framework or agent)
+- `maturana-tool-create` — create a host or guest tool
+- `maturana-wasm-tool` — build a new executable capability on the fly (WASM)
+- `maturana-skill-deploy` — install a tested skill/tool into a target agent
+- `maturana-deploy` — deploy a Codex-developed skill/tool/MCP server
+
+(31 skills. If this index drifts from `skills/`, the directory is the source of
+truth — list it with `ls skills/` and read the relevant `SKILL.md`.)
 
 ### Agent specs
 `MATURANA.md` is the durable unit of agent definition. Codex is expected
@@ -140,7 +180,10 @@ On Linux, the Firecracker guest OS of course Linux. On Windows, the Hyper-V gues
 
 ## Working in this repo
 1. Read this file first.
-2. Treat Codex skills as the primary user-facing surface.
+2. Skills are the primary surface. For any Maturana task, find the matching skill
+   in the index above and **read `skills/<name>/SKILL.md` before acting** — that
+   file is the procedure. Codex does not auto-load skills; you load them by
+   reading them. `ls skills/` is the source of truth.
 3. Keep the core small and move extension behavior into skills or tools
 4. Keep it simple - composable Unix-like tool over complex monoliths
 5. Keep it simple, stupid. Prefer direct, boring, skill-invoked workflows
