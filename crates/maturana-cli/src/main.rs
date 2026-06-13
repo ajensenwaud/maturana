@@ -1713,8 +1713,15 @@ fn build_orchestrator_config(
         command.agent_ids.clone()
     };
     if agent_ids.is_empty() {
-        anyhow::bail!(
-            "no agents to supervise; launch one with `maturana agent launch` or pass --agent-id"
+        // Fresh install with no agents yet: keep the plane healthy (supervise
+        // sessiond, idle-waiting) instead of exiting with an error. Maturana is
+        // Codex-native - the user builds their first agent from Codex, then
+        // restarts `maturana up` to wire its channels/schedules. A failed
+        // service on a brand-new box reads as "broken"; an idle one reads as
+        // "ready".
+        eprintln!(
+            "up: no agents configured yet - supervising sessiond only (idle). \
+             Build an agent from Codex (`cd <repo> && codex`), then restart `maturana up`."
         );
     }
     // claude-code agents get the host-owned OAuth refresh daemon.
