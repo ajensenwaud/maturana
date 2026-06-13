@@ -6,7 +6,6 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use crate::harness::{parse, spawn_streaming, HarnessAdapter, TurnEvent, TurnHandle, TurnRequest};
-use crate::ws::protocol::HarnessKind;
 
 pub struct CodexExecAdapter;
 
@@ -60,10 +59,6 @@ impl CodexExecAdapter {
 }
 
 impl HarnessAdapter for CodexExecAdapter {
-    fn kind(&self) -> HarnessKind {
-        HarnessKind::Codex
-    }
-
     fn start_turn(
         &self,
         request: TurnRequest,

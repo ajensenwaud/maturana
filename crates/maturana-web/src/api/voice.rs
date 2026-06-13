@@ -95,7 +95,7 @@ pub async fn stt(
 fn multipart_transcription(filename: &str, audio: &[u8]) -> (String, Vec<u8>) {
     let boundary = "maturanavoiceboundary7e3f";
     let mut body = Vec::new();
-    let mut part = |headers: &str, data: &[u8], body: &mut Vec<u8>| {
+    let part = |headers: &str, data: &[u8], body: &mut Vec<u8>| {
         body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
         body.extend_from_slice(headers.as_bytes());
         body.extend_from_slice(b"\r\n\r\n");

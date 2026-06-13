@@ -125,6 +125,7 @@ pub enum WirePhase {
     Failed { detail: Option<String> },
 }
 
+#[cfg(test)]
 impl WirePhase {
     pub fn is_terminal(&self) -> bool {
         matches!(self, WirePhase::Done { .. } | WirePhase::Failed { .. })
