@@ -5,8 +5,11 @@ worker agents.
 
 ## Install
 
-One-liners (idempotent: bootstrap toolchain, clone/update, build, register
-the `maturana up` runtime plane and `maturana web` cockpit as services):
+One-liners. Both download the **signed prebuilt `maturana` binary** from the
+latest [GitHub Release](https://github.com/ajensenwaud/maturana/releases) (no
+Rust/C/MSYS2 toolchain on your machine), verify its SHA256, clone the repo for
+the skills/scripts/orientation files, and register the `maturana up` runtime
+plane + `maturana web` cockpit as services:
 
 ```sh
 # Linux (control plane: CLI + web cockpit)
@@ -14,20 +17,52 @@ curl -fsSL https://raw.githubusercontent.com/ajensenwaud/maturana/main/scripts/i
 
 # Linux that will also RUN isolated agents — add the Firecracker microVM host:
 curl -fsSL https://raw.githubusercontent.com/ajensenwaud/maturana/main/scripts/install.sh | bash -s -- --firecracker
+
+# Build locally from source instead of downloading the prebuilt binary:
+curl -fsSL .../scripts/install.sh | bash -s -- --from-source
 ```
 
 ```powershell
-# Windows (Hyper-V)
-irm https://raw.githubusercontent.com/ajensenwaud/maturana/main/scripts/install.ps1 | iex
+# Windows (Hyper-V) — downloads the signed maturana.exe, then installs.
+# Self-elevates (one UAC) and prompts for your Windows password (for the
+# no-login boot tasks). See "Zero-touch reboot recovery" below.
+irm https://raw.githubusercontent.com/ajensenwaud/maturana/main/scripts/bootstrap.ps1 | iex
 ```
 
-Or clone this repo and run `scripts/install.sh` / `scripts/install.ps1`
-directly. On Linux, `--firecracker` (or running
-`scripts/install-firecracker-host.sh` standalone) provisions the microVM
+Or clone this repo and run `scripts/install.sh` / `scripts/install-windows.ps1`
+directly (the Windows in-repo path builds from source and needs Rust + MSYS2;
+the `irm | iex` bootstrap above avoids both). On Linux, `--firecracker` (or
+running `scripts/install-firecracker-host.sh` standalone) provisions the microVM
 substrate — the `firecracker` binary, KVM access, the libguestfs/qemu
 image-build toolchain, and guest-egress NAT — then `maturana repair
 firecracker-harnesses` builds the images and launches agents (see
 [docs/linux-firecracker-harnesses.md](docs/linux-firecracker-harnesses.md)).
+
+### Releases, verification & signing
+
+Tagging `v*` runs `.github/workflows/release.yml`, which builds
+`maturana-x86_64-unknown-linux-gnu.tar.gz` and
+`maturana-x86_64-pc-windows-msvc.zip`, publishes them with a `SHA256SUMS`
+manifest, and (when the signing secrets are configured) **Authenticode-signs the
+Windows `.exe`** and **GPG-signs `SHA256SUMS`**. The installers always verify the
+SHA256; signature verification is best-effort until the certs are wired in:
+
+- Windows code signing: add repo secrets `WINDOWS_PFX_BASE64` (base64 of the
+  code-signing `.pfx`) + `WINDOWS_PFX_PASSWORD`.
+- Linux checksum signing: add `GPG_PRIVATE_KEY` (ASCII-armored) + `GPG_PASSPHRASE`;
+  verify with `gpg --verify SHA256SUMS.asc SHA256SUMS`.
+
+Manual verification:
+
+```sh
+sha256sum -c --ignore-missing SHA256SUMS         # Linux
+```
+```powershell
+(Get-AuthenticodeSignature maturana.exe).Status  # Windows (Valid once signed)
+```
+
+> The public site will live at **www.maturana.sh**; the install URLs will move
+> there once it's up. For now they point at GitHub.
 
 Afterwards there are two equal control surfaces: run `codex` in the repo
 (AGENTS.md + skills/ orient it) or open the web cockpit at
