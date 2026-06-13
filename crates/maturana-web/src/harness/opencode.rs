@@ -7,7 +7,6 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use crate::harness::{spawn_streaming, HarnessAdapter, TurnEvent, TurnHandle, TurnRequest};
-use crate::ws::protocol::HarnessKind;
 
 pub const DEFAULT_OPENROUTER_MODEL: &str = "anthropic/claude-sonnet-4.5";
 const API_KEY_SECRET: &str = "openrouter/api-key";
@@ -30,10 +29,6 @@ impl OpencodeAdapter {
 }
 
 impl HarnessAdapter for OpencodeAdapter {
-    fn kind(&self) -> HarnessKind {
-        HarnessKind::Openrouter
-    }
-
     fn start_turn(
         &self,
         request: TurnRequest,

@@ -329,7 +329,6 @@ mod tests {
         turns.insert(
             "t1".to_string(),
             TurnHandle {
-                turn_id: "t1".to_string(),
                 pid: None,
                 child_kill: None,
             },
