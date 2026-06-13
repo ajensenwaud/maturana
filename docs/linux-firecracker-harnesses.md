@@ -65,12 +65,15 @@ target/debug/maturana service install fleet
 
 This installs a systemd **oneshot** (`maturana-fleet.service`) ordered
 `After=maturana-up.service` that runs `repair firecracker-harnesses
---skip-services --skip-assets`: it recreates each agent's TAP + NAT rule and
-relaunches the VM from the baked rootfs (no libguestfs rebuild, no sessiond).
-The enabled in-guest `maturana-agent.service` + stable sessiond token let the
-worker self-recover. `service install` also runs `loginctl enable-linger` so the
-user manager (and its units) start at boot without a login. `install.sh
---firecracker` registers `fleet` automatically.
+--skip-services --skip-assets --skip-worker-refresh`: it recreates each agent's
+TAP + NAT rule and relaunches the VM from the baked rootfs (no libguestfs
+rebuild, no sessiond, no SSH-in). The enabled in-guest `maturana-agent.service`
++ stable sessiond token let the worker self-recover, so there's no need to SSH
+in and reinstall it — which also means one slow guest can't block the others
+(the relaunch loop is per-agent resilient and reports any failures at the end).
+`service install` also runs `loginctl enable-linger` so the user manager (and
+its units) start at boot without a login. `install.sh --firecracker` registers
+`fleet` automatically.
 
 Two flags make this idempotent: `--skip-net` (leave it OFF for boot — the TAP is
 ephemeral and must be recreated) and the un-baked guard (a profile with no
