@@ -257,8 +257,12 @@ struct UpCommand {
     sessiond_bind: String,
     #[arg(long, env = "MATURANA_SESSIOND_TOKEN")]
     sessiond_token: Option<String>,
-    #[arg(long, default_value = "telegram-main")]
-    session_id: String,
+    /// Override every agent's session id. When omitted (the default), each
+    /// agent's session id is derived from its materialized spec / Firecracker
+    /// profile via [`infer_agent_session_id`], so the supervised channel writes
+    /// to the same queue the guest worker claims from.
+    #[arg(long)]
+    session_id: Option<String>,
     #[arg(long, default_value = "pipelock:telegram/bot-token")]
     telegram_token_source: String,
     #[arg(long)]
@@ -664,6 +668,13 @@ enum RepairSubcommand {
         skip_launch: bool,
         #[arg(long)]
         skip_worker_refresh: bool,
+        /// Skip starting sessiond + the MaturanaGraph service. Tokens are still
+        /// ensured (so guest artifacts and `maturana up`'s graph supervision can
+        /// find them), but the plane processes are left for `maturana up` to
+        /// own, avoiding a port collision on 47834/47835 with the systemd
+        /// `maturana-up` service.
+        #[arg(long)]
+        skip_services: bool,
         #[arg(long)]
         no_install_harness: bool,
         #[arg(long, default_value_t = 120)]
@@ -1712,7 +1723,7 @@ fn build_orchestrator_config(
         .collect::<Vec<_>>();
     let agents = agent_ids
         .into_iter()
-        .map(|agent_id| {
+        .map(|agent_id| -> anyhow::Result<AgentRuntime> {
             let spec =
                 AgentSpec::from_maturana_markdown(&home.agent_dir(&agent_id).join("MATURANA.md"))
                     .ok();
@@ -1729,17 +1740,32 @@ fn build_orchestrator_config(
                     api_key_source: m.api_key_source,
                     inbox: m.inbox,
                 });
-            AgentRuntime {
+            // A single global `--session-id` would write every channel to one
+            // queue, but per-agent guest workers claim from their own profile
+            // session id (codex-main, claude-main, …). Derive each agent's
+            // session id so the supervised channel matches its guest worker;
+            // an explicit `--session-id` still overrides all of them.
+            let session_id = match &command.session_id {
+                Some(session_id) => session_id.clone(),
+                None => infer_agent_session_id(home, &agent_id)?,
+            };
+            // Each fleet agent has its own Telegram bot; a single shared token
+            // would point every channel at the same bot. Prefer the agent's
+            // profile token, falling back to the command default for others.
+            let telegram_token_source = firecracker_profile_for(&agent_id)
+                .map(|profile| profile.telegram_token_source.to_string())
+                .unwrap_or_else(|| command.telegram_token_source.clone());
+            Ok(AgentRuntime {
                 agent_id,
-                session_id: command.session_id.clone(),
+                session_id,
                 telegram: !command.no_telegram,
-                telegram_token_source: command.telegram_token_source.clone(),
+                telegram_token_source,
                 schedules: !command.no_schedules,
                 slack,
                 agentmail,
-            }
+            })
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()?;
     // sessiond now refuses to run unauthenticated, so default the token to the
     // persistent per-home token file when the operator did not pass one. This
     // keeps `up` secure-by-default without forcing a manual --sessiond-token.
@@ -2125,6 +2151,7 @@ fn run_repair(home: &MaturanaHome, command: RepairCommand) -> anyhow::Result<()>
             skip_assets,
             skip_launch,
             skip_worker_refresh,
+            skip_services,
             no_install_harness,
             ssh_wait_seconds,
         } => repair_firecracker_harnesses(
@@ -2137,6 +2164,7 @@ fn run_repair(home: &MaturanaHome, command: RepairCommand) -> anyhow::Result<()>
                 skip_assets,
                 skip_launch,
                 skip_worker_refresh,
+                skip_services,
                 install_harness: !no_install_harness,
                 ssh_wait_seconds,
             },
@@ -2431,6 +2459,7 @@ struct FirecrackerHarnessRepair {
     skip_assets: bool,
     skip_launch: bool,
     skip_worker_refresh: bool,
+    skip_services: bool,
     install_harness: bool,
     ssh_wait_seconds: u64,
 }
@@ -2446,9 +2475,20 @@ struct FirecrackerHarnessProfile {
     tap_name: &'static str,
     guest_mac: &'static str,
     session_id: &'static str,
+    /// Pipelock source for this agent's own Telegram bot token, so `maturana up`
+    /// supervises each fleet channel with the right bot (not one shared token).
+    telegram_token_source: &'static str,
     auth_source: &'static str,
     auth_guest_path: &'static str,
     spec_path: &'static str,
+}
+
+/// Look up a Firecracker fleet profile by agent id, so `maturana up` can wire
+/// each agent's channel to the same session id its guest worker claims from.
+fn firecracker_profile_for(agent_id: &str) -> Option<&'static FirecrackerHarnessProfile> {
+    FIRECRACKER_HARNESS_PROFILES
+        .iter()
+        .find(|profile| profile.agent_id == agent_id)
 }
 
 const FIRECRACKER_HARNESS_PROFILES: &[FirecrackerHarnessProfile] = &[
@@ -2462,6 +2502,7 @@ const FIRECRACKER_HARNESS_PROFILES: &[FirecrackerHarnessProfile] = &[
         tap_name: "tap-mat-codex",
         guest_mac: "AA:FC:00:00:10:01",
         session_id: "codex-main",
+        telegram_token_source: "pipelock:telegram/bot-token",
         auth_source: ".maturana/host-auth/codex",
         auth_guest_path: "/home/ubuntu/.codex",
         spec_path: "examples/MATURANA.codex-firecracker.md",
@@ -2476,6 +2517,7 @@ const FIRECRACKER_HARNESS_PROFILES: &[FirecrackerHarnessProfile] = &[
         tap_name: "tap-mat-open",
         guest_mac: "AA:FC:00:00:10:02",
         session_id: "opencode-main",
+        telegram_token_source: "pipelock:telegram/opencode-bot-token",
         auth_source: ".maturana/host-auth/opencode",
         auth_guest_path: "/home/ubuntu",
         spec_path: "examples/MATURANA.opencode-firecracker.md",
@@ -2490,6 +2532,7 @@ const FIRECRACKER_HARNESS_PROFILES: &[FirecrackerHarnessProfile] = &[
         tap_name: "tap-mat-claude",
         guest_mac: "AA:FC:00:00:10:03",
         session_id: "claude-main",
+        telegram_token_source: "pipelock:telegram/claude-bot-token",
         auth_source: ".maturana/host-auth/claude-code",
         auth_guest_path: "/home/ubuntu/.claude",
         spec_path: "examples/MATURANA.claude-firecracker.md",
@@ -2508,12 +2551,19 @@ fn repair_firecracker_harnesses(
     let sessiond_token_path = absolute_or_cwd(repair.sessiond_token_path.clone())?;
     let ssh_key = absolute_or_cwd(repair.ssh_key.clone())?;
     let sessiond_token = ensure_sessiond_token(&sessiond_token_path)?;
-    start_linux_sessiond(
-        home,
-        &repair.sessiond_bind,
-        &sessiond_token,
-        &sessiond_token_path,
-    )?;
+    // With --skip-services the plane (sessiond + graph) is owned by the systemd
+    // `maturana up` service, so we must NOT start our own copies — they would
+    // collide on ports 47834/47835. We still ensure the tokens below, since
+    // guest artifacts embed them and `maturana up` reads the graph token to
+    // decide whether to supervise the graph service.
+    if !repair.skip_services {
+        start_linux_sessiond(
+            home,
+            &repair.sessiond_bind,
+            &sessiond_token,
+            &sessiond_token_path,
+        )?;
+    }
 
     // MaturanaGraph is opt-in: only stand up the host graph service when at
     // least one selected agent enabled `knowledge_graph`. Ensuring the token
@@ -2526,7 +2576,9 @@ fn repair_firecracker_harnesses(
     });
     if graph_opt_in {
         let graph_token = ensure_graph_token(home)?;
-        start_linux_graph(home, GRAPH_BIND, &graph_token)?;
+        if !repair.skip_services {
+            start_linux_graph(home, GRAPH_BIND, &graph_token)?;
+        }
     }
 
     for profile in selected {
@@ -5685,6 +5737,157 @@ mod tests {
         assert!(list_undelivered(&paths).unwrap().is_empty());
 
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    fn up_command_for_test(agent_ids: Vec<&str>, session_id: Option<&str>) -> UpCommand {
+        UpCommand {
+            agent_ids: agent_ids.into_iter().map(String::from).collect(),
+            sessiond_bind: "0.0.0.0:47834".to_string(),
+            sessiond_token: Some("tok".to_string()),
+            session_id: session_id.map(String::from),
+            telegram_token_source: "pipelock:telegram/bot-token".to_string(),
+            no_telegram: false,
+            no_schedules: false,
+            channel_poll_seconds: 5,
+            schedule_poll_seconds: 60,
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn build_orchestrator_config_derives_per_agent_session_ids() {
+        let temp = std::env::temp_dir().join(format!(
+            "maturana-up-session-derive-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp);
+        let home = MaturanaHome::new(&temp);
+
+        // codex-firecracker has a materialized sessiond.env (highest priority);
+        // claude-firecracker has none, so it falls back to its profile default.
+        let state_dir = home.agent_dir("codex-firecracker").join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join("sessiond.env"),
+            "MATURANA_SESSION_ID='codex-rendered'\n",
+        )
+        .unwrap();
+
+        let command = up_command_for_test(vec!["codex-firecracker", "claude-firecracker"], None);
+        let config = build_orchestrator_config(&home, &command).unwrap();
+
+        let codex = config
+            .agents
+            .iter()
+            .find(|a| a.agent_id == "codex-firecracker")
+            .unwrap();
+        let claude = config
+            .agents
+            .iter()
+            .find(|a| a.agent_id == "claude-firecracker")
+            .unwrap();
+        // Materialized spec wins for codex; profile default for claude. They are
+        // NOT collapsed onto a single global session id.
+        assert_eq!(codex.session_id, "codex-rendered");
+        assert_eq!(claude.session_id, "claude-main");
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn build_orchestrator_config_session_id_flag_overrides_all_agents() {
+        let temp = std::env::temp_dir().join(format!(
+            "maturana-up-session-override-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp);
+        let home = MaturanaHome::new(&temp);
+
+        let command = up_command_for_test(
+            vec!["codex-firecracker", "claude-firecracker"],
+            Some("global-session"),
+        );
+        let config = build_orchestrator_config(&home, &command).unwrap();
+        assert!(config
+            .agents
+            .iter()
+            .all(|a| a.session_id == "global-session"));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    fn parse_firecracker_repair(args: &[&str]) -> FirecrackerHarnessRepair {
+        let cli = Cli::try_parse_from(args).expect("parse repair firecracker-harnesses");
+        match cli.command {
+            Command::Repair(RepairCommand {
+                command:
+                    RepairSubcommand::FirecrackerHarnesses {
+                        agent_ids,
+                        ssh_key,
+                        sessiond_bind,
+                        sessiond_token_path,
+                        skip_assets,
+                        skip_launch,
+                        skip_worker_refresh,
+                        skip_services,
+                        no_install_harness,
+                        ssh_wait_seconds,
+                    },
+            }) => FirecrackerHarnessRepair {
+                agent_ids,
+                ssh_key,
+                sessiond_bind,
+                sessiond_token_path,
+                skip_assets,
+                skip_launch,
+                skip_worker_refresh,
+                skip_services,
+                install_harness: !no_install_harness,
+                ssh_wait_seconds,
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skip_services_flag_parses_and_defaults_false() {
+        let without = parse_firecracker_repair(&["maturana", "repair", "firecracker-harnesses"]);
+        assert!(
+            !without.skip_services,
+            "--skip-services must default to false so a bare repair still owns the plane"
+        );
+
+        let with = parse_firecracker_repair(&[
+            "maturana",
+            "repair",
+            "firecracker-harnesses",
+            "--skip-services",
+        ]);
+        assert!(with.skip_services);
+    }
+
+    #[test]
+    fn firecracker_profiles_carry_per_agent_telegram_tokens() {
+        // `maturana up` reads these so each fleet channel uses its own bot,
+        // matching the per-agent session id its guest worker claims from.
+        assert_eq!(
+            firecracker_profile_for("codex-firecracker").unwrap().telegram_token_source,
+            "pipelock:telegram/bot-token"
+        );
+        assert_eq!(
+            firecracker_profile_for("claude-firecracker").unwrap().telegram_token_source,
+            "pipelock:telegram/claude-bot-token"
+        );
+        assert_eq!(
+            firecracker_profile_for("opencode-firecracker").unwrap().telegram_token_source,
+            "pipelock:telegram/opencode-bot-token"
+        );
+        // Session id and token agree per agent (no cross-wiring).
+        assert_eq!(
+            firecracker_profile_for("claude-firecracker").unwrap().session_id,
+            "claude-main"
+        );
+        assert!(firecracker_profile_for("not-a-fleet-agent").is_none());
     }
 
     #[test]
