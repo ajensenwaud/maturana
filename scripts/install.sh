@@ -83,6 +83,13 @@ cd "$DEST"
 "$DEST/target/release/maturana" pipelock init >/dev/null 2>&1 || true
 say "registering services (maturana up + maturana web)"
 "$DEST/target/release/maturana" service install up web
+# Firecracker hosts also get the boot-time fleet relauncher (zero-touch reboot
+# recovery): a systemd oneshot that recreates the TAP + relaunches the microVMs
+# from the baked rootfs after a reboot, with no interactive login.
+if [ "$WITH_FIRECRACKER" = "1" ] && [ "$(uname -s)" = "Linux" ]; then
+  say "registering fleet boot service (maturana fleet)"
+  "$DEST/target/release/maturana" service install fleet
+fi
 
 # 7. Orientation: both control surfaces are equals.
 say "install complete"
@@ -99,5 +106,6 @@ fi
 if [ "$WITH_FIRECRACKER" = "1" ]; then
   echo "    3. Launch isolated agents:   maturana repair firecracker-harnesses"
   echo "       (stage creds under .maturana/host-auth/<harness>/ first)"
+  echo "       microVMs relaunch automatically after a reboot (fleet service)"
 fi
-echo "  boot-time start: loginctl enable-linger \$USER"
+echo "  boot-time start: linger enabled automatically (zero-touch reboot recovery)"
