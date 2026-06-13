@@ -72,6 +72,17 @@ try {
     }
 
     if (!$SkipServices) {
+        # Remove stale Startup-folder launchers from the OLD per-logon approach
+        # (MaturanaSessiond.cmd / MaturanaTelegramChannel*.cmd). They start a
+        # second, --home-less plane at logon that grabs sessiond's port 47834 and
+        # races the MaturanaUp boot task (-> up's critical sessiond dies with
+        # address-in-use). The scheduled-task model supersedes them.
+        $startupDir = [Environment]::GetFolderPath('Startup')
+        Get-ChildItem -Path $startupDir -Filter 'Maturana*.cmd' -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "Removing stale startup launcher: $($_.Name)"
+            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+        }
+
         # Register the up + web boot tasks. They run at startup as the current
         # user via a stored password (zero-touch reboot recovery, no login).
         if (-not $WindowsPassword) {

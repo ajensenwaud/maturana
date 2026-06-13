@@ -1905,11 +1905,24 @@ fn supervise_plan(home: &MaturanaHome, plan: &[SupervisedProcess]) -> anyhow::Re
     }
 }
 
+/// Resolve the Claude credentials path. The default (`.maturana/host-auth/...`)
+/// is repo-root-relative, so a bare relative path must resolve against the repo
+/// root (the parent of `--home`) — NOT the cwd. Under the boot scheduled task
+/// cwd is `System32`, which is exactly where `absolute_or_cwd` went wrong and
+/// left the claude token un-refreshed at boot.
+fn resolve_claude_creds(home: &MaturanaHome, creds: PathBuf) -> PathBuf {
+    if creds.is_absolute() {
+        return creds;
+    }
+    let repo_root = home.root().parent().unwrap_or_else(|| home.root());
+    repo_root.join(creds)
+}
+
 fn run_claude_refresh(home: &MaturanaHome, command: ClaudeRefreshCommand) -> anyhow::Result<()> {
     use maturana_core::claude_refresh as cr;
     match command.command {
         ClaudeRefreshSubcommand::Probe { creds } => {
-            let creds_path = absolute_or_cwd(creds)?;
+            let creds_path = resolve_claude_creds(home, creds);
             let current = cr::read_claude_creds(&creds_path)?;
             let now = chrono::Utc::now().timestamp_millis();
             let mins = (current.expires_at_ms - now) / 60000;
@@ -1926,7 +1939,7 @@ fn run_claude_refresh(home: &MaturanaHome, command: ClaudeRefreshCommand) -> any
             creds,
             poll_seconds,
         } => {
-            let creds_path = absolute_or_cwd(creds)?;
+            let creds_path = resolve_claude_creds(home, creds);
             println!("claude-refresh daemon: watching {}", creds_path.display());
             loop {
                 if let Err(error) = claude_refresh_tick(home, &creds_path, &agent_ids) {
