@@ -1,53 +1,45 @@
 #!/usr/bin/env bash
 # Maturana Linux installer. Idempotent leaf adapter: the lifecycle logic lives
-# in the Rust CLI (`maturana service`, `maturana pipelock`); this script only
-# bootstraps the toolchain, builds, and hands over.
+# in the Rust CLI (`maturana service`, `maturana pipelock`). By default it
+# downloads the signed prebuilt `maturana` binary from the latest GitHub Release
+# (no Rust/C toolchain needed) and falls back to a source build if no prebuilt
+# is available for this arch (or with --from-source).
 #
 #   curl -fsSL https://raw.githubusercontent.com/ajensenwaud/maturana/main/scripts/install.sh | bash
+#   curl -fsSL .../install.sh | bash -s -- --firecracker        # also provision the microVM host
+#   curl -fsSL .../install.sh | bash -s -- --from-source        # build locally instead of downloading
 #
 set -euo pipefail
 
 REPO_URL="${MATURANA_REPO_URL:-https://github.com/ajensenwaud/maturana.git}"
 DEST="${MATURANA_DIR:-$HOME/maturana}"
+REL_BASE="${MATURANA_RELEASE_BASE:-https://github.com/ajensenwaud/maturana/releases/latest/download}"
 
-# --firecracker also provisions the Linux microVM agent-host substrate
-# (firecracker binary, KVM, libguestfs/qemu, NAT) via install-firecracker-host.sh.
 WITH_FIRECRACKER=0
+FROM_SOURCE=0
 for arg in "$@"; do
   case "$arg" in
     --firecracker) WITH_FIRECRACKER=1 ;;
+    --from-source) FROM_SOURCE=1 ;;
   esac
 done
 
 say() { printf '\033[36m[maturana]\033[0m %s\n' "$*"; }
+die() { printf '\033[31m[maturana] %s\033[0m\n' "$*" >&2; exit 1; }
 
-# 1. Base dependencies.
-if ! command -v git >/dev/null 2>&1 || ! command -v cc >/dev/null 2>&1; then
-  say "installing git + build tools (sudo)"
+# 1. Base tools always needed: git (clone repo assets) + curl + tar.
+if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+  say "installing git + curl (sudo)"
   if command -v apt-get >/dev/null 2>&1; then
-    sudo apt-get update -qq && sudo apt-get install -y -qq git build-essential pkg-config curl
+    sudo apt-get update -qq && sudo apt-get install -y -qq git curl ca-certificates tar
   elif command -v dnf >/dev/null 2>&1; then
-    sudo dnf install -y git gcc make pkgconf curl
+    sudo dnf install -y git curl ca-certificates tar
   else
-    say "unsupported distro: install git + a C toolchain manually, then re-run"; exit 1
+    die "unsupported distro: install git + curl manually, then re-run"
   fi
 fi
 
-# 2. Rust toolchain.
-if ! command -v cargo >/dev/null 2>&1; then
-  if [ -f "$HOME/.cargo/env" ]; then
-    # shellcheck disable=SC1091
-    . "$HOME/.cargo/env"
-  fi
-fi
-if ! command -v cargo >/dev/null 2>&1; then
-  say "installing rustup"
-  curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path
-  # shellcheck disable=SC1091
-  . "$HOME/.cargo/env"
-fi
-
-# 3. Source: clone or update.
+# 2. Source: clone or update (skills/, AGENTS.md, scripts, examples are needed at runtime).
 if [ -d "$DEST/.git" ]; then
   say "updating $DEST"
   git -C "$DEST" pull --ff-only
@@ -58,11 +50,66 @@ else
   git clone "$REPO_URL" "$DEST"
 fi
 
-# 4. Build + link.
-say "building (release)"
-cargo build --release --manifest-path "$DEST/Cargo.toml" -p maturana-cli
 mkdir -p "$HOME/.local/bin"
-ln -sf "$DEST/target/release/maturana" "$HOME/.local/bin/maturana"
+BIN=""
+
+# 3. Prefer the signed prebuilt binary (no toolchain). x86_64 only for now.
+if [ "$FROM_SOURCE" = "0" ]; then
+  case "$(uname -m)" in
+    x86_64) TRIPLE="x86_64-unknown-linux-gnu" ;;
+    *)      TRIPLE="" ;;
+  esac
+  if [ -n "$TRIPLE" ]; then
+    asset="maturana-${TRIPLE}.tar.gz"
+    tmp="$(mktemp -d)"
+    say "downloading prebuilt $asset"
+    if curl -fSL "$REL_BASE/$asset" -o "$tmp/$asset" \
+       && curl -fSL "$REL_BASE/SHA256SUMS" -o "$tmp/SHA256SUMS"; then
+      want="$(grep "$asset" "$tmp/SHA256SUMS" | awk '{print $1}' | head -1)"
+      got="$(sha256sum "$tmp/$asset" | awk '{print $1}')"
+      if [ -n "$want" ] && [ "$want" = "$got" ]; then
+        tar -xzf "$tmp/$asset" -C "$tmp"
+        install -m 0755 "$tmp/maturana" "$HOME/.local/bin/maturana"
+        BIN="$HOME/.local/bin/maturana"
+        say "checksum OK; installed prebuilt binary"
+      else
+        say "checksum mismatch or missing (want=$want got=$got); falling back to source build"
+      fi
+    else
+      say "no prebuilt release found for $TRIPLE; falling back to source build"
+    fi
+    rm -rf "$tmp"
+  else
+    say "no prebuilt for $(uname -m); building from source"
+  fi
+fi
+
+# 4. Source build fallback (needs a C toolchain + Rust).
+if [ -z "$BIN" ]; then
+  if ! command -v cc >/dev/null 2>&1; then
+    say "installing build tools (sudo)"
+    if command -v apt-get >/dev/null 2>&1; then
+      sudo apt-get install -y -qq build-essential pkg-config
+    elif command -v dnf >/dev/null 2>&1; then
+      sudo dnf install -y gcc make pkgconf
+    fi
+  fi
+  if ! command -v cargo >/dev/null 2>&1 && [ -f "$HOME/.cargo/env" ]; then
+    # shellcheck disable=SC1091
+    . "$HOME/.cargo/env"
+  fi
+  if ! command -v cargo >/dev/null 2>&1; then
+    say "installing rustup"
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path
+    # shellcheck disable=SC1091
+    . "$HOME/.cargo/env"
+  fi
+  say "building (release)"
+  cargo build --release --manifest-path "$DEST/Cargo.toml" -p maturana-cli
+  ln -sf "$DEST/target/release/maturana" "$HOME/.local/bin/maturana"
+  BIN="$HOME/.local/bin/maturana"
+fi
+
 case ":$PATH:" in
   *":$HOME/.local/bin:"*) ;;
   *) say "add ~/.local/bin to PATH" ;;
@@ -80,15 +127,15 @@ fi
 
 # 6. Initialize + register services (Rust owns the logic).
 cd "$DEST"
-"$DEST/target/release/maturana" pipelock init >/dev/null 2>&1 || true
+"$BIN" pipelock init >/dev/null 2>&1 || true
 say "registering services (maturana up + maturana web)"
-"$DEST/target/release/maturana" service install up web
+"$BIN" service install up web
 # Firecracker hosts also get the boot-time fleet relauncher (zero-touch reboot
 # recovery): a systemd oneshot that recreates the TAP + relaunches the microVMs
 # from the baked rootfs after a reboot, with no interactive login.
 if [ "$WITH_FIRECRACKER" = "1" ] && [ "$(uname -s)" = "Linux" ]; then
   say "registering fleet boot service (maturana fleet)"
-  "$DEST/target/release/maturana" service install fleet
+  "$BIN" service install fleet
 fi
 
 # 7. Orientation: both control surfaces are equals.

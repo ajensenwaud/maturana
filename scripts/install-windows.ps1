@@ -7,10 +7,20 @@ param(
     # tasks with logon type Password so they run at boot WITHOUT an interactive
     # login (codex/claude auth lives in the user profile). Prompted securely if
     # omitted. Windows stores it in the LSA vault, never on disk.
-    [System.Security.SecureString]$WindowsPassword
+    [System.Security.SecureString]$WindowsPassword,
+    # Path to a prebuilt maturana.exe (set by bootstrap.ps1). When provided, the
+    # whole install runs the signed release binary and skips the local Rust/MSYS2
+    # build entirely.
+    [string]$MaturanaBin
 )
 
 $ErrorActionPreference = "Stop"
+
+# Make the prebuilt binary visible to the child scripts (maturana.ps1,
+# install-hostd-task.ps1) which check MATURANA_BIN to skip building.
+if ($MaturanaBin -and (Test-Path -LiteralPath $MaturanaBin)) {
+    $env:MATURANA_BIN = (Resolve-Path -LiteralPath $MaturanaBin).Path
+}
 
 # Registering the up/web boot tasks (logon type Password, -AtStartup, -RunLevel
 # Highest) writes a credential into the LSA vault and therefore REQUIRES an
@@ -31,6 +41,7 @@ if (-not $SkipServices) {
         if ($SkipImage)  { $fwd += '-SkipImage' }
         if ($ForceImage) { $fwd += '-ForceImage' }
         if ($SkipHostd)  { $fwd += '-SkipHostd' }
+        if ($env:MATURANA_BIN) { $fwd += @('-MaturanaBin', $env:MATURANA_BIN) }
         $launchArgs = @('-NoExit','-NoProfile','-ExecutionPolicy','Bypass','-File', $PSCommandPath) + $fwd
         try {
             Start-Process powershell.exe -Verb RunAs -ArgumentList $launchArgs | Out-Null
@@ -47,7 +58,11 @@ $imagePath = Join-Path $repoRoot ".maturana\images\ubuntu-noble\noble-server-clo
 
 Push-Location $repoRoot
 try {
-    Write-Host "Building maturana CLI with the Windows GNU toolchain..."
+    if ($env:MATURANA_BIN) {
+        Write-Host "Using prebuilt maturana binary: $env:MATURANA_BIN"
+    } else {
+        Write-Host "Building maturana CLI with the Windows GNU toolchain..."
+    }
     & .\scripts\maturana.ps1 --help | Out-Null
 
     Write-Host "Preparing agent SSH key..."
