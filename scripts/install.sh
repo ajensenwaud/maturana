@@ -128,6 +128,8 @@ fi
 # 6. Initialize + register services (Rust owns the logic).
 cd "$DEST"
 "$BIN" pipelock init >/dev/null 2>&1 || true
+# Expose every skill as a Codex /maturana-<name> slash command (best-effort).
+"$BIN" skill codex-prompts "$DEST/skills" >/dev/null 2>&1 || true
 say "registering services (maturana up + maturana web)"
 "$BIN" service install up web
 # Firecracker hosts also get the boot-time fleet relauncher (zero-touch reboot
@@ -165,7 +167,9 @@ echo
 echo "2) Build your first agent:"
 echo "     cd $DEST"
 echo "     codex"
-echo "   then ask Codex: \"create and launch a new agent\"."
+echo "   then ask Codex: \"create and launch a new agent\","
+echo "   or use a skill directly, e.g.  /maturana-agent-create"
+echo "   (all 31 skills are installed as /maturana-<name> slash commands)."
 echo
 echo "Web cockpit:  http://$(hostname):47836"
 echo "     token:  $token"
