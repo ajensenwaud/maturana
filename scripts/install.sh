@@ -138,28 +138,41 @@ if [ "$WITH_FIRECRACKER" = "1" ] && [ "$(uname -s)" = "Linux" ]; then
   "$BIN" service install fleet
 fi
 
-# 7. Orientation: Codex-native. Everything flows from Codex; the cockpit is secondary.
-say "install complete"
+# 7. Orientation: Codex-native. Harness credential pre-check + first-agent steps.
+harness_status() {
+  # $1 cli, $2 auth path, $3 login hint, $4 install hint
+  if command -v "$1" >/dev/null 2>&1 && [ -f "$2" ]; then
+    echo "ready"
+  elif command -v "$1" >/dev/null 2>&1; then
+    echo "installed, NOT logged in -> run: $3"
+  else
+    echo "missing -> install: $4  then: $3"
+  fi
+}
+codex_status="$(harness_status codex "$HOME/.codex/auth.json" 'codex login' 'npm install -g @openai/codex')"
+claude_status="$(harness_status claude "$HOME/.claude/.credentials.json" 'claude (then /login)' 'npm install -g @anthropic-ai/claude-code')"
+token="$(head -1 "$DEST/.maturana/web/token" 2>/dev/null || echo '(run: maturana web token)')"
+
 echo
-echo "  Maturana is Codex-native - you build and run agents from Codex, which is"
-echo "  oriented by this repo's AGENTS.md + skills/."
+echo "==================== Maturana ready ===================="
+echo "A Codex-native agent framework. Build agents from Codex,"
+echo "which is oriented by this repo's AGENTS.md + skills/."
 echo
-echo "  NEXT STEP - start building agents:"
-echo "      cd $DEST"
-echo "      codex"
-echo "    then ask Codex to create and launch your first agent."
-if ! command -v codex >/dev/null 2>&1; then
-  echo
-  echo "    ! codex CLI not found - install it first: npm install -g @openai/codex"
-fi
+echo "1) Authenticate a harness (agents need at least one):"
+echo "     codex  : $codex_status"
+echo "     claude : $claude_status"
 echo
-echo "    first run? authenticate your subscription once:  codex login"
+echo "2) Build your first agent:"
+echo "     cd $DEST"
+echo "     codex"
+echo "   then ask Codex: \"create and launch a new agent\"."
 echo
-echo "  Optional web cockpit (nice-to-have):  http://$(hostname):47836"
-echo "      token: $DEST/.maturana/web/token"
+echo "Web cockpit:  http://$(hostname):47836"
+echo "     token:  $token"
 if [ "$WITH_FIRECRACKER" = "1" ]; then
   echo
-  echo "  Firecracker microVM host ready; isolated agents relaunch after reboot"
-  echo "  (fleet service). Ask Codex to launch one, or: maturana repair firecracker-harnesses"
+  echo "Firecracker microVM host ready; isolated agents relaunch after reboot."
 fi
-echo "  boot-time start: linger enabled automatically (zero-touch reboot recovery)"
+echo
+echo "Help:  maturana --help        Docs:  $DEST/docs"
+echo "========================================================"
