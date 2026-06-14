@@ -365,10 +365,15 @@ pub struct TelegramChannel {
     pub chat_id_source: Option<String>,
 }
 
+/// Discord as a full two-way channel: a bot connected to the Discord Gateway
+/// (WebSocket) for inbound messages and the REST API for replies. `bot_token`
+/// is resolved host-side; the bot needs the MESSAGE CONTENT intent enabled in
+/// the Developer Portal. (One-off outbound pings still use `maturana notify
+/// discord --webhook-source ...`, which is separate from this channel.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiscordChannel {
-    pub webhook_source: String,
+    pub bot_token_source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

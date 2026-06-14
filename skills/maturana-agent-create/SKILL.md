@@ -59,9 +59,14 @@ sensible defaults silently and only ask when a choice genuinely matters to them.
      (`maturana pipelock set telegram/bot-token --value <token>`), set
      `channels.telegram.token_source: pipelock:telegram/bot-token`. Pairing
      happens at go-live (step below).
-   - **Discord** (outbound notifications): store the webhook
-     (`maturana pipelock set discord/webhook --value <url>`); deliver via
-     `maturana notify discord --webhook-source pipelock:discord/webhook`.
+   - **Discord** (full two-way bot, like Telegram): create a bot in the Discord
+     Developer Portal, **enable the MESSAGE CONTENT intent**, and invite it to
+     the server (or open a DM). Store the bot token in pipelock
+     (`maturana pipelock set discord/bot-token --value <token>`) and set
+     `channels.discord.bot_token_source: pipelock:discord/bot-token`. The agent
+     then reads and replies over the Discord gateway once `maturana up` runs — no
+     pairing step needed. (For one-off outbound pings only, `maturana notify
+     discord --webhook-source ...` still exists, separate from this channel.)
    Leave channels the user didn't choose disabled.
 6. **Tools / capabilities.** Ask which to enable, and record them in the spec's
    installed skills/tools. Offer the common ones: `maturana-browse`,

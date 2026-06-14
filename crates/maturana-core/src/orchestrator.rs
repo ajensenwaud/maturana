@@ -72,6 +72,8 @@ pub struct AgentRuntime {
     #[serde(default)]
     pub slack: Option<SlackRuntime>,
     #[serde(default)]
+    pub discord: Option<DiscordRuntime>,
+    #[serde(default)]
     pub agentmail: Option<AgentMailRuntime>,
 }
 
@@ -83,6 +85,11 @@ fn default_true() -> bool {
 pub struct SlackRuntime {
     pub bot_token_source: String,
     pub app_token_source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscordRuntime {
+    pub bot_token_source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,6 +105,7 @@ impl AgentRuntime {
             session_id: "telegram-main".to_string(),
             telegram: true,
             slack: None,
+            discord: None,
             agentmail: None,
             telegram_token_source: "pipelock:telegram/bot-token".to_string(),
             schedules: true,
@@ -204,6 +212,23 @@ pub fn plan_processes(config: &OrchestratorConfig) -> Vec<SupervisedProcess> {
                     slack.bot_token_source.clone(),
                     "--app-token-source".to_string(),
                     slack.app_token_source.clone(),
+                ],
+                critical: false,
+            });
+        }
+        if let Some(discord) = &agent.discord {
+            processes.push(SupervisedProcess {
+                name: format!("channel:discord:{}", agent.agent_id),
+                args: vec![
+                    "channel".to_string(),
+                    "serve".to_string(),
+                    "discord".to_string(),
+                    "--agent-id".to_string(),
+                    agent.agent_id.clone(),
+                    "--session-id".to_string(),
+                    agent.session_id.clone(),
+                    "--bot-token-source".to_string(),
+                    discord.bot_token_source.clone(),
                 ],
                 critical: false,
             });

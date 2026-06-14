@@ -121,8 +121,8 @@ pub fn validate_spec(spec: &AgentSpec) -> ValidationReport {
     }
     if let Some(discord) = &spec.channels.discord {
         validate_secret_source(
-            &discord.webhook_source,
-            "channels.discord.webhook_source",
+            &discord.bot_token_source,
+            "channels.discord.bot_token_source",
             &mut errors,
         );
     }
