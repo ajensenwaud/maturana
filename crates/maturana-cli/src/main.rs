@@ -1862,6 +1862,12 @@ fn build_orchestrator_config(
                     app_token_source: s.app_token_source,
                 }
             });
+            let discord = spec
+                .as_ref()
+                .and_then(|s| s.channels.discord.clone())
+                .map(|d| maturana_core::orchestrator::DiscordRuntime {
+                    bot_token_source: d.bot_token_source,
+                });
             let agentmail = spec
                 .as_ref()
                 .and_then(|s| s.channels.agentmail.clone())
@@ -1892,6 +1898,7 @@ fn build_orchestrator_config(
                 schedules: !command.no_schedules,
                 proactive: !command.no_proactive,
                 slack,
+                discord,
                 agentmail,
             })
         })

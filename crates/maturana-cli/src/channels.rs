@@ -102,6 +102,7 @@ pub enum TelegramPairSubcommand {
 pub enum ChannelServeSubcommand {
     Telegram(TelegramServe),
     Slack(SlackServe),
+    Discord(DiscordServe),
     Agentmail(AgentMailServe),
 }
 
@@ -115,6 +116,20 @@ pub struct SlackServe {
     pub bot_token_source: String,
     #[arg(long, default_value = "pipelock:slack/app-token")]
     pub app_token_source: String,
+    #[arg(long)]
+    pub once: bool,
+    #[arg(long)]
+    pub run_once_provider: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct DiscordServe {
+    #[arg(long)]
+    pub agent_id: String,
+    #[arg(long, default_value = "discord-main")]
+    pub session_id: String,
+    #[arg(long, default_value = "pipelock:discord/bot-token")]
+    pub bot_token_source: String,
     #[arg(long)]
     pub once: bool,
     #[arg(long)]
@@ -411,6 +426,7 @@ pub fn handle_channel(command: ChannelCommand, home: &MaturanaHome) -> anyhow::R
         ChannelSubcommand::Serve { command } => match command {
             ChannelServeSubcommand::Telegram(config) => serve_telegram(home, config),
             ChannelServeSubcommand::Slack(config) => serve_slack(home, config),
+            ChannelServeSubcommand::Discord(config) => serve_discord(home, config),
             ChannelServeSubcommand::Agentmail(config) => serve_agentmail(home, config),
         },
         ChannelSubcommand::Status { platform: _, agent_id } => channel_status(home, &agent_id),
@@ -3381,6 +3397,240 @@ fn slack_post_message(
     Ok(resp.get("ts").and_then(|v| v.as_str()).map(str::to_string))
 }
 
+// ---- Discord: full two-way channel via the Gateway (WS) + REST API ----
+
+const DISCORD_API: &str = "https://discord.com/api/v10";
+// GUILDS | GUILD_MESSAGES | DIRECT_MESSAGES | MESSAGE_CONTENT. MESSAGE_CONTENT
+// is privileged and must be enabled in the Discord Developer Portal.
+const DISCORD_INTENTS: u64 = 1 | (1 << 9) | (1 << 12) | (1 << 15);
+
+fn serve_discord(home: &MaturanaHome, config: DiscordServe) -> anyhow::Result<()> {
+    let token = resolve_secret_source_with_home(&config.bot_token_source, home.root())?;
+    let token = token.expose_for_runtime().to_string();
+    let paths = session_paths(&home.agent_dir(&config.agent_id), &config.session_id);
+    ensure_session(&paths)?;
+    println!("discord channel serving agent {}", config.agent_id);
+    loop {
+        if let Err(error) = discord_gateway_session(home, &config, &token, &paths) {
+            eprintln!("discord gateway error: {error}");
+        }
+        if config.once {
+            break;
+        }
+        thread::sleep(Duration::from_secs(5));
+    }
+    Ok(())
+}
+
+/// Connect the Discord Gateway, IDENTIFY, heartbeat on schedule, and turn
+/// MESSAGE_CREATE events into agent prompts (replying via REST) until the socket
+/// drops; the outer loop reconnects.
+fn discord_gateway_session(
+    home: &MaturanaHome,
+    config: &DiscordServe,
+    bot_token: &str,
+    paths: &SessionPaths,
+) -> anyhow::Result<()> {
+    let (mut socket, _) = tungstenite::connect("wss://gateway.discord.gg/?v=10&encoding=json")
+        .map_err(|e| anyhow::anyhow!("discord gateway connect failed: {e}"))?;
+    // Short read timeout so the loop wakes to send heartbeats even when idle.
+    discord_set_read_timeout(&mut socket, Duration::from_millis(1000));
+
+    let mut heartbeat_interval = Duration::from_secs(41);
+    let mut last_heartbeat = std::time::Instant::now();
+    let mut last_seq: Option<i64> = None;
+    let mut identified = false;
+    let mut self_id: Option<String> = None;
+
+    loop {
+        if last_heartbeat.elapsed() >= heartbeat_interval {
+            let hb = serde_json::json!({ "op": 1, "d": last_seq }).to_string();
+            socket
+                .send(tungstenite::Message::Text(hb))
+                .map_err(|e| anyhow::anyhow!("discord heartbeat send: {e}"))?;
+            last_heartbeat = std::time::Instant::now();
+        }
+
+        let msg = match socket.read() {
+            Ok(msg) => msg,
+            Err(tungstenite::Error::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(e) => return Err(anyhow::anyhow!("discord read: {e}")),
+        };
+        let text = match msg {
+            tungstenite::Message::Text(t) => t,
+            tungstenite::Message::Close(_) => {
+                return Err(anyhow::anyhow!("discord gateway closed"))
+            }
+            _ => continue,
+        };
+        let event: serde_json::Value = serde_json::from_str(&text)?;
+        let op = event.get("op").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if let Some(s) = event.get("s").and_then(|v| v.as_i64()) {
+            last_seq = Some(s);
+        }
+        match op {
+            10 => {
+                if let Some(ms) = event
+                    .pointer("/d/heartbeat_interval")
+                    .and_then(|v| v.as_u64())
+                {
+                    heartbeat_interval = Duration::from_millis(ms);
+                }
+                last_heartbeat = std::time::Instant::now();
+                if !identified {
+                    let identify = serde_json::json!({
+                        "op": 2,
+                        "d": {
+                            "token": bot_token,
+                            "intents": DISCORD_INTENTS,
+                            "properties": { "os": "linux", "browser": "maturana", "device": "maturana" }
+                        }
+                    })
+                    .to_string();
+                    socket
+                        .send(tungstenite::Message::Text(identify))
+                        .map_err(|e| anyhow::anyhow!("discord identify send: {e}"))?;
+                    identified = true;
+                }
+            }
+            1 => {
+                let hb = serde_json::json!({ "op": 1, "d": last_seq }).to_string();
+                let _ = socket.send(tungstenite::Message::Text(hb));
+                last_heartbeat = std::time::Instant::now();
+            }
+            11 => { /* heartbeat ACK */ }
+            7 | 9 => {
+                return Err(anyhow::anyhow!(
+                    "discord gateway requested reconnect (op {op})"
+                ))
+            }
+            0 => {
+                let t = event.get("t").and_then(|v| v.as_str()).unwrap_or("");
+                match t {
+                    "READY" => {
+                        self_id = event
+                            .pointer("/d/user/id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                    }
+                    "MESSAGE_CREATE" => {
+                        if let Some((channel_id, content)) =
+                            discord_extract_prompt(&event, self_id.as_deref())
+                        {
+                            enqueue_channel_prompt(
+                                home,
+                                &config.agent_id,
+                                &config.session_id,
+                                "discord",
+                                &channel_id,
+                                None,
+                                &content,
+                            )?;
+                            if let Some(provider) = &config.run_once_provider {
+                                let options = RunnerOptions {
+                                    provider: provider.to_string(),
+                                };
+                                run_session_once(paths, &options, 20)?;
+                            }
+                            let token = bot_token.to_string();
+                            let chan = channel_id.clone();
+                            deliver_channel_outbox(
+                                home,
+                                &config.agent_id,
+                                &config.session_id,
+                                "discord",
+                                &channel_id,
+                                |reply, _| discord_post_message(&token, &chan, reply),
+                            )?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Set a read timeout on the gateway socket so the heartbeat loop can run even
+/// when no events arrive (works for both plaintext and rustls streams).
+fn discord_set_read_timeout(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    dur: Duration,
+) {
+    match socket.get_mut() {
+        tungstenite::stream::MaybeTlsStream::Plain(s) => {
+            let _ = s.set_read_timeout(Some(dur));
+        }
+        tungstenite::stream::MaybeTlsStream::Rustls(s) => {
+            let _ = s.sock.set_read_timeout(Some(dur));
+        }
+        _ => {}
+    }
+}
+
+/// Pull (channel_id, content) from a MESSAGE_CREATE event; skip bot/own messages
+/// and empty content.
+fn discord_extract_prompt(
+    event: &serde_json::Value,
+    self_id: Option<&str>,
+) -> Option<(String, String)> {
+    let d = event.get("d")?;
+    if d.pointer("/author/bot").and_then(|v| v.as_bool()) == Some(true) {
+        return None;
+    }
+    if let (Some(self_id), Some(author_id)) =
+        (self_id, d.pointer("/author/id").and_then(|v| v.as_str()))
+    {
+        if self_id == author_id {
+            return None;
+        }
+    }
+    let channel_id = d.get("channel_id").and_then(|v| v.as_str())?.to_string();
+    let content = d
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if content.is_empty() {
+        return None;
+    }
+    Some((channel_id, strip_discord_mention(&content)))
+}
+
+/// Remove a leading `<@id>` / `<@!id>` bot mention so the prompt is clean.
+fn strip_discord_mention(text: &str) -> String {
+    let trimmed = text.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("<@") {
+        if let Some(close) = rest.find('>') {
+            return rest[close + 1..].trim().to_string();
+        }
+    }
+    text.to_string()
+}
+
+fn discord_post_message(
+    bot_token: &str,
+    channel_id: &str,
+    text: &str,
+) -> anyhow::Result<Option<String>> {
+    // Discord caps message content at 2000 characters.
+    let content: String = text.chars().take(2000).collect();
+    let resp: serde_json::Value =
+        ureq::post(&format!("{DISCORD_API}/channels/{channel_id}/messages"))
+            .set("authorization", &format!("Bot {bot_token}"))
+            .send_json(serde_json::json!({ "content": content }))
+            .map_err(|e| anyhow::anyhow!("discord send message failed: {e}"))?
+            .into_json()?;
+    Ok(resp.get("id").and_then(|v| v.as_str()).map(str::to_string))
+}
+
 // ---- shared channel-state persistence (generic over channel name) ----
 
 fn read_channel_state<T: serde::de::DeserializeOwned + Default>(
@@ -3658,6 +3908,36 @@ mod tests {
                 args: String::new()
             }
         );
+    }
+
+    #[test]
+    fn discord_extracts_prompt_and_skips_bot_and_self() {
+        // A real user message: returns (channel_id, content) with the leading
+        // bot mention stripped.
+        let ev = serde_json::json!({
+            "op": 0, "t": "MESSAGE_CREATE",
+            "d": { "channel_id": "123", "content": "<@999> hello there",
+                   "author": { "id": "42", "bot": false } }
+        });
+        assert_eq!(
+            discord_extract_prompt(&ev, Some("999")),
+            Some(("123".to_string(), "hello there".to_string()))
+        );
+        // Bot-authored message is ignored.
+        let bot = serde_json::json!({
+            "d": { "channel_id": "1", "content": "hi", "author": { "id": "7", "bot": true } }
+        });
+        assert_eq!(discord_extract_prompt(&bot, Some("999")), None);
+        // Our own message (author id == self) is ignored (no echo loop).
+        let own = serde_json::json!({
+            "d": { "channel_id": "1", "content": "hi", "author": { "id": "999" } }
+        });
+        assert_eq!(discord_extract_prompt(&own, Some("999")), None);
+        // Empty content is ignored.
+        let empty = serde_json::json!({
+            "d": { "channel_id": "1", "content": "   ", "author": { "id": "42" } }
+        });
+        assert_eq!(discord_extract_prompt(&empty, Some("999")), None);
     }
 
     #[test]
