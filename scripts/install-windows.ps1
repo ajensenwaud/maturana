@@ -11,7 +11,10 @@ param(
     # Path to a prebuilt maturana.exe (set by bootstrap.ps1). When provided, the
     # whole install runs the signed release binary and skips the local Rust/MSYS2
     # build entirely.
-    [string]$MaturanaBin
+    [string]$MaturanaBin,
+    # Skills as Codex /slash commands in ~/.codex/prompts. Default: ask.
+    [switch]$CodexPrompts,
+    [switch]$NoCodexPrompts
 )
 
 $ErrorActionPreference = "Stop"
@@ -42,6 +45,8 @@ if (-not $SkipServices) {
         if ($ForceImage) { $fwd += '-ForceImage' }
         if ($SkipHostd)  { $fwd += '-SkipHostd' }
         if ($env:MATURANA_BIN) { $fwd += @('-MaturanaBin', $env:MATURANA_BIN) }
+        if ($CodexPrompts)   { $fwd += '-CodexPrompts' }
+        if ($NoCodexPrompts) { $fwd += '-NoCodexPrompts' }
         $launchArgs = @('-NoExit','-NoProfile','-ExecutionPolicy','Bypass','-File', $PSCommandPath) + $fwd
         try {
             Start-Process powershell.exe -Verb RunAs -ArgumentList $launchArgs | Out-Null
@@ -120,8 +125,23 @@ try {
         & .\scripts\set-vm-autostart.ps1
     }
 
-    # Expose every skill as a Codex /maturana-<name> slash command (best-effort).
-    try { & .\scripts\maturana.ps1 skill codex-prompts (Join-Path $repoRoot 'skills') 2>$null | Out-Null } catch {}
+    # Skills as Codex /slash commands (~/.codex/prompts) vs kept in the repo only
+    # (Codex still loads them on demand via AGENTS.md). Ask unless told via switch.
+    $doPrompts = $true
+    if ($NoCodexPrompts) {
+        $doPrompts = $false
+    } elseif (-not $CodexPrompts) {
+        $ans = Read-Host "Install skills as Codex /slash commands in ~/.codex/prompts? [Y/n]"
+        if ($ans -match '^(n|no)$') { $doPrompts = $false }
+    }
+    if ($doPrompts) {
+        try {
+            & .\scripts\maturana.ps1 skill codex-prompts (Join-Path $repoRoot 'skills') 2>$null | Out-Null
+            Write-Host "  skills installed as Codex /maturana-<name> slash commands"
+        } catch { Write-Host "  could not install Codex prompts (skills still load via AGENTS.md)" }
+    } else {
+        Write-Host "  skills kept in the repo (Codex loads them on demand via AGENTS.md)"
+    }
 
     # Put `maturana` on PATH (prebuilt-binary install) so `maturana --help` works.
     if ($env:MATURANA_BIN) {
