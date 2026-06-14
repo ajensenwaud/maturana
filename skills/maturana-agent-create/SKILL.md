@@ -107,16 +107,28 @@ Fix spec fields until validation is clean — never weaken validation.
 3. **Personal scaffolding** — `maturana personal init <id> --spec
    .maturana/agents/<id>/MATURANA.md` (memory, context, schedules, wiki). It
    preserves your authored `IDENTITY.md`/`SOUL.md`/`MEMORY.md`.
-4. **Pair channels:**
+4. **Pair Telegram:**
    ```
    maturana channel pair telegram start --agent-id <id>
    # ask the user to send the printed /pair CODE to the bot
    maturana channel pair telegram complete --agent-id <id>
-   maturana channel serve telegram --agent-id <id>
    ```
    For Discord, send a test `maturana notify discord` and confirm it arrives.
-5. **Confirm it's live** — send a real message through the paired channel and
-   confirm the agent replies; check `maturana heartbeat status <id>`.
+5. **Bring the agent online — supervised, not by hand.** Start the plane so the
+   channel + proactivity + schedule runners are supervised together:
+   ```
+   maturana up --agent-id <id>            # foreground supervisor (one agent)
+   # or, for an always-on agent that survives reboot:
+   maturana service install up
+   ```
+   **Do NOT launch `channel serve` as a background/hidden process yourself** —
+   `maturana up` (and the `up` service) own the long-running runners.
+6. **Confirm it's live:**
+   ```
+   maturana channel status telegram --agent-id <id>   # paired: true, presence active
+   ```
+   Then send a real message through the paired channel and confirm the agent
+   replies.
 
 (On Windows you can use `.\scripts\maturana.ps1 …` if `maturana` isn't yet on
 PATH in the current shell.)
@@ -148,6 +160,9 @@ Before claiming success, collect:
 
 - Do not skip the interview or invent a name/identity/soul the user didn't give.
 - Do not launch from an unvalidated spec, or without harness auth present.
+- Do not provision the guest, or run channel/proactive/schedule runners, by hand
+  (no SSH provisioning, no backgrounded `channel serve`): `agent launch --apply`
+  provisions; `maturana up` / the `up` service supervise the runners.
 - Do not store OpenAI/Claude OAuth in pipelock; inject it directly into the VM.
 - Do not paste raw secrets into `MATURANA.md`, `IDENTITY.md`, `SOUL.md`, memory,
   wiki, or logs.
