@@ -439,7 +439,7 @@ fn complete_telegram_pair(
     let mut state = read_telegram_state(home, agent_id)?;
     let attempts = timeout_seconds.max(1);
     for _ in 0..attempts {
-        let updates = telegram_updates(token.expose_for_runtime(), state.offset)?;
+        let updates = telegram_updates(token.expose_for_runtime(), state.offset, 0)?;
         for update in &updates {
             state.offset = Some(update.update_id + 1);
             if let InboundAction::Pair { chat_id } =
@@ -496,7 +496,7 @@ fn serve_telegram(home: &MaturanaHome, config: TelegramServe) -> anyhow::Result<
     ))?;
     println!("telegram channel serving agent {}", config.agent_id);
     if state.offset.is_none() {
-        let updates = telegram_updates(&token, None)?;
+        let updates = telegram_updates(&token, None, 0)?;
         if let Some(max_update_id) = updates.iter().map(|update| update.update_id).max() {
             state.offset = Some(max_update_id + 1);
             state.last_seen_at = Some(Utc::now());
@@ -507,9 +507,40 @@ fn serve_telegram(home: &MaturanaHome, config: TelegramServe) -> anyhow::Result<
             return Ok(());
         }
     }
+    // Deliver agent replies on a dedicated fast cadence so an outbound message
+    // never waits for the inbound long-poll. Without this, a reply sits in the
+    // outbox until the next getUpdates returns - the main source of "sluggish".
+    if !config.once {
+        let deliver_root = home.root().to_path_buf();
+        let deliver_token = token.clone();
+        let deliver_agent = config.agent_id.clone();
+        let deliver_session = config.session_id.clone();
+        thread::spawn(move || {
+            let home = MaturanaHome::new(deliver_root);
+            loop {
+                if let Some(chat_id) = current_paired_telegram_chat_id(&home, &deliver_agent) {
+                    let _ = deliver_telegram_outbox(
+                        &home,
+                        &deliver_token,
+                        &deliver_agent,
+                        &deliver_session,
+                        chat_id,
+                    );
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+        });
+    }
+    // Long-poll inbound: getUpdates blocks server-side until a message arrives,
+    // so inbound is near-instant instead of waiting for a client sleep.
+    let long_poll_secs = if config.once {
+        0
+    } else {
+        config.timeout_seconds.clamp(1, 50)
+    };
     loop {
         write_telegram_heartbeat(home, &config.agent_id, "polling", None)?;
-        let updates = match telegram_updates(&token, state.offset) {
+        let updates = match telegram_updates(&token, state.offset, long_poll_secs) {
             Ok(updates) => updates,
             Err(error) => {
                 let message = error.to_string();
@@ -563,28 +594,22 @@ fn serve_telegram(home: &MaturanaHome, config: TelegramServe) -> anyhow::Result<
             }
         }
         write_telegram_state(home, &config.agent_id, &state)?;
-        if let Some(chat_id) = current_paired_telegram_chat_id(home, &config.agent_id) {
-            if let Err(error) =
-                deliver_telegram_outbox(home, &token, &config.agent_id, &config.session_id, chat_id)
-            {
-                let message = error.to_string();
-                write_telegram_heartbeat(home, &config.agent_id, "deliver_error", Some(&message))?;
-                audit_channel_event(
-                    home,
-                    &config.agent_id,
-                    "channel.telegram.deliver_error",
-                    &message,
-                )?;
-                if config.once {
-                    return Err(error);
-                }
-            }
-        }
-        write_telegram_heartbeat(home, &config.agent_id, "idle", None)?;
+        // In serve mode the delivery thread handles the outbox; in `once` mode
+        // (tests / one-shot) deliver inline since no thread was spawned.
         if config.once {
+            if let Some(chat_id) = current_paired_telegram_chat_id(home, &config.agent_id) {
+                deliver_telegram_outbox(
+                    home,
+                    &token,
+                    &config.agent_id,
+                    &config.session_id,
+                    chat_id,
+                )?;
+            }
             break;
         }
-        thread::sleep(Duration::from_secs(config.poll_seconds.max(1)));
+        write_telegram_heartbeat(home, &config.agent_id, "idle", None)?;
+        // No client-side sleep: the long-poll getUpdates above paces the loop.
     }
     Ok(())
 }
@@ -1648,12 +1673,21 @@ fn telegram_bot_username(token: &str) -> anyhow::Result<Option<String>> {
     Ok(response.result.and_then(|user| user.username))
 }
 
-fn telegram_updates(token: &str, offset: Option<i64>) -> anyhow::Result<Vec<TelegramUpdate>> {
-    let mut url = format!("https://api.telegram.org/bot{token}/getUpdates?timeout=0");
+/// Fetch updates. `long_poll_secs > 0` uses Telegram long-polling: the call
+/// blocks server-side until a message arrives (near-instant inbound) or the
+/// timeout elapses, instead of returning immediately and forcing a client-side
+/// sleep. The HTTP read timeout is set above the long-poll window.
+fn telegram_updates(
+    token: &str,
+    offset: Option<i64>,
+    long_poll_secs: u64,
+) -> anyhow::Result<Vec<TelegramUpdate>> {
+    let mut url = format!("https://api.telegram.org/bot{token}/getUpdates?timeout={long_poll_secs}");
     if let Some(offset) = offset {
         url.push_str(&format!("&offset={offset}"));
     }
     let response: TelegramUpdatesResponse = ureq::get(&url)
+        .timeout(Duration::from_secs(long_poll_secs + 15))
         .call()
         .context("Telegram getUpdates failed")?
         .into_json()
