@@ -166,8 +166,13 @@ Say "preparing agent SSH key"
 $imagePath = Join-Path $Dir ".maturana\images\ubuntu-noble\noble-server-cloudimg-amd64.vhdx"
 if (-not $SkipImage) {
     if ($ForceImage -or -not (Test-Path -LiteralPath $imagePath)) {
-        Say "preparing Ubuntu Hyper-V image (this can take a few minutes)"
+        # The slowest step by far (download + convert to VHDX). Set the
+        # expectation and report elapsed time so it never looks frozen.
+        Say "preparing Ubuntu Hyper-V image - one-time, ~3-8 min (downloading + converting)..."
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
         if ($ForceImage) { & $Exe repair ubuntu-cloudimg --force } else { & $Exe repair ubuntu-cloudimg }
+        $sw.Stop()
+        Say ("Ubuntu image ready in {0:n0}s" -f $sw.Elapsed.TotalSeconds)
     } else {
         Say "using existing Ubuntu image: $imagePath"
     }

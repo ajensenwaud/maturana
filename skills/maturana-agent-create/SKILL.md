@@ -30,13 +30,27 @@ Confirm the chosen harness is authenticated on the host before launching:
 If missing, stop and guide the user through auth first — a launched agent with no
 harness auth cannot answer.
 
-## Decision Path — the setup interview (ask one topic at a time, confirm each)
+## Decision Path — the setup interview (a few quick questions, then build)
 
 **Talk like a person, not a config file.** Ask each question in plain language and
 translate the answers into `MATURANA.md` fields yourself. NEVER make the user
 confirm raw field names or values (`on_launch`, `retain`, `egress_allowlist`,
 `harness_auth`, `token_source`, kebab `id`, etc.) — those are your job. Use
 sensible defaults silently and only ask when a choice genuinely matters to them.
+
+**Keep it short and front-loaded.** Gather the few real decisions up front, then
+build the whole agent in one go without stopping to re-confirm. Concretely:
+- **Batch the quick ones.** Name, owner/timezone, purpose, runtime, and which
+  channels can be asked together (or in two short messages) — don't drag a
+  one-line answer into five round-trips.
+- **Never re-ask what you already know.** If the user already said the name,
+  timezone, harness, etc. earlier in the conversation, use it.
+- **Resume, don't restart.** If `.maturana/agents/<id>/` already exists, read it
+  and fill only the gaps (missing channel token, unvalidated spec, not launched
+  yet) instead of re-interviewing from scratch.
+- **Set expectations before slow steps.** The first launch downloads/boots a VM
+  and provisions the guest — say "this takes a few minutes, I'll report when it's
+  up" so a multi-minute step doesn't look stuck.
 
 1. **Name & id.** Ask what they want to call the agent. Derive a kebab-case
    `id` (e.g. "Ada" → `ada`); confirm it.
