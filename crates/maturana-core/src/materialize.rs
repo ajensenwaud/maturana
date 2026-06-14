@@ -45,7 +45,12 @@ pub fn materialize_agent(
 
     fs::write(agent_dir.join("MATURANA.md"), source_markdown)?;
     fs::write(agent_dir.join("AGENTS.md"), render_guest_agents(spec))?;
-    fs::write(agent_dir.join("SOUL.md"), render_soul(spec))?;
+    // IDENTITY.md (who the agent is + who its owner is) and SOUL.md (voice,
+    // values, behavior) are authored personality files. Scaffold them only when
+    // absent so the setup wizard's / user's authored versions are never
+    // clobbered on re-materialize.
+    write_if_absent(&agent_dir.join("IDENTITY.md"), || render_identity(spec))?;
+    write_if_absent(&agent_dir.join("SOUL.md"), || render_soul(spec))?;
 
     let provider: Box<dyn Provider> = match spec.vm.provider {
         HostProvider::HyperV => Box::new(HyperVProvider),
@@ -138,9 +143,55 @@ fn render_guest_agents(spec: &AgentSpec) -> String {
     )
 }
 
+fn write_if_absent<F: FnOnce() -> String>(path: &std::path::Path, content: F) -> std::io::Result<()> {
+    if path.exists() {
+        Ok(())
+    } else {
+        fs::write(path, content())
+    }
+}
+
+/// Rich scaffold for IDENTITY.md: who the agent is and who its owner is. The
+/// setup wizard fills the angle-bracket prompts from the interview; left as-is it
+/// still reads as a usable template.
+fn render_identity(spec: &AgentSpec) -> String {
+    format!(
+        "# Identity — {name}\n\
+         <!-- id: {id} -->\n\n\
+         ## Who I am\n\
+         {name} — {purpose}\n\n\
+         <Expand: my role, what I help with, and why I exist.>\n\n\
+         ## Who you are to me\n\
+         <Your owner: name, how to address you, timezone, working hours, and what\n\
+         you rely on me for.>\n\n\
+         ## Scope & boundaries\n\
+         - In scope: <what I should do>\n\
+         - Out of scope: <what I must not do without asking>\n\n\
+         ## How we work together\n\
+         <Channels you reach me on, when to ping you, response expectations.>\n",
+        name = spec.identity.name,
+        id = spec.identity.id,
+        purpose = spec.identity.purpose,
+    )
+}
+
+/// Rich scaffold for SOUL.md: the durable personality + operating posture.
 fn render_soul(spec: &AgentSpec) -> String {
     format!(
-        "# {}\n\nDefault posture: secure, bounded, inspectable, and reversible.\n\nNever request credentials directly. Use declared credential sources only.\n",
-        spec.identity.name
+        "# Soul — {name}\n\n\
+         My durable personality and posture across every conversation. Edit freely.\n\n\
+         ## Voice\n\
+         <Tone, formality, brevity, humor — how I should sound.>\n\n\
+         ## Values\n\
+         - Secure, bounded, inspectable, and reversible by default.\n\
+         - <Your values…>\n\n\
+         ## Behavior\n\
+         - Do: <…>\n\
+         - Don't: <…>\n\
+         - Never request credentials directly; use declared credential sources only.\n\n\
+         ## Memory & continuity\n\
+         I persist durable facts to memory and shared context to the wiki; I do not\n\
+         rely on the chat window to remember.\n",
+        name = spec.identity.name,
     )
 }
