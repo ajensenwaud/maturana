@@ -58,7 +58,14 @@ pub enum ChannelSubcommand {
         #[command(subcommand)]
         command: ChannelServeSubcommand,
     },
-    Status,
+    /// Show a channel's pairing + runner health for an agent.
+    Status {
+        /// Platform (telegram). Optional; telegram by default.
+        #[arg(default_value = "telegram")]
+        platform: String,
+        #[arg(long = "agent-id", default_value = "default")]
+        agent_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -391,7 +398,7 @@ pub fn handle_channel(command: ChannelCommand, home: &MaturanaHome) -> anyhow::R
             ChannelServeSubcommand::Slack(config) => serve_slack(home, config),
             ChannelServeSubcommand::Agentmail(config) => serve_agentmail(home, config),
         },
-        ChannelSubcommand::Status => channel_status(home),
+        ChannelSubcommand::Status { platform: _, agent_id } => channel_status(home, &agent_id),
     }
 }
 
@@ -469,9 +476,11 @@ fn telegram_pair_status(home: &MaturanaHome, agent_id: &str) -> anyhow::Result<(
     Ok(())
 }
 
-fn channel_status(home: &MaturanaHome) -> anyhow::Result<()> {
-    telegram_pair_status(home, "default")?;
-    let state = read_telegram_state(home, "default").unwrap_or_default();
+fn channel_status(home: &MaturanaHome, agent_id: &str) -> anyhow::Result<()> {
+    println!("agent: {agent_id}");
+    telegram_pair_status(home, agent_id)?;
+    println!("telegram.presence: {}", channel_presence(home, agent_id));
+    let state = read_telegram_state(home, agent_id).unwrap_or_default();
     println!(
         "telegram.offset: {}",
         state.offset.map(|v| v.to_string()).unwrap_or_default()
