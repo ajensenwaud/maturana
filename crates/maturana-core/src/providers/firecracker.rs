@@ -522,7 +522,15 @@ fn validate_firecracker_prerequisites(
 fn ensure_kvm_ready() -> anyhow::Result<()> {
     let path = Path::new("/dev/kvm");
     if !path.exists() {
-        anyhow::bail!("/dev/kvm does not exist");
+        // Vendor-agnostic: this only means the kvm module isn't loaded (works the
+        // same for Intel vmx and AMD svm). Point at the enabler rather than a
+        // bare failure.
+        anyhow::bail!(
+            "/dev/kvm does not exist - KVM is not enabled on this host. \
+             Run scripts/kvm-enable.sh (it loads the kvm_intel/kvm_amd module \
+             and persists it). If that fails, enable VT-x/AMD-V in firmware, or \
+             nested virtualization on the VM host."
+        );
     }
     #[cfg(unix)]
     {
@@ -534,7 +542,16 @@ fn ensure_kvm_ready() -> anyhow::Result<()> {
     let readable = fs::OpenOptions::new().read(true).open(path).is_ok();
     let writable = fs::OpenOptions::new().write(true).open(path).is_ok();
     if !readable || !writable {
-        anyhow::bail!("/dev/kvm must be readable and writable by the current user");
+        // /dev/kvm exists but the current user can't open it - almost always
+        // missing kvm-group membership (and a group add doesn't apply to an
+        // already-open session). Say exactly how to fix it.
+        let user = std::env::var("USER").unwrap_or_else(|_| "<you>".to_string());
+        anyhow::bail!(
+            "/dev/kvm exists but is not readable/writable by the current user. \
+             Add your user to the 'kvm' group and start a NEW session:\n  \
+             sudo usermod -aG kvm {user}\n  newgrp kvm   # or log out and back in / reboot\n\
+             (scripts/kvm-enable.sh does the group add for you.)"
+        );
     }
     Ok(())
 }
