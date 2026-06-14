@@ -215,6 +215,18 @@ if [ "$WITH_FIRECRACKER" = "1" ]; then
   echo
   echo "Firecracker microVM host ready; isolated agents relaunch after reboot."
 fi
+# KVM group membership added during install does NOT apply to this shell or to
+# already-running user services. If /dev/kvm exists but isn't accessible yet,
+# agents can't launch until a new login session picks up the kvm group. Make
+# that the loud, last thing the user sees so a one-shot install doesn't appear
+# done while the very next launch would fail.
+if [ "$(uname -s)" = "Linux" ] && [ -e /dev/kvm ] && { [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; }; then
+  echo
+  echo "!! ACTION NEEDED: you were added to the 'kvm' group, but it isn't active"
+  echo "   in this session. Log out and back in (or reboot) BEFORE launching"
+  echo "   agents, so the runners can open /dev/kvm. Quick check afterwards:"
+  echo "     [ -r /dev/kvm ] && [ -w /dev/kvm ] && echo 'kvm OK'"
+fi
 echo
 echo "Help:  maturana --help        Docs:  $DEST/docs"
 echo "========================================================"
