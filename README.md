@@ -26,12 +26,13 @@ curl -fsSL .../scripts/install.sh | bash -s -- --from-source
 # Windows (Hyper-V) — downloads the signed maturana.exe, then installs.
 # Self-elevates (one UAC) and prompts for your Windows password (for the
 # no-login boot tasks). See "Zero-touch reboot recovery" below.
-irm https://raw.githubusercontent.com/ajensenwaud/maturana/main/scripts/bootstrap.ps1 | iex
+irm https://maturana.sh/install.ps1 | iex
 ```
 
-Or clone this repo and run `scripts/install.sh` / `scripts/install-windows.ps1`
-directly (the Windows in-repo path builds from source and needs Rust + MSYS2;
-the `irm | iex` bootstrap above avoids both). On Linux, `--firecracker` (or
+Or clone this repo and run `scripts/install.sh` / `scripts/install.ps1`
+directly. The Windows installer downloads the prebuilt binary by default; pass
+`-FromSource` to build with the Rust MSVC toolchain instead. On Linux,
+`--firecracker` (or
 running `scripts/install-firecracker-host.sh` standalone) provisions the microVM
 substrate — the `firecracker` binary, KVM access, the libguestfs/qemu
 image-build toolchain, and guest-egress NAT — then `maturana repair
@@ -338,7 +339,7 @@ Prepare Windows once from a normal PowerShell session. The last step may show a
 single UAC prompt to install the privileged scheduled-task host daemon:
 
 ```powershell
-.\scripts\install-windows.ps1
+.\scripts\install.ps1
 ```
 
 Or run the steps separately. Prepare the official Ubuntu cloud image once:

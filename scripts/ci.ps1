@@ -27,7 +27,7 @@ try {
         "firecracker-prepare-assets.sh",
         "firecracker-setup-tap.sh",
         "install-hostd-task.ps1",
-        "install-windows.ps1",
+        "install.ps1",
         "launch-ubuntu-cloudimg-hyperv.ps1",
         "maturana.ps1",
         "run-elevated.ps1",

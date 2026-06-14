@@ -24,7 +24,9 @@ These scripts are acceptable as host setup or host primitive wrappers:
   explicit allowlist of scripts and syntax-checks every remaining PowerShell and
   bash script. It also rejects known orchestration/policy strings in leaf
   scripts, including Hyper-V cloud-init generation and proxy-policy parsing.
-- `scripts/install-windows.ps1`: one-shot Windows bootstrap aggregator.
+- `scripts/install.ps1`: the single Windows installer (downloads the prebuilt
+  binary, or `-FromSource` builds it; self-elevates once; sets up hostd, the
+  Ubuntu image, and the up/web boot services).
 - `scripts/install-hostd-task.ps1`, `scripts/uninstall-hostd-task.ps1`:
   scheduled task registration for the Rust `maturana hostd serve` daemon.
 - Windows session/channel runners are started and optionally registered by the
