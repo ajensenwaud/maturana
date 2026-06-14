@@ -29,19 +29,17 @@ if [ "$(id -u)" -ne 0 ]; then
   SUDO="sudo"
 fi
 
-# 1. KVM: the provider boots microVMs through /dev/kvm.
-say "checking virtualization (KVM)"
-if [ ! -e /dev/kvm ]; then
-  if grep -Eqc '(vmx|svm)' /proc/cpuinfo; then
-    die "CPU supports virtualization but /dev/kvm is missing — enable KVM (load kvm_intel/kvm_amd, and enable VT-x/AMD-V in BIOS, or nested virt on a cloud VM)"
-  fi
-  die "/dev/kvm absent and no vmx/svm in /proc/cpuinfo — this host cannot run Firecracker"
-fi
-if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
-  say "granting KVM access to $USER (kvm group)"
-  $SUDO groupadd -r kvm 2>/dev/null || true
-  $SUDO usermod -aG kvm "$USER" || true
-  say "NOTE: log out/in (or 'newgrp kvm') for kvm group membership to take effect"
+# 1. KVM: the provider boots microVMs through /dev/kvm. Detect + ENABLE it
+#    (load the vendor module, persist it, grant access) rather than only
+#    checking. Delegated to the shared, idempotent kvm-enable.sh so install.sh
+#    and this script behave identically. A Firecracker host without KVM is
+#    pointless, so a failure here is fatal.
+say "ensuring virtualization (KVM)"
+KVM_HELPER="$(dirname "$0")/kvm-enable.sh"
+if [ -f "$KVM_HELPER" ]; then
+  bash "$KVM_HELPER"
+else
+  curl -fsSL https://raw.githubusercontent.com/ajensenwaud/maturana/main/scripts/kvm-enable.sh | bash
 fi
 
 # 2. Packages: image-build toolchain used by firecracker-prepare-assets.sh
