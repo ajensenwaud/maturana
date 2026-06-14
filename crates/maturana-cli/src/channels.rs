@@ -275,6 +275,21 @@ struct TelegramUpdate {
     update_id: i64,
     message: Option<TelegramMessage>,
     channel_post: Option<TelegramMessage>,
+    /// Set when the user taps an inline-keyboard button (e.g. the model selector).
+    #[serde(default)]
+    callback_query: Option<TelegramCallbackQuery>,
+}
+
+/// A tap on an inline-keyboard button. `data` carries our `action:value` payload
+/// (e.g. `model:gpt-5`); `message` is the bot message the keyboard is attached to,
+/// which gives us the chat id (for the pairing gate) and message id (to edit).
+#[derive(Debug, Deserialize)]
+struct TelegramCallbackQuery {
+    id: String,
+    #[serde(default)]
+    data: Option<String>,
+    #[serde(default)]
+    message: Option<TelegramMessage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -504,6 +519,11 @@ fn serve_telegram(home: &MaturanaHome, config: TelegramServe) -> anyhow::Result<
         &config.session_id,
     ))?;
     println!("telegram channel serving agent {}", config.agent_id);
+    // Publish the slash-command menu so `/` brings up the interactive picker.
+    // Best-effort: a transient API hiccup here must not stop the channel.
+    if let Err(error) = set_telegram_commands(&token) {
+        eprintln!("telegram: could not set command menu: {error:#}");
+    }
     if state.offset.is_none() {
         let updates = telegram_updates(&token, None, 0)?;
         if let Some(max_update_id) = updates.iter().map(|update| update.update_id).max() {
@@ -640,6 +660,10 @@ fn handle_telegram_update(
     pair_code: Option<&str>,
     update: &TelegramUpdate,
 ) -> anyhow::Result<()> {
+    // Inline-keyboard button taps arrive as callback queries, not messages.
+    if let Some(callback) = &update.callback_query {
+        return handle_telegram_callback(home, token, config, paired_chat_id, callback);
+    }
     let reply_to_message_id = telegram_message(update).map(|message| message.message_id);
     match classify_telegram_update(update, paired_chat_id, pair_code) {
         InboundAction::Ignore => Ok(()),
@@ -724,6 +748,22 @@ fn handle_telegram_update(
                 "channel.telegram.command",
                 &format!("/{name}"),
             )?;
+            // Commands with a natural set of choices render as a tappable
+            // selector (model picker, TTS provider, session state). Bare form
+            // only — `/model gpt-5` still sets directly via the text path.
+            if let Some((prompt, buttons, columns)) =
+                command_selector(home, config, &name, &args)
+            {
+                send_telegram_keyboard(
+                    token,
+                    &chat_id.to_string(),
+                    &prompt,
+                    &buttons,
+                    columns,
+                    reply_to_message_id,
+                )?;
+                return Ok(());
+            }
             let reply = handle_channel_command(home, config, chat_id, &name, &args)
                 .unwrap_or_else(|error| format!("Command failed: {error:#}"));
             send_telegram(token, &chat_id.to_string(), &reply, reply_to_message_id)?;
@@ -1149,6 +1189,14 @@ fn classify_telegram_update(
         Some((c, a)) => (c.to_ascii_lowercase(), a.trim().to_string()),
         None => (command.to_ascii_lowercase(), String::new()),
     };
+    // The Telegram command menu sends hyphenated commands as underscores
+    // (`/graph_query`), since Telegram command names can't contain hyphens. Map
+    // them back to our canonical hyphenated form before matching.
+    let cmd = if cmd.starts_with('/') {
+        cmd.replace('_', "-")
+    } else {
+        cmd
+    };
     match cmd.as_str() {
         "/start" | "/help" => InboundAction::Help { chat_id },
         "/status" => InboundAction::Status { chat_id },
@@ -1496,6 +1544,26 @@ fn subagents_text(home: &MaturanaHome, agent_id: &str) -> String {
     }
 }
 
+/// Curated model ids per harness. Codex/Claude don't expose a subscription-aware
+/// catalog API, so we ship a current short list (OpenCode uses the live
+/// OpenRouter catalog instead). Keep these in sync with the latest releases.
+const CODEX_MODELS: &[&str] = &["gpt-5-codex", "gpt-5", "gpt-5-mini"];
+const CLAUDE_MODELS: &[&str] = &["claude-opus-4.8", "claude-sonnet-4.6", "claude-haiku-4.5"];
+const TTS_PROVIDERS: &[&str] = &["elevenlabs", "openai", "deepgram"];
+
+/// Models offered as tappable buttons in the interactive selector. For OpenCode
+/// we surface the top of the live OpenRouter catalog; the full list stays in the
+/// /models text. Bounded so the inline keyboard stays usable.
+fn model_button_choices(home: &MaturanaHome, agent_id: &str) -> Vec<String> {
+    match harness_label(home, agent_id).as_str() {
+        "opencode" => fetch_openrouter_models()
+            .map(|ids| ids.into_iter().take(8).collect())
+            .unwrap_or_default(),
+        "claude-code" => CLAUDE_MODELS.iter().map(|s| s.to_string()).collect(),
+        _ => CODEX_MODELS.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
 /// Live OpenRouter catalog for OpenCode/OpenRouter; a short curated set otherwise.
 fn models_text(home: &MaturanaHome, agent_id: &str) -> String {
     let settings = load_channel_settings(home, agent_id);
@@ -1511,9 +1579,12 @@ fn models_text(home: &MaturanaHome, agent_id: &str) -> String {
             Err(error) => format!("Could not fetch OpenRouter catalog: {error:#}"),
         }
     } else if harness == "codex" {
-        "Codex models: gpt-5-codex, gpt-5, o4-mini\n(your Codex subscription decides availability)".to_string()
+        format!(
+            "Codex models: {}\n(your Codex subscription decides availability)",
+            CODEX_MODELS.join(", ")
+        )
     } else {
-        "claude-code models: claude-sonnet-4.5, claude-opus-4.1, claude-haiku-4.5".to_string()
+        format!("claude-code models: {}", CLAUDE_MODELS.join(", "))
     };
     format!("Current: {current}\nSet with /model <id>\n\n{body}")
 }
@@ -1761,6 +1832,138 @@ fn handle_channel_command(
     Ok(reply)
 }
 
+/// For commands with a small, well-known choice set, return an interactive
+/// selector (prompt text, `(label, callback_data)` buttons, column count) instead
+/// of a plain text reply. Returns `None` for everything else (handled as text) and
+/// for the explicit-argument form (`/model gpt-5` sets directly, no menu).
+fn command_selector(
+    home: &MaturanaHome,
+    config: &TelegramServe,
+    name: &str,
+    args: &str,
+) -> Option<(String, Vec<(String, String)>, usize)> {
+    if !args.trim().is_empty() {
+        return None;
+    }
+    let settings = load_channel_settings(home, &config.agent_id);
+    match name {
+        "models" | "model" => {
+            let current = settings
+                .model
+                .unwrap_or_else(|| "(harness default)".to_string());
+            // callback_data is capped at 64 bytes; drop any id that wouldn't fit.
+            let buttons: Vec<(String, String)> = model_button_choices(home, &config.agent_id)
+                .into_iter()
+                .map(|id| {
+                    let data = format!("model:{id}");
+                    (id, data)
+                })
+                .filter(|(_, data)| data.len() <= 64)
+                .collect();
+            if buttons.is_empty() {
+                return None;
+            }
+            Some((format!("Current model: {current}\nPick one:"), buttons, 1))
+        }
+        "tts-provider" => {
+            let current = settings.tts_provider.unwrap_or_else(|| "(none)".to_string());
+            let buttons = TTS_PROVIDERS
+                .iter()
+                .map(|p| (p.to_string(), format!("ttsprov:{p}")))
+                .collect();
+            Some((format!("TTS provider: {current}\nPick one:"), buttons, 1))
+        }
+        "tts" => {
+            let buttons = vec![
+                ("Enable".to_string(), "tts:on".to_string()),
+                ("Disable".to_string(), "tts:off".to_string()),
+            ];
+            Some((
+                format!(
+                    "Text-to-speech is {}.",
+                    if settings.tts_enabled { "ON" } else { "off" }
+                ),
+                buttons,
+                2,
+            ))
+        }
+        "session" => {
+            let buttons = vec![
+                ("Active".to_string(), "session:active".to_string()),
+                ("Idle".to_string(), "session:idle".to_string()),
+            ];
+            Some((
+                format!(
+                    "Session is {}.",
+                    if settings.idle { "idle" } else { "active" }
+                ),
+                buttons,
+                2,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Apply an inline-keyboard button tap: persist the chosen setting, clear the
+/// client spinner with a toast, and replace the menu message with a confirmation.
+fn handle_telegram_callback(
+    home: &MaturanaHome,
+    token: &str,
+    config: &TelegramServe,
+    paired_chat_id: Option<i64>,
+    callback: &TelegramCallbackQuery,
+) -> anyhow::Result<()> {
+    let Some(message) = &callback.message else {
+        // The original message is no longer accessible; just stop the spinner.
+        return answer_callback_query(token, &callback.id, None);
+    };
+    let chat_id = message.chat.id;
+    if paired_chat_id != Some(chat_id) {
+        answer_callback_query(token, &callback.id, Some("Not paired with this chat."))?;
+        return Ok(());
+    }
+    let data = callback.data.clone().unwrap_or_default();
+    let (action, value) = data.split_once(':').unwrap_or((data.as_str(), ""));
+    let mut settings = load_channel_settings(home, &config.agent_id);
+    let (toast, updated) = match action {
+        "model" => {
+            settings.model = Some(value.to_string());
+            save_channel_settings(home, &config.agent_id, &settings)?;
+            (
+                format!("Model: {value}"),
+                format!("Model set to `{value}` (applies to new turns)."),
+            )
+        }
+        "ttsprov" => {
+            settings.tts_provider = Some(value.to_string());
+            save_channel_settings(home, &config.agent_id, &settings)?;
+            (
+                format!("Provider: {value}"),
+                format!("TTS provider set to `{value}`."),
+            )
+        }
+        "tts" => {
+            settings.tts_enabled = value == "on";
+            save_channel_settings(home, &config.agent_id, &settings)?;
+            let state = if settings.tts_enabled { "ENABLED" } else { "disabled" };
+            (format!("TTS {state}"), format!("Text-to-speech {state}."))
+        }
+        "session" => {
+            settings.idle = value == "idle";
+            save_channel_settings(home, &config.agent_id, &settings)?;
+            let state = if settings.idle { "idle" } else { "active" };
+            (format!("Session {state}"), format!("Session set to {state}."))
+        }
+        _ => (String::new(), "Unknown selection.".to_string()),
+    };
+    answer_callback_query(token, &callback.id, Some(&toast))?;
+    // Replacing the text also strips the keyboard, so the menu can't be re-tapped.
+    let _ = edit_telegram_message(token, chat_id, message.message_id, &updated);
+    audit_channel_event(home, &config.agent_id, "channel.telegram.callback", &data)?;
+    Ok(())
+}
+
 fn telegram_message(update: &TelegramUpdate) -> Option<&TelegramMessage> {
     update.message.as_ref().or(update.channel_post.as_ref())
 }
@@ -1859,6 +2062,113 @@ fn send_telegram(
         anyhow::bail!("Telegram sendMessage returned ok=false");
     }
     Ok(response.result.map(|message| message.message_id))
+}
+
+/// Register the slash-command menu so Telegram clients show the command list
+/// when the user types `/` (the interactive command picker). Telegram command
+/// names allow only `[a-z0-9_]{1,32}`, so hyphens in our catalog (`graph-query`)
+/// are sent as underscores; the classifier maps `_` back to `-` on the way in.
+fn set_telegram_commands(token: &str) -> anyhow::Result<()> {
+    let mut commands: Vec<serde_json::Value> = Vec::new();
+    for (_, cmds) in COMMAND_GROUPS {
+        for (name, desc) in *cmds {
+            let command = name.trim_start_matches('/').replace('-', "_");
+            let description: String = desc.chars().take(256).collect();
+            commands.push(serde_json::json!({
+                "command": command,
+                "description": description,
+            }));
+        }
+    }
+    let body = serde_json::json!({ "commands": commands });
+    let response: TelegramOkResponse = ureq::post(&format!(
+        "https://api.telegram.org/bot{token}/setMyCommands"
+    ))
+    .set("content-type", "application/json")
+    .send_string(&body.to_string())
+    .map_err(|error| anyhow::anyhow!("Telegram setMyCommands failed: {error}"))
+    .and_then(|response| {
+        response.into_json().map_err(|error| {
+            anyhow::anyhow!("failed to parse Telegram setMyCommands response: {error}")
+        })
+    })?;
+    if !response.ok {
+        anyhow::bail!("Telegram setMyCommands returned ok=false");
+    }
+    Ok(())
+}
+
+/// Send a message with an inline keyboard (tappable buttons). `buttons` is a flat
+/// list of `(label, callback_data)`; `columns` lays them out into rows. The data
+/// payloads come back as a `callback_query` update when tapped (max 64 bytes each).
+fn send_telegram_keyboard(
+    token: &str,
+    chat_id: &str,
+    text: &str,
+    buttons: &[(String, String)],
+    columns: usize,
+    reply_to_message_id: Option<i64>,
+) -> anyhow::Result<Option<i64>> {
+    let columns = columns.max(1);
+    let rows: Vec<Vec<serde_json::Value>> = buttons
+        .chunks(columns)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .map(|(label, data)| {
+                    serde_json::json!({ "text": label, "callback_data": data })
+                })
+                .collect()
+        })
+        .collect();
+    let mut body = serde_json::json!({
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": { "inline_keyboard": rows },
+    });
+    if let Some(message_id) = reply_to_message_id {
+        body["reply_parameters"] = serde_json::json!({ "message_id": message_id });
+    }
+    let response: TelegramSendResponse =
+        ureq::post(&format!("https://api.telegram.org/bot{token}/sendMessage"))
+            .set("content-type", "application/json")
+            .send_string(&body.to_string())
+            .map_err(|error| anyhow::anyhow!("Telegram sendMessage (keyboard) failed: {error}"))
+            .and_then(|response| {
+                response.into_json().map_err(|error| {
+                    anyhow::anyhow!("failed to parse Telegram sendMessage response: {error}")
+                })
+            })?;
+    if !response.ok {
+        anyhow::bail!("Telegram sendMessage (keyboard) returned ok=false");
+    }
+    Ok(response.result.map(|message| message.message_id))
+}
+
+/// Acknowledge a button tap so Telegram stops the client-side spinner. An
+/// optional short `text` is shown as a transient toast.
+fn answer_callback_query(token: &str, callback_query_id: &str, text: Option<&str>) -> anyhow::Result<()> {
+    let mut body = serde_json::json!({ "callback_query_id": callback_query_id });
+    if let Some(text) = text {
+        if !text.is_empty() {
+            body["text"] = serde_json::json!(text);
+        }
+    }
+    let response: TelegramOkResponse = ureq::post(&format!(
+        "https://api.telegram.org/bot{token}/answerCallbackQuery"
+    ))
+    .set("content-type", "application/json")
+    .send_string(&body.to_string())
+    .map_err(|error| anyhow::anyhow!("Telegram answerCallbackQuery failed: {error}"))
+    .and_then(|response| {
+        response.into_json().map_err(|error| {
+            anyhow::anyhow!("failed to parse Telegram answerCallbackQuery response: {error}")
+        })
+    })?;
+    if !response.ok {
+        anyhow::bail!("Telegram answerCallbackQuery returned ok=false");
+    }
+    Ok(())
 }
 
 fn send_telegram_chat_action(token: &str, chat_id: &str, action: &str) -> anyhow::Result<()> {
@@ -3328,6 +3638,29 @@ mod tests {
     }
 
     #[test]
+    fn command_menu_underscores_map_to_hyphenated_commands() {
+        // Telegram's setMyCommands can't carry hyphens, so the interactive `/`
+        // menu sends `/graph_query` and `/tts_provider`; these must classify the
+        // same as their canonical hyphenated forms.
+        assert_eq!(
+            classify_telegram_update(&text_update(7, "/graph_query roadmap q3"), Some(7), None),
+            InboundAction::Command {
+                chat_id: 7,
+                name: "graph-query".to_string(),
+                args: "roadmap q3".to_string()
+            }
+        );
+        assert_eq!(
+            classify_telegram_update(&text_update(7, "/tts_provider"), Some(7), None),
+            InboundAction::Command {
+                chat_id: 7,
+                name: "tts-provider".to_string(),
+                args: String::new()
+            }
+        );
+    }
+
+    #[test]
     fn memory_extraction_explicit_and_heuristic() {
         // Explicit cue is stripped to the bare fact.
         assert_eq!(
@@ -3644,6 +3977,7 @@ mod tests {
                 chat: TelegramChat { id: chat_id },
             }),
             channel_post: None,
+            callback_query: None,
         }
     }
 
@@ -3662,6 +3996,7 @@ mod tests {
                 chat: TelegramChat { id: chat_id },
             }),
             channel_post: None,
+            callback_query: None,
         }
     }
 

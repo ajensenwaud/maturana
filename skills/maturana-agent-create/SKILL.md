@@ -123,12 +123,26 @@ Fix spec fields until validation is clean — never weaken validation.
    ```
    **Do NOT launch `channel serve` as a background/hidden process yourself** —
    `maturana up` (and the `up` service) own the long-running runners.
-6. **Confirm it's live:**
+6. **Confirm it's live — self-verify the round-trip, don't make the user relay
+   a message.** Pairing only proves the host-side channel plumbing (token valid,
+   chat-id stored, runner polling). It does NOT prove the agent actually answers
+   — that depends on the VM being up, the guest worker consuming the queue, and
+   the harness being authenticated in the guest. Verify that yourself:
    ```
    maturana channel status telegram --agent-id <id>   # paired: true, presence active
+   maturana agent run <id> --prompt "Confirm you are live in one sentence." --wait
    ```
-   Then send a real message through the paired channel and confirm the agent
-   replies.
+   `agent run --wait` enqueues straight into sessiond and blocks for the guest's
+   response, so it exercises the full sessiond -> guest worker -> harness ->
+   outbound path with no human in the loop. If it returns an answer, the agent is
+   live. If it hangs, THAT is the real failure (VM down, worker not consuming, or
+   harness auth missing in the guest) — diagnose it (see Recovery), don't ask the
+   user to message the bot.
+
+   Only after `agent run --wait` succeeds, optionally ask the user to send one
+   real Telegram message — and ONLY if you specifically want to confirm outbound
+   *Telegram delivery* (the outbox thread pushing to the chat), which `agent run`
+   doesn't cover. Don't make this a routine relay-and-say-"sent" step.
 
 (On Windows you can use `.\scripts\maturana.ps1 …` if `maturana` isn't yet on
 PATH in the current shell.)
@@ -140,7 +154,9 @@ Before claiming success, collect:
 - Clean `maturana spec validate` output.
 - Security-review result.
 - Launch evidence (VM running, guest worker active).
-- Channel pairing status true + a real round-trip message answered.
+- Channel pairing status true, plus a successful `agent run <id> --wait`
+  round-trip (the agent answered). A manual Telegram message is optional and only
+  to confirm outbound delivery — not required as proof of liveness.
 - A summary: name, id, runtime, channels (paired), tools enabled, how the user
   talks to it.
 - Evidence that no raw secrets were written into any spec/identity/soul/memory.
@@ -151,8 +167,14 @@ Before claiming success, collect:
   drafting broad permissions.
 - Harness not authenticated: stop and guide auth (`codex login` / `claude`).
 - Validation fails: fix spec fields, not validation.
-- Pairing fails: inspect pair status, channel heartbeat, transcript, runner logs
-  (see `maturana-personal-agent`).
+- Pairing fails (pair code rejected / never stored): inspect pair status, channel
+  heartbeat, transcript, runner logs (see `maturana-personal-agent`).
+- **Paired but no reply** (the common one — `paired: true`, runner `polling`, yet
+  the bot is silent): the channel is fine; the round-trip is broken. Check the VM
+  is running (`maturana agent inspect <id> --live`), the guest worker is active,
+  and the harness is authenticated in the guest. Confirm with
+  `maturana agent run <id> --prompt "ping" --wait` — if that also hangs, the
+  failure is guest-side, not the channel.
 - Missing token: store it in pipelock and reference it; never paste it into the
   spec.
 
