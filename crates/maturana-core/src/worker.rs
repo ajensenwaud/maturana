@@ -342,7 +342,7 @@ PY
   claim="$(curl -fsS -X POST "$sessiond_url/session/claim" "${headers[@]}" --data "$claim_body" 2>>/var/log/maturana/worker.err.log || true)"
   count="$(printf '%s' "$claim" | python3 -c 'import json,sys; print(len(json.loads(sys.stdin.read() or "{\"messages\":[]}").get("messages", [])))' 2>/dev/null || echo 0)"
   if [ "$count" = "0" ]; then
-    sleep 2
+    sleep 1
     continue
   fi
   printf '%s' "$claim" > /tmp/maturana-session-claim.json
