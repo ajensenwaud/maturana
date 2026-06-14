@@ -1405,13 +1405,28 @@ fn sync_codex_prompts(root: &Path, dest_dir: Option<&Path>) -> anyhow::Result<us
             body
         } else {
             let description = derive_skill_description(&body);
-            format!("---\nname: {name}\ndescription: {description}\n---\n\n{body}")
+            // Quote both values: a derived description routinely contains a colon
+            // (e.g. "when running the flywheel: capture ..."), which unquoted YAML
+            // parses as a nested mapping and Codex then rejects the whole skill.
+            format!(
+                "---\nname: {}\ndescription: {}\n---\n\n{body}",
+                yaml_quote_scalar(name),
+                yaml_quote_scalar(&description)
+            )
         };
         let out_dir = dest.join(name);
         fs::create_dir_all(&out_dir)?;
         fs::write(out_dir.join("SKILL.md"), contents)?;
     }
     Ok(names.len())
+}
+
+/// Render a string as a YAML double-quoted scalar so values containing `:`, `#`,
+/// quotes, etc. survive parsing. Only `\` and `"` need escaping inside a
+/// double-quoted scalar (derived text is already newline-free).
+fn yaml_quote_scalar(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 /// First meaningful line of a skill body as its Codex `description` (single
@@ -6267,6 +6282,44 @@ mod tests {
             .failures
             .iter()
             .any(|failure| failure.contains("thin-wrapper language")));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn codex_prompts_quote_descriptions_with_colons() {
+        // A derived description whose first line contains a colon ("speech:")
+        // must be emitted as a quoted YAML scalar, else Codex rejects the skill
+        // ("mapping values are not allowed in this context").
+        let temp = std::env::temp_dir().join(format!(
+            "maturana-codex-prompts-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = fs::remove_dir_all(&temp);
+        let skills_root = temp.join("skills");
+        let skill_dir = skills_root.join("voicey");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "# voicey\n\nUse this skill when an agent needs speech: transcribe audio to text.\n",
+        )
+        .unwrap();
+        let dest = temp.join("dest");
+        let count = sync_codex_prompts(&skills_root, Some(&dest)).unwrap();
+        assert_eq!(count, 1);
+
+        let generated = fs::read_to_string(dest.join("voicey").join("SKILL.md")).unwrap();
+        let desc_line = generated
+            .lines()
+            .find(|l| l.starts_with("description:"))
+            .expect("description line present");
+        // The value must be wrapped in double quotes so the inner colon is safe.
+        let value = desc_line.trim_start_matches("description:").trim();
+        assert!(value.starts_with('"') && value.ends_with('"'), "description not quoted: {desc_line}");
+        assert!(value.contains("speech:"), "colon-bearing text preserved: {desc_line}");
+        // name is quoted too.
+        assert!(generated.contains("name: \"voicey\""));
 
         let _ = fs::remove_dir_all(&temp);
     }
