@@ -59,14 +59,30 @@ sensible defaults silently and only ask when a choice genuinely matters to them.
      (`maturana pipelock set telegram/bot-token --value <token>`), set
      `channels.telegram.token_source: pipelock:telegram/bot-token`. Pairing
      happens at go-live (step below).
-   - **Discord** (full two-way bot, like Telegram): create a bot in the Discord
-     Developer Portal, **enable the MESSAGE CONTENT intent**, and invite it to
-     the server (or open a DM). Store the bot token in pipelock
-     (`maturana pipelock set discord/bot-token --value <token>`) and set
-     `channels.discord.bot_token_source: pipelock:discord/bot-token`. The agent
-     then reads and replies over the Discord gateway once `maturana up` runs — no
-     pairing step needed. (For one-off outbound pings only, `maturana notify
-     discord --webhook-source ...` still exists, separate from this channel.)
+   - **Discord** (full two-way bot, like Telegram). Assume the user has **no bot
+     yet** — walk them through creating one, one step at a time, and wait for
+     each result:
+     1. Open <https://discord.com/developers/applications> → **New Application**
+        (name it after the agent).
+     2. **Bot** tab → **Reset Token** → copy the token (shown once). This is the
+        secret you'll store.
+     3. Still on the Bot tab, under **Privileged Gateway Intents**, turn on
+        **MESSAGE CONTENT INTENT** and Save. Without it the agent receives empty
+        messages and can't reply to anything. (Enable SERVER MEMBERS only if a
+        tool needs it.)
+     4. Invite the bot: **OAuth2 → URL Generator**, tick scope **`bot`**, then
+        permissions **Send Messages** + **Read Message History** (add Attach
+        Files / Add Reactions if wanted). Open the generated URL and add the bot
+        to a server, or DM it directly.
+     5. Store the token and wire the spec:
+        ```
+        maturana pipelock set discord/bot-token --value <token>
+        ```
+        set `channels.discord.bot_token_source: pipelock:discord/bot-token`.
+     The agent reads and replies over the Discord gateway once `maturana up`
+     runs — there is **no pairing step**. (A one-off outbound ping uses
+     `maturana notify discord --webhook-source ...`, which is separate from this
+     channel and not needed here.)
    Leave channels the user didn't choose disabled.
 6. **Tools / capabilities.** Ask which to enable, and record them in the spec's
    installed skills/tools. Offer the common ones: `maturana-browse`,
@@ -128,7 +144,9 @@ example, and re-run — never weaken validation, and don't guess at new fields.
    # ask the user to send the printed /pair CODE to the bot
    maturana channel pair telegram complete --agent-id <id>
    ```
-   For Discord, send a test `maturana notify discord` and confirm it arrives.
+   **Discord needs no pairing** — once the bot token is in pipelock and the spec
+   has `channels.discord`, the gateway runner connects when `maturana up` starts.
+   Verify it live below (message the bot) rather than with a one-off notify.
 5. **Bring the agent online — supervised, not by hand.** Start the plane so the
    channel + proactivity + schedule runners are supervised together:
    ```
