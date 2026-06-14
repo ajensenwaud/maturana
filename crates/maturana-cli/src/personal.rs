@@ -316,15 +316,23 @@ fn init_personal_agent(
     write_if_missing(
         &agent_dir.join("AGENTS.md"),
         &format!(
-            "# {}\n\nRead `/agent/SOUL.md`, `/memory/MEMORY.md`, `/wiki/INDEX.md`, and `/agent/MATURANA.md` before acting.\n\nOperate only through declared tools, mounted paths, channels, schedules, and pipelock-governed egress.\n",
+            "# {}\n\nRead `/agent/IDENTITY.md`, `/agent/SOUL.md`, `/memory/MEMORY.md`, `/wiki/INDEX.md`, and `/agent/MATURANA.md` before acting.\n\nOperate only through declared tools, mounted paths, channels, schedules, and pipelock-governed egress.\n",
             identity.0
+        ),
+        force,
+    )?;
+    write_if_missing(
+        &agent_dir.join("IDENTITY.md"),
+        &format!(
+            "# Identity — {}\n\n## Who I am\n{} — {}\n\n## Who you are to me\n<Your owner: name, how to address you, timezone, and what you rely on me for.>\n\n## Scope & boundaries\n- In scope: <…>\n- Out of scope: <…>\n",
+            identity.0, identity.0, identity.1
         ),
         force,
     )?;
     write_if_missing(
         &agent_dir.join("SOUL.md"),
         &format!(
-            "# {}\n\nPurpose: {}\n\nDefault posture: useful, calm, secure, and concise. Ask for approval before writing long-term personal memory unless the user explicitly says to remember something.\n",
+            "# Soul — {}\n\nPurpose: {}\n\n## Voice\n<Tone, formality, brevity, humor.>\n\n## Behavior\nDefault posture: useful, calm, secure, and concise. Ask for approval before writing long-term personal memory unless the user explicitly says to remember something.\n",
             identity.0, identity.1
         ),
         force,
