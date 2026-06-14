@@ -81,10 +81,18 @@ sensible defaults silently and only ask when a choice genuinely matters to them.
 
 Write all three into `.maturana/agents/<id>/`:
 - `IDENTITY.md` and `SOUL.md` from the interview (rich, not stubs).
-- `MATURANA.md` from the closest example, filled with the interview answers:
-  identity (id/name/purpose), runtime, vm, harness_auth, filesystem mounts
-  (bounded), network egress allowlist, credentials (references only), memory,
-  browser, channels, snapshots.
+- `MATURANA.md`: **copy the closest example file verbatim first**, then edit only
+  the values you need (identity id/name/purpose, runtime, vm, harness_auth,
+  filesystem mounts, egress allowlist, credentials as references, channels,
+  snapshots). For example, on Windows:
+  ```
+  cp examples/MATURANA.codex-hyperv.md .maturana/agents/<id>/MATURANA.md
+  ```
+  **Do NOT invent or rename keys.** The spec is parsed with
+  `deny_unknown_fields`: any unknown/misspelled key (or a section copied from the
+  wrong provider) makes `spec validate` fail hard. Start from a known-valid
+  example and change values, not structure. Only include `channels`,
+  `mcp_servers`, etc. when the user asked for them; omit (don't stub) the rest.
 
 Then validate:
 
@@ -92,13 +100,15 @@ Then validate:
 maturana spec validate .maturana/agents/<id>/MATURANA.md
 ```
 
-Fix spec fields until validation is clean — never weaken validation.
+If validation fails, read the error, correct that exact field against the
+example, and re-run — never weaken validation, and don't guess at new fields.
 
 ### Launch and go live
 
 1. **Security review** — run the `maturana-security-review` skill over the spec.
 2. **Launch** — use the `maturana-agent-launch` skill (`maturana agent launch
-   --spec .maturana/agents/<id>/MATURANA.md --apply`). This materializes the
+   .maturana/agents/<id>/MATURANA.md --apply` — the spec is a POSITIONAL
+   argument; there is no `--spec` flag on `agent launch`). This materializes the
    agent (scaffolding `IDENTITY.md`/`SOUL.md` only if absent — your authored ones
    are preserved), boots the VM, AND provisions the guest (proxy CA, harness +
    auth, browser, `maturana-agent.service`). **Do NOT SSH in and provision by
