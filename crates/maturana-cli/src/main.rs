@@ -760,6 +760,12 @@ fn main() -> anyhow::Result<()> {
                     .with_context(|| format!("failed to read {}", spec.display()))?;
                 let parsed = AgentSpec::from_maturana_markdown(&spec)
                     .with_context(|| format!("failed to parse {}", spec.display()))?;
+                // Graph is on by default; guest provisioning embeds the graph
+                // token (read_graph_token). Generate it now so an --apply launch
+                // gives the guest working graph access without a later re-provision.
+                if apply && parsed.knowledge_graph.enabled {
+                    ensure_graph_token(&home)?;
+                }
                 let mode = if apply {
                     LaunchMode::Apply
                 } else {
@@ -1837,6 +1843,13 @@ fn build_orchestrator_config(
         })
         .cloned()
         .collect::<Vec<_>>();
+    // Compute graph opt-in before `agent_ids` is consumed below. MaturanaGraph is
+    // on by default, so this is true unless a spec sets enabled: false.
+    let graph_opt_in = agent_ids.iter().any(|id| {
+        AgentSpec::from_maturana_markdown(&home.agent_dir(id).join("MATURANA.md"))
+            .map(|spec| spec.knowledge_graph.enabled)
+            .unwrap_or(false)
+    });
     let agents = agent_ids
         .into_iter()
         .map(|agent_id| -> anyhow::Result<AgentRuntime> {
@@ -1890,6 +1903,16 @@ fn build_orchestrator_config(
         Some(token) => Some(token),
         None => Some(ensure_sessiond_token(&home.root().join("sessiond/token"))?),
     };
+    // MaturanaGraph is on by default, but the graph service is only supervised
+    // when a token exists. On the `up`/Hyper-V path nothing generated it, so a
+    // graph-enabled agent would silently get no graph. Ensure the token whenever
+    // any selected agent opts in (mirrors the firecracker repair path); fall back
+    // to read-only for hosts where the graph is managed manually.
+    let graph_token = if graph_opt_in {
+        Some(ensure_graph_token(home)?)
+    } else {
+        maturana_core::worker::read_graph_token(home.root())
+    };
     Ok(OrchestratorConfig {
         sessiond_bind: command.sessiond_bind.clone(),
         sessiond_token,
@@ -1897,8 +1920,7 @@ fn build_orchestrator_config(
         schedule_poll_seconds: command.schedule_poll_seconds,
         agents,
         graph_bind: "0.0.0.0:47835".to_string(),
-        // Supervise the graph service only if it's been set up (token present).
-        graph_token: maturana_core::worker::read_graph_token(home.root()),
+        graph_token,
         claude_refresh_agents,
     })
 }
@@ -1908,7 +1930,9 @@ fn run_up(home: &MaturanaHome, command: UpCommand) -> anyhow::Result<()> {
     let plan = plan_processes(&config);
 
     if command.dry_run {
-        println!("{}", serde_json::to_string_pretty(&plan)?);
+        // Don't echo secrets: the plan carries `--token <value>` args (sessiond,
+        // graph). Redact those before printing the dry-run plan.
+        println!("{}", serde_json::to_string_pretty(&redact_plan(&plan))?);
         println!("\nguest workers must claim from these session ids:");
         for agent in &config.agents {
             println!("  {} -> {}", agent.agent_id, agent.session_id);
@@ -1917,6 +1941,26 @@ fn run_up(home: &MaturanaHome, command: UpCommand) -> anyhow::Result<()> {
     }
 
     supervise_plan(home, &plan)
+}
+
+/// Redact the value following any `--token` flag in a process plan, so
+/// `up --dry-run` never prints the sessiond/graph bearer tokens.
+fn redact_plan(plan: &[SupervisedProcess]) -> Vec<SupervisedProcess> {
+    plan.iter()
+        .map(|process| {
+            let mut redacted = process.clone();
+            let mut next_is_secret = false;
+            for arg in redacted.args.iter_mut() {
+                if next_is_secret {
+                    *arg = "<redacted>".to_string();
+                    next_is_secret = false;
+                } else if arg == "--token" {
+                    next_is_secret = true;
+                }
+            }
+            redacted
+        })
+        .collect()
 }
 
 struct Supervised {
