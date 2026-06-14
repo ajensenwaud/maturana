@@ -902,7 +902,7 @@ fn handle_telegram_document(
     let knowledge_graph = agent_knowledge_graph(home, &config.agent_id);
     let graph_token = maturana_core::worker::read_graph_token(home.root());
     let (graph_token, graph_name) = match (graph_token, knowledge_graph.enabled) {
-        (Some(token), true) => (token, knowledge_graph.graph_name(&config.agent_id)),
+        (Some(token), true) => (token, crate::graph::agent_graph_name(&config.agent_id)),
         _ => {
             send_telegram(
                 token,
@@ -1515,12 +1515,12 @@ fn graph_query_text(home: &MaturanaHome, agent_id: &str, terms: &str) -> String 
     let Some(token) = maturana_core::worker::read_graph_token(home.root()) else {
         return "Knowledge graph service is not available (no graph token).".to_string();
     };
-    let graph = kg.graph_name(agent_id);
+    let agent_graph = crate::graph::agent_graph_name(agent_id);
+    let graphs = vec![agent_graph.clone(), kg.graph_name(agent_id)];
     let term_list: Vec<String> = terms.split_whitespace().map(String::from).collect();
-    match crate::graph::query_rendered_context(crate::graph::DEFAULT_LOCAL_URL, &token, &graph, &term_list, 2) {
-        Ok(rendered) => format!("GraphRAG `{graph}`:\n{}", truncate_inline(&rendered, 3500)),
-        Err(error) => format!("Graph query failed: {error:#}"),
-    }
+    let rendered =
+        crate::graph::query_blended_context(crate::graph::DEFAULT_LOCAL_URL, &token, &graphs, &term_list, 2);
+    format!("GraphRAG (private + shared):\n{}", truncate_inline(&rendered, 3500))
 }
 
 /// Handle a slash command that returns a text reply (and may persist settings or
@@ -1601,7 +1601,34 @@ fn handle_channel_command(
             }
         }
         "graph-query" => graph_query_text(home, &config.agent_id, args),
-        "graph-insert" => "To add to MaturanaGraph, send me a document (attach a file) and I ingest it automatically. Inline text insert is coming soon.".to_string(),
+        "graph-insert" => {
+            if args.trim().is_empty() {
+                "Usage: /graph-insert <text> — adds a note to your private memory graph. (Or attach a document to ingest it.)".to_string()
+            } else {
+                match maturana_core::worker::read_graph_token(home.root()) {
+                    Some(token) => {
+                        let agent_graph = crate::graph::agent_graph_name(&config.agent_id);
+                        let dir = home.agent_dir(&config.agent_id).join("inbox");
+                        let _ = fs::create_dir_all(&dir);
+                        let path = dir.join(format!("note-{}.md", Utc::now().timestamp_millis()));
+                        match fs::write(&path, args) {
+                            Ok(()) => match crate::graph::ingest_file_into_service(
+                                crate::graph::DEFAULT_LOCAL_URL,
+                                &token,
+                                &agent_graph,
+                                &path,
+                                1200,
+                            ) {
+                                Ok(chunks) => format!("Added to your memory graph `{agent_graph}` ({chunks} chunk(s))."),
+                                Err(error) => format!("Graph insert failed: {error:#}"),
+                            },
+                            Err(error) => format!("Could not stage note: {error:#}"),
+                        }
+                    }
+                    None => "Knowledge graph service is not available.".to_string(),
+                }
+            }
+        }
         "emerge" => "Usage: /emerge <task> — runs a sub-agent on the task.".to_string(),
         "skill" => {
             // No args: list skills so the user can pick one. With args, classify
@@ -2007,18 +2034,16 @@ fn load_graph_channel_context(
         return None;
     }
     let token = maturana_core::worker::read_graph_token(home.root())?;
-    let graph = knowledge_graph.graph_name(agent_id);
-    let rendered = match crate::graph::query_rendered_context(
-        crate::graph::DEFAULT_LOCAL_URL,
-        &token,
-        &graph,
-        terms,
-        2,
-    ) {
-        Ok(rendered) => rendered,
-        Err(error) => format!("(knowledge graph unavailable: {error:#})"),
-    };
-    Some(GraphChannelContext { graph, rendered })
+    let shared = knowledge_graph.graph_name(agent_id);
+    let agent_graph = crate::graph::agent_graph_name(agent_id);
+    // Blended read: the agent's private memory section + the shared graph.
+    let graphs = vec![agent_graph.clone(), shared.clone()];
+    let rendered =
+        crate::graph::query_blended_context(crate::graph::DEFAULT_LOCAL_URL, &token, &graphs, terms, 2);
+    Some(GraphChannelContext {
+        graph: format!("{agent_graph} + {shared}"),
+        rendered,
+    })
 }
 
 fn render_channel_prompt(context: &ChannelContextBundle, user_message: &str) -> String {
