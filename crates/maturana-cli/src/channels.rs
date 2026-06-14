@@ -2437,15 +2437,65 @@ fn reset_channel_context(home: &MaturanaHome, agent_id: &str, chat_id: i64) -> a
     Ok(())
 }
 
+/// Decide whether a user message carries a durable fact worth remembering, and
+/// return the fact text. Explicit cues ("remember …", "/remember …") win and are
+/// stripped to the bare fact; otherwise a tight set of high-signal heuristics
+/// (identity, contact, location, preferences, commitments) captures the message.
+/// Deliberately conservative to avoid surprising the user with noisy memories.
+fn extract_memory_fact(text: &str) -> Option<String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let lower = t.to_ascii_lowercase();
+    for cue in [
+        "/remember ",
+        "remember that ",
+        "remember this: ",
+        "remember this:",
+        "remember: ",
+        "remember:",
+        "please remember ",
+        "remember ",
+    ] {
+        if let Some(rest) = lower.strip_prefix(cue) {
+            let fact = t[t.len() - rest.len()..].trim();
+            if !fact.is_empty() {
+                return Some(fact.to_string());
+            }
+        }
+    }
+    const HEURISTICS: &[&str] = &[
+        "my name is",
+        "call me ",
+        "i prefer",
+        "i live in",
+        "i work at",
+        "my email",
+        "my phone",
+        "my timezone",
+        "my birthday",
+        "remind me",
+        "deadline",
+        "due by",
+        "due on",
+    ];
+    if HEURISTICS.iter().any(|h| lower.contains(h)) {
+        return Some(t.to_string());
+    }
+    None
+}
+
 fn maybe_remember_user_message(
     home: &MaturanaHome,
     agent_id: &str,
     text: &str,
 ) -> anyhow::Result<()> {
-    let normalized = text.to_ascii_lowercase();
-    if !normalized.contains("remember") {
+    let Some(fact) = extract_memory_fact(text) else {
         return Ok(());
-    }
+    };
+
+    // 1. Durable MEMORY.md (loaded into the channel context every turn).
     let path = home.agent_dir(agent_id).join("memory/MEMORY.md");
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -2453,12 +2503,31 @@ fn maybe_remember_user_message(
     if !path.exists() {
         fs::write(&path, "# Memory\n")?;
     }
-    let entry = format!("\n- {}: {}\n", Utc::now().date_naive(), text.trim());
+    let entry = format!("\n- {}: {}\n", Utc::now().date_naive(), fact);
     let mut file = fs::OpenOptions::new()
         .append(true)
         .open(&path)
         .with_context(|| format!("failed to open {}", path.display()))?;
     file.write_all(entry.as_bytes())?;
+
+    // 2. Private memory section in MaturanaGraph (best-effort; powers GraphRAG
+    //    recall via the blended read). A graph hiccup must never break the turn.
+    if let Some(token) = maturana_core::worker::read_graph_token(home.root()) {
+        let agent_graph = crate::graph::agent_graph_name(agent_id);
+        let dir = home.agent_dir(agent_id).join("inbox");
+        if fs::create_dir_all(&dir).is_ok() {
+            let note = dir.join(format!("memory-{}.md", Utc::now().timestamp_millis()));
+            if fs::write(&note, &fact).is_ok() {
+                let _ = crate::graph::ingest_file_into_service(
+                    crate::graph::DEFAULT_LOCAL_URL,
+                    &token,
+                    &agent_graph,
+                    &note,
+                    1200,
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3154,6 +3223,31 @@ mod tests {
     }
 
     #[test]
+    fn memory_extraction_explicit_and_heuristic() {
+        // Explicit cue is stripped to the bare fact.
+        assert_eq!(
+            extract_memory_fact("remember that my standup is at 9am"),
+            Some("my standup is at 9am".to_string())
+        );
+        assert_eq!(
+            extract_memory_fact("/remember the API key rotates monthly"),
+            Some("the API key rotates monthly".to_string())
+        );
+        // Heuristic captures the whole message.
+        assert_eq!(
+            extract_memory_fact("My name is Anders"),
+            Some("My name is Anders".to_string())
+        );
+        assert_eq!(
+            extract_memory_fact("remind me to call the bank tomorrow"),
+            Some("remind me to call the bank tomorrow".to_string())
+        );
+        // Ordinary chatter is not remembered.
+        assert_eq!(extract_memory_fact("what's the weather like?"), None);
+        assert_eq!(extract_memory_fact("   "), None);
+    }
+
+    #[test]
     fn help_and_commands_cover_the_catalog() {
         let help = help_text();
         for group in ["Session", "Options", "Status", "Management", "MaturanaGraph", "Voice"] {
@@ -3384,7 +3478,9 @@ mod tests {
             .unwrap();
 
         let memory = fs::read_to_string(home.agent_dir("agent").join("memory/MEMORY.md")).unwrap();
-        assert!(memory.contains("remember that I prefer short replies"));
+        // The explicit "remember that" cue is stripped to the bare fact.
+        assert!(memory.contains("I prefer short replies"));
+        assert!(!memory.contains("remember that"));
     }
 
     #[test]
