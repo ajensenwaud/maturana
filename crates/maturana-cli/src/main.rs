@@ -303,14 +303,17 @@ enum SkillSubcommand {
         #[arg(long)]
         json: bool,
     },
-    /// Install each skill as a Codex custom prompt so it's a `/maturana-<name>`
-    /// slash command in Codex (writes ~/.codex/prompts/maturana-<name>.md).
+    /// Install Maturana's skills as native Codex skills (discovered via the
+    /// `/skills` menu, `$name` mention, or implicitly). Writes
+    /// `<dest>/<name>/SKILL.md` with the required frontmatter; default dest is
+    /// the user-level Codex skill root `~/.agents/skills`.
+    #[command(alias = "codex")]
     CodexPrompts {
         #[arg(default_value = "skills")]
         root: PathBuf,
-        /// Override the Codex prompts directory (default ~/.codex/prompts).
-        #[arg(long)]
-        prompts_dir: Option<PathBuf>,
+        /// Override the Codex skills directory (default ~/.agents/skills).
+        #[arg(long, alias = "prompts-dir")]
+        dest: Option<PathBuf>,
     },
 }
 
@@ -1351,39 +1354,40 @@ fn handle_skill(command: SkillCommand) -> anyhow::Result<()> {
                 )
             }
         }
-        SkillSubcommand::CodexPrompts { root, prompts_dir } => {
-            let count = sync_codex_prompts(&root, prompts_dir.as_deref())?;
-            println!("installed {count} Codex prompt(s) (/maturana-<name>)");
+        SkillSubcommand::CodexPrompts { root, dest } => {
+            let count = sync_codex_prompts(&root, dest.as_deref())?;
+            println!("installed {count} Codex skill(s); use /skills or $<name> in Codex");
             Ok(())
         }
     }
 }
 
-/// Mirror each `skills/<name>/SKILL.md` into a Codex custom prompt at
-/// `<prompts_dir>/maturana-<name>.md`, so Codex exposes a `/maturana-<name>`
-/// slash command that loads + follows the canonical skill. The prompt points at
-/// the absolute SKILL.md (single source of truth, never stale) rather than
-/// copying its body. Idempotent.
-fn sync_codex_prompts(root: &Path, prompts_dir: Option<&Path>) -> anyhow::Result<usize> {
+/// Install Maturana's skills as native **Codex skills** so Codex discovers them
+/// (`/skills` menu, `$name` mention, or implicit selection). Current Codex
+/// (0.117+) reads skills from `<dest>/<name>/SKILL.md` under one of its skill
+/// roots (default user-level `~/.agents/skills`); the deprecated
+/// `~/.codex/prompts` slash-command path no longer applies. Each emitted
+/// `SKILL.md` gets the required `name`/`description` YAML frontmatter (Codex caps
+/// the description in the initial list) followed by the canonical skill body.
+/// Idempotent.
+fn sync_codex_prompts(root: &Path, dest_dir: Option<&Path>) -> anyhow::Result<usize> {
     let skills_root = absolute_or_cwd(root.to_path_buf())?;
     if !skills_root.is_dir() {
         anyhow::bail!("skills directory not found: {}", skills_root.display());
     }
-    let repo_root = skills_root.parent().unwrap_or(&skills_root).to_path_buf();
-    let prompts = match prompts_dir {
+    let dest = match dest_dir {
         Some(p) => p.to_path_buf(),
         None => dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory"))?
-            .join(".codex")
-            .join("prompts"),
+            .join(".agents")
+            .join("skills"),
     };
-    fs::create_dir_all(&prompts)?;
+    fs::create_dir_all(&dest)?;
 
     let mut names: Vec<String> = Vec::new();
     for entry in fs::read_dir(&skills_root)? {
         let dir = entry?.path();
-        let skill_md = dir.join("SKILL.md");
-        if dir.is_dir() && skill_md.exists() {
+        if dir.is_dir() && dir.join("SKILL.md").exists() {
             if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
                 names.push(name.to_string());
             }
@@ -1392,19 +1396,36 @@ fn sync_codex_prompts(root: &Path, prompts_dir: Option<&Path>) -> anyhow::Result
     names.sort();
 
     for name in &names {
-        let skill_md = skills_root.join(name).join("SKILL.md");
-        let body = format!(
-            "You are running the Maturana skill `{name}`.\n\n\
-             Read the full skill definition and follow it exactly:\n  {skill}\n\n\
-             Repo root: {repo}\n  (skills/, examples/, and the `maturana` CLI live here).\n\n\
-             Load the skill, then carry out the user's request below.\n\n$ARGUMENTS\n",
-            name = name,
-            skill = skill_md.display(),
-            repo = repo_root.display(),
-        );
-        fs::write(prompts.join(format!("{name}.md")), body)?;
+        let src = skills_root.join(name).join("SKILL.md");
+        let body = fs::read_to_string(&src)
+            .with_context(|| format!("failed to read {}", src.display()))?;
+        // If the canonical file already has frontmatter, copy as-is; else derive
+        // a one-line description and prepend the required frontmatter.
+        let contents = if body.trim_start().starts_with("---") {
+            body
+        } else {
+            let description = derive_skill_description(&body);
+            format!("---\nname: {name}\ndescription: {description}\n---\n\n{body}")
+        };
+        let out_dir = dest.join(name);
+        fs::create_dir_all(&out_dir)?;
+        fs::write(out_dir.join("SKILL.md"), contents)?;
     }
     Ok(names.len())
+}
+
+/// First meaningful line of a skill body as its Codex `description` (single
+/// line, trimmed, capped). Prefers the "Use this skill when …" sentence.
+fn derive_skill_description(body: &str) -> String {
+    let line = body
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .unwrap_or("A Maturana skill.");
+    let line = line.trim_start_matches("Use this skill ").trim();
+    let one_line: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let capped: String = one_line.chars().take(300).collect();
+    capped.replace(['\n', '\r'], " ")
 }
 
 fn validate_skill_pack(root: &Path) -> anyhow::Result<SkillValidationReport> {
