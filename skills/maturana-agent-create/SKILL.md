@@ -32,6 +32,12 @@ harness auth cannot answer.
 
 ## Decision Path — the setup interview (ask one topic at a time, confirm each)
 
+**Talk like a person, not a config file.** Ask each question in plain language and
+translate the answers into `MATURANA.md` fields yourself. NEVER make the user
+confirm raw field names or values (`on_launch`, `retain`, `egress_allowlist`,
+`harness_auth`, `token_source`, kebab `id`, etc.) — those are your job. Use
+sensible defaults silently and only ask when a choice genuinely matters to them.
+
 1. **Name & id.** Ask what they want to call the agent. Derive a kebab-case
    `id` (e.g. "Ada" → `ada`); confirm it.
 2. **Identity → write `IDENTITY.md`.** Interview, then author
@@ -65,7 +71,11 @@ harness auth cannot answer.
    the matching `network.egress_allowlist` hosts each tool needs.
 7. **Memory, wiki, schedules.** Enable memory + wiki paths. Offer schedules
    (e.g. a morning brief) via the `maturana-schedule` skill.
-8. **Snapshots.** Confirm `on_launch: true` + a retain count.
+8. **Backups (snapshots).** In plain terms: offer automatic backups so you can
+   roll the agent back if something breaks — e.g. "Want me to keep automatic
+   backups so we can undo if anything goes wrong? I'll keep the last few." Default
+   to on, keeping the most recent five. Map this to `snapshots.on_launch` /
+   `snapshots.retain` yourself; don't show those names.
 
 ## Actions
 
