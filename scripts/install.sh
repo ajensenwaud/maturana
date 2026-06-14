@@ -134,11 +134,12 @@ fi
 cd "$DEST"
 "$BIN" pipelock init >/dev/null 2>&1 || true
 
-# Skills as Codex /slash commands (~/.codex/prompts) vs kept in the repo only
-# (Codex still loads them on demand via AGENTS.md). Ask unless told via flag/env.
+# Install Maturana's skills as native Codex skills (~/.agents/skills, discovered
+# via /skills or $name) vs kept in the repo only (Codex still loads them via
+# AGENTS.md). Ask unless told via flag/env.
 if [ -z "$CODEX_PROMPTS" ]; then
   if [ -r /dev/tty ]; then
-    printf '\033[36m[maturana]\033[0m Install skills as Codex /slash commands in ~/.codex/prompts? [Y/n] ' > /dev/tty
+    printf '\033[36m[maturana]\033[0m Install Maturana skills as Codex skills (~/.agents/skills)? [Y/n] ' > /dev/tty
     read -r _ans < /dev/tty || _ans=""
     case "$_ans" in n|N|no|NO) CODEX_PROMPTS=0 ;; *) CODEX_PROMPTS=1 ;; esac
   else
@@ -147,8 +148,8 @@ if [ -z "$CODEX_PROMPTS" ]; then
 fi
 if [ "$CODEX_PROMPTS" = "1" ]; then
   "$BIN" skill codex-prompts "$DEST/skills" >/dev/null 2>&1 \
-    && say "skills installed as Codex /maturana-<name> slash commands" \
-    || say "could not install Codex prompts (skills still load via AGENTS.md)"
+    && say "skills installed as Codex skills (use /skills or \$<name> in Codex)" \
+    || say "could not install Codex skills (they still load via AGENTS.md)"
 else
   say "skills kept in the repo (Codex loads them on demand via AGENTS.md)"
 fi
@@ -191,8 +192,8 @@ echo "2) Build your first agent:"
 echo "     cd $DEST"
 echo "     codex"
 echo "   then ask Codex: \"create and launch a new agent\","
-echo "   or use a skill directly, e.g.  /maturana-agent-create"
-echo "   (all 31 skills are installed as /maturana-<name> slash commands)."
+echo "   or invoke a skill directly: type /skills, or \$maturana-agent-create"
+echo "   (all 31 skills are installed as Codex skills under ~/.agents/skills)."
 echo
 echo "Web cockpit:  http://$(hostname):47836"
 echo "     token:  $token"
