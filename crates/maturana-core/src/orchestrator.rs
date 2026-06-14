@@ -65,10 +65,18 @@ pub struct AgentRuntime {
     pub telegram: bool,
     pub telegram_token_source: String,
     pub schedules: bool,
+    /// Open-ended proactivity loop: periodically gives the agent a turn to act
+    /// or reach out on its own (self-set follow-ups, due reminders, updates).
+    #[serde(default = "default_true")]
+    pub proactive: bool,
     #[serde(default)]
     pub slack: Option<SlackRuntime>,
     #[serde(default)]
     pub agentmail: Option<AgentMailRuntime>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -93,6 +101,7 @@ impl AgentRuntime {
             agentmail: None,
             telegram_token_source: "pipelock:telegram/bot-token".to_string(),
             schedules: true,
+            proactive: true,
         }
     }
 }
@@ -238,6 +247,19 @@ pub fn plan_processes(config: &OrchestratorConfig) -> Vec<SupervisedProcess> {
                 critical: false,
             });
         }
+        if agent.proactive {
+            processes.push(SupervisedProcess {
+                name: format!("proactive:{}", agent.agent_id),
+                args: vec![
+                    "proactive".to_string(),
+                    "serve".to_string(),
+                    agent.agent_id.clone(),
+                    "--session-id".to_string(),
+                    agent.session_id.clone(),
+                ],
+                critical: false,
+            });
+        }
     }
 
     processes
@@ -256,18 +278,22 @@ mod tests {
         config.agents.push(agent.clone());
 
         let processes = plan_processes(&config);
-        // sessiond + telegram + schedule
-        assert_eq!(processes.len(), 3);
+        // sessiond + telegram + schedule + proactive
+        assert_eq!(processes.len(), 4);
         assert_eq!(processes[0].name, "sessiond");
         assert!(processes[0].critical);
         assert!(processes[0].args.contains(&"--token".to_string()));
 
         let channel = &processes[1];
         let schedule = &processes[2];
+        let proactive = &processes[3];
+        assert_eq!(proactive.name, "proactive:personal");
         let channel_session = session_id_arg(&channel.args);
         let schedule_session = session_id_arg(&schedule.args);
+        let proactive_session = session_id_arg(&proactive.args);
         // The whole point: these can never drift apart.
         assert_eq!(channel_session, schedule_session);
+        assert_eq!(channel_session, proactive_session);
         assert_eq!(channel_session.as_deref(), Some("telegram-main"));
         assert_eq!(guest_session_id(&agent), "telegram-main");
     }
@@ -363,6 +389,7 @@ mod tests {
         let mut agent = AgentRuntime::new("worker");
         agent.telegram = false;
         agent.schedules = true;
+        agent.proactive = false;
         config.agents.push(agent);
 
         let processes = plan_processes(&config);

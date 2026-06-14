@@ -855,6 +855,13 @@ fn deliver_telegram_outbox(
             continue;
         }
         let response = truncate_for_telegram(&message_text(&message.content)?);
+        // A proactive self-check that decided there's nothing worth saying emits
+        // the silence sentinel: mark it delivered (so it isn't retried) but don't
+        // message the user.
+        if response.trim() == crate::proactive::SILENCE_SENTINEL {
+            mark_delivered(&paths, &message.id, None)?;
+            continue;
+        }
         let reply_to_message_id = message
             .thread_id
             .as_deref()

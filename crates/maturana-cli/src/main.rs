@@ -1,5 +1,6 @@
 mod channels;
 mod graph;
+mod proactive;
 mod service;
 mod personal;
 mod session;
@@ -71,6 +72,7 @@ enum Command {
     Wiki(WikiCommand),
     Heartbeat(HeartbeatCommand),
     Schedule(ScheduleCommand),
+    Proactive(proactive::ProactiveCommand),
     Deploy(DeployCommand),
     Develop(DevelopCommand),
     Skill(SkillCommand),
@@ -269,6 +271,8 @@ struct UpCommand {
     no_telegram: bool,
     #[arg(long)]
     no_schedules: bool,
+    #[arg(long)]
+    no_proactive: bool,
     #[arg(long, default_value_t = 5)]
     channel_poll_seconds: u64,
     #[arg(long, default_value_t = 60)]
@@ -1267,6 +1271,7 @@ fn main() -> anyhow::Result<()> {
         Command::Wiki(command) => handle_wiki(command, &home)?,
         Command::Heartbeat(command) => handle_heartbeat(command, &home)?,
         Command::Schedule(command) => handle_schedule(command, &home)?,
+        Command::Proactive(command) => proactive::handle_proactive(command, &home)?,
         Command::Deploy(command) => handle_deploy(command, &home)?,
         Command::Develop(command) => handle_develop(command)?,
         Command::Skill(command) => handle_skill(command)?,
@@ -1836,6 +1841,7 @@ fn build_orchestrator_config(
                 telegram: !command.no_telegram,
                 telegram_token_source,
                 schedules: !command.no_schedules,
+                proactive: !command.no_proactive,
                 slack,
                 agentmail,
             })
@@ -5891,6 +5897,7 @@ mod tests {
             telegram_token_source: "pipelock:telegram/bot-token".to_string(),
             no_telegram: false,
             no_schedules: false,
+            no_proactive: false,
             channel_poll_seconds: 5,
             schedule_poll_seconds: 60,
             dry_run: false,
