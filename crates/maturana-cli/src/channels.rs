@@ -662,12 +662,27 @@ fn handle_telegram_update(
                 "channel.telegram.paired",
                 "paired telegram chat",
             )?;
-            send_telegram(
-                token,
-                &chat_id.to_string(),
-                "Maturana paired. You can now message the agent.",
-                reply_to_message_id,
-            )?;
+            // First contact: greet + run a brief onboarding interview so the
+            // agent learns who its owner is. The agent's greeting arrives via the
+            // outbox delivery thread once the guest worker runs the turn.
+            if !is_onboarded(home, &config.agent_id) {
+                enqueue_onboarding(home, &config.agent_id, &config.session_id)?;
+                let _ = mark_onboarded(home, &config.agent_id);
+                send_telegram(
+                    token,
+                    &chat_id.to_string(),
+                    "Paired! One moment — let me introduce myself.",
+                    reply_to_message_id,
+                )?;
+                send_telegram_chat_action(token, &chat_id.to_string(), "typing")?;
+            } else {
+                send_telegram(
+                    token,
+                    &chat_id.to_string(),
+                    "Paired. Welcome back — message me any time.",
+                    reply_to_message_id,
+                )?;
+            }
             Ok(())
         }
         InboundAction::Help { chat_id } => {
@@ -1175,7 +1190,7 @@ fn classify_telegram_update(
         }
         "/commands" | "/tools" | "/models" | "/model" | "/reset" | "/stop" | "/compact"
         | "/session" | "/subagents" | "/graph-query" | "/graph-insert" | "/tts"
-        | "/tts-provider" | "/emerge" | "/skill" => InboundAction::Command {
+        | "/tts-provider" | "/emerge" | "/skill" | "/onboard" => InboundAction::Command {
             chat_id,
             name: cmd.trim_start_matches('/').to_string(),
             args,
@@ -1336,6 +1351,7 @@ const COMMAND_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("/stop", "stop the current run"),
             ("/compact", "compact the session context"),
             ("/session", "session settings (e.g. /session idle)"),
+            ("/onboard", "(re)run the first-run interview"),
         ],
     ),
     (
@@ -1419,9 +1435,10 @@ fn status_text(home: &MaturanaHome, config: &TelegramServe) -> String {
     let model = settings.model.unwrap_or_else(|| "(harness default)".to_string());
     let now = Utc::now().format("%Y-%m-%d %H:%M UTC");
     format!(
-        "Status\n  agent: {}\n  channel: telegram (session {})\n  harness: {}\n  model: {}\n  OS: {}\n  time: {}\n  idle: {}",
+        "Status\n  agent: {}\n  channel: telegram (session {})\n  presence: {}\n  harness: {}\n  model: {}\n  OS: {}\n  time: {}\n  idle: {}",
         config.agent_id,
         config.session_id,
+        channel_presence(home, &config.agent_id),
         harness,
         model,
         std::env::consts::OS,
@@ -1528,6 +1545,73 @@ fn graph_query_text(home: &MaturanaHome, agent_id: &str, terms: &str) -> String 
     let rendered =
         crate::graph::query_blended_context(crate::graph::DEFAULT_LOCAL_URL, &token, &graphs, &term_list, 2);
     format!("GraphRAG (private + shared):\n{}", truncate_inline(&rendered, 3500))
+}
+
+// --- First-run interview + presence -----------------------------------------
+
+fn onboarded_marker(home: &MaturanaHome, agent_id: &str) -> PathBuf {
+    home.agent_dir(agent_id).join("onboarded")
+}
+
+fn is_onboarded(home: &MaturanaHome, agent_id: &str) -> bool {
+    onboarded_marker(home, agent_id).exists()
+}
+
+fn mark_onboarded(home: &MaturanaHome, agent_id: &str) -> anyhow::Result<()> {
+    let path = onboarded_marker(home, agent_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, Utc::now().to_rfc3339())?;
+    Ok(())
+}
+
+/// First contact: the agent greets the user and runs a short onboarding
+/// interview so it learns who they are (name, timezone, what they want help
+/// with) and records it to memory + IDENTITY.md.
+fn onboarding_prompt() -> String {
+    "[FIRST CONTACT - your owner just paired with you; they have NOT spoken yet.]\n\n\
+     Greet them warmly and briefly in your own voice (per SOUL.md), then begin a short \
+     onboarding interview. Ask their name and how they'd like to be addressed, their \
+     timezone / working hours, and the main things they want your help with. Ask only \
+     1-2 questions at a time - keep it natural, not a form. As you learn durable facts, \
+     save them to your memory and fill in IDENTITY.md's \"Who you are to me\" section. \
+     Send your greeting and first question now."
+        .to_string()
+}
+
+fn enqueue_onboarding(
+    home: &MaturanaHome,
+    agent_id: &str,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let paths = session_paths(&home.agent_dir(agent_id), session_id);
+    ensure_session(&paths)?;
+    let prompt = onboarding_prompt();
+    insert_inbound(
+        &paths,
+        "onboard",
+        "onboard",
+        &format!("onboard-{}", Utc::now().timestamp_millis()),
+        None,
+        &serde_json::json!({ "text": prompt, "prompt": prompt }).to_string(),
+    )?;
+    Ok(())
+}
+
+/// A short presence line for /status: the channel's last heartbeat.
+fn channel_presence(home: &MaturanaHome, agent_id: &str) -> String {
+    match fs::read_to_string(telegram_heartbeat_path(home, agent_id))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    {
+        Some(hb) => {
+            let status = hb.get("status").and_then(|s| s.as_str()).unwrap_or("unknown");
+            let at = hb.get("at").and_then(|a| a.as_str()).unwrap_or("?");
+            format!("{status} (last beat {at})")
+        }
+        None => "not started".to_string(),
+    }
 }
 
 /// Handle a slash command that returns a text reply (and may persist settings or
@@ -1637,6 +1721,11 @@ fn handle_channel_command(
             }
         }
         "emerge" => "Usage: /emerge <task> — runs a sub-agent on the task.".to_string(),
+        "onboard" => {
+            enqueue_onboarding(home, &config.agent_id, &config.session_id)?;
+            let _ = mark_onboarded(home, &config.agent_id);
+            "Starting onboarding — I'll introduce myself and ask a few questions.".to_string()
+        }
         "skill" => {
             // No args: list skills so the user can pick one. With args, classify
             // routes it to a prompt instead, so this only handles the bare form.
