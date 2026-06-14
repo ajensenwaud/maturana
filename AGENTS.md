@@ -88,7 +88,8 @@ load and follow that skill. Regenerate them after adding/editing skills with
 **Available skills** (read `skills/<name>/SKILL.md` to load the procedure):
 
 Agent lifecycle
-- `maturana-agent-create` — turn an agent goal into a durable `MATURANA.md` spec
+- `maturana-agent-create` — guided personal-agent **setup wizard**: name →
+  IDENTITY.md → SOUL.md → runtime → channels (+pairing) → tools → launch → live
 - `maturana-agent-validate` — validate a `MATURANA.md` spec before launch
 - `maturana-agent-launch` — materialize/launch an agent (Firecracker or Hyper-V)
 - `maturana-agent-inspect` — inspect a live agent: health, logs, audit, status
