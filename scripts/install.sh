@@ -17,10 +17,15 @@ REL_BASE="${MATURANA_RELEASE_BASE:-https://github.com/ajensenwaud/maturana/relea
 
 WITH_FIRECRACKER=0
 FROM_SOURCE=0
+# Whether to install skills as Codex /slash commands in ~/.codex/prompts.
+# "" = ask (interactive), "1" = yes, "0" = no (keep them in the repo only).
+CODEX_PROMPTS="${MATURANA_CODEX_PROMPTS:-}"
 for arg in "$@"; do
   case "$arg" in
     --firecracker) WITH_FIRECRACKER=1 ;;
     --from-source) FROM_SOURCE=1 ;;
+    --codex-prompts) CODEX_PROMPTS=1 ;;
+    --no-codex-prompts) CODEX_PROMPTS=0 ;;
   esac
 done
 
@@ -128,8 +133,26 @@ fi
 # 6. Initialize + register services (Rust owns the logic).
 cd "$DEST"
 "$BIN" pipelock init >/dev/null 2>&1 || true
-# Expose every skill as a Codex /maturana-<name> slash command (best-effort).
-"$BIN" skill codex-prompts "$DEST/skills" >/dev/null 2>&1 || true
+
+# Skills as Codex /slash commands (~/.codex/prompts) vs kept in the repo only
+# (Codex still loads them on demand via AGENTS.md). Ask unless told via flag/env.
+if [ -z "$CODEX_PROMPTS" ]; then
+  if [ -r /dev/tty ]; then
+    printf '\033[36m[maturana]\033[0m Install skills as Codex /slash commands in ~/.codex/prompts? [Y/n] ' > /dev/tty
+    read -r _ans < /dev/tty || _ans=""
+    case "$_ans" in n|N|no|NO) CODEX_PROMPTS=0 ;; *) CODEX_PROMPTS=1 ;; esac
+  else
+    CODEX_PROMPTS=1   # non-interactive default: install them
+  fi
+fi
+if [ "$CODEX_PROMPTS" = "1" ]; then
+  "$BIN" skill codex-prompts "$DEST/skills" >/dev/null 2>&1 \
+    && say "skills installed as Codex /maturana-<name> slash commands" \
+    || say "could not install Codex prompts (skills still load via AGENTS.md)"
+else
+  say "skills kept in the repo (Codex loads them on demand via AGENTS.md)"
+fi
+
 say "registering services (maturana up + maturana web)"
 "$BIN" service install up web
 # Firecracker hosts also get the boot-time fleet relauncher (zero-touch reboot
