@@ -11,6 +11,7 @@ use maturana_core::{
         ensure_session, insert_inbound, list_undelivered, mark_delivered, session_paths,
         SessionPaths,
     },
+    spec::{AgentSpec, HarnessRuntime},
     state::MaturanaHome,
     tools::{run_tool, ToolRegistry},
 };
@@ -351,6 +352,11 @@ enum InboundAction {
         chat_id: i64,
         value: f64,
     },
+    Command {
+        chat_id: i64,
+        name: String,
+        args: String,
+    },
     Deny {
         chat_id: i64,
     },
@@ -640,12 +646,7 @@ fn handle_telegram_update(
             Ok(())
         }
         InboundAction::Help { chat_id } => {
-            send_telegram(
-                token,
-                &chat_id.to_string(),
-                "Commands: /status, /new, /spawn, /help. Any other message is sent to the agent.",
-                reply_to_message_id,
-            )?;
+            send_telegram(token, &chat_id.to_string(), &help_text(), reply_to_message_id)?;
             Ok(())
         }
         InboundAction::Status { chat_id } => {
@@ -658,9 +659,25 @@ fn handle_telegram_update(
             send_telegram(
                 token,
                 &chat_id.to_string(),
-                "Maturana channel is alive and paired.",
+                &status_text(home, config),
                 reply_to_message_id,
             )?;
+            Ok(())
+        }
+        InboundAction::Command {
+            chat_id,
+            name,
+            args,
+        } => {
+            audit_channel_event(
+                home,
+                &config.agent_id,
+                "channel.telegram.command",
+                &format!("/{name}"),
+            )?;
+            let reply = handle_channel_command(home, config, chat_id, &name, &args)
+                .unwrap_or_else(|error| format!("Command failed: {error:#}"));
+            send_telegram(token, &chat_id.to_string(), &reply, reply_to_message_id)?;
             Ok(())
         }
         InboundAction::New { chat_id } => {
@@ -1072,7 +1089,11 @@ fn classify_telegram_update(
         return InboundAction::Deny { chat_id };
     }
     let command = normalize_bot_command(text);
-    match command.as_str() {
+    let (cmd, args) = match command.split_once(char::is_whitespace) {
+        Some((c, a)) => (c.to_ascii_lowercase(), a.trim().to_string()),
+        None => (command.to_ascii_lowercase(), String::new()),
+    };
+    match cmd.as_str() {
         "/start" | "/help" => InboundAction::Help { chat_id },
         "/status" => InboundAction::Status { chat_id },
         "/new" => InboundAction::New { chat_id },
@@ -1084,7 +1105,7 @@ fn classify_telegram_update(
             chat_id,
             value: signals::THUMBS_DOWN,
         },
-        _ if command.starts_with("/tool ") => match parse_tool_command(&command) {
+        "/tool" => match parse_tool_command(&command) {
             Some((name, input)) => InboundAction::Tool {
                 chat_id,
                 name,
@@ -1092,7 +1113,7 @@ fn classify_telegram_update(
             },
             None => InboundAction::Help { chat_id },
         },
-        _ if command.starts_with("/spawn ") => match parse_spawn_command(&command) {
+        "/spawn" => match parse_spawn_command(&command) {
             Some((mode, name, prompt)) => InboundAction::Spawn {
                 chat_id,
                 mode,
@@ -1101,7 +1122,37 @@ fn classify_telegram_update(
             },
             None => InboundAction::Help { chat_id },
         },
-        _ if command.starts_with('/') => InboundAction::Help { chat_id },
+        // /emerge <task> spawns an ephemeral sub-agent on the task.
+        "/emerge" if !args.is_empty() => InboundAction::Spawn {
+            chat_id,
+            mode: SpawnMode::Ephemeral,
+            name: slugify_channel_id(&args),
+            prompt: args,
+        },
+        // /skill <name> [args] runs a skill by telling the agent to use it
+        // (reuses the full prompt pipeline). Bare /skill lists skills.
+        "/skill" if !args.is_empty() => {
+            let (skill, rest) = match args.split_once(char::is_whitespace) {
+                Some((s, r)) => (s, r.trim()),
+                None => (args.as_str(), ""),
+            };
+            InboundAction::Prompt {
+                chat_id,
+                text: format!("Use the `{skill}` skill. {rest}").trim().to_string(),
+            }
+        }
+        "/commands" | "/tools" | "/models" | "/model" | "/reset" | "/stop" | "/compact"
+        | "/session" | "/subagents" | "/graph-query" | "/graph-insert" | "/tts"
+        | "/tts-provider" | "/emerge" | "/skill" => InboundAction::Command {
+            chat_id,
+            name: cmd.trim_start_matches('/').to_string(),
+            args,
+        },
+        _ if cmd.starts_with('/') => InboundAction::Command {
+            chat_id,
+            name: "unknown".to_string(),
+            args: cmd,
+        },
         _ => InboundAction::Prompt {
             chat_id,
             text: text.to_string(),
@@ -1192,6 +1243,365 @@ fn slugify_channel_id(value: &str) -> String {
     } else {
         slug
     }
+}
+
+// ---------------------------------------------------------------------------
+// In-channel slash commands: the control surface a user drives the agent with.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ChannelSettings {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    tts_enabled: bool,
+    #[serde(default)]
+    tts_provider: Option<String>,
+    #[serde(default)]
+    idle: bool,
+}
+
+fn truncate_inline(value: &str, limit: usize) -> String {
+    let value = value.trim();
+    if value.chars().count() <= limit {
+        value.to_string()
+    } else {
+        value.chars().take(limit).collect::<String>() + "…"
+    }
+}
+
+fn channel_settings_path(home: &MaturanaHome, agent_id: &str) -> PathBuf {
+    home.agent_dir(agent_id).join("channel-settings.json")
+}
+
+fn load_channel_settings(home: &MaturanaHome, agent_id: &str) -> ChannelSettings {
+    fs::read_to_string(channel_settings_path(home, agent_id))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_channel_settings(
+    home: &MaturanaHome,
+    agent_id: &str,
+    settings: &ChannelSettings,
+) -> anyhow::Result<()> {
+    let path = channel_settings_path(home, agent_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_string_pretty(settings)?)?;
+    Ok(())
+}
+
+/// Grouped command catalog — single source of truth for /help and /commands.
+const COMMAND_GROUPS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Session",
+        &[
+            ("/new", "start a new session"),
+            ("/reset", "reset the current session"),
+            ("/stop", "stop the current run"),
+            ("/compact", "compact the session context"),
+            ("/session", "session settings (e.g. /session idle)"),
+        ],
+    ),
+    (
+        "Options",
+        &[
+            ("/model", "show or set the model (/model <id>)"),
+            ("/models", "list available models"),
+        ],
+    ),
+    (
+        "Status",
+        &[
+            ("/help", "show available commands"),
+            ("/commands", "list all slash commands"),
+            ("/tools", "list available runtime tools"),
+            ("/status", "model, channel, harness, time, OS"),
+        ],
+    ),
+    (
+        "Management",
+        &[
+            ("/subagents", "inspect subagent runs for this session"),
+            ("/skill", "run a skill by name (/skill <name> [args])"),
+            ("/emerge", "run a sub-agent on a task (/emerge <task>)"),
+        ],
+    ),
+    (
+        "MaturanaGraph",
+        &[
+            ("/graph-query", "GraphRAG query (/graph-query <terms>)"),
+            ("/graph-insert", "add content to MaturanaGraph"),
+        ],
+    ),
+    (
+        "Voice",
+        &[
+            ("/tts", "enable/disable text-to-speech"),
+            ("/tts-provider", "set TTS provider (e.g. elevenlabs)"),
+        ],
+    ),
+];
+
+fn help_text() -> String {
+    let mut out = String::from("Maturana commands:\n");
+    for (group, cmds) in COMMAND_GROUPS {
+        out.push_str(&format!("\n{group}\n"));
+        for (name, desc) in *cmds {
+            out.push_str(&format!("  {name} — {desc}\n"));
+        }
+    }
+    out.push_str("\nAny other message is sent to the agent.");
+    out
+}
+
+fn commands_text() -> String {
+    let mut names: Vec<&str> = Vec::new();
+    for (_, cmds) in COMMAND_GROUPS {
+        for (name, _) in *cmds {
+            names.push(name);
+        }
+    }
+    format!("{}\n/good /bad — rate the last reply", names.join("  "))
+}
+
+fn harness_label(home: &MaturanaHome, agent_id: &str) -> String {
+    let spec_path = home.agent_dir(agent_id).join("MATURANA.md");
+    match AgentSpec::from_maturana_markdown(&spec_path) {
+        Ok(spec) => match spec.runtime.harness {
+            HarnessRuntime::Codex => "codex",
+            HarnessRuntime::ClaudeCode => "claude-code",
+            HarnessRuntime::Opencode => "opencode",
+        }
+        .to_string(),
+        Err(_) => "unknown".to_string(),
+    }
+}
+
+fn status_text(home: &MaturanaHome, config: &TelegramServe) -> String {
+    let settings = load_channel_settings(home, &config.agent_id);
+    let harness = harness_label(home, &config.agent_id);
+    let model = settings.model.unwrap_or_else(|| "(harness default)".to_string());
+    let now = Utc::now().format("%Y-%m-%d %H:%M UTC");
+    format!(
+        "Status\n  agent: {}\n  channel: telegram (session {})\n  harness: {}\n  model: {}\n  OS: {}\n  time: {}\n  idle: {}",
+        config.agent_id,
+        config.session_id,
+        harness,
+        model,
+        std::env::consts::OS,
+        now,
+        if settings.idle { "on" } else { "off" },
+    )
+}
+
+fn tools_text(home: &MaturanaHome) -> String {
+    match ToolRegistry::new(home.root().join("tools")).list() {
+        Ok(tools) if !tools.is_empty() => {
+            let mut out = String::from("Runtime tools:\n");
+            for t in tools {
+                let desc = t.description.lines().next().unwrap_or("").trim();
+                out.push_str(&format!("  {} — {}\n", t.name, truncate_inline(desc, 80)));
+            }
+            out
+        }
+        Ok(_) => "No runtime tools installed yet. Build one with the maturana-tool-create or maturana-wasm-tool skill.".to_string(),
+        Err(error) => format!("Could not list tools: {error:#}"),
+    }
+}
+
+fn subagents_text(home: &MaturanaHome, agent_id: &str) -> String {
+    let dir = home.agent_dir(agent_id).join("subagents");
+    let mut entries: Vec<String> = Vec::new();
+    if let Ok(read) = fs::read_dir(&dir) {
+        for e in read.flatten() {
+            if e.path().extension().and_then(|x| x.to_str()) == Some("json") {
+                if let Some(stem) = e.path().file_stem().and_then(|s| s.to_str()) {
+                    let mode = fs::read_to_string(e.path())
+                        .ok()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                        .and_then(|v| v.get("mode").and_then(|m| m.as_str()).map(String::from))
+                        .unwrap_or_else(|| "ephemeral".to_string());
+                    entries.push(format!("  {stem} ({mode})"));
+                }
+            }
+        }
+    }
+    if entries.is_empty() {
+        "No subagents yet. Spawn one with /emerge <task>.".to_string()
+    } else {
+        entries.sort();
+        format!("Subagents:\n{}", entries.join("\n"))
+    }
+}
+
+/// Live OpenRouter catalog for OpenCode/OpenRouter; a short curated set otherwise.
+fn models_text(home: &MaturanaHome, agent_id: &str) -> String {
+    let settings = load_channel_settings(home, agent_id);
+    let current = settings.model.clone().unwrap_or_else(|| "(harness default)".to_string());
+    let harness = harness_label(home, agent_id);
+    let body = if harness == "opencode" {
+        match fetch_openrouter_models() {
+            Ok(ids) if !ids.is_empty() => {
+                let shown: Vec<String> = ids.into_iter().take(60).collect();
+                format!("OpenRouter models (first {}):\n{}", shown.len(), shown.join("\n"))
+            }
+            Ok(_) => "OpenRouter returned no models.".to_string(),
+            Err(error) => format!("Could not fetch OpenRouter catalog: {error:#}"),
+        }
+    } else if harness == "codex" {
+        "Codex models: gpt-5-codex, gpt-5, o4-mini\n(your Codex subscription decides availability)".to_string()
+    } else {
+        "claude-code models: claude-sonnet-4.5, claude-opus-4.1, claude-haiku-4.5".to_string()
+    };
+    format!("Current: {current}\nSet with /model <id>\n\n{body}")
+}
+
+fn fetch_openrouter_models() -> anyhow::Result<Vec<String>> {
+    let resp: serde_json::Value = ureq::get("https://openrouter.ai/api/v1/models")
+        .timeout(std::time::Duration::from_secs(15))
+        .call()
+        .context("OpenRouter request failed")?
+        .into_json()
+        .context("failed to parse OpenRouter response")?;
+    let ids = resp
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(ids)
+}
+
+fn graph_query_text(home: &MaturanaHome, agent_id: &str, terms: &str) -> String {
+    if terms.trim().is_empty() {
+        return "Usage: /graph-query <terms>".to_string();
+    }
+    let kg = agent_knowledge_graph(home, agent_id);
+    if !kg.enabled {
+        return "Knowledge graph is not enabled for this agent.".to_string();
+    }
+    let Some(token) = maturana_core::worker::read_graph_token(home.root()) else {
+        return "Knowledge graph service is not available (no graph token).".to_string();
+    };
+    let graph = kg.graph_name(agent_id);
+    let term_list: Vec<String> = terms.split_whitespace().map(String::from).collect();
+    match crate::graph::query_rendered_context(crate::graph::DEFAULT_LOCAL_URL, &token, &graph, &term_list, 2) {
+        Ok(rendered) => format!("GraphRAG `{graph}`:\n{}", truncate_inline(&rendered, 3500)),
+        Err(error) => format!("Graph query failed: {error:#}"),
+    }
+}
+
+/// Handle a slash command that returns a text reply (and may persist settings or
+/// reset context). Side-effecting spawns/prompts are routed earlier in classify.
+fn handle_channel_command(
+    home: &MaturanaHome,
+    config: &TelegramServe,
+    chat_id: i64,
+    name: &str,
+    args: &str,
+) -> anyhow::Result<String> {
+    let reply = match name {
+        "commands" => commands_text(),
+        "tools" => tools_text(home),
+        "subagents" => subagents_text(home, &config.agent_id),
+        "models" => models_text(home, &config.agent_id),
+        "model" => {
+            let mut settings = load_channel_settings(home, &config.agent_id);
+            if args.trim().is_empty() {
+                format!(
+                    "Model: {}",
+                    settings.model.clone().unwrap_or_else(|| "(harness default)".to_string())
+                )
+            } else {
+                settings.model = Some(args.trim().to_string());
+                save_channel_settings(home, &config.agent_id, &settings)?;
+                format!("Model set to `{}` (applies to new turns).", args.trim())
+            }
+        }
+        "reset" => {
+            reset_channel_context(home, &config.agent_id, chat_id)?;
+            "Session reset — durable memory and wiki are preserved.".to_string()
+        }
+        "stop" => "Nothing to stop — channel turns run one at a time and finish on reply.".to_string(),
+        "compact" => "The conversation context is compacted automatically each turn (durable memory + wiki + recent transcript). Use /new to start fresh.".to_string(),
+        "session" => {
+            let mut settings = load_channel_settings(home, &config.agent_id);
+            let sub = args.split_whitespace().next().unwrap_or("");
+            match sub {
+                "idle" => {
+                    settings.idle = true;
+                    save_channel_settings(home, &config.agent_id, &settings)?;
+                    "Session set to idle.".to_string()
+                }
+                "active" | "wake" => {
+                    settings.idle = false;
+                    save_channel_settings(home, &config.agent_id, &settings)?;
+                    "Session active.".to_string()
+                }
+                _ => format!(
+                    "Session {}\n  idle: {}\n  model: {}\nSet with: /session idle | /session active",
+                    config.session_id,
+                    if settings.idle { "on" } else { "off" },
+                    settings.model.clone().unwrap_or_else(|| "(default)".to_string()),
+                ),
+            }
+        }
+        "tts" => {
+            let mut settings = load_channel_settings(home, &config.agent_id);
+            settings.tts_enabled = !settings.tts_enabled;
+            save_channel_settings(home, &config.agent_id, &settings)?;
+            let prov = settings.tts_provider.clone().unwrap_or_else(|| "none set".to_string());
+            format!(
+                "Text-to-speech {} (provider: {}). Set a provider with /tts-provider <name>.",
+                if settings.tts_enabled { "ENABLED" } else { "disabled" },
+                prov
+            )
+        }
+        "tts-provider" => {
+            if args.trim().is_empty() {
+                let s = load_channel_settings(home, &config.agent_id);
+                format!("TTS provider: {}", s.tts_provider.unwrap_or_else(|| "(none)".to_string()))
+            } else {
+                let mut settings = load_channel_settings(home, &config.agent_id);
+                settings.tts_provider = Some(args.trim().to_string());
+                save_channel_settings(home, &config.agent_id, &settings)?;
+                format!("TTS provider set to `{}`.", args.trim())
+            }
+        }
+        "graph-query" => graph_query_text(home, &config.agent_id, args),
+        "graph-insert" => "To add to MaturanaGraph, send me a document (attach a file) and I ingest it automatically. Inline text insert is coming soon.".to_string(),
+        "emerge" => "Usage: /emerge <task> — runs a sub-agent on the task.".to_string(),
+        "skill" => {
+            // No args: list skills so the user can pick one. With args, classify
+            // routes it to a prompt instead, so this only handles the bare form.
+            let skills_dir = std::path::Path::new("skills");
+            let mut names: Vec<String> = Vec::new();
+            if let Ok(read) = fs::read_dir(skills_dir) {
+                for e in read.flatten() {
+                    if e.path().join("SKILL.md").exists() {
+                        if let Some(n) = e.path().file_name().and_then(|s| s.to_str()) {
+                            names.push(n.to_string());
+                        }
+                    }
+                }
+            }
+            names.sort();
+            if names.is_empty() {
+                "Usage: /skill <name> [args]".to_string()
+            } else {
+                format!("Usage: /skill <name> [args]\nSkills:\n{}", names.join(", "))
+            }
+        }
+        _ => format!("Unknown command `/{name}`. Try /help."),
+    };
+    Ok(reply)
 }
 
 fn telegram_message(update: &TelegramUpdate) -> Option<&TelegramMessage> {
@@ -2644,6 +3054,56 @@ mod tests {
                 prompt: "find context".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn routes_new_slash_commands() {
+        assert_eq!(
+            classify_telegram_update(&text_update(7, "/models"), Some(7), None),
+            InboundAction::Command { chat_id: 7, name: "models".to_string(), args: String::new() }
+        );
+        assert_eq!(
+            classify_telegram_update(&text_update(7, "/model openai/gpt-5"), Some(7), None),
+            InboundAction::Command { chat_id: 7, name: "model".to_string(), args: "openai/gpt-5".to_string() }
+        );
+        assert_eq!(
+            classify_telegram_update(&text_update(7, "/graph-query roadmap q3"), Some(7), None),
+            InboundAction::Command { chat_id: 7, name: "graph-query".to_string(), args: "roadmap q3".to_string() }
+        );
+        // /emerge spawns a sub-agent; /skill <name> becomes a prompt.
+        assert_eq!(
+            classify_telegram_update(&text_update(7, "/emerge summarize my inbox"), Some(7), None),
+            InboundAction::Spawn {
+                chat_id: 7,
+                mode: SpawnMode::Ephemeral,
+                name: "summarize-my-inbox".to_string(),
+                prompt: "summarize my inbox".to_string(),
+            }
+        );
+        assert_eq!(
+            classify_telegram_update(&text_update(7, "/skill maturana-pipelock list"), Some(7), None),
+            InboundAction::Prompt {
+                chat_id: 7,
+                text: "Use the `maturana-pipelock` skill. list".to_string(),
+            }
+        );
+        // Unknown slash command routes to the command handler (replies via /help).
+        assert_eq!(
+            classify_telegram_update(&text_update(7, "/wat"), Some(7), None),
+            InboundAction::Command { chat_id: 7, name: "unknown".to_string(), args: "/wat".to_string() }
+        );
+    }
+
+    #[test]
+    fn help_and_commands_cover_the_catalog() {
+        let help = help_text();
+        for group in ["Session", "Options", "Status", "Management", "MaturanaGraph", "Voice"] {
+            assert!(help.contains(group), "help missing group {group}");
+        }
+        for cmd in ["/model", "/models", "/tools", "/status", "/subagents", "/graph-query", "/tts"] {
+            assert!(help.contains(cmd), "help missing {cmd}");
+            assert!(commands_text().contains(cmd), "commands missing {cmd}");
+        }
     }
 
     #[test]
