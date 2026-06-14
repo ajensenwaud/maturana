@@ -231,13 +231,24 @@ pub struct Browser {
 /// `graph` names the graph to connect to. Multiple agents naming the **same**
 /// graph share it (multi-agent knowledge graph); omitting it gives the agent a
 /// private graph named after its id.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KnowledgeGraph {
-    #[serde(default)]
+    /// On by default — the built-in graph store is a headline feature, so agents
+    /// get private memory + GraphRAG unless a spec opts out with `enabled: false`.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
     pub graph: Option<String>,
+}
+
+impl Default for KnowledgeGraph {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            graph: None,
+        }
+    }
 }
 
 impl KnowledgeGraph {
