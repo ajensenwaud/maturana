@@ -22,7 +22,7 @@ $cargo = Join-Path $env:USERPROFILE ".cargo\bin\cargo.exe"
 $exe = Join-Path $repoRoot "target\x86_64-pc-windows-gnu\debug\maturana.exe"
 
 if (!(Test-Path -LiteralPath $cargo)) {
-    throw "cargo.exe not found. Install Rust with: winget install --id Rustlang.Rustup -e (or use the prebuilt installer: irm https://raw.githubusercontent.com/ajensenwaud/maturana/main/scripts/bootstrap.ps1 | iex)"
+    throw "cargo.exe not found. Install Rust with: winget install --id Rustlang.Rustup -e (or use the prebuilt installer: irm https://maturana.sh/install.ps1 | iex)"
 }
 
 $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"

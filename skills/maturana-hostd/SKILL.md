@@ -33,7 +33,8 @@ prompts. It is not a general command runner.
 - Hostd reachable: use normal Rust CLI commands for launch, inspect, stop, and
   Hyper-V snapshots.
 - Hostd unreachable: install or restart the fixed Windows task once through
-  `install-windows.ps1`; then retry the Rust CLI command.
+  `install-hostd-task.ps1` (or re-run `install.ps1`); then retry the Rust CLI
+  command.
 - Hyper-V operation failed: inspect hostd response, log file, Hyper-V state,
   and the materialized launch plan before editing scripts.
 - Guest command requested: do not add a hostd command endpoint. Use
@@ -57,7 +58,7 @@ Use JSON output when another tool or script needs structured status:
 If `reachable` is false, install or restart the elevated scheduled task:
 
 ```powershell
-.\scripts\install-windows.ps1
+.\scripts\install-hostd-task.ps1
 ```
 
 Then retry the original Rust CLI command, for example:
@@ -79,7 +80,7 @@ Before claiming success, collect:
 
 ## Recovery
 
-- Scheduled task missing: run `install-windows.ps1` from an elevated shell once.
+- Scheduled task missing: run `install-hostd-task.ps1` from an elevated shell once.
 - Health endpoint unreachable: inspect `.maturana/logs/hostd.log`, then restart
   the fixed scheduled task.
 - Token mismatch: regenerate/install hostd through the Windows installer rather

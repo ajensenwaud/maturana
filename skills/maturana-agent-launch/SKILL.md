@@ -82,7 +82,7 @@ Before declaring launch successful, collect:
 Prepare the official Ubuntu VHDX and SSH key once, then reuse them:
 
 ```powershell
-.\scripts\install-windows.ps1
+.\scripts\install.ps1
 ```
 
 Launch through the Rust CLI. The CLI talks to Rust hostd; hostd performs
