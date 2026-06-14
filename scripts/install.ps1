@@ -1,6 +1,6 @@
 # Maturana Windows installer - the single entry point.
 #
-#   irm https://maturana.sh/install.ps1 | iex
+#   irm https://www.maturana.sh/install.ps1 | iex
 #
 # Downloads the signed prebuilt maturana.exe from the latest GitHub Release (no
 # Rust toolchain needed), clones the repo for skills/AGENTS.md/scripts/examples,

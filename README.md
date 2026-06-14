@@ -26,7 +26,7 @@ curl -fsSL .../scripts/install.sh | bash -s -- --from-source
 # Windows (Hyper-V) — downloads the signed maturana.exe, then installs.
 # Self-elevates (one UAC) and prompts for your Windows password (for the
 # no-login boot tasks). See "Zero-touch reboot recovery" below.
-irm https://maturana.sh/install.ps1 | iex
+irm https://www.maturana.sh/install.ps1 | iex
 ```
 
 Or clone this repo and run `scripts/install.sh` / `scripts/install.ps1`
