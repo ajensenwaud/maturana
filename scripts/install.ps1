@@ -71,8 +71,11 @@ if (-not $SkipServices -and -not $isAdmin) {
         if ($CodexPrompts)   { $pf += "`$env:MATURANA_CODEX_PROMPTS=1; " }
         if ($NoCodexPrompts) { $pf += "`$env:MATURANA_NO_CODEX_PROMPTS=1; " }
         if ($env:MATURANA_DIR) { $pf += "`$env:MATURANA_DIR='$($env:MATURANA_DIR)'; " }
+        # Re-fetch from the raw URL (200), NOT the maturana.sh vanity URL: the
+        # vanity URL is a redirect and Windows PowerShell's irm won't follow a
+        # 307/308, which would break the elevated re-fetch.
         $launch = @('-NoExit','-NoProfile','-ExecutionPolicy','Bypass','-Command',
-                    "$pf irm https://maturana.sh/install.ps1 | iex")
+                    "$pf irm https://raw.githubusercontent.com/ajensenwaud/maturana/main/scripts/install.ps1 | iex")
     }
     try { Start-Process powershell.exe -Verb RunAs -ArgumentList $launch | Out-Null }
     catch { throw "Elevation was declined. Re-run from an elevated PowerShell, or pass -SkipServices to install without boot services." }
