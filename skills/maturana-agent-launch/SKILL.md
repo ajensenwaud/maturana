@@ -224,6 +224,13 @@ adapter that copies Rust-rendered files into the image.
 ## Boundaries
 
 - Do not implement launch orchestration in PowerShell or bash.
+- **Do not provision the guest by hand.** Installing the proxy CA, injecting
+  Codex/Claude auth, installing the harness/browser, bootstrapping directories,
+  copying the agent contract, and enabling/starting `maturana-agent.service` are
+  ALL done by `maturana agent launch … --apply` (Rust: `provision_hyperv_guest` /
+  `install_guest_worker`). Never SSH into the guest to run apt/cp/systemctl
+  yourself, and never author a PowerShell/bash wrapper to do it. If `--apply`
+  fails, report its exact error and stop — do not reimplement provisioning.
 - Do not add a queue or broker for command execution.
 - Do not add generic host command execution to hostd.
 - Do not copy host directories into the guest unless the spec declares them.

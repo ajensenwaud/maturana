@@ -98,9 +98,12 @@ Fix spec fields until validation is clean — never weaken validation.
 
 1. **Security review** — run the `maturana-security-review` skill over the spec.
 2. **Launch** — use the `maturana-agent-launch` skill (`maturana agent launch
-   --spec .maturana/agents/<id>/MATURANA.md`). This materializes the agent
-   (scaffolding `IDENTITY.md`/`SOUL.md` only if absent — your authored ones are
-   preserved) and boots the VM.
+   --spec .maturana/agents/<id>/MATURANA.md --apply`). This materializes the
+   agent (scaffolding `IDENTITY.md`/`SOUL.md` only if absent — your authored ones
+   are preserved), boots the VM, AND provisions the guest (proxy CA, harness +
+   auth, browser, `maturana-agent.service`). **Do NOT SSH in and provision by
+   hand or write a PowerShell/bash wrapper** — `--apply` owns that. If it fails,
+   report the exact error and stop.
 3. **Personal scaffolding** — `maturana personal init <id> --spec
    .maturana/agents/<id>/MATURANA.md` (memory, context, schedules, wiki). It
    preserves your authored `IDENTITY.md`/`SOUL.md`/`MEMORY.md`.
