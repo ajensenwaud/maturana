@@ -118,6 +118,42 @@ pub(crate) fn ingest_file_into_service(
     Ok(ingested.chunks)
 }
 
+/// An agent's private memory section: a per-agent graph it alone writes to.
+/// Reads blend this with shared graphs (see `query_blended_context`).
+pub(crate) fn agent_graph_name(agent_id: &str) -> String {
+    let safe: String = agent_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c.to_ascii_lowercase() } else { '-' })
+        .collect();
+    format!("agent.{}", safe.trim_matches('-'))
+}
+
+/// Blended GraphRAG read across several graphs (e.g. the agent's private section
+/// + shared graphs). Per-graph failures (missing/empty store) are skipped so one
+/// absent graph never sinks the query. Each non-empty section is labelled.
+pub(crate) fn query_blended_context(
+    url: &str,
+    token: &str,
+    graphs: &[String],
+    terms: &[String],
+    depth: usize,
+) -> String {
+    let mut out = String::new();
+    for graph in graphs {
+        if let Ok(rendered) = query_rendered_context(url, token, graph, terms, depth) {
+            let trimmed = rendered.trim();
+            if !trimmed.is_empty() && trimmed != "(no result)" {
+                out.push_str(&format!("[{graph}]\n{trimmed}\n\n"));
+            }
+        }
+    }
+    if out.trim().is_empty() {
+        "(no graph results)".to_string()
+    } else {
+        out.trim_end().to_string()
+    }
+}
+
 /// Run a keyword GraphRAG query via the running service and return the rendered
 /// context (host-side: no embedding, pure text seed + graph expansion).
 pub(crate) fn query_rendered_context(
@@ -534,6 +570,16 @@ mod tests {
         for bad in ["", "..", "../x", "a/b", "a\\b", "/abs"] {
             assert!(!valid_graph_name(bad), "should reject {bad:?}");
         }
+    }
+
+    #[test]
+    fn agent_graph_name_is_private_and_valid() {
+        // Per-agent private section is a valid (dotted) graph name distinct from
+        // any shared graph, and id is sanitized.
+        assert_eq!(agent_graph_name("codex-firecracker"), "agent.codex-firecracker");
+        assert_eq!(agent_graph_name("Ada Lovelace!"), "agent.ada-lovelace");
+        assert!(valid_graph_name(&agent_graph_name("codex-firecracker")));
+        assert_ne!(agent_graph_name("codex-firecracker"), "personal");
     }
 
     #[test]
