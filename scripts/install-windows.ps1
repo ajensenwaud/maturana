@@ -131,14 +131,14 @@ try {
     if ($NoCodexPrompts) {
         $doPrompts = $false
     } elseif (-not $CodexPrompts) {
-        $ans = Read-Host "Install skills as Codex /slash commands in ~/.codex/prompts? [Y/n]"
+        $ans = Read-Host "Install Maturana skills as Codex skills (~/.agents/skills)? [Y/n]"
         if ($ans -match '^(n|no)$') { $doPrompts = $false }
     }
     if ($doPrompts) {
         try {
             & .\scripts\maturana.ps1 skill codex-prompts (Join-Path $repoRoot 'skills') 2>$null | Out-Null
-            Write-Host "  skills installed as Codex /maturana-<name> slash commands"
-        } catch { Write-Host "  could not install Codex prompts (skills still load via AGENTS.md)" }
+            Write-Host "  skills installed as Codex skills (use /skills or `$<name> in Codex)"
+        } catch { Write-Host "  could not install Codex skills (they still load via AGENTS.md)" }
     } else {
         Write-Host "  skills kept in the repo (Codex loads them on demand via AGENTS.md)"
     }
@@ -180,9 +180,9 @@ try {
     Write-Host "2) Build your first agent:"
     Write-Host "     cd `"$repoRoot`""
     Write-Host "     codex"
-    Write-Host "   then ask Codex: ""create and launch a new agent"", or use a"
-    Write-Host "   skill directly, e.g.  /maturana-agent-create"
-    Write-Host "   (all 31 skills are installed as /maturana-<name> slash commands)."
+    Write-Host "   then ask Codex: ""create and launch a new agent"", or invoke a"
+    Write-Host "   skill directly: type /skills, or `$maturana-agent-create"
+    Write-Host "   (all 31 skills are installed as Codex skills under ~/.agents/skills)."
     Write-Host ""
     Write-Host "Web cockpit:  http://localhost:47836"
     if ($token) { Write-Host "     token:  $token" } else { Write-Host "     token:  (run: maturana web token)" }
