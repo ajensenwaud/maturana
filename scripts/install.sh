@@ -120,6 +120,20 @@ case ":$PATH:" in
   *) say "add ~/.local/bin to PATH" ;;
 esac
 
+# 4b. KVM: agents run in Firecracker microVMs, which need /dev/kvm. Check +
+#     enable it on every Linux install so the failure surfaces here (with a fix
+#     attempt and clear guidance) instead of later at agent launch. Best-effort:
+#     a control-plane-only box without virtualization can still run the CLI/web,
+#     so we warn rather than abort. The --firecracker path enables KVM itself
+#     (fatally) inside install-firecracker-host.sh, so skip the duplicate here.
+if [ "$(uname -s)" = "Linux" ] && [ "$WITH_FIRECRACKER" = "0" ]; then
+  if ! bash "$DEST/scripts/kvm-enable.sh"; then
+    say "WARNING: KVM is not enabled — agents need it to launch. Fix the cause"
+    say "above (firmware virtualization / nested virt), then re-run"
+    say "'$DEST/scripts/kvm-enable.sh'. The CLI and web cockpit still installed."
+  fi
+fi
+
 # 5. Optional: provision the Linux Firecracker agent-host substrate.
 if [ "$WITH_FIRECRACKER" = "1" ]; then
   if [ "$(uname -s)" = "Linux" ]; then
