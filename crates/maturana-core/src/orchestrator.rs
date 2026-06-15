@@ -75,6 +75,13 @@ pub struct AgentRuntime {
     pub discord: Option<DiscordRuntime>,
     #[serde(default)]
     pub agentmail: Option<AgentMailRuntime>,
+    /// When the agent declares `network.proxy.enabled`, supervise its pipelock
+    /// egress proxy as well. Without this a `proxy.enabled` agent authenticates
+    /// fine but every outbound call (harness backend, tools) dies at a dead
+    /// proxy port — the proxy was previously a manual `pipelock proxy` command
+    /// nothing in the plane started.
+    #[serde(default)]
+    pub proxy: bool,
 }
 
 fn default_true() -> bool {
@@ -110,6 +117,7 @@ impl AgentRuntime {
             telegram_token_source: "pipelock:telegram/bot-token".to_string(),
             schedules: true,
             proactive: true,
+            proxy: false,
         }
     }
 }
@@ -285,6 +293,22 @@ pub fn plan_processes(config: &OrchestratorConfig) -> Vec<SupervisedProcess> {
                 critical: false,
             });
         }
+        // Per-agent egress proxy: reads the agent's spec for its bind +
+        // allowlist (`pipelock proxy --spec`). Supervised like the other
+        // per-agent runners — not critical, so a bind clash on a multi-agent
+        // host degrades that one agent's egress instead of taking the plane down.
+        if agent.proxy {
+            processes.push(SupervisedProcess {
+                name: format!("proxy:{}", agent.agent_id),
+                args: vec![
+                    "pipelock".to_string(),
+                    "proxy".to_string(),
+                    "--spec".to_string(),
+                    format!(".maturana/agents/{}/MATURANA.md", agent.agent_id),
+                ],
+                critical: false,
+            });
+        }
     }
 
     processes
@@ -406,6 +430,34 @@ mod tests {
         // No claude agents → no daemon.
         let bare = OrchestratorConfig::default();
         assert!(plan_processes(&bare).iter().all(|p| p.name != "claude-refresh"));
+    }
+
+    #[test]
+    fn proxy_runner_emitted_only_when_enabled() {
+        // Off by default (AgentRuntime::new) → no proxy runner, existing counts hold.
+        let mut config = OrchestratorConfig::default();
+        let mut agent = AgentRuntime::new("hestefisk");
+        config.agents.push(agent.clone());
+        assert!(plan_processes(&config)
+            .iter()
+            .all(|p| !p.name.starts_with("proxy:")));
+
+        // proxy.enabled agent → one `proxy:<id>` runner that starts the egress
+        // proxy from the agent's spec, pinned to that agent.
+        agent.proxy = true;
+        config.agents = vec![agent];
+        let processes = plan_processes(&config);
+        let proxy = processes
+            .iter()
+            .find(|p| p.name == "proxy:hestefisk")
+            .expect("proxy runner present");
+        assert!(!proxy.critical);
+        assert_eq!(proxy.args[0], "pipelock");
+        assert_eq!(proxy.args[1], "proxy");
+        assert!(proxy
+            .args
+            .windows(2)
+            .any(|w| w == ["--spec", ".maturana/agents/hestefisk/MATURANA.md"]));
     }
 
     #[test]

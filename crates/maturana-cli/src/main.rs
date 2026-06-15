@@ -1907,6 +1907,14 @@ fn build_orchestrator_config(
             let telegram_token_source = firecracker_profile_for(&agent_id)
                 .map(|profile| profile.telegram_token_source.to_string())
                 .unwrap_or_else(|| command.telegram_token_source.clone());
+            // Supervise the agent's egress proxy whenever its spec turns the
+            // proxy on. Otherwise a proxy.enabled agent has no running proxy and
+            // its outbound (harness backend, tools) is refused at a dead port.
+            let proxy = spec
+                .as_ref()
+                .and_then(|s| s.network.proxy.as_ref())
+                .map(|p| p.enabled)
+                .unwrap_or(false);
             Ok(AgentRuntime {
                 agent_id,
                 session_id,
@@ -1917,6 +1925,7 @@ fn build_orchestrator_config(
                 slack,
                 discord,
                 agentmail,
+                proxy,
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
