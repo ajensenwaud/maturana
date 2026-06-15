@@ -35,9 +35,26 @@ directly. The Windows installer downloads the prebuilt binary by default; pass
 `--firecracker` (or
 running `scripts/install-firecracker-host.sh` standalone) provisions the microVM
 substrate — the `firecracker` binary, KVM access, the libguestfs/qemu
-image-build toolchain, and guest-egress NAT — then `maturana repair
+image-build toolchain, and guest-egress NAT — then `maturana setup
 firecracker-harnesses` builds the images and launches agents (see
 [docs/linux-firecracker-harnesses.md](docs/linux-firecracker-harnesses.md)).
+
+#### Script vs. tool — what *you* run
+
+There are only **two things you ever run by hand**:
+
+1. **`install.sh` / `install.ps1`** — the one-time bootstrap (download the
+   binary, set up the host). Run it once per machine.
+2. **`maturana <command>`** — everything after that: `maturana up`,
+   `maturana agent …`, `maturana channel …`, `maturana setup …`, `maturana web`.
+   The Rust CLI owns all the logic.
+
+Every other file in `scripts/` (`install-hostd-task.ps1`, `set-vm-autostart.ps1`,
+`install-firecracker-host.sh`, `firecracker-*.sh`, …) is an **internal adapter**
+the installer or the CLI calls for you — you don't invoke them directly. Rule of
+thumb: **if it's a `.ps1`/`.sh` you typed, it's only ever `install`/`uninstall`;
+anything else is `maturana …`.** (`maturana setup` was historically `maturana
+repair`, which still works as an alias.)
 
 ### Releases, verification & signing
 
@@ -346,8 +363,8 @@ Or run the steps separately. Prepare the official Ubuntu cloud image once:
 
 ```powershell
 winget install --id cloudbase.qemu-img --exact
-.\scripts\maturana.ps1 repair ubuntu-cloudimg
-.\scripts\maturana.ps1 repair ssh-key
+.\scripts\maturana.ps1 setup ubuntu-cloudimg
+.\scripts\maturana.ps1 setup ssh-key
 ```
 
 Install the privileged host daemon once. From a normal shell this requests UAC;
@@ -535,7 +552,7 @@ Prepare the standard harness image/assets through the Rust-owned repair path:
 ```bash
 sudo apt-get install -y qemu-utils libguestfs-tools
 cargo build -p maturana-cli
-target/debug/maturana repair firecracker-harnesses --agent-id codex-firecracker
+target/debug/maturana setup firecracker-harnesses --agent-id codex-firecracker
 ```
 
 The repair command starts `sessiond`, creates the host TAP device, renders the
@@ -558,7 +575,7 @@ cargo run -p maturana-cli -- agent inspect firecracker-demo --live
 For the built-in aidev harnesses:
 
 ```bash
-target/debug/maturana repair firecracker-harnesses
+target/debug/maturana setup firecracker-harnesses
 ```
 
 The Linux Firecracker image-prep adapter injects SSH, static guest networking,

@@ -234,7 +234,7 @@ try {
     Invoke-Checked { & $cargo +stable-x86_64-pc-windows-gnu run -p maturana-cli --target x86_64-pc-windows-gnu -- spec validate examples/MATURANA.opencode-hyperv.md } "opencode spec validation"
     Invoke-Checked { & $cargo +stable-x86_64-pc-windows-gnu run -p maturana-cli --target x86_64-pc-windows-gnu -- spec validate examples/MATURANA.firecracker-demo.md } "firecracker spec validation"
     Invoke-Checked { & $cargo +stable-x86_64-pc-windows-gnu run -p maturana-cli --target x86_64-pc-windows-gnu -- agent launch examples/MATURANA.firecracker-demo.md } "firecracker materialization"
-    Invoke-Checked { & $cargo +stable-x86_64-pc-windows-gnu run -p maturana-cli --target x86_64-pc-windows-gnu -- repair ubuntu-cloudimg --help } "ubuntu cloudimg repair cli"
+    Invoke-Checked { & $cargo +stable-x86_64-pc-windows-gnu run -p maturana-cli --target x86_64-pc-windows-gnu -- setup ubuntu-cloudimg --help } "ubuntu cloudimg repair cli"
 
     $runId = [Guid]::NewGuid().ToString("N")
     $sshKeyDir = ".maturana-ci\ssh-key-$runId"
@@ -242,7 +242,7 @@ try {
     Remove-Item -LiteralPath $sshKeyDir -Recurse -Force -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force -Path $sshKeyDir | Out-Null
     Set-Content -LiteralPath $sshKeyPath -Value "ci-existing-key" -NoNewline
-    Invoke-Checked { & $cargo +stable-x86_64-pc-windows-gnu run -p maturana-cli --target x86_64-pc-windows-gnu -- repair ssh-key --key-path $sshKeyPath } "ssh key repair"
+    Invoke-Checked { & $cargo +stable-x86_64-pc-windows-gnu run -p maturana-cli --target x86_64-pc-windows-gnu -- setup ssh-key --key-path $sshKeyPath } "ssh key repair"
     if ((Get-Content -LiteralPath $sshKeyPath -Raw) -ne "ci-existing-key") {
         throw "ssh key repair should keep an existing key unless --force is passed"
     }

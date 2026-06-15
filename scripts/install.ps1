@@ -107,6 +107,22 @@ if (Test-Path -LiteralPath (Join-Path $Dir ".git")) {
 }
 Set-Location $Dir
 
+# --- Structured progression log (logs/setup.log): one append-only file with a
+# header, a per-step line (name + duration + status), and a footer. The terminal
+# stays the level-1 summary; this is the level-2 record you'd paste when setup
+# misbehaves. Pure logging — it never changes control flow.
+$script:SetupLog = Join-Path $Dir "logs\setup.log"
+New-Item -ItemType Directory -Force -Path (Split-Path $SetupLog) | Out-Null
+"## $(Get-Date -Format o) - maturana install started (dir=$Dir ref=$Ref from_source=$FromSource)" |
+    Out-File -FilePath $SetupLog -Append -Encoding utf8
+$script:StepClock = [System.Diagnostics.Stopwatch]::StartNew()
+function Log-Milestone($name, $status = 'success') {
+    $secs = '{0:n1}' -f $script:StepClock.Elapsed.TotalSeconds
+    "=== [$(Get-Date -Format o)] $name [${secs}s] -> $status ===" |
+        Out-File -FilePath $script:SetupLog -Append -Encoding utf8
+    $script:StepClock.Restart()
+}
+
 # 3. Obtain the maturana binary: prebuilt download (default) or build (-FromSource).
 $binDir = Join-Path $Dir "bin"
 New-Item -ItemType Directory -Force -Path $binDir | Out-Null
@@ -149,6 +165,7 @@ if ($FromSource) {
 }
 if (-not (Test-Path -LiteralPath $Exe)) { throw "maturana.exe missing after install" }
 $env:MATURANA_BIN = $Exe
+Log-Milestone ("binary ({0})" -f $(if ($FromSource) { 'built' } else { 'prebuilt' }))
 
 # Put bin on PATH (User scope) so `maturana` works in new shells.
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -162,7 +179,7 @@ $env:Path = "$binDir;$env:Path"
 
 # 5. Agent SSH key + Ubuntu Hyper-V image.
 Say "preparing agent SSH key"
-& $Exe repair ssh-key
+& $Exe setup ssh-key
 $imagePath = Join-Path $Dir ".maturana\images\ubuntu-noble\noble-server-cloudimg-amd64.vhdx"
 if (-not $SkipImage) {
     if ($ForceImage -or -not (Test-Path -LiteralPath $imagePath)) {
@@ -170,18 +187,22 @@ if (-not $SkipImage) {
         # expectation and report elapsed time so it never looks frozen.
         Say "preparing Ubuntu Hyper-V image - one-time, ~3-8 min (downloading + converting)..."
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        if ($ForceImage) { & $Exe repair ubuntu-cloudimg --force } else { & $Exe repair ubuntu-cloudimg }
+        if ($ForceImage) { & $Exe setup ubuntu-cloudimg --force } else { & $Exe setup ubuntu-cloudimg }
         $sw.Stop()
         Say ("Ubuntu image ready in {0:n0}s" -f $sw.Elapsed.TotalSeconds)
     } else {
         Say "using existing Ubuntu image: $imagePath"
     }
 }
+Log-Milestone 'ubuntu-image'
 
 # 6. hostd (privileged Hyper-V control, runs as SYSTEM). Already elevated here.
 if (-not $SkipHostd) {
     Say "installing privileged host daemon (hostd)"
     & (Join-Path $Dir "scripts\install-hostd-task.ps1")
+    Log-Milestone 'hostd'
+} else {
+    Log-Milestone 'hostd' 'skipped'
 }
 
 # 7. Boot services (up + web) via a stored password; clear stale launchers; VM autostart.
@@ -201,6 +222,9 @@ if (-not $SkipServices) {
     finally { $pw = $null; [System.GC]::Collect() }
     # Make the Hyper-V agent VMs auto-boot with the host too.
     & (Join-Path $Dir "scripts\set-vm-autostart.ps1")
+    Log-Milestone 'boot-services'
+} else {
+    Log-Milestone 'boot-services' 'skipped'
 }
 
 # 8. Skills as native Codex skills (~/.agents/skills) vs repo-only. Ask unless told.
@@ -219,6 +243,8 @@ if ($doPrompts) {
 } else {
     Say "skills kept in the repo (Codex loads them on demand via AGENTS.md)"
 }
+Log-Milestone 'skills'
+"## $(Get-Date -Format o) - install completed" | Out-File -FilePath $script:SetupLog -Append -Encoding utf8
 
 # 9. Harness credential pre-check + orientation.
 function Test-Harness($cli, $authPath, $loginHint, $installHint) {

@@ -131,7 +131,7 @@ Only refresh Firecracker assets when the kernel or rootfs is actually missing
 or intentionally being rebuilt. Use the Rust-owned repair flow first:
 
 ```bash
-target/debug/maturana repair firecracker-harnesses --agent-id codex-firecracker
+target/debug/maturana setup firecracker-harnesses --agent-id codex-firecracker
 ```
 
 Run `scripts/firecracker-prepare-assets.sh` directly only for adapter-level

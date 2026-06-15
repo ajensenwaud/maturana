@@ -15,13 +15,13 @@ Sync the repo to `aidev`, copy harness auth directories into `.maturana/host-aut
 ```bash
 cd /var/tmp/maturana-aidev
 cargo build -p maturana-cli
-target/debug/maturana repair firecracker-harnesses
+target/debug/maturana setup firecracker-harnesses
 ```
 
 To resume one agent:
 
 ```bash
-target/debug/maturana repair firecracker-harnesses --agent-id opencode-firecracker
+target/debug/maturana setup firecracker-harnesses --agent-id opencode-firecracker
 ```
 
 Agents:
@@ -39,7 +39,7 @@ guest workers:
 
 ```bash
 target/debug/maturana service install up web
-target/debug/maturana repair firecracker-harnesses --skip-services
+target/debug/maturana setup firecracker-harnesses --skip-services
 ```
 
 `--skip-services` keeps `repair` from starting its own sessiond/graph (which
@@ -64,7 +64,7 @@ target/debug/maturana service install fleet
 ```
 
 This installs a systemd **oneshot** (`maturana-fleet.service`) ordered
-`After=maturana-up.service` that runs `repair firecracker-harnesses
+`After=maturana-up.service` that runs `setup firecracker-harnesses
 --skip-services --skip-assets --skip-worker-refresh`: it recreates each agent's
 TAP + NAT rule and relaunches the VM from the baked rootfs (no libguestfs
 rebuild, no sessiond, no SSH-in). The enabled in-guest `maturana-agent.service`
@@ -130,10 +130,10 @@ reports `running-api-unresponsive`; treat that as a live process with a wedged
 control plane and use an explicit stop or repair before relaunching.
 
 The old `scripts/deploy-aidev-firecracker-harnesses.sh` compatibility wrapper
-has been removed. Use `maturana repair firecracker-harnesses` directly.
+has been removed. Use `maturana setup firecracker-harnesses` directly.
 
 Do not run `scripts/firecracker-prepare-assets.sh` as an orchestration path.
-`maturana repair firecracker-harnesses` renders the guest worker artifacts in
+`maturana setup firecracker-harnesses` renders the guest worker artifacts in
 Rust, renders the guest netplan and cloud network-disable config, and renders
 `proxy.env` from the typed spec when pipelock proxying is enabled. It passes
 those files to the image-prep adapter, then launches/materializes the agent. The
@@ -147,7 +147,7 @@ match the selected Firecracker profile.
 ## Refresh Worker
 
 ```bash
-target/debug/maturana repair guest-worker \
+target/debug/maturana setup guest-worker \
   --agent-id codex-firecracker \
   --session-id codex-main \
   --harness codex \
@@ -159,7 +159,7 @@ target/debug/maturana repair guest-worker \
   --install-harness
 ```
 
-`repair guest-worker` renders `sessiond.env` and `run-agent.sh` in Rust, infers
+`setup guest-worker` renders `sessiond.env` and `run-agent.sh` in Rust, infers
 the guest IP from live provider inspect, copies the worker files to the guest,
 and restarts `maturana-agent.service`. Use `--guest-ip` only to override
 inspect when recovering a broken materialized spec.

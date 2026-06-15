@@ -43,9 +43,9 @@ smallest Maturana command that changes or proves that state.
   manifest, session inbox/outbox, and runner logs before changing code.
 - Snapshot: use `maturana snapshot list|take|restore`; local markers are not
   restorable, live restore requires `--live`.
-- Firecracker repair: prefer `maturana repair firecracker-harnesses` for the
+- Firecracker repair: prefer `maturana setup firecracker-harnesses` for the
   known Linux harness set, then inspect live state.
-- Hyper-V repair: prefer `maturana repair windows-harnesses`; one UAC/elevated
+- Hyper-V repair: prefer `maturana setup windows-harnesses`; one UAC/elevated
   setup is acceptable, repeated ad hoc elevated scripts are not.
 - Tool/skill development: build and test on the Codex host, then deploy with
   `maturana deploy skill|tool`.
@@ -78,7 +78,7 @@ Common commands:
 - Channel: `maturana channel pair|serve|status`
 - Session: `maturana session init|enqueue|run-once|outbox|serve`
 - Doctor: `maturana doctor [--agent-id <id>] [--json]`
-- Repair: `maturana repair windows-harnesses|firecracker-harnesses`
+- Repair: `maturana setup windows-harnesses|firecracker-harnesses`
 
 ## Evidence
 
