@@ -97,6 +97,10 @@ build the whole agent in one go without stopping to re-confirm. Concretely:
    `opencode`. Provider is the host-native one (Hyper-V / Firecracker); set
    `harness_auth` source/guest paths for the subscription harness.
 5. **Channels (how the user talks to it).** Ask which to set up:
+   - **Console TUI** (always available, no setup): set `channels.tui: true`. The
+     user talks to the agent from a terminal with `maturana agent chat <id>` — a
+     full-screen chat (history, slash commands, multiline). Great for the first
+     conversation and for verifying the agent live.
    - **Telegram** (primary, paired): store the bot token in pipelock
      (`maturana pipelock set telegram/bot-token --value <token>`), set
      `channels.telegram.token_source: pipelock:telegram/bot-token`. Pairing

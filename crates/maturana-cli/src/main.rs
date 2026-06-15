@@ -4,6 +4,7 @@ mod proactive;
 mod service;
 mod personal;
 mod session;
+mod tui;
 
 use anyhow::Context;
 use channels::{handle_channel, paired_telegram_chat_source, ChannelCommand};
@@ -372,6 +373,13 @@ enum AgentSubcommand {
         agent_id: String,
         #[arg(long)]
         live: bool,
+    },
+    /// Open an interactive console TUI to chat with a running agent.
+    Chat {
+        agent_id: String,
+        /// Seconds to wait for each reply before showing a timeout.
+        #[arg(long, default_value_t = 180)]
+        timeout_seconds: u64,
     },
     Run {
         agent_id: String,
@@ -851,6 +859,12 @@ fn main() -> anyhow::Result<()> {
                     anyhow::bail!("agent stop currently requires --live");
                 }
                 stop_agent(&home, &agent_id)?;
+            }
+            AgentSubcommand::Chat {
+                agent_id,
+                timeout_seconds,
+            } => {
+                tui::run_chat(&home, &agent_id, timeout_seconds)?;
             }
             AgentSubcommand::Run {
                 agent_id,
@@ -4678,6 +4692,20 @@ fn wait_for_agent_run(
         queued.message_id,
         queued.session_id
     )
+}
+
+/// One synchronous chat turn for the console TUI (`maturana agent chat`):
+/// enqueue the prompt into sessiond and block until the agent's reply (or
+/// timeout). Called from a background thread so the TUI stays responsive.
+pub(crate) fn agent_chat_turn(
+    home: &MaturanaHome,
+    agent_id: &str,
+    prompt: &str,
+    timeout_seconds: u64,
+) -> anyhow::Result<String> {
+    let queued = enqueue_agent_run(home, agent_id, prompt)?;
+    let completed = wait_for_agent_run(home, agent_id, &queued, timeout_seconds)?;
+    Ok(completed.text)
 }
 
 fn infer_agent_session_id(home: &MaturanaHome, agent_id: &str) -> anyhow::Result<String> {

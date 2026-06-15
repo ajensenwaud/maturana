@@ -272,6 +272,9 @@ pub struct Schedule {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Channels {
+    /// Local console chat: declares the agent is reachable from the terminal via
+    /// `maturana agent chat <id>` (an interactive TUI over sessiond). Informational
+    /// — the TUI works for any running agent; this records it as an intended surface.
     #[serde(default)]
     pub tui: bool,
     #[serde(default)]
