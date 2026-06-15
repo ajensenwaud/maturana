@@ -8,8 +8,8 @@ use maturana_core::{
     pipelock::PipelockVault,
     secrets::resolve_secret_source_with_home,
     session_db::{
-        ensure_session, insert_inbound, list_undelivered, mark_delivered, session_paths,
-        SessionPaths,
+        clear_progress, ensure_session, insert_inbound, list_undelivered, mark_delivered,
+        read_progress, session_paths, ProgressEvent, SessionPaths,
     },
     spec::{AgentSpec, HarnessRuntime},
     state::MaturanaHome,
@@ -870,7 +870,7 @@ fn handle_telegram_update(
             let prompt = build_channel_prompt(home, &config.agent_id, chat_id, &text)?;
             let paths = session_paths(&home.agent_dir(&config.agent_id), &config.session_id);
             ensure_session(&paths)?;
-            insert_inbound(
+            let inbound_id = insert_inbound(
                 &paths,
                 "chat",
                 "telegram",
@@ -890,6 +890,21 @@ fn handle_telegram_update(
                 };
                 run_session_once(&paths, &options, 20)?;
             }
+            // Live progress: a status message edited in place as the agent works
+            // (tool calls, streamed text), then finalized into the reply. The
+            // loop marks the final outbound delivered so the delivery thread
+            // doesn't re-send; on timeout it leaves the late final to that thread.
+            let status_id = send_telegram(token, &chat_id.to_string(), "🤔 working…", reply_to_message_id)?;
+            stream_turn_to_telegram(
+                home,
+                token,
+                config,
+                chat_id,
+                &inbound_id,
+                status_id,
+                &paths,
+                Duration::from_secs(300),
+            )?;
             deliver_telegram_outbox(home, token, &config.agent_id, &config.session_id, chat_id)?;
             Ok(())
         }
@@ -2354,6 +2369,99 @@ fn send_telegram_chat_action(token: &str, chat_id: &str, action: &str) -> anyhow
 /// Run a registered wasm tool from Telegram with an OpenClaw-style animated
 /// status message, post its output, and capture the run as a self-improvement
 /// trajectory (so `/good` / `/bad` can reward it afterwards).
+/// Render the live progress side-lane into one Telegram status message: the
+/// recent tool lines plus the agent's streamed text so far. Plain text
+/// (editMessageText carries no parse_mode), bounded to Telegram's message size.
+fn render_turn_progress(events: &[ProgressEvent]) -> String {
+    if events.is_empty() {
+        return "🤔 working…".to_string();
+    }
+    let mut tools: Vec<&str> = Vec::new();
+    let mut text = "";
+    let mut errored = false;
+    for event in events {
+        match event.kind.as_str() {
+            "tool" => tools.push(event.text.as_str()),
+            "text" => text = event.text.as_str(),
+            "status" if event.text == "error" => errored = true,
+            _ => {}
+        }
+    }
+    let mut out = String::from(if errored { "⚠️ working…" } else { "🤔 working…" });
+    for tool in tools.iter().rev().take(6).rev() {
+        out.push_str("\n🔧 ");
+        out.push_str(&truncate_chars(tool, 80));
+    }
+    if !text.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(&truncate_chars(text, 1500));
+    }
+    truncate_for_telegram(&out)
+}
+
+/// Stream a turn's live progress into `status_id` (edited in place), then finalize
+/// it into the agent's reply. The outbox is polled tightly so this loop wins the
+/// finalize over the 1s delivery thread; either way `mark_delivered` guarantees a
+/// single send. On timeout it returns and leaves the late final to that thread.
+fn stream_turn_to_telegram(
+    home: &MaturanaHome,
+    token: &str,
+    config: &TelegramServe,
+    chat_id: i64,
+    inbound_id: &str,
+    status_id: Option<i64>,
+    paths: &SessionPaths,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last_render = String::new();
+    let mut last_edit = std::time::Instant::now();
+    loop {
+        // Final reply ready? (polled every tick so this loop beats the delivery thread)
+        if let Some(final_msg) = list_undelivered(paths)?
+            .into_iter()
+            .find(|m| m.channel == "telegram" && m.in_reply_to.as_deref() == Some(inbound_id))
+        {
+            let reply = truncate_for_telegram(&message_text(&final_msg.content)?);
+            let sent = match status_id {
+                // Finalize the status message into the reply; fall back to a new
+                // message if the edit fails (unchanged / too long).
+                Some(id) => match edit_telegram_message(token, chat_id, id, &reply) {
+                    Ok(()) => Some(id),
+                    Err(_) => send_telegram(token, &chat_id.to_string(), &reply, None)?,
+                },
+                None => send_telegram(token, &chat_id.to_string(), &reply, None)?,
+            };
+            append_channel_turn(home, &config.agent_id, chat_id, "assistant", &reply)?;
+            mark_delivered(paths, &final_msg.id, sent.map(|id| id.to_string()).as_deref())?;
+            let _ = clear_progress(paths, inbound_id);
+            audit_channel_event(
+                home,
+                &config.agent_id,
+                "channel.telegram.outbound",
+                "sent telegram response",
+            )?;
+            return Ok(());
+        }
+        // Refresh the in-flight progress view, throttled (~1.2s) for rate limits and
+        // only when the rendered text actually changed.
+        if last_edit.elapsed() >= Duration::from_millis(1200) {
+            let rendered = render_turn_progress(&read_progress(paths, inbound_id)?);
+            if rendered != last_render {
+                if let Some(id) = status_id {
+                    let _ = edit_telegram_message(token, chat_id, id, &rendered);
+                }
+                last_render = rendered;
+            }
+            last_edit = std::time::Instant::now();
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(300));
+    }
+}
+
 fn run_tool_with_animation(
     home: &MaturanaHome,
     token: &str,
@@ -4519,6 +4627,27 @@ mod tests {
         ] {
             assert!(names.contains(&cmd), "catalog missing {cmd}");
         }
+    }
+
+    #[test]
+    fn turn_progress_renders_tools_and_streamed_text() {
+        // Empty → a plain working indicator.
+        assert_eq!(render_turn_progress(&[]), "🤔 working…");
+
+        let events = vec![
+            ProgressEvent { seq: 0, kind: "tool".into(), text: "running: rg foo".into() },
+            ProgressEvent { seq: 1, kind: "tool".into(), text: "done: rg foo".into() },
+            ProgressEvent { seq: 2, kind: "text".into(), text: "Here is the answer.".into() },
+        ];
+        let rendered = render_turn_progress(&events);
+        assert!(rendered.starts_with("🤔 working…"));
+        assert!(rendered.contains("🔧 running: rg foo"));
+        assert!(rendered.contains("🔧 done: rg foo"));
+        assert!(rendered.contains("Here is the answer."));
+
+        // An error status flips the header.
+        let errored = vec![ProgressEvent { seq: 0, kind: "status".into(), text: "error".into() }];
+        assert!(render_turn_progress(&errored).starts_with("⚠️ working…"));
     }
 
     impl TempDir {
