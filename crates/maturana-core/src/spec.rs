@@ -358,6 +358,11 @@ pub struct Capabilities {
     pub image_gen: bool,
     #[serde(default)]
     pub voice: bool,
+    /// Allow the in-guest agent to build and run its own sandboxed WebAssembly
+    /// capabilities on the fly via `/session/forge` (the self-mutation runtime).
+    /// Off by default: an agent can only self-forge when explicitly granted.
+    #[serde(default)]
+    pub self_forge: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -129,10 +129,12 @@ Building & extending Maturana
 - `maturana-skill-create` — create a new Codex skill (framework or agent)
 - `maturana-tool-create` — create a host or guest tool
 - `maturana-wasm-tool` — build a new executable capability on the fly (WASM)
+- `maturana-self-forge` — let an agent build + run its own WASM capabilities on
+  the fly (self-mutation), gated by the `self_forge` capability
 - `maturana-skill-deploy` — install a tested skill/tool into a target agent
 - `maturana-deploy` — deploy a Codex-developed skill/tool/MCP server
 
-(31 skills. If this index drifts from `skills/`, the directory is the source of
+(32 skills. If this index drifts from `skills/`, the directory is the source of
 truth — list it with `ls skills/` and read the relevant `SKILL.md`.)
 
 ### Agent specs

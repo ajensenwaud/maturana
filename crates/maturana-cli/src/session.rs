@@ -184,6 +184,31 @@ struct ProgressRequest {
     text: String,
 }
 
+/// A guest agent asking the host to build and run a capability it just authored
+/// (self-mutation). Gated on the agent's `self_forge` capability.
+#[derive(Debug, serde::Deserialize)]
+struct ForgeRequest {
+    agent_id: String,
+    session_id: String,
+    /// The in-flight turn's message id; when present, forge progress is streamed
+    /// onto that turn's lane so the channel animates it.
+    #[serde(default)]
+    message_id: Option<String>,
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    /// "wat" (default) or "wasm" (base64-encoded module).
+    #[serde(default)]
+    format: Option<String>,
+    source: String,
+    #[serde(default)]
+    input: Option<String>,
+    #[serde(default)]
+    capabilities: Option<maturana_core::tools::Capabilities>,
+    #[serde(default)]
+    limits: Option<maturana_core::tools::ResourceLimits>,
+}
+
 fn serve_sessiond(home: &MaturanaHome, bind: &str, token: Option<&str>) -> anyhow::Result<()> {
     // sessiond binds 0.0.0.0 by design (guest VMs reach it), so the token is the
     // only thing standing between any guest/LAN host and every agent's queue.
@@ -320,12 +345,158 @@ fn handle_sessiond_request(
             )?;
             write_json_response(stream, 200, &serde_json::json!({ "ok": true }))
         }
+        // Self-mutation: a guest agent forges a capability (WAT/wasm) and runs it
+        // live. Capability-gated; progress is streamed so the channel animates.
+        ("POST", "/session/forge") => handle_forge(home, &request, stream),
         _ => write_json_response(
             stream,
             404,
             &serde_json::json!({ "ok": false, "error": "not found" }),
         ),
     }
+}
+
+/// Build + run a capability an agent authored on the fly. Validates the agent is
+/// allowed to self-forge, then delegates to the engine (feature-gated).
+fn handle_forge(
+    home: &MaturanaHome,
+    request: &HttpRequest,
+    stream: &mut TcpStream,
+) -> anyhow::Result<()> {
+    let body: ForgeRequest = match serde_json::from_slice(&request.body) {
+        Ok(body) => body,
+        Err(error) => {
+            return write_json_response(
+                stream,
+                400,
+                &serde_json::json!({ "ok": false, "error": format!("invalid forge request: {error}") }),
+            )
+        }
+    };
+    if let Err(error) = check_identifiers(&body.agent_id, &body.session_id) {
+        return write_json_response(stream, 400, &error);
+    }
+    // Capability gate: only an agent explicitly granted self_forge may build and
+    // run new code. Default-deny — an unknown/unparseable spec is treated as no.
+    let granted = maturana_core::spec::AgentSpec::from_maturana_markdown(
+        home.agent_dir(&body.agent_id).join("MATURANA.md"),
+    )
+    .map(|spec| spec.capabilities.self_forge)
+    .unwrap_or(false);
+    if !granted {
+        return write_json_response(
+            stream,
+            403,
+            &serde_json::json!({
+                "ok": false,
+                "error": "self_forge capability not granted (set capabilities.self_forge: true in MATURANA.md)"
+            }),
+        );
+    }
+    forge_impl(home, &body, stream)
+}
+
+#[cfg(feature = "wasm-runtime")]
+fn forge_impl(
+    home: &MaturanaHome,
+    body: &ForgeRequest,
+    stream: &mut TcpStream,
+) -> anyhow::Result<()> {
+    use maturana_core::tools::{forge, ToolRegistry};
+
+    let paths = session_paths(&home.agent_dir(&body.agent_id), &body.session_id);
+    ensure_session(&paths)?;
+    let name = body.name.trim().to_string();
+    let base_seq = Utc::now().timestamp_millis().max(0) as u64;
+    // Stream forge progress onto the active turn's lane so the channel's live
+    // progress animation surfaces the self-mutation as it happens.
+    let emit = |offset: u64, kind: &str, text: String| {
+        if let Some(message_id) = body.message_id.as_deref() {
+            let _ = append_progress(
+                &paths,
+                message_id,
+                &ProgressEvent {
+                    seq: base_seq + offset,
+                    kind: kind.to_string(),
+                    text,
+                },
+            );
+        }
+    };
+
+    let format = match forge::ForgeFormat::parse(body.format.as_deref().unwrap_or("wat")) {
+        Ok(format) => format,
+        Err(error) => {
+            return write_json_response(
+                stream,
+                400,
+                &serde_json::json!({ "ok": false, "error": error.to_string() }),
+            )
+        }
+    };
+
+    emit(0, "forge.building", format!("🔨 Building `{name}` — assembling WebAssembly…"));
+    let registry = ToolRegistry::new(home.agent_dir(&body.agent_id).join("forge"));
+    let spec = forge::ForgeSpec {
+        name: &name,
+        description: body.description.as_deref().unwrap_or("forged on the fly"),
+        format,
+        source: &body.source,
+        input: body.input.as_deref().unwrap_or("{}"),
+        capabilities: body.capabilities.clone().unwrap_or_default(),
+        limits: body.limits.clone().unwrap_or_default(),
+    };
+    emit(1, "forge.running", format!("⚙️ Running forged `{name}`…"));
+
+    match forge::forge_and_run(&registry, spec) {
+        Ok(outcome) => {
+            emit(
+                2,
+                "forge.done",
+                format!(
+                    "✅ Forged `{}` ({} bytes, {} ms)",
+                    name, outcome.bytes, outcome.run.duration_ms
+                ),
+            );
+            write_json_response(
+                stream,
+                200,
+                &serde_json::json!({
+                    "ok": outcome.run.ok,
+                    "name": outcome.name,
+                    "bytes": outcome.bytes,
+                    "stdout": outcome.run.stdout,
+                    "stderr": outcome.run.stderr,
+                    "fuel_used": outcome.run.fuel_used,
+                    "duration_ms": outcome.run.duration_ms,
+                }),
+            )
+        }
+        Err(error) => {
+            emit(2, "forge.failed", format!("❌ Forge `{name}` failed"));
+            write_json_response(
+                stream,
+                400,
+                &serde_json::json!({ "ok": false, "error": format!("{error:#}") }),
+            )
+        }
+    }
+}
+
+#[cfg(not(feature = "wasm-runtime"))]
+fn forge_impl(
+    _home: &MaturanaHome,
+    _body: &ForgeRequest,
+    stream: &mut TcpStream,
+) -> anyhow::Result<()> {
+    write_json_response(
+        stream,
+        501,
+        &serde_json::json!({
+            "ok": false,
+            "error": "wasm forge engine not built into this binary (build with --features wasm-runtime)"
+        }),
+    )
 }
 
 struct HttpRequest {

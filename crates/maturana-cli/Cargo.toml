@@ -31,7 +31,9 @@ tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
 ratatui = "0.29"
 
 [features]
-default = []
-# Build the maturana binary with the WebAssembly tool engine so `maturana tool
-# run` can actually execute tools (otherwise it explains the engine is absent).
+# The WebAssembly engine + on-the-fly forge ship by default: agents are told the
+# runtime is "provided to them", so `maturana tool run` and `/session/forge` must
+# actually execute. Build without it (`--no-default-features`) only for a lean
+# control-plane-only binary.
+default = ["wasm-runtime"]
 wasm-runtime = ["maturana-core/wasm-runtime"]
