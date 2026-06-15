@@ -10,6 +10,34 @@ take it live. Do not invent a name or assume defaults the user hasn't given —
 End state: a named, running, reachable personal agent with `IDENTITY.md`,
 `SOUL.md`, a validated `MATURANA.md`, paired channels, and enabled tools.
 
+## Flow & tone — run it like an onboarding, not a form
+
+This is the user's first impression of their agent, so make it feel crafted —
+a friendly, confident setup wizard, not an interrogation or a config dump.
+
+- **Open warmly and set the frame.** One or two lines: greet, say what you're
+  about to do, and preview the few things you'll ask. e.g. *"Let's bring your
+  agent to life. I'll ask a handful of quick things — its name, who you are, how
+  you'll reach it, and what it can do — then build and launch it (a few minutes)."*
+- **One idea per turn, kept short.** Ask in small, plain-language steps; always
+  offer a sensible default the user can accept with a single word ("Codex —
+  sound good?").
+- **Narrate progress so it feels like motion.** A short marker between phases:
+  *"✓ Identity set. Now — how do you want to reach it?"* → *"✓ Telegram wired."*
+- **Reflect the agent back** once identity + soul are captured: a one-line "here's
+  who I'm building" so the user feels seen before the slow steps begin.
+- **Set expectations before anything slow.** Launch + guest provisioning takes a
+  few minutes — say so, then report when it's up. Never go silent mid-step.
+- **Land it.** Finish on a concrete, satisfying go-live moment, not a log dump:
+  *"🎉 <name> is live. Message it on Telegram, or try `<one example>`. Here's what
+  it can do for you: …"* — name how to reach it and one thing to try right now.
+- **Resume gracefully.** If you're picking up a half-built agent, say so warmly
+  ("Looks like we started <name> earlier — let's finish it") and fill only the
+  gaps; don't re-interview.
+
+Keep the security posture invisible-but-present: never ask for raw secrets in
+chat, and store tokens via pipelock as you collect them.
+
 ## Grounding
 
 1. Read `AGENTS.md` first.
