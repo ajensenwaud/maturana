@@ -331,6 +331,70 @@ PY
   curl -fsS -X POST "$sessiond_url/session/heartbeat" "${headers[@]}" --data "$heartbeat_body" >/dev/null 2>>/var/log/maturana/worker.err.log || true
 }
 
+# Progress streamer: reads `codex exec --json` JSONL on stdin, POSTs distilled
+# live-progress events to sessiond (tool calls, the agent message), and prints
+# the final agent text to stdout (captured as the reply). Self-contained and
+# crash-proof so a parse hiccup never drops the turn.
+cat > /tmp/maturana-stream-progress.py <<'PYEOF'
+import json, os, subprocess, sys
+
+url = os.environ.get("SESSIOND_URL", "")
+token = os.environ.get("MATURANA_SESSIOND_TOKEN", "")
+agent = os.environ.get("MATURANA_AGENT_ID", "")
+session = os.environ.get("MATURANA_SESSION_ID", "")
+msg = os.environ.get("MSG_ID", "")
+seq = 0
+final = []
+
+def post(kind, text):
+    global seq
+    if not url or not msg:
+        return
+    body = json.dumps({"agent_id": agent, "session_id": session,
+                       "message_id": msg, "seq": seq, "kind": kind, "text": text})
+    seq += 1
+    args = ["curl", "-fsS", "-X", "POST", url + "/session/progress",
+            "-H", "content-type: application/json"]
+    if token:
+        args += ["-H", "x-maturana-session-token: " + token]
+    args += ["--data", body]
+    try:
+        subprocess.run(args, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=5)
+    except Exception:
+        pass
+
+def first_line(s, n):
+    return (s or "").strip().split("\n", 1)[0][:n]
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        ev = json.loads(line)
+    except Exception:
+        continue
+    t = ev.get("type", "")
+    item = ev.get("item", {}) if isinstance(ev.get("item"), dict) else {}
+    it = item.get("type", "")
+    if t == "item.started" and it == "command_execution":
+        post("tool", "running: " + first_line(item.get("command"), 120))
+    elif t == "item.completed" and it == "command_execution":
+        code = item.get("exit_code")
+        label = "done" if code == 0 else "failed (%s)" % code
+        post("tool", label + ": " + first_line(item.get("command"), 80))
+    elif t == "item.completed" and it == "agent_message":
+        txt = item.get("text") or ""
+        final.append(txt)
+        post("text", txt[:3500])
+    elif t in ("turn.failed", "error"):
+        post("status", "error")
+
+post("status", "done")
+sys.stdout.write("\n".join(final))
+PYEOF
+
 while true; do
   date -Is > /var/log/maturana/heartbeat
   heartbeat idle
@@ -384,10 +448,18 @@ PY
     timeout --kill-after=10s "${harness_timeout}s" "$@"
   }
   if [ "${MATURANA_HARNESS}" = "codex" ]; then
-    if run_harness codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C /workspace -o /tmp/maturana-session-response.txt "$(cat /tmp/maturana-session-prompt.txt)" >>/var/log/maturana/worker.out.log 2>>/var/log/maturana/worker.err.log; then
+    # Stream `codex exec --json`: the streamer POSTs live progress to sessiond and
+    # prints the final agent text. `set -o pipefail` makes a codex failure fail
+    # the pipeline so the else branch's fallback applies.
+    : > /tmp/maturana-session-response.txt
+    if run_harness codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C /workspace "$(cat /tmp/maturana-session-prompt.txt)" 2>>/var/log/maturana/worker.err.log \
+        | SESSIOND_URL="$sessiond_url" MSG_ID="$msg_id" python3 /tmp/maturana-stream-progress.py > /tmp/maturana-session-response.txt 2>>/var/log/maturana/worker.err.log; then
       response="$(cat /tmp/maturana-session-response.txt)"
     else
-      response="I hit an error while processing that message."
+      response="$(cat /tmp/maturana-session-response.txt)"
+      if [ -z "$response" ]; then
+        response="I hit an error while processing that message."
+      fi
     fi
   elif [ "${MATURANA_HARNESS}" = "claude-code" ]; then
     if run_harness claude -p "$(cat /tmp/maturana-session-prompt.txt)" >/tmp/maturana-session-response.txt 2>>/var/log/maturana/worker.err.log; then
