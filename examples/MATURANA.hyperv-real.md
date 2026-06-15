@@ -20,6 +20,7 @@ filesystem:
 network:
   egress_allowlist:
     - api.openai.com
+    - chatgpt.com
     - github.com
     - api.telegram.org
   proxy:

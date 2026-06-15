@@ -30,6 +30,7 @@ filesystem:
 network:
   egress_allowlist:
     - api.openai.com
+    - chatgpt.com
     - github.com
 memory:
   wiki_path: .maturana/wiki

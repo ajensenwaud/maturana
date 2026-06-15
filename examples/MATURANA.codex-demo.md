@@ -18,6 +18,7 @@ filesystem:
 network:
   egress_allowlist:
     - api.openai.com
+    - chatgpt.com
     - github.com
   proxy:
     enabled: true
