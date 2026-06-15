@@ -555,6 +555,11 @@ enum PipelockSubcommand {
     },
     CaCert,
     Proxy {
+        /// Resolve the agent's spec from `--home` (the agent's MATURANA.md).
+        /// Preferred over `--spec` for supervised runs: it is independent of the
+        /// process working directory, which `maturana up` does not set.
+        #[arg(long)]
+        agent_id: Option<String>,
         #[arg(long)]
         spec: Option<PathBuf>,
         #[arg(long)]
@@ -1184,11 +1189,18 @@ fn main() -> anyhow::Result<()> {
                     println!("{}", path.display());
                 }
                 PipelockSubcommand::Proxy {
+                    agent_id,
                     spec,
                     bind,
                     allowlist,
                     inject_headers,
                 } => {
+                    // `--agent-id` resolves the spec from `--home` so supervised
+                    // runs (where the working directory is unset) work; an
+                    // explicit `--spec` still takes precedence when both are given.
+                    let spec = spec.or_else(|| {
+                        agent_id.map(|id| home.agent_dir(&id).join("MATURANA.md"))
+                    });
                     let (bind, mut config) = match spec {
                         Some(spec_path) => {
                             let spec = AgentSpec::from_maturana_markdown(&spec_path).with_context(
