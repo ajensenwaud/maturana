@@ -4176,7 +4176,13 @@ pub(crate) fn discover_agent_ids(home: &MaturanaHome) -> anyhow::Result<Vec<Stri
     for entry in fs::read_dir(agents_dir)? {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
-            ids.push(entry.file_name().to_string_lossy().to_string());
+            let id = entry.file_name().to_string_lossy().to_string();
+            // Only supervise materialized agents (a real agent has a MATURANA.md).
+            // Skips phantom dirs — e.g. a session created for a bogus agent id —
+            // that would otherwise spawn duplicate channel runners on the same bot.
+            if home.agent_dir(&id).join("MATURANA.md").exists() {
+                ids.push(id);
+            }
         }
     }
     ids.sort();

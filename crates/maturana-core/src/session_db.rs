@@ -377,6 +377,23 @@ pub fn mark_delivered(
     Ok(())
 }
 
+/// Atomically claim an outbound for delivery: returns `true` only for the first
+/// caller. Channels have several delivery paths (the per-channel delivery thread,
+/// the streaming render loop, the inline fallback) that each read
+/// `list_undelivered` then send — without an atomic claim the same reply goes out
+/// multiple times. The winning claimer sends, then records the platform id via
+/// `mark_delivered`.
+pub fn claim_delivery(paths: &SessionPaths, message_id: &str) -> anyhow::Result<bool> {
+    let db = open_rw(&paths.inbound_db)?;
+    ensure_inbound_schema(&db)?;
+    let now = Utc::now().to_rfc3339();
+    let changed = db.execute(
+        "INSERT OR IGNORE INTO delivered (message_id, platform_message_id, delivered_at) VALUES (?1, NULL, ?2)",
+        params![message_id, now],
+    )?;
+    Ok(changed > 0)
+}
+
 /// One distilled progress event for an in-flight turn, written by the guest
 /// worker as the harness streams its work. Stored in a per-message JSONL
 /// side-lane SEPARATE from the inbound/outbound queues, so turn delivery and
@@ -679,6 +696,31 @@ mod tests {
         clear_progress(&paths, msg).unwrap();
         assert!(read_progress(&paths, msg).unwrap().is_empty());
         assert_eq!(list_undelivered(&paths).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn claim_delivery_is_atomically_once_only() {
+        let temp = temp_dir();
+        let paths = session_paths(&temp, "telegram-main");
+        ensure_session(&paths).unwrap();
+        write_outbound(
+            &paths,
+            Some("in-1"),
+            "chat",
+            "telegram",
+            "chat-1",
+            None,
+            r#"{"text":"hi"}"#,
+        )
+        .unwrap();
+        let id = list_undelivered(&paths).unwrap()[0].id.clone();
+        // First claimer wins, all subsequent claimers lose — the dedup guarantee
+        // that stops several delivery paths sending the same reply.
+        assert!(claim_delivery(&paths, &id).unwrap());
+        assert!(!claim_delivery(&paths, &id).unwrap());
+        assert!(!claim_delivery(&paths, &id).unwrap());
+        // A claimed outbound is no longer undelivered.
+        assert!(list_undelivered(&paths).unwrap().is_empty());
     }
 
     #[test]
