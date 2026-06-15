@@ -4,9 +4,9 @@ use clap::{Args, Subcommand};
 use maturana_core::{
     improvement::TrajectoryStore,
     session_db::{
-        claim_pending_inbound, ensure_session, insert_inbound, list_recent_inbound,
-        list_undelivered, mark_delivered, mark_inbound_completed, session_paths, write_outbound,
-        SessionPaths,
+        append_progress, claim_pending_inbound, ensure_session, insert_inbound,
+        list_recent_inbound, list_undelivered, mark_delivered, mark_inbound_completed,
+        session_paths, write_outbound, ProgressEvent, SessionPaths,
     },
     state::MaturanaHome,
 };
@@ -174,6 +174,16 @@ struct HeartbeatRequest {
     error: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct ProgressRequest {
+    agent_id: String,
+    session_id: String,
+    message_id: String,
+    seq: u64,
+    kind: String,
+    text: String,
+}
+
 fn serve_sessiond(home: &MaturanaHome, bind: &str, token: Option<&str>) -> anyhow::Result<()> {
     // sessiond binds 0.0.0.0 by design (guest VMs reach it), so the token is the
     // only thing standing between any guest/LAN host and every agent's queue.
@@ -286,6 +296,28 @@ fn handle_sessiond_request(
                 return write_json_response(stream, 400, &error);
             }
             write_worker_status(home, &body)?;
+            write_json_response(stream, 200, &serde_json::json!({ "ok": true }))
+        }
+        // Live turn progress: the guest worker streams distilled events here as
+        // the harness works. Written to a per-message side-lane (NOT the outbound
+        // queue), so delivery and `agent run --wait` are unaffected; channels
+        // tail it to show tool calls / streamed text before the final reply.
+        ("POST", "/session/progress") => {
+            let body: ProgressRequest = serde_json::from_slice(&request.body)?;
+            if let Err(error) = check_identifiers(&body.agent_id, &body.session_id) {
+                return write_json_response(stream, 400, &error);
+            }
+            let paths = session_paths(&home.agent_dir(&body.agent_id), &body.session_id);
+            ensure_session(&paths)?;
+            append_progress(
+                &paths,
+                &body.message_id,
+                &ProgressEvent {
+                    seq: body.seq,
+                    kind: body.kind,
+                    text: body.text,
+                },
+            )?;
             write_json_response(stream, 200, &serde_json::json!({ "ok": true }))
         }
         _ => write_json_response(
