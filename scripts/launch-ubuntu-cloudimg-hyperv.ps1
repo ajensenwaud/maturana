@@ -53,9 +53,15 @@ function Write-Log {
 
 function Invoke-Guest {
     param([string]$Ip, [string]$Command)
-    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o ConnectTimeout=10 -i $SshKeyPath "$SshUser@$Ip" $Command
+    # Pipe the script to `bash -s` over STDIN rather than passing it as an ssh
+    # argument. Windows PowerShell mangles native-exe arguments that contain
+    # quotes / newlines / $(...), and this .ps1's CRLF line endings would reach
+    # the remote shell as ^M — together that made multi-line guest commands fail
+    # with ssh exit 255. Normalize to LF and feed stdin to sidestep both.
+    $clean = $Command -replace "`r", ""
+    $clean | ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o BatchMode=yes -o ConnectTimeout=10 -i $SshKeyPath "$SshUser@$Ip" "bash -s"
     if ($LASTEXITCODE -ne 0) {
-        throw "Guest command failed with exit code ${LASTEXITCODE}: $Command"
+        throw "Guest command failed with exit code ${LASTEXITCODE}"
     }
 }
 
@@ -158,7 +164,7 @@ function Wait-Ssh {
         try {
             $global:PSNativeCommandUseErrorActionPreference = $false
             $ErrorActionPreference = "Continue"
-            $result = ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o ConnectTimeout=5 -i $SshKeyPath "$SshUser@$Ip" "echo alive" 2>$null
+            $result = ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o BatchMode=yes -o ConnectTimeout=5 -i $SshKeyPath "$SshUser@$Ip" "echo alive" 2>$null
             if ($result -match "alive") {
                 return
             }
