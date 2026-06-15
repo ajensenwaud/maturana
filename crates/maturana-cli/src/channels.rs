@@ -2440,21 +2440,26 @@ fn stream_turn_to_telegram(
             .find(|m| m.channel == "telegram" && m.in_reply_to.as_deref() == Some(inbound_id))
         {
             // Claim atomically. If the delivery thread already claimed it, it is
-            // sending the reply as its own message — stop streaming and let it,
-            // rather than double-sending.
+            // sending the reply as its own message — drop our orphaned progress
+            // status (if any) so there's no duplicate, then stop.
             if !claim_delivery(paths, &final_msg.id)? {
+                if let Some(id) = status_id {
+                    let _ = delete_telegram_message(token, chat_id, id);
+                }
                 let _ = clear_progress(paths, inbound_id);
                 return Ok(());
             }
             let reply = truncate_for_telegram(&message_text(&final_msg.content)?);
             let sent = match status_id {
-                // Finalize the streamed status message into the reply; fall back to
-                // a new message if the edit fails (unchanged / too long).
-                Some(id) => match edit_telegram_message(token, chat_id, id, &reply) {
-                    Ok(()) => Some(id),
-                    Err(_) => send_telegram(token, &chat_id.to_string(), &reply, reply_to)?,
-                },
-                // No status was ever posted (fast reply) → just send it.
+                // A status message exists (we streamed progress into it): finalize
+                // it into the reply, best-effort. A "message is not modified" no-op
+                // (the streamed status already shows this exact text) is NOT a
+                // reason to send a second message — keep this one as the reply.
+                Some(id) => {
+                    let _ = edit_telegram_message(token, chat_id, id, &reply);
+                    Some(id)
+                }
+                // No status was ever posted (fast reply, no progress to show) → send it.
                 None => send_telegram(token, &chat_id.to_string(), &reply, reply_to)?,
             };
             append_channel_turn(home, &config.agent_id, chat_id, "assistant", &reply)?;
@@ -2650,6 +2655,20 @@ fn edit_telegram_message(
     if !response.ok {
         anyhow::bail!("Telegram editMessageText returned ok=false");
     }
+    Ok(())
+}
+
+/// Delete a Telegram message (used to clean up an orphaned progress status when
+/// another delivery path sent the reply). Best-effort; the caller ignores errors.
+fn delete_telegram_message(token: &str, chat_id: i64, message_id: i64) -> anyhow::Result<()> {
+    let body = serde_json::json!({ "chat_id": chat_id, "message_id": message_id });
+    let _: TelegramOkResponse = ureq::post(&format!(
+        "https://api.telegram.org/bot{token}/deleteMessage"
+    ))
+    .set("content-type", "application/json")
+    .send_string(&body.to_string())
+    .map_err(|error| anyhow::anyhow!("Telegram deleteMessage failed: {error}"))?
+    .into_json()?;
     Ok(())
 }
 
