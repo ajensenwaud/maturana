@@ -27,13 +27,13 @@ rusqlite.workspace = true
 ureq = { version = "2.10.1", features = ["json"] }
 wasmtime = { version = "27", optional = true, default-features = false, features = ["cranelift", "runtime"] }
 wasmtime-wasi = { version = "27", optional = true }
+# WAT -> WASM assembler, used by the on-the-fly "forge" so an agent can author a
+# capability in WebAssembly text (no external toolchain) and run it live.
+wat = { version = "1", optional = true }
 
 [features]
 default = []
-# Opt-in WebAssembly execution engine for the agent tool framework. Kept
-# behind a feature so the control plane stays dependency-light and fast to
-# build; enable with `--features wasm-runtime` to actually run tools.
-wasm-runtime = ["dep:wasmtime", "dep:wasmtime-wasi"]
-
-[dev-dependencies]
-wat = "1"
+# WebAssembly execution engine + on-the-fly forge for the agent tool framework.
+# Behind a feature so the library stays dependency-light, but enabled by default
+# in the `maturana` binary (see maturana-cli) so the runtime is always provided.
+wasm-runtime = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:wat"]

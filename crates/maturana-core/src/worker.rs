@@ -313,6 +313,57 @@ if [ -n "${MATURANA_SESSIOND_TOKEN:-}" ]; then
   headers+=(-H "x-maturana-session-token: ${MATURANA_SESSIOND_TOKEN}")
 fi
 
+# Self-forge helper, installed on PATH: lets the in-guest agent build + run a
+# sandboxed WebAssembly capability on the fly via sessiond's /session/forge. The
+# host enforces the `self_forge` capability and the fuel/memory/timeout sandbox.
+forge_bin="${HOME:-/home/ubuntu}/.local/bin"
+mkdir -p "$forge_bin"
+cat > "$forge_bin/maturana-forge" <<'FORGEEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+name="${1:-}"; shift || true
+if [ -z "$name" ]; then
+  echo "usage: maturana-forge <name> [--input JSON] [--wasm BASE64] [--desc TEXT]   (WAT on stdin)" >&2
+  exit 2
+fi
+input='{}'; desc='forged on the fly'; src=''; fmt='wat'
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --input) input="${2:-}"; shift 2;;
+    --wasm) src="${2:-}"; fmt='wasm'; shift 2;;
+    --desc) desc="${2:-}"; shift 2;;
+    *) echo "maturana-forge: unknown arg '$1'" >&2; exit 2;;
+  esac
+done
+if [ -f /agent/sessiond.env ]; then set -a; . /agent/sessiond.env; set +a; fi
+url="${MATURANA_SESSIOND_URL:-}"
+case "$url" in
+  ''|*DEFAULT*) gw="$(ip route | awk '/default/ {print $3; exit}')"; url="http://${gw}:47834";;
+esac
+if [ "$fmt" = "wat" ]; then src="$(cat)"; fi
+msg="$(cat /tmp/maturana-current-msg 2>/dev/null || true)"
+body="$(MF_NAME="$name" MF_DESC="$desc" MF_FMT="$fmt" MF_SRC="$src" MF_INPUT="$input" MF_MSG="$msg" python3 - <<'PY'
+import json, os
+print(json.dumps({
+  "agent_id": os.environ["MATURANA_AGENT_ID"],
+  "session_id": os.environ["MATURANA_SESSION_ID"],
+  "message_id": os.environ.get("MF_MSG") or None,
+  "name": os.environ["MF_NAME"],
+  "description": os.environ["MF_DESC"],
+  "format": os.environ["MF_FMT"],
+  "source": os.environ["MF_SRC"],
+  "input": os.environ["MF_INPUT"],
+}))
+PY
+)"
+h=(-H "content-type: application/json")
+if [ -n "${MATURANA_SESSIOND_TOKEN:-}" ]; then h+=(-H "x-maturana-session-token: ${MATURANA_SESSIOND_TOKEN}"); fi
+curl -sS -X POST "${url}/session/forge" "${h[@]}" --data "$body"
+echo
+FORGEEOF
+chmod 0755 "$forge_bin/maturana-forge" 2>/dev/null || true
+export PATH="$forge_bin:${PATH}"
+
 heartbeat() {
   status="$1"
   message_id="${2:-}"
@@ -417,6 +468,9 @@ print(d["messages"][0]["id"])
 PY
 )"
   heartbeat claimed "$msg_id"
+  # Expose the in-flight message id so `maturana-forge` can stream forge progress
+  # onto this turn's lane (the channel animates it).
+  printf '%s' "$msg_id" > /tmp/maturana-current-msg 2>/dev/null || true
   channel="$(python3 - <<'PY'
 import json
 d=json.load(open("/tmp/maturana-session-claim.json"))
@@ -592,6 +646,17 @@ mod tests {
         assert!(runner.contains("/session/outbound"));
         assert!(runner.contains("/agent/proxy.env"));
         assert!(runner.contains("MATURANA_PROXY_PORT"));
+    }
+
+    #[test]
+    fn runner_installs_self_forge_helper() {
+        let runner = render_run_agent();
+        // The guest gets the on-PATH forge helper and exposes the in-flight
+        // message id so forge progress can animate on the channel.
+        assert!(runner.contains("maturana-forge"));
+        assert!(runner.contains("/session/forge"));
+        assert!(runner.contains("/tmp/maturana-current-msg"));
+        assert!(runner.contains(".local/bin"));
     }
 
     #[test]

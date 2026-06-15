@@ -25,6 +25,11 @@ use std::{
 #[cfg(feature = "wasm-runtime")]
 pub mod wasm;
 
+/// On-the-fly capability forge (self-mutation). Needs the WAT assembler + the
+/// execution engine, so it rides the same feature as `wasm`.
+#[cfg(feature = "wasm-runtime")]
+pub mod forge;
+
 /// What a tool is allowed to touch. Default is the empty set: a freshly
 /// authored tool is pure compute (stdin -> stdout) until the author opts in.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
