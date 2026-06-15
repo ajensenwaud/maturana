@@ -1916,9 +1916,25 @@ fn build_orchestrator_config(
             // Each fleet agent has its own Telegram bot; a single shared token
             // would point every channel at the same bot. Prefer the agent's
             // profile token, falling back to the command default for others.
-            let telegram_token_source = firecracker_profile_for(&agent_id)
+            let firecracker_profile = firecracker_profile_for(&agent_id);
+            let telegram_token_source = firecracker_profile
                 .map(|profile| profile.telegram_token_source.to_string())
                 .unwrap_or_else(|| command.telegram_token_source.clone());
+            // Only supervise a Telegram channel for agents that actually use
+            // Telegram. Discord/Slack/AgentMail are already gated on their spec
+            // presence, but Telegram was historically default-on for every
+            // agent — which crash-loops `channel:telegram:<id>` for an agent
+            // that has no bot token (e.g. a Discord-only agent). Enable it when
+            // the spec declares `channels.telegram`, OR the agent is a
+            // Firecracker fleet member: fleet agents rely on their profile's
+            // `telegram_token_source` without declaring `channels.telegram` in
+            // their spec. `--no-telegram` still forces it off for everyone.
+            let telegram = !command.no_telegram
+                && (spec
+                    .as_ref()
+                    .map(|s| s.channels.telegram.is_some())
+                    .unwrap_or(false)
+                    || firecracker_profile.is_some());
             // Supervise the agent's egress proxy whenever its spec turns the
             // proxy on. Otherwise a proxy.enabled agent has no running proxy and
             // its outbound (harness backend, tools) is refused at a dead port.
@@ -1930,7 +1946,7 @@ fn build_orchestrator_config(
             Ok(AgentRuntime {
                 agent_id,
                 session_id,
-                telegram: !command.no_telegram,
+                telegram,
                 telegram_token_source,
                 schedules: !command.no_schedules,
                 proactive: !command.no_proactive,
@@ -6106,6 +6122,69 @@ mod tests {
             .agents
             .iter()
             .all(|a| a.session_id == "global-session"));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn build_orchestrator_config_no_telegram_for_discord_only_agent() {
+        // An agent whose spec declares only Discord must NOT get a Telegram
+        // runner: there is no bot token, so `channel:telegram:<id>` would
+        // crash-loop. Telegram is default-on only for agents that actually use
+        // it (spec `channels.telegram`) or Firecracker fleet members.
+        let temp = std::env::temp_dir().join(format!(
+            "maturana-up-discord-only-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp);
+        let home = MaturanaHome::new(&temp);
+
+        let agent_dir = home.agent_dir("discord-only");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("MATURANA.md"),
+            "---\n\
+             identity:\n\
+            \x20 id: discord-only\n\
+            \x20 name: Discord Only Agent\n\
+            \x20 purpose: Reachable over Discord, never Telegram.\n\
+             runtime:\n\
+            \x20 harness: codex\n\
+             vm:\n\
+            \x20 provider: hyper-v\n\
+             channels:\n\
+            \x20 discord:\n\
+            \x20\x20\x20 bot_token_source: pipelock:discord/bot-token\n\
+             ---\n\
+             # Discord Only Agent\n",
+        )
+        .unwrap();
+
+        let command = up_command_for_test(vec!["discord-only"], None);
+        let config = build_orchestrator_config(&home, &command).unwrap();
+        let agent = config
+            .agents
+            .iter()
+            .find(|a| a.agent_id == "discord-only")
+            .unwrap();
+        // Discord is wired; Telegram is not (no spec channel, not a fleet agent).
+        assert!(agent.discord.is_some());
+        assert!(
+            !agent.telegram,
+            "discord-only agent must not get a Telegram runner"
+        );
+
+        // And the plan must carry no telegram process for it, but must carry a
+        // discord one — the actual crash-loop surface.
+        let plan = maturana_core::orchestrator::plan_processes(&config);
+        assert!(
+            plan.iter()
+                .all(|p| p.name != "channel:telegram:discord-only"),
+            "no telegram runner should be planned for a discord-only agent"
+        );
+        assert!(plan
+            .iter()
+            .any(|p| p.name == "channel:discord:discord-only"));
 
         let _ = fs::remove_dir_all(&temp);
     }
