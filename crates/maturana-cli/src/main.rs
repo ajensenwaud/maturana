@@ -81,6 +81,10 @@ enum Command {
     Session(SessionCommand),
     Graph(graph::GraphCommand),
     Up(UpCommand),
+    /// Interactive console TUI with an agent selector. `maturana tui` opens the
+    /// selector; pass an agent id to jump straight in. Cycle agents with
+    /// Ctrl+←/→ and reopen the selector with Ctrl+P.
+    Tui(TuiCommand),
     /// Serve the web cockpit: a browser control surface complementing the
     /// Codex CLI control plane.
     Web(WebCommand),
@@ -97,6 +101,16 @@ enum Command {
     /// provisioning). Named `setup`; `repair` is kept as a back-compat alias.
     #[command(name = "setup", visible_alias = "repair")]
     Repair(RepairCommand),
+}
+
+/// Interactive console TUI with an agent selector and live agent switching.
+#[derive(Debug, Args)]
+struct TuiCommand {
+    /// Start chatting with this agent. Omit to open the agent selector first.
+    agent_id: Option<String>,
+    /// Seconds to wait for each reply before showing a timeout.
+    #[arg(long, default_value_t = 180)]
+    timeout_seconds: u64,
 }
 
 /// Self-improvement flywheel: capture agent trajectories, attach reward
@@ -1317,6 +1331,9 @@ fn main() -> anyhow::Result<()> {
         Command::Session(command) => handle_session(command, &home)?,
         Command::Graph(command) => graph::handle_graph(command, &home)?,
         Command::Up(command) => run_up(&home, command)?,
+        Command::Tui(command) => {
+            tui::run_tui(&home, command.agent_id.as_deref(), command.timeout_seconds)?
+        }
         Command::Web(command) => match command.command {
             Some(WebSubcommand::Token) => {
                 println!("{}", maturana_web::login_token(home.root())?);
@@ -4150,7 +4167,7 @@ fn print_doctor_check(label: &str, check: &DoctorCheck) {
     }
 }
 
-fn discover_agent_ids(home: &MaturanaHome) -> anyhow::Result<Vec<String>> {
+pub(crate) fn discover_agent_ids(home: &MaturanaHome) -> anyhow::Result<Vec<String>> {
     let agents_dir = home.agents_dir();
     if !agents_dir.exists() {
         return Ok(Vec::new());

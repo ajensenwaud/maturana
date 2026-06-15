@@ -43,6 +43,9 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 
 struct App {
     home: MaturanaHome,
+    /// All selectable agents (sorted); `current` indexes into this.
+    agents: Vec<String>,
+    current: usize,
     agent_id: String,
     session_id: String,
     harness: String,
@@ -57,30 +60,37 @@ struct App {
     reply_rx: Option<mpsc::Receiver<Result<String, String>>>,
     show_slash: bool,
     slash_sel: usize,
+    /// When Some, the agent-selector HUD is open; the value is the highlighted row.
+    selector: Option<usize>,
     quit: bool,
 }
 
-impl App {
-    fn new(home: &MaturanaHome, agent_id: &str, timeout_seconds: u64) -> Self {
-        let harness = AgentSpec::from_maturana_markdown(
-            &home.agent_dir(agent_id).join("MATURANA.md"),
-        )
+fn harness_of(home: &MaturanaHome, agent_id: &str) -> String {
+    AgentSpec::from_maturana_markdown(&home.agent_dir(agent_id).join("MATURANA.md"))
         .map(|spec| match spec.runtime.harness {
             HarnessRuntime::Codex => "codex",
             HarnessRuntime::ClaudeCode => "claude-code",
             HarnessRuntime::Opencode => "opencode",
         })
         .unwrap_or("unknown")
-        .to_string();
-        // Match the agent's guest worker session so commands (status, /session,
-        // feedback) target the same queue the turns use.
-        let session_id = crate::infer_agent_session_id(home, agent_id)
-            .unwrap_or_else(|_| "telegram-main".to_string());
+        .to_string()
+}
+
+impl App {
+    fn new(
+        home: &MaturanaHome,
+        agents: Vec<String>,
+        current: usize,
+        open_selector: bool,
+        timeout_seconds: u64,
+    ) -> Self {
         let mut app = Self {
             home: MaturanaHome::new(home.root().to_path_buf()),
-            agent_id: agent_id.to_string(),
-            session_id,
-            harness,
+            agents,
+            current,
+            agent_id: String::new(),
+            session_id: String::new(),
+            harness: String::new(),
             timeout_seconds,
             messages: Vec::new(),
             input: String::new(),
@@ -91,17 +101,65 @@ impl App {
             reply_rx: None,
             show_slash: false,
             slash_sel: 0,
+            selector: if open_selector { Some(current) } else { None },
             quit: false,
         };
+        app.load_current();
         app.messages.push(ChatMsg {
             role: Role::System,
             text: format!(
                 "Connected to agent '{}' ({} harness). Type a message and press Enter. \
-                 /help for commands, Esc or Ctrl+C to quit.",
+                 /help for commands · Ctrl+P agents · Ctrl+←/→ switch · Esc or Ctrl+C quit.",
                 app.agent_id, app.harness
             ),
         });
         app
+    }
+
+    /// Load the agent at `current` into agent_id/session_id/harness.
+    fn load_current(&mut self) {
+        let agent_id = self.agents.get(self.current).cloned().unwrap_or_default();
+        self.harness = harness_of(&self.home, &agent_id);
+        // Match the agent's guest worker session so commands (status, /session,
+        // feedback) target the same queue the turns use.
+        self.session_id = crate::infer_agent_session_id(&self.home, &agent_id)
+            .unwrap_or_else(|_| "telegram-main".to_string());
+        self.agent_id = agent_id;
+    }
+
+    /// Switch the active agent: abandon any in-flight reply, reload identity, and
+    /// reset the conversation view.
+    fn switch_to(&mut self, index: usize) {
+        if self.agents.is_empty() {
+            return;
+        }
+        self.current = index.min(self.agents.len() - 1);
+        self.finish_wait();
+        self.load_current();
+        self.messages.clear();
+        self.input.clear();
+        self.show_slash = false;
+        self.scrollback = 0;
+        self.messages.push(ChatMsg {
+            role: Role::System,
+            text: format!(
+                "▸ agent '{}' ({}/{}, {} harness). Ctrl+P to switch.",
+                self.agent_id,
+                self.current + 1,
+                self.agents.len(),
+                self.harness
+            ),
+        });
+    }
+
+    /// Cycle to the previous/next agent (wrapping).
+    fn cycle(&mut self, delta: i32) {
+        let n = self.agents.len();
+        if n < 2 {
+            return;
+        }
+        let next = (self.current as i32 + delta).rem_euclid(n as i32) as usize;
+        self.switch_to(next);
     }
 
     fn slash_matches(&self) -> Vec<(&'static str, &'static str)> {
@@ -236,8 +294,37 @@ impl App {
     }
 }
 
+/// `maturana agent chat <id>` — jump straight into the TUI for one agent.
 pub fn run_chat(home: &MaturanaHome, agent_id: &str, timeout_seconds: u64) -> Result<()> {
-    let mut app = App::new(home, agent_id, timeout_seconds);
+    run_tui(home, Some(agent_id), timeout_seconds)
+}
+
+/// `maturana tui [agent]` — open the console TUI. With no agent the agent-selector
+/// HUD opens first; otherwise it starts in that agent. Ctrl+P reopens the selector
+/// and Ctrl+←/→ cycle between agents.
+pub fn run_tui(home: &MaturanaHome, agent_id: Option<&str>, timeout_seconds: u64) -> Result<()> {
+    let mut agents = crate::discover_agent_ids(home)?;
+    if let Some(id) = agent_id {
+        if !agents.iter().any(|a| a == id) {
+            // Allow targeting an agent whose dir exists but wasn't discovered
+            // (e.g. just created); put it first.
+            agents.insert(0, id.to_string());
+        }
+    }
+    if agents.is_empty() {
+        anyhow::bail!(
+            "no agents found under {}. Create one from Codex (the maturana-agent-create skill), \
+             then run `maturana tui`.",
+            home.agents_dir().display()
+        );
+    }
+    let current = agent_id
+        .and_then(|id| agents.iter().position(|a| a == id))
+        .unwrap_or(0);
+    // No agent on the command line → open the selector first.
+    let open_selector = agent_id.is_none();
+    let mut app = App::new(home, agents, current, open_selector, timeout_seconds);
+
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, &mut app);
     ratatui::restore();
@@ -259,9 +346,30 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
                 }
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 let alt = key.modifiers.contains(KeyModifiers::ALT);
+                // While the agent-selector HUD is open it captures navigation.
+                if let Some(sel) = app.selector {
+                    match key.code {
+                        KeyCode::Char('c') if ctrl => app.quit = true,
+                        KeyCode::Up => app.selector = Some(sel.saturating_sub(1)),
+                        KeyCode::Down => {
+                            app.selector = Some((sel + 1).min(app.agents.len().saturating_sub(1)));
+                        }
+                        KeyCode::Enter => {
+                            app.selector = None;
+                            app.switch_to(sel);
+                        }
+                        KeyCode::Esc => app.selector = None,
+                        KeyCode::Char('p') if ctrl => app.selector = None,
+                        _ => {}
+                    }
+                    continue;
+                }
                 match key.code {
                     KeyCode::Char('c') if ctrl => app.quit = true,
                     KeyCode::Char('x') if ctrl => app.interrupt(false),
+                    KeyCode::Char('p') if ctrl => app.selector = Some(app.current),
+                    KeyCode::Left if ctrl => app.cycle(-1),
+                    KeyCode::Right if ctrl => app.cycle(1),
                     KeyCode::Esc => {
                         if app.show_slash {
                             app.show_slash = false;
@@ -343,6 +451,9 @@ fn draw(f: &mut Frame, app: &App) {
     if app.show_slash {
         draw_slash_popup(f, chunks[2], app);
     }
+    if let Some(sel) = app.selector {
+        draw_agent_selector(f, f.area(), app, sel);
+    }
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
@@ -357,7 +468,12 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     };
     let line = Line::from(vec![
         Span::styled(
-            format!(" maturana · {} ", app.agent_id),
+            format!(
+                " maturana · {} ({}/{}) ",
+                app.agent_id,
+                app.current + 1,
+                app.agents.len()
+            ),
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
@@ -440,11 +556,54 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_footer(f: &mut Frame, area: Rect, _app: &App) {
     let hint = Line::from(vec![Span::styled(
-        " Enter send · Alt+Enter newline · / commands · PgUp/PgDn scroll · \
-         Esc/Ctrl+X interrupt · Ctrl+C quit ",
+        " Enter send · Alt+Enter newline · / commands · Ctrl+P agents · \
+         Ctrl+←/→ switch · PgUp/PgDn scroll · Esc/Ctrl+X interrupt · Ctrl+C quit ",
         Style::default().fg(Color::DarkGray),
     )]);
     f.render_widget(Paragraph::new(hint), area);
+}
+
+/// Centered agent-selector HUD: lists every agent, marks the active one (●),
+/// highlights the cursor row. Opened at startup (no agent arg) and via Ctrl+P.
+fn draw_agent_selector(f: &mut Frame, full: Rect, app: &App, sel: usize) {
+    let rows = app.agents.len() as u16;
+    let height = (rows + 2).min(full.height.saturating_sub(2)).max(3);
+    let width = 52.min(full.width.saturating_sub(4)).max(24);
+    let area = Rect {
+        x: full.x + full.width.saturating_sub(width) / 2,
+        y: full.y + full.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    let items: Vec<ListItem> = app
+        .agents
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            let marker = if i == app.current { "● " } else { "  " };
+            let harness = harness_of(&app.home, id);
+            let style = if i == sel {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!(" {marker}{id} "),
+                    style.add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {harness}"), Style::default().fg(Color::DarkGray)),
+            ]))
+        })
+        .collect();
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" select agent · ↑↓ Enter · Esc cancel ")
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    f.render_widget(Clear, area);
+    f.render_widget(list, area);
 }
 
 fn draw_slash_popup(f: &mut Frame, input_area: Rect, app: &App) {
