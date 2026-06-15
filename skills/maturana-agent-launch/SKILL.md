@@ -169,8 +169,8 @@ For the standard three harnesses on `aidev`, use the Rust-owned repair/deploy
 workflow:
 
 ```bash
-maturana repair firecracker-harnesses
-maturana repair firecracker-harnesses --agent-id codex-firecracker
+maturana setup firecracker-harnesses
+maturana setup firecracker-harnesses --agent-id codex-firecracker
 ```
 
 That command starts `sessiond`, calls the narrow TAP/image-prep adapters,
@@ -180,7 +180,7 @@ wrapper has been removed. Use the Rust command directly.
 
 ```bash
 sudo apt-get install -y qemu-utils libguestfs-tools
-maturana repair firecracker-harnesses --agent-id codex-firecracker
+maturana setup firecracker-harnesses --agent-id codex-firecracker
 maturana spec validate examples/MATURANA.firecracker-demo.md
 maturana agent launch examples/MATURANA.firecracker-demo.md
 maturana agent launch examples/MATURANA.firecracker-demo.md --apply

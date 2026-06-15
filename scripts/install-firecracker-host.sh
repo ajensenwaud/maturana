@@ -2,7 +2,7 @@
 # Provision a fresh Linux host into a Maturana Firecracker agent host: the
 # firecracker binary, KVM access, the libguestfs/qemu image-build toolchain,
 # and IPv4 forwarding for guest egress. Idempotent. Run this BEFORE
-# `maturana repair firecracker-harnesses` (which builds images + launches VMs).
+# `maturana setup firecracker-harnesses` (which builds images + launches VMs).
 #
 #   curl -fsSL https://raw.githubusercontent.com/ajensenwaud/maturana/main/scripts/install-firecracker-host.sh | bash
 #
@@ -105,6 +105,6 @@ say "firecracker host ready"
 echo
 echo "  Next:"
 echo "    1. Install the control plane:  curl -fsSL .../scripts/install.sh | bash"
-echo "    2. Build images + launch agents: maturana repair firecracker-harnesses"
+echo "    2. Build images + launch agents: maturana setup firecracker-harnesses"
 echo "       (set credentials under .maturana/host-auth/<harness>/ first)"
 echo "    3. Drive agents: codex in the repo, or the web cockpit at :47836"

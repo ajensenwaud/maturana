@@ -57,13 +57,13 @@ Restart the local session bridge, refresh guest workers, start Telegram channel
 runners, and run doctor:
 
 ```powershell
-.\scripts\maturana.ps1 repair windows-harnesses
+.\scripts\maturana.ps1 setup windows-harnesses
 ```
 
 Install persistent scheduled tasks instead of direct background processes:
 
 ```powershell
-.\scripts\maturana.ps1 repair windows-harnesses --register-tasks
+.\scripts\maturana.ps1 setup windows-harnesses --register-tasks
 ```
 
 The repair command does not rebuild VMs. It owns the repair decision path and
@@ -83,5 +83,5 @@ registration.
 If Telegram does not reply, run `maturana doctor` first, then
 `maturana agent inspect <agent-id> --live --guest`. If the VM is running but
 Telegram or worker heartbeat is stale, run
-`maturana repair windows-harnesses`. If the VM itself is missing or has no IP,
+`maturana setup windows-harnesses`. If the VM itself is missing or has no IP,
 relaunch that VM from its `MATURANA.md`.

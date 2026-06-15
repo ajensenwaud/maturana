@@ -92,6 +92,9 @@ enum Command {
     Tool(ToolCommand),
     Improve(ImproveCommand),
     Doctor(DoctorCommand),
+    /// Prepare host/guest prerequisites (Ubuntu image, SSH key, harness
+    /// provisioning). Named `setup`; `repair` is kept as a back-compat alias.
+    #[command(name = "setup", visible_alias = "repair")]
     Repair(RepairCommand),
 }
 

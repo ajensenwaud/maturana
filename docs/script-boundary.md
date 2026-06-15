@@ -94,7 +94,7 @@ Recently migrated:
   `/opt/maturana/browsers`, sets `PLAYWRIGHT_BROWSERS_PATH`, and writes a
   narrow browser smoke script. PowerShell and bash adapters must not decide
   browser packages or browser policy.
-- Windows personal-agent daemon repair: `maturana repair windows-harnesses`
+- Windows personal-agent daemon repair: `maturana setup windows-harnesses`
   now creates sessiond/channel token, log, pid, process, and optional scheduled
   task state directly in Rust. It does not call PowerShell for generic runner
   lifecycles.
@@ -129,7 +129,7 @@ These scripts have been removed from the product surface:
 - `scripts/inspect-ubuntu-hyperv-agent.ps1`: replaced by
   `maturana agent inspect <agent-id> --live --guest`.
 - `scripts/repair-windows-harnesses.ps1`: replaced by
-  `maturana repair windows-harnesses`.
+  `maturana setup windows-harnesses`.
 - `scripts/invoke-hostd-ubuntu-launch.ps1`: replaced by
   `maturana agent launch <spec> --apply`.
 - `scripts/start-hyperv-agent.ps1`: replaced by
@@ -139,14 +139,14 @@ These scripts have been removed from the product surface:
 - `scripts/demo-windows.ps1`: replaced by direct `maturana spec validate`,
   `maturana agent launch`, and `maturana agent inspect` commands.
 - `scripts/refresh-guest-worker.ps1`: replaced by
-  `maturana repair windows-harnesses`, which renders the worker in Rust.
+  `maturana setup windows-harnesses`, which renders the worker in Rust.
 - `scripts/refresh-firecracker-worker.sh`: replaced by
-  `maturana repair guest-worker`, which renders the worker in Rust.
+  `maturana setup guest-worker`, which renders the worker in Rust.
 - `scripts/deploy-aidev-firecracker-harnesses.sh`: replaced by
-  `maturana repair firecracker-harnesses`.
-- `scripts/init-agent-ssh-key.ps1`: replaced by `maturana repair ssh-key`.
+  `maturana setup firecracker-harnesses`.
+- `scripts/init-agent-ssh-key.ps1`: replaced by `maturana setup ssh-key`.
 - `scripts/get-ubuntu-cloudimg.ps1`: replaced by
-  `maturana repair ubuntu-cloudimg`.
+  `maturana setup ubuntu-cloudimg`.
 - `scripts/maturana-hostd.ps1`: replaced by `maturana hostd serve`; the
   scheduled task installer starts the Rust binary directly.
 
