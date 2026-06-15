@@ -32,7 +32,6 @@ These scripts are acceptable as host setup or host primitive wrappers:
 - Windows session/channel runners are started and optionally registered by the
   Rust CLI. Do not add PowerShell task helpers for these generic runner
   lifecycles.
-- `scripts/run-elevated.ps1`: UAC helper for one-off host setup.
 - `scripts/firecracker-setup-tap.sh`: Linux TAP setup.
 - `scripts/firecracker-prepare-assets.sh`: Linux image/kernel/rootfs
   preparation.

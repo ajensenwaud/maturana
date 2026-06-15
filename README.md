@@ -49,7 +49,7 @@ There are only **two things you ever run by hand**:
    `maturana agent …`, `maturana channel …`, `maturana setup …`, `maturana web`.
    The Rust CLI owns all the logic.
 
-Every other file in `scripts/` (`install-hostd-task.ps1`, `set-vm-autostart.ps1`,
+Every other file in `scripts/` (`install-hostd-task.ps1`,
 `install-firecracker-host.sh`, `firecracker-*.sh`, …) is an **internal adapter**
 the installer or the CLI calls for you — you don't invoke them directly. Rule of
 thumb: **if it's a `.ps1`/`.sh` you typed, it's only ever `install`/`uninstall`;
