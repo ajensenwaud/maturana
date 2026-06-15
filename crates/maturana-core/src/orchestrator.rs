@@ -303,8 +303,11 @@ pub fn plan_processes(config: &OrchestratorConfig) -> Vec<SupervisedProcess> {
                 args: vec![
                     "pipelock".to_string(),
                     "proxy".to_string(),
-                    "--spec".to_string(),
-                    format!(".maturana/agents/{}/MATURANA.md", agent.agent_id),
+                    // `--agent-id` (not `--spec`) so the runner resolves the spec
+                    // from `--home`, independent of the working directory — `up`
+                    // is launched (e.g. by the Windows task) with no CWD set.
+                    "--agent-id".to_string(),
+                    agent.agent_id.clone(),
                 ],
                 critical: false,
             });
@@ -454,10 +457,12 @@ mod tests {
         assert!(!proxy.critical);
         assert_eq!(proxy.args[0], "pipelock");
         assert_eq!(proxy.args[1], "proxy");
+        // `--agent-id` (not `--spec`) so the runner resolves from `--home`,
+        // independent of the (unset) working directory under `maturana up`.
         assert!(proxy
             .args
             .windows(2)
-            .any(|w| w == ["--spec", ".maturana/agents/hestefisk/MATURANA.md"]));
+            .any(|w| w == ["--agent-id", "hestefisk"]));
     }
 
     #[test]
