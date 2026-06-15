@@ -377,6 +377,84 @@ pub fn mark_delivered(
     Ok(())
 }
 
+/// One distilled progress event for an in-flight turn, written by the guest
+/// worker as the harness streams its work. Stored in a per-message JSONL
+/// side-lane SEPARATE from the inbound/outbound queues, so turn delivery and
+/// `agent run --wait` never see it — it exists purely so channels can show what
+/// the agent is doing before the final reply lands.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProgressEvent {
+    pub seq: u64,
+    /// "tool" | "thinking" | "text" | "status" | "done"
+    pub kind: String,
+    pub text: String,
+}
+
+/// Path to the progress side-lane for one in-flight message.
+pub fn progress_path(paths: &SessionPaths, message_id: &str) -> PathBuf {
+    let safe: String = message_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    paths.dir.join("progress").join(format!("{safe}.jsonl"))
+}
+
+/// Append a progress event for `message_id`. Append-only JSONL; cheap enough for
+/// the high-frequency (per-harness-event) writes the worker makes.
+pub fn append_progress(
+    paths: &SessionPaths,
+    message_id: &str,
+    event: &ProgressEvent,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let path = progress_path(paths, message_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("failed to open progress log {}", path.display()))?;
+    writeln!(file, "{}", serde_json::to_string(event)?)?;
+    Ok(())
+}
+
+/// Read all progress events recorded for `message_id`, in order. Missing file →
+/// empty; malformed lines are skipped (a half-written line during a concurrent
+/// append is simply ignored until the next poll).
+pub fn read_progress(paths: &SessionPaths, message_id: &str) -> anyhow::Result<Vec<ProgressEvent>> {
+    let path = progress_path(paths, message_id);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()))
+        }
+    };
+    Ok(raw
+        .lines()
+        .filter_map(|line| serde_json::from_str::<ProgressEvent>(line.trim()).ok())
+        .collect())
+}
+
+/// Drop the progress side-lane for `message_id` once its final reply is
+/// delivered, so it doesn't accumulate. Missing file is fine.
+pub fn clear_progress(paths: &SessionPaths, message_id: &str) -> anyhow::Result<()> {
+    let path = progress_path(paths, message_id);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
 fn open_rw(path: &Path) -> anyhow::Result<Connection> {
     let db =
         Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
@@ -544,6 +622,63 @@ mod tests {
         assert_eq!(undelivered.len(), 1);
         mark_delivered(&paths, &undelivered[0].id, Some("telegram-1")).unwrap();
         assert!(list_undelivered(&paths).unwrap().is_empty());
+    }
+
+    #[test]
+    fn progress_lane_is_independent_of_the_outbound_queue() {
+        let temp = temp_dir();
+        let paths = session_paths(&temp, "telegram-main");
+        ensure_session(&paths).unwrap();
+
+        let msg = "msg-abc-123";
+        assert!(read_progress(&paths, msg).unwrap().is_empty());
+
+        for (seq, kind, text) in [
+            (0u64, "status", "thinking"),
+            (1, "tool", "web_search"),
+            (2, "text", "Here is the"),
+        ] {
+            append_progress(
+                &paths,
+                msg,
+                &ProgressEvent {
+                    seq,
+                    kind: kind.into(),
+                    text: text.into(),
+                },
+            )
+            .unwrap();
+        }
+        let events = read_progress(&paths, msg).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events[1],
+            ProgressEvent {
+                seq: 1,
+                kind: "tool".into(),
+                text: "web_search".into()
+            }
+        );
+
+        // Writing progress must not enqueue anything deliverable, and the final
+        // outbound is unaffected by progress (the safety property: delivery and
+        // `agent run --wait` never see the side-lane).
+        write_outbound(
+            &paths,
+            Some(msg),
+            "chat",
+            "telegram",
+            "chat-1",
+            None,
+            r#"{"text":"done"}"#,
+        )
+        .unwrap();
+        assert_eq!(list_undelivered(&paths).unwrap().len(), 1);
+        assert_eq!(read_progress(&paths, msg).unwrap().len(), 3);
+
+        clear_progress(&paths, msg).unwrap();
+        assert!(read_progress(&paths, msg).unwrap().is_empty());
+        assert_eq!(list_undelivered(&paths).unwrap().len(), 1);
     }
 
     #[test]
