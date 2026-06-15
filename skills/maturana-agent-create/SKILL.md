@@ -96,6 +96,12 @@ build the whole agent in one go without stopping to re-confirm. Concretely:
 4. **Runtime.** Ask the harness — `codex` (default), `claude-code`, or
    `opencode`. Provider is the host-native one (Hyper-V / Firecracker); set
    `harness_auth` source/guest paths for the subscription harness.
+   When `network.proxy.enabled`, the harness's **own backend host** must be in
+   `network.egress_allowlist` or the agent authenticates but can't run a turn
+   (proxy denies it, codex reports `Connection refused`): codex via a ChatGPT
+   subscription needs `chatgpt.com` (not just `api.openai.com`); claude-code
+   needs `api.anthropic.com` + `platform.claude.com`. The `codex-*` / `claude-*`
+   example specs already include these — keep them.
 5. **Channels (how the user talks to it).** Ask which to set up:
    - **Console TUI** (always available, no setup): set `channels.tui: true`. The
      user talks to the agent from a terminal with `maturana agent chat <id>` — a
