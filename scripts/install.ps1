@@ -220,8 +220,16 @@ if (-not $SkipServices) {
     Say "registering Maturana boot services (up + web)"
     try { & $Exe service install up web --windows-password $pw }
     finally { $pw = $null; [System.GC]::Collect() }
-    # Make the Hyper-V agent VMs auto-boot with the host too.
-    & (Join-Path $Dir "scripts\set-vm-autostart.ps1")
+    # Make existing maturana-* Hyper-V VMs auto-boot with the host (staggered to
+    # avoid a boot thundering-herd). New VMs get this from the Hyper-V launcher.
+    $autostartVms = @(Get-VM -Name 'maturana-*' -ErrorAction SilentlyContinue)
+    $vmIdx = 0
+    foreach ($vm in $autostartVms) {
+        $delay = 30 + (15 * $vmIdx)
+        Set-VM -VM $vm -AutomaticStartAction Start -AutomaticStartDelay $delay
+        Say "  $($vm.Name): auto-start on (delay ${delay}s)"
+        $vmIdx++
+    }
     Log-Milestone 'boot-services'
 } else {
     Log-Milestone 'boot-services' 'skipped'
