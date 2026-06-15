@@ -8,8 +8,8 @@ use maturana_core::{
     pipelock::PipelockVault,
     secrets::resolve_secret_source_with_home,
     session_db::{
-        clear_progress, ensure_session, insert_inbound, list_undelivered, mark_delivered,
-        read_progress, session_paths, ProgressEvent, SessionPaths,
+        claim_delivery, clear_progress, ensure_session, insert_inbound, list_undelivered,
+        mark_delivered, read_progress, session_paths, ProgressEvent, SessionPaths,
     },
     spec::{AgentSpec, HarnessRuntime},
     state::MaturanaHome,
@@ -227,6 +227,8 @@ struct ChannelContextBundle {
     graph_context: Option<GraphChannelContext>,
     /// Few-shot examples from past positively-rewarded turns (self-improvement).
     learned_examples: String,
+    /// Whether this agent may build + run WebAssembly capabilities on the fly.
+    self_forge: bool,
     transcript: String,
     transcript_path: PathBuf,
 }
@@ -1079,12 +1081,15 @@ fn deliver_telegram_outbox(
         if message.channel != "telegram" || message.platform_id != chat_id.to_string() {
             continue;
         }
+        // Atomic claim: the streaming render loop / inline fallback also deliver,
+        // so claim first or the same reply goes out multiple times.
+        if !claim_delivery(&paths, &message.id)? {
+            continue;
+        }
         let response = truncate_for_telegram(&message_text(&message.content)?);
         // A proactive self-check that decided there's nothing worth saying emits
-        // the silence sentinel: mark it delivered (so it isn't retried) but don't
-        // message the user.
+        // the silence sentinel: already claimed above, so just skip messaging.
         if response.trim() == crate::proactive::SILENCE_SENTINEL {
-            mark_delivered(&paths, &message.id, None)?;
             continue;
         }
         let reply_to_message_id = message
@@ -2422,6 +2427,13 @@ fn stream_turn_to_telegram(
             .into_iter()
             .find(|m| m.channel == "telegram" && m.in_reply_to.as_deref() == Some(inbound_id))
         {
+            // Claim atomically. If the delivery thread already claimed it, it is
+            // sending the reply as its own message — stop streaming and let it,
+            // rather than double-sending.
+            if !claim_delivery(paths, &final_msg.id)? {
+                let _ = clear_progress(paths, inbound_id);
+                return Ok(());
+            }
             let reply = truncate_for_telegram(&message_text(&final_msg.content)?);
             let sent = match status_id {
                 // Finalize the status message into the reply; fall back to a new
@@ -2696,6 +2708,9 @@ fn load_channel_context(
         wiki_term_sources: wiki_query.term_sources,
         graph_context,
         learned_examples,
+        self_forge: AgentSpec::from_maturana_markdown(agent_dir.join("MATURANA.md"))
+            .map(|spec| spec.capabilities.self_forge)
+            .unwrap_or(false),
         transcript,
         transcript_path,
     })
@@ -2727,8 +2742,43 @@ fn load_graph_channel_context(
     })
 }
 
+/// Awareness block injected when the agent is granted `self_forge`: tells it the
+/// WebAssembly runtime exists, that it is allowed to build, and exactly how.
+fn forge_prompt_section() -> &'static str {
+    r#"
+## Self-Forge — build and run a capability on the fly
+You are allowed to extend yourself at runtime. When a task needs computation or
+transformation you don't already have, author a small WebAssembly capability and
+run it immediately, the same turn, in a sandbox — no host rebuild. Use the
+`maturana-forge` shell helper:
+
+```
+maturana-forge <name> --input '{"n": 7}' <<'WAT'
+(module
+  (import "wasi_snapshot_preview1" "fd_write"
+    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  ;; ... compute, then write the result to stdout (fd 1) via fd_write ...
+  (func (export "_start") ...))
+WAT
+```
+
+It assembles your WAT, runs the module under a fuel/memory/timeout sandbox (no
+ambient filesystem or network unless you declare it), and returns the module's
+stdout. Submit a precompiled module with `--wasm <base64>` instead of heredoc
+WAT. The channel shows a 🔨 Building / ⚙️ Running animation while it happens.
+Forge sparingly and only when it helps; then describe in your reply what you
+built and what it returned.
+"#
+}
+
 fn render_channel_prompt(context: &ChannelContextBundle, user_message: &str) -> String {
     let wiki_chunks = render_wiki_chunks(&context.wiki_chunks);
+    let forge_section = if context.self_forge {
+        forge_prompt_section()
+    } else {
+        ""
+    };
     let graph_section = match &context.graph_context {
         Some(graph) => format!(
             "\n## Knowledge Graph Context (GraphRAG, graph `{}`)\n\nEntities and relationships retrieved from your knowledge graph for this message. Treat them as ground truth about ingested documents and recorded facts.\n\n{}\n",
@@ -2773,7 +2823,7 @@ Return only the message that should be sent back to Telegram.
 
 ## Relevant Wiki Chunks
 {wiki_chunks}
-{graph_section}{learned_section}
+{graph_section}{learned_section}{forge_section}
 ## Recent Telegram Transcript
 {transcript}
 
@@ -3976,6 +4026,10 @@ where
     let mut delivered = 0;
     for message in list_undelivered(&paths)? {
         if message.channel != channel || message.platform_id != platform_id {
+            continue;
+        }
+        // Atomic claim so concurrent delivery paths can't double-send this reply.
+        if !claim_delivery(&paths, &message.id)? {
             continue;
         }
         let response = truncate_for_telegram(&message_text(&message.content)?);
