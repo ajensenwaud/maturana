@@ -157,48 +157,29 @@ function Wait-GuestIp {
 }
 
 function Wait-Ssh {
+    # Keyless TCP reachability check on port 22. This launcher runs under hostd as
+    # SYSTEM, and Windows OpenSSH's strict-mode rejects the (aj-owned) agent key
+    # when invoked as SYSTEM, so a key-based `ssh ... echo alive` here fails
+    # silently for the whole window. We only need to confirm sshd is listening;
+    # the real key-authenticated SSH (readiness, root-expand, provisioning) is
+    # done afterwards by the Rust CLI, which runs as the user whose key it is.
     param([string]$Ip)
     for ($i = 0; $i -lt 180; $i++) {
-        $previousNativeErrorMode = $global:PSNativeCommandUseErrorActionPreference
-        $previousErrorAction = $ErrorActionPreference
         try {
-            $global:PSNativeCommandUseErrorActionPreference = $false
-            $ErrorActionPreference = "Continue"
-            $result = ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o BatchMode=yes -o ConnectTimeout=5 -i $SshKeyPath "$SshUser@$Ip" "echo alive" 2>$null
-            if ($result -match "alive") {
+            $client = New-Object System.Net.Sockets.TcpClient
+            $async = $client.BeginConnect($Ip, 22, $null, $null)
+            $ok = $async.AsyncWaitHandle.WaitOne(3000)
+            if ($ok -and $client.Connected) {
+                $client.Close()
                 return
             }
+            $client.Close()
         } catch {
-            # SSH may accept TCP before the daemon has completed banner exchange.
-        } finally {
-            $global:PSNativeCommandUseErrorActionPreference = $previousNativeErrorMode
-            $ErrorActionPreference = $previousErrorAction
+            # Not listening yet; keep polling.
         }
         Start-Sleep -Seconds 5
     }
-    throw "SSH did not become ready at $Ip."
-}
-
-function Expand-GuestRoot {
-    param([string]$Ip)
-    $command = @'
-set -eu
-root_source="$(findmnt -n -o SOURCE /)"
-disk_name="$(lsblk -no PKNAME "$root_source" | head -n1)"
-part_name="$(basename "$root_source")"
-part_num="$(cat "/sys/class/block/$part_name/partition")"
-if [ -n "$disk_name" ] && [ -n "$part_num" ]; then
-  sudo growpart "/dev/$disk_name" "$part_num" || true
-fi
-fs_type="$(findmnt -n -o FSTYPE /)"
-if [ "$fs_type" = "xfs" ]; then
-  sudo xfs_growfs /
-else
-  sudo resize2fs "$root_source" || true
-fi
-df -h /
-'@
-    Invoke-Guest -Ip $Ip -Command $command
+    throw "SSH port 22 did not open at $Ip within the wait window."
 }
 
 Assert-Elevated
@@ -266,9 +247,11 @@ if ((Get-VM -Name $VmName).State -ne "Running") {
 $ip = Wait-GuestIp -Name $VmName
 Write-Log "VM IPv4: $ip"
 Wait-Ssh -Ip $ip
-Write-Log "SSH ready."
-Write-Log "Expanding guest root filesystem..."
-Expand-GuestRoot -Ip $ip
+Write-Log "sshd is listening; handing off to the Rust CLI for key-authenticated provisioning."
+# NOTE: key-authenticated SSH readiness, root-filesystem expansion, and all
+# guest provisioning are done by the Rust CLI (running as the user that owns the
+# agent SSH key), not here under SYSTEM. See provision_hyperv_guest in
+# crates/maturana-core/src/providers/hyperv.rs.
 
 Write-Log "create-only launch complete."
 $result = @{ ok = $true; agent_id = $AgentId; vm = $VmName; ipv4 = $ip; log = $script:LogPath }

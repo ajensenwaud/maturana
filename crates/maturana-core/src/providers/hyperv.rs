@@ -13,6 +13,8 @@ use serde::Serialize;
 use std::{
     path::{Path, PathBuf},
     process::Command,
+    thread,
+    time::{Duration, Instant},
 };
 
 pub struct HyperVProvider;
@@ -353,6 +355,21 @@ struct HyperVGuestProvision<'a> {
 }
 
 fn provision_hyperv_guest(config: HyperVGuestProvision<'_>) -> anyhow::Result<()> {
+    // The SYSTEM launcher only confirmed TCP/22 is open (it can't use the
+    // user-owned agent key under strict-mode). This CLI runs as that user, so
+    // here we do the first real key-authenticated handshake — retried until the
+    // guest accepts our key (cloud-init may still be writing authorized_keys on
+    // a fresh boot), or we give up with the last SSH error so the failure is
+    // legible instead of a black box.
+    wait_for_guest_ssh_ready(&config, Duration::from_secs(240))?;
+
+    // Root-filesystem expansion (formerly done in the launcher) — the base image
+    // ships a small root partition; grow it to fill the resized VHDX. Best-effort:
+    // a failure here must not abort provisioning.
+    if let Err(error) = invoke_guest(&config, EXPAND_ROOT_SCRIPT) {
+        eprintln!("warning: guest root filesystem expansion failed (continuing): {error:#}");
+    }
+
     copy_to_guest(&config, config.bootstrap_path, "/tmp/guest-bootstrap.sh")?;
     invoke_guest(
         &config,
@@ -483,6 +500,65 @@ fn invoke_guest(config: &HyperVGuestProvision<'_>, command: &str) -> anyhow::Res
     }
     Ok(())
 }
+
+/// Block until the guest accepts a key-authenticated SSH session, retrying on a
+/// short interval. The launcher (running as SYSTEM) only proved TCP/22 is open;
+/// this is the first connection that actually uses the agent key, so it must
+/// tolerate the brief window where sshd is up but cloud-init hasn't finished
+/// installing `authorized_keys`. On timeout it surfaces the last SSH error.
+fn wait_for_guest_ssh_ready(
+    config: &HyperVGuestProvision<'_>,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let destination = format!("{}@{}", config.ssh_user, config.ip);
+    let deadline = Instant::now() + timeout;
+    loop {
+        let output = Command::new("ssh")
+            .args(guest_ssh_options(config))
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg(&destination)
+            .arg("echo maturana-ssh-ready")
+            .output();
+        let last_err = match output {
+            Ok(out) if out.status.success() => return Ok(()),
+            Ok(out) => format!(
+                "exit {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Err(error) => format!("failed to spawn ssh: {error}"),
+        };
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "guest SSH did not accept the agent key at {} within {}s (last error: {})",
+                config.ip,
+                timeout.as_secs(),
+                last_err
+            );
+        }
+        thread::sleep(Duration::from_secs(3));
+    }
+}
+
+/// Grow the guest root partition + filesystem to fill the resized VHDX. Mirrors
+/// the bash the launcher used to run; kept tolerant (`|| true`) so a quirk on an
+/// already-expanded image doesn't fail the launch.
+const EXPAND_ROOT_SCRIPT: &str = r#"set -eu
+root_source="$(findmnt -n -o SOURCE /)"
+disk_name="$(lsblk -no PKNAME "$root_source" | head -n1)"
+part_name="$(basename "$root_source")"
+part_num="$(cat "/sys/class/block/$part_name/partition")"
+if [ -n "$disk_name" ] && [ -n "$part_num" ]; then
+  sudo growpart "/dev/$disk_name" "$part_num" || true
+fi
+fs_type="$(findmnt -n -o FSTYPE /)"
+if [ "$fs_type" = "xfs" ]; then
+  sudo xfs_growfs / || true
+else
+  sudo resize2fs "$root_source" || true
+fi
+df -h /"#;
 
 fn copy_to_guest(
     config: &HyperVGuestProvision<'_>,
