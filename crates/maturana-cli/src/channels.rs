@@ -892,18 +892,18 @@ fn handle_telegram_update(
                 };
                 run_session_once(&paths, &options, 20)?;
             }
-            // Live progress: a status message edited in place as the agent works
-            // (tool calls, streamed text), then finalized into the reply. The
-            // loop marks the final outbound delivered so the delivery thread
-            // doesn't re-send; on timeout it leaves the late final to that thread.
-            let status_id = send_telegram(token, &chat_id.to_string(), "🤔 working…", reply_to_message_id)?;
+            // Live progress: a status message is created lazily as the agent works
+            // (tool calls + streamed text), then finalized into the reply — no
+            // "working…" placeholder. The loop marks the final outbound delivered
+            // so the delivery thread doesn't re-send; on timeout it leaves the late
+            // final to that thread.
             stream_turn_to_telegram(
                 home,
                 token,
                 config,
                 chat_id,
                 &inbound_id,
-                status_id,
+                reply_to_message_id,
                 &paths,
                 Duration::from_secs(300),
             )?;
@@ -2378,9 +2378,6 @@ fn send_telegram_chat_action(token: &str, chat_id: &str, action: &str) -> anyhow
 /// recent tool lines plus the agent's streamed text so far. Plain text
 /// (editMessageText carries no parse_mode), bounded to Telegram's message size.
 fn render_turn_progress(events: &[ProgressEvent]) -> String {
-    if events.is_empty() {
-        return "🤔 working…".to_string();
-    }
     let mut tools: Vec<&str> = Vec::new();
     let mut text = "";
     let mut errored = false;
@@ -2392,35 +2389,50 @@ fn render_turn_progress(events: &[ProgressEvent]) -> String {
             _ => {}
         }
     }
-    let mut out = String::from(if errored { "⚠️ working…" } else { "🤔 working…" });
+    // No placeholder chrome: show the actual work — recent tool lines and the
+    // streamed text. Empty when there's nothing to show yet (the caller then
+    // doesn't post a status message at all).
+    let mut out = String::new();
     for tool in tools.iter().rev().take(6).rev() {
-        out.push_str("\n🔧 ");
+        out.push_str("🔧 ");
         out.push_str(&truncate_chars(tool, 80));
+        out.push('\n');
     }
     if !text.is_empty() {
-        out.push_str("\n\n");
-        out.push_str(&truncate_chars(text, 1500));
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&truncate_chars(text, 3500));
+    } else if errored && out.is_empty() {
+        out.push_str("⚠️");
     }
-    truncate_for_telegram(&out)
+    truncate_for_telegram(out.trim_end())
 }
 
-/// Stream a turn's live progress into `status_id` (edited in place), then finalize
-/// it into the agent's reply. The outbox is polled tightly so this loop wins the
-/// finalize over the 1s delivery thread; either way `mark_delivered` guarantees a
-/// single send. On timeout it returns and leaves the late final to that thread.
+/// Stream a turn's live progress into a status message (created lazily on the
+/// first real progress, edited in place), then finalize it into the reply. No
+/// "working…" placeholder: a turn with nothing to show (a fast conversational
+/// reply with no tools and no streamed deltas) posts only the final message. The
+/// outbox is polled tightly so this loop wins the finalize over the 1s delivery
+/// thread; `claim_delivery` guarantees a single send either way.
 fn stream_turn_to_telegram(
     home: &MaturanaHome,
     token: &str,
     config: &TelegramServe,
     chat_id: i64,
     inbound_id: &str,
-    status_id: Option<i64>,
+    reply_to: Option<i64>,
     paths: &SessionPaths,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let deadline = std::time::Instant::now() + timeout;
+    // The status message is created only once there's something to show.
+    let mut status_id: Option<i64> = None;
     let mut last_render = String::new();
-    let mut last_edit = std::time::Instant::now();
+    // Allow an immediate first render.
+    let mut last_edit = std::time::Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(std::time::Instant::now);
     loop {
         // Final reply ready? (polled every tick so this loop beats the delivery thread)
         if let Some(final_msg) = list_undelivered(paths)?
@@ -2436,13 +2448,14 @@ fn stream_turn_to_telegram(
             }
             let reply = truncate_for_telegram(&message_text(&final_msg.content)?);
             let sent = match status_id {
-                // Finalize the status message into the reply; fall back to a new
-                // message if the edit fails (unchanged / too long).
+                // Finalize the streamed status message into the reply; fall back to
+                // a new message if the edit fails (unchanged / too long).
                 Some(id) => match edit_telegram_message(token, chat_id, id, &reply) {
                     Ok(()) => Some(id),
-                    Err(_) => send_telegram(token, &chat_id.to_string(), &reply, None)?,
+                    Err(_) => send_telegram(token, &chat_id.to_string(), &reply, reply_to)?,
                 },
-                None => send_telegram(token, &chat_id.to_string(), &reply, None)?,
+                // No status was ever posted (fast reply) → just send it.
+                None => send_telegram(token, &chat_id.to_string(), &reply, reply_to)?,
             };
             append_channel_turn(home, &config.agent_id, chat_id, "assistant", &reply)?;
             mark_delivered(paths, &final_msg.id, sent.map(|id| id.to_string()).as_deref())?;
@@ -2455,13 +2468,17 @@ fn stream_turn_to_telegram(
             )?;
             return Ok(());
         }
-        // Refresh the in-flight progress view, throttled (~1.2s) for rate limits and
-        // only when the rendered text actually changed.
-        if last_edit.elapsed() >= Duration::from_millis(1200) {
+        // Refresh the in-flight progress view, throttled (~1s) for rate limits and
+        // only when the rendered text actually changed. The status message is
+        // created on the first non-empty render, not before.
+        if last_edit.elapsed() >= Duration::from_millis(1000) {
             let rendered = render_turn_progress(&read_progress(paths, inbound_id)?);
-            if rendered != last_render {
-                if let Some(id) = status_id {
-                    let _ = edit_telegram_message(token, chat_id, id, &rendered);
+            if !rendered.is_empty() && rendered != last_render {
+                match status_id {
+                    Some(id) => {
+                        let _ = edit_telegram_message(token, chat_id, id, &rendered);
+                    }
+                    None => status_id = send_telegram(token, &chat_id.to_string(), &rendered, reply_to)?,
                 }
                 last_render = rendered;
             }
@@ -4685,8 +4702,8 @@ mod tests {
 
     #[test]
     fn turn_progress_renders_tools_and_streamed_text() {
-        // Empty → a plain working indicator.
-        assert_eq!(render_turn_progress(&[]), "🤔 working…");
+        // Nothing to show yet → empty (no placeholder; caller posts no status).
+        assert_eq!(render_turn_progress(&[]), "");
 
         let events = vec![
             ProgressEvent { seq: 0, kind: "tool".into(), text: "running: rg foo".into() },
@@ -4694,14 +4711,15 @@ mod tests {
             ProgressEvent { seq: 2, kind: "text".into(), text: "Here is the answer.".into() },
         ];
         let rendered = render_turn_progress(&events);
-        assert!(rendered.starts_with("🤔 working…"));
         assert!(rendered.contains("🔧 running: rg foo"));
         assert!(rendered.contains("🔧 done: rg foo"));
         assert!(rendered.contains("Here is the answer."));
+        // No "working…" chrome.
+        assert!(!rendered.contains("working"));
 
-        // An error status flips the header.
+        // Error with nothing else → a minimal marker.
         let errored = vec![ProgressEvent { seq: 0, kind: "status".into(), text: "error".into() }];
-        assert!(render_turn_progress(&errored).starts_with("⚠️ working…"));
+        assert_eq!(render_turn_progress(&errored), "⚠️");
     }
 
     impl TempDir {
