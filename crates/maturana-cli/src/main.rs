@@ -3435,16 +3435,21 @@ fn wait_for_guest_ssh(
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
+    // Keep the last attempt's error so the timeout failure names the real cause
+    // (host-key mismatch / auth / connection reset) instead of a black box.
+    let mut last_err: Option<String> = None;
     while Instant::now() < deadline {
-        if run_ssh_with_stdin(guest_ip, ssh_user, ssh_key, host_key, "echo ok", None).is_ok() {
-            return Ok(());
+        match run_ssh_with_stdin(guest_ip, ssh_user, ssh_key, host_key, "echo ok", None) {
+            Ok(_) => return Ok(()),
+            Err(error) => last_err = Some(format!("{error:#}")),
         }
         thread::sleep(Duration::from_secs(2));
     }
     anyhow::bail!(
-        "guest SSH did not become reachable at {} within {}s",
+        "guest SSH did not become reachable at {} within {}s (last SSH error: {})",
         guest_ip,
-        timeout.as_secs()
+        timeout.as_secs(),
+        last_err.as_deref().unwrap_or("none captured")
     )
 }
 
