@@ -220,6 +220,16 @@ adapter that copies Rust-rendered files into the image.
   agent before relaunching. If the PID is stale, relaunch can clean it.
 - Harness auth missing: inject Codex or Claude OAuth state directly into the
   guest auth path. Do not move OAuth into pipelock.
+- **`--apply` fails partway (hostd 500, SSH exit 255, guest command error):**
+  do NOT start editing `scripts/` or tweaking ssh flags to chase it. Capture the
+  evidence and stop: `.maturana/logs/hyperv-launch-<agent-id>.log` (the leaf
+  launcher) and `.maturana/logs/hostd.log` (the daemon), plus the exact failing
+  step. Report those. The leaf scripts are Rust-rendered/owned adapters — a real
+  fix goes into the Maturana source (e.g. `provider`/`worker` or the launcher in
+  the repo), not into a live hand-edit on this host, which only drifts the
+  install and masks the bug. (Example: an ssh exit 255 on a multi-line guest
+  command is a PowerShell quoting/CRLF problem in the launcher, not something to
+  fix by adding ssh options — it's fixed in the repo.)
 
 ## Boundaries
 
@@ -231,6 +241,11 @@ adapter that copies Rust-rendered files into the image.
   `install_guest_worker`). Never SSH into the guest to run apt/cp/systemctl
   yourself, and never author a PowerShell/bash wrapper to do it. If `--apply`
   fails, report its exact error and stop — do not reimplement provisioning.
+- **Do not edit the leaf scripts (`scripts/launch-ubuntu-cloudimg-hyperv.ps1`,
+  `firecracker-*.sh`, …) or tweak ssh options on this host to get past a launch
+  error.** They are Rust-rendered/owned adapters; a live hand-edit drifts the
+  install from source and hides the real bug. Collect the logs, report the
+  failing step, and fix it in the Maturana repo instead.
 - Do not add a queue or broker for command execution.
 - Do not add generic host command execution to hostd.
 - Do not copy host directories into the guest unless the spec declares them.
