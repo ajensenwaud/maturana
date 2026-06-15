@@ -748,7 +748,7 @@ fn handle_telegram_update(
             send_telegram(
                 token,
                 &chat_id.to_string(),
-                &status_text(home, config),
+                &status_text(home, &config.agent_id, &config.session_id, "telegram"),
                 reply_to_message_id,
             )?;
             Ok(())
@@ -780,8 +780,9 @@ fn handle_telegram_update(
                 )?;
                 return Ok(());
             }
-            let reply = handle_channel_command(home, config, chat_id, &name, &args)
-                .unwrap_or_else(|error| format!("Command failed: {error:#}"));
+            let reply =
+                handle_channel_command(home, &config.agent_id, &config.session_id, chat_id, &name, &args)
+                    .unwrap_or_else(|error| format!("Command failed: {error:#}"));
             send_telegram(token, &chat_id.to_string(), &reply, reply_to_message_id)?;
             Ok(())
         }
@@ -807,32 +808,7 @@ fn handle_telegram_update(
             name,
             prompt,
         } => {
-            let subagent_id = create_subagent(home, &config.agent_id, &name, mode, &prompt)?;
-            let paths = session_paths(
-                &home.agent_dir(&config.agent_id),
-                &format!("subagent-{subagent_id}"),
-            );
-            ensure_session(&paths)?;
-            insert_inbound(
-                &paths,
-                "spawn",
-                "subagent",
-                &subagent_id,
-                None,
-                &serde_json::json!({
-                    "text": prompt,
-                    "prompt": prompt,
-                    "subagent_id": subagent_id,
-                    "parent_agent_id": config.agent_id,
-                })
-                .to_string(),
-            )?;
-            audit_channel_event(
-                home,
-                &config.agent_id,
-                "channel.telegram.spawn",
-                "spawned sub-agent session",
-            )?;
+            let subagent_id = spawn_subagent(home, &config.agent_id, &name, mode, &prompt)?;
             send_telegram(
                 token,
                 &chat_id.to_string(),
@@ -917,6 +893,160 @@ fn handle_telegram_update(
             deliver_telegram_outbox(home, token, &config.agent_id, &config.session_id, chat_id)?;
             Ok(())
         }
+    }
+}
+
+/// Create a sub-agent and seed its session with the task prompt; returns the
+/// sub-agent id. Shared by the Telegram channel and the console command dispatcher.
+fn spawn_subagent(
+    home: &MaturanaHome,
+    agent_id: &str,
+    name: &str,
+    mode: SpawnMode,
+    prompt: &str,
+) -> anyhow::Result<String> {
+    let subagent_id = create_subagent(home, agent_id, name, mode, prompt)?;
+    let paths = session_paths(&home.agent_dir(agent_id), &format!("subagent-{subagent_id}"));
+    ensure_session(&paths)?;
+    insert_inbound(
+        &paths,
+        "spawn",
+        "subagent",
+        &subagent_id,
+        None,
+        &serde_json::json!({
+            "text": prompt,
+            "prompt": prompt,
+            "subagent_id": subagent_id,
+            "parent_agent_id": agent_id,
+        })
+        .to_string(),
+    )?;
+    audit_channel_event(home, agent_id, "channel.spawn", "spawned sub-agent session")?;
+    Ok(subagent_id)
+}
+
+/// A stable per-channel "chat key" for the console TUI, so commands that key off
+/// a chat id (transcript reset) have a consistent target.
+fn console_chat_key() -> i64 {
+    stable_chat_key("console:tui")
+}
+
+/// The full slash-command catalog the console TUI advertises (autocomplete +
+/// /help) — the Telegram command menu plus the TUI-local commands.
+pub(crate) fn console_command_catalog() -> Vec<(&'static str, &'static str)> {
+    let mut out: Vec<(&'static str, &'static str)> = vec![
+        ("/help", "show commands and keybindings"),
+        ("/clear", "clear the transcript view"),
+        ("/quit", "exit the chat"),
+    ];
+    for (_, cmds) in COMMAND_GROUPS {
+        for (name, desc) in *cmds {
+            if !out.iter().any(|(n, _)| n == name) {
+                out.push((name, desc));
+            }
+        }
+    }
+    out.push(("/good", "rate the last reply"));
+    out.push(("/bad", "rate the last reply"));
+    out
+}
+
+/// What a console slash command resolves to; the TUI renders/acts on this.
+pub(crate) enum ConsoleCommand {
+    /// Show this text in the transcript (no agent turn).
+    Reply(String),
+    /// Send this text to the agent as a normal turn.
+    Prompt(String),
+    /// Clear the on-screen transcript.
+    Clear,
+    /// Start a fresh session view (context reset).
+    NewSession,
+    /// Exit the TUI.
+    Quit,
+}
+
+/// Dispatch a slash command typed in the console TUI, reusing the same handlers
+/// the Telegram channel uses so the two stay at parity. `raw` includes the
+/// leading '/'.
+pub(crate) fn run_console_command(
+    home: &MaturanaHome,
+    agent_id: &str,
+    session_id: &str,
+    raw: &str,
+) -> ConsoleCommand {
+    let trimmed = raw.trim();
+    let (head, args) = match trimmed.split_once(char::is_whitespace) {
+        Some((h, a)) => (h, a.trim()),
+        None => (trimmed, ""),
+    };
+    let name = head
+        .trim_start_matches('/')
+        .replace('_', "-")
+        .to_ascii_lowercase();
+
+    match name.as_str() {
+        "help" | "start" => ConsoleCommand::Reply(format!(
+            "{}\n\nKeys: Enter send · Alt+Enter newline · PgUp/PgDn scroll · / menu · \
+             Esc interrupts a reply · Ctrl+C quits.",
+            help_text()
+        )),
+        "clear" => ConsoleCommand::Clear,
+        "quit" | "exit" => ConsoleCommand::Quit,
+        // Both reset the conversation view; /new and /reset behave the same here.
+        "new" | "reset" => {
+            let _ = reset_channel_context(home, agent_id, console_chat_key());
+            ConsoleCommand::NewSession
+        }
+        "status" => ConsoleCommand::Reply(status_text(home, agent_id, session_id, "console")),
+        "good" | "bad" => {
+            let value = if name == "good" {
+                signals::THUMBS_UP
+            } else {
+                signals::THUMBS_DOWN
+            };
+            let reply = match TrajectoryStore::open(&TrajectoryStore::store_path(home.root()))
+                .and_then(|store| store.reward_latest(agent_id, session_id, "console", value, None))
+            {
+                Ok(Some(_)) if value > 0.0 => "Logged a 👍 on the last reply.".to_string(),
+                Ok(Some(_)) => "Logged a 👎 on the last reply.".to_string(),
+                Ok(None) => "No recent agent turn to rate yet.".to_string(),
+                Err(error) => format!("Could not record feedback: {error:#}"),
+            };
+            ConsoleCommand::Reply(reply)
+        }
+        // /skill <name> [args] runs the skill via a normal turn (matches Telegram).
+        "skill" if !args.is_empty() => {
+            let (skill, rest) = match args.split_once(char::is_whitespace) {
+                Some((s, r)) => (s, r.trim()),
+                None => (args, ""),
+            };
+            ConsoleCommand::Prompt(format!("Use the `{skill}` skill. {rest}").trim().to_string())
+        }
+        // /emerge <task> spawns an ephemeral sub-agent on the task.
+        "emerge" if !args.is_empty() => {
+            match spawn_subagent(
+                home,
+                agent_id,
+                &slugify_channel_id(args),
+                SpawnMode::Ephemeral,
+                args,
+            ) {
+                Ok(id) => ConsoleCommand::Reply(format!("Spawned sub-agent `{id}` on the task.")),
+                Err(error) => ConsoleCommand::Reply(format!("Spawn failed: {error:#}")),
+            }
+        }
+        // Everything else with a text reply goes through the shared handler.
+        "commands" | "tools" | "models" | "model" | "stop" | "compact" | "session"
+        | "subagents" | "graph-query" | "graph-insert" | "tts" | "tts-provider" | "onboard"
+        | "skill" | "emerge" => {
+            match handle_channel_command(home, agent_id, session_id, console_chat_key(), &name, args)
+            {
+                Ok(reply) => ConsoleCommand::Reply(reply),
+                Err(error) => ConsoleCommand::Reply(format!("Command failed: {error:#}")),
+            }
+        }
+        _ => ConsoleCommand::Reply(format!("Unknown command /{name}. Try /help.")),
     }
 }
 
@@ -1502,16 +1632,17 @@ fn harness_label(home: &MaturanaHome, agent_id: &str) -> String {
     }
 }
 
-fn status_text(home: &MaturanaHome, config: &TelegramServe) -> String {
-    let settings = load_channel_settings(home, &config.agent_id);
-    let harness = harness_label(home, &config.agent_id);
+fn status_text(home: &MaturanaHome, agent_id: &str, session_id: &str, channel: &str) -> String {
+    let settings = load_channel_settings(home, agent_id);
+    let harness = harness_label(home, agent_id);
     let model = settings.model.unwrap_or_else(|| "(harness default)".to_string());
     let now = Utc::now().format("%Y-%m-%d %H:%M UTC");
     format!(
-        "Status\n  agent: {}\n  channel: telegram (session {})\n  presence: {}\n  harness: {}\n  model: {}\n  OS: {}\n  time: {}\n  idle: {}",
-        config.agent_id,
-        config.session_id,
-        channel_presence(home, &config.agent_id),
+        "Status\n  agent: {}\n  channel: {} (session {})\n  presence: {}\n  harness: {}\n  model: {}\n  OS: {}\n  time: {}\n  idle: {}",
+        agent_id,
+        channel,
+        session_id,
+        channel_presence(home, agent_id),
         harness,
         model,
         std::env::consts::OS,
@@ -1714,11 +1845,22 @@ fn channel_presence(home: &MaturanaHome, agent_id: &str) -> String {
 /// reset context). Side-effecting spawns/prompts are routed earlier in classify.
 fn handle_channel_command(
     home: &MaturanaHome,
-    config: &TelegramServe,
+    agent_id: &str,
+    session_id: &str,
     chat_id: i64,
     name: &str,
     args: &str,
 ) -> anyhow::Result<String> {
+    // Channel-agnostic: the console TUI and Telegram share this handler. A tiny
+    // owned shim keeps the body's `config.agent_id`/`config.session_id` reads intact.
+    struct Target {
+        agent_id: String,
+        session_id: String,
+    }
+    let config = Target {
+        agent_id: agent_id.to_string(),
+        session_id: session_id.to_string(),
+    };
     let reply = match name {
         "commands" => commands_text(),
         "tools" => tools_text(home),
@@ -4320,6 +4462,63 @@ mod tests {
 
     struct TempDir {
         path: PathBuf,
+    }
+
+    #[test]
+    fn console_command_dispatch_matches_telegram_catalog() {
+        let temp = temp_dir("console-commands");
+        let home = MaturanaHome::new(temp.path().join(".maturana"));
+        fs::create_dir_all(home.agent_dir("agent")).unwrap();
+
+        assert!(matches!(
+            run_console_command(&home, "agent", "telegram-main", "/clear"),
+            ConsoleCommand::Clear
+        ));
+        assert!(matches!(
+            run_console_command(&home, "agent", "telegram-main", "/quit"),
+            ConsoleCommand::Quit
+        ));
+        assert!(matches!(
+            run_console_command(&home, "agent", "telegram-main", "/new"),
+            ConsoleCommand::NewSession
+        ));
+        match run_console_command(&home, "agent", "telegram-main", "/status") {
+            ConsoleCommand::Reply(t) => {
+                assert!(t.contains("agent: agent"));
+                assert!(t.contains("console"));
+            }
+            _ => panic!("/status should produce a reply"),
+        }
+        // /skill <name> [args] runs the skill via a normal agent turn.
+        match run_console_command(&home, "agent", "telegram-main", "/skill summarize the notes") {
+            ConsoleCommand::Prompt(p) => assert_eq!(p, "Use the `summarize` skill. the notes"),
+            _ => panic!("/skill with args should be a prompt"),
+        }
+        // /model persists a setting and confirms it (shared with Telegram).
+        match run_console_command(&home, "agent", "telegram-main", "/model gpt-5") {
+            ConsoleCommand::Reply(t) => assert!(t.contains("gpt-5")),
+            _ => panic!("/model should reply"),
+        }
+        match run_console_command(&home, "agent", "telegram-main", "/bogus") {
+            ConsoleCommand::Reply(t) => assert!(t.contains("Unknown command")),
+            _ => panic!("unknown command should reply"),
+        }
+        // The catalog the TUI advertises includes the Telegram menu commands.
+        let names: Vec<&str> = console_command_catalog().into_iter().map(|(n, _)| n).collect();
+        for cmd in [
+            "/model",
+            "/models",
+            "/session",
+            "/tools",
+            "/subagents",
+            "/graph-query",
+            "/tts",
+            "/onboard",
+            "/new",
+            "/good",
+        ] {
+            assert!(names.contains(&cmd), "catalog missing {cmd}");
+        }
     }
 
     impl TempDir {

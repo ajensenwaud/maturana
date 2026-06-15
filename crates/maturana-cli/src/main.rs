@@ -4734,7 +4734,7 @@ pub(crate) fn agent_chat_turn(
     Ok(completed.text)
 }
 
-fn infer_agent_session_id(home: &MaturanaHome, agent_id: &str) -> anyhow::Result<String> {
+pub(crate) fn infer_agent_session_id(home: &MaturanaHome, agent_id: &str) -> anyhow::Result<String> {
     let env_path = home.agent_dir(agent_id).join("state/sessiond.env");
     if env_path.exists() {
         let raw = fs::read_to_string(&env_path)
