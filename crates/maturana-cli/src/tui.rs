@@ -113,9 +113,30 @@ impl App {
             .collect()
     }
 
+    /// Interrupt the in-flight turn: drop the receiver so the orphaned worker
+    /// thread's eventual result is discarded, and stop waiting locally. Used for
+    /// both a bare interrupt (Esc / Ctrl+X) and interrupt-and-redirect (a new
+    /// message sent while a reply is pending).
+    fn interrupt(&mut self, redirecting: bool) {
+        if !self.awaiting {
+            return;
+        }
+        self.reply_rx = None;
+        self.awaiting = false;
+        self.waited = None;
+        self.messages.push(ChatMsg {
+            role: Role::System,
+            text: if redirecting {
+                "↪ interrupted the previous turn — redirecting".to_string()
+            } else {
+                "✕ interrupted (the previous turn was abandoned)".to_string()
+            },
+        });
+    }
+
     fn submit(&mut self) {
         let text = self.input.trim_end().to_string();
-        if text.is_empty() || self.awaiting {
+        if text.is_empty() {
             return;
         }
         self.input.clear();
@@ -123,8 +144,15 @@ impl App {
         self.scrollback = 0;
 
         if text.starts_with('/') {
+            // Local commands run without disturbing an in-flight turn.
             self.handle_slash(&text);
             return;
+        }
+
+        // Interrupt-and-redirect: a new message while a reply is pending
+        // abandons the in-flight turn and starts this one.
+        if self.awaiting {
+            self.interrupt(true);
         }
 
         self.messages.push(ChatMsg {
@@ -152,7 +180,10 @@ impl App {
                 role: Role::System,
                 text: "Commands: /help /status /clear /quit\n\
                        Keys: Enter send · Alt+Enter or Ctrl+J newline · \
-                       PgUp/PgDn scroll · Esc/Ctrl+C quit · / for command menu"
+                       PgUp/PgDn scroll · / command menu\n\
+                       While the agent is replying: Esc or Ctrl+X interrupts; \
+                       just type a new message + Enter to interrupt and redirect. \
+                       Ctrl+C quits."
                     .to_string(),
             }),
             "/status" => self.messages.push(ChatMsg {
@@ -234,9 +265,14 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
                 let alt = key.modifiers.contains(KeyModifiers::ALT);
                 match key.code {
                     KeyCode::Char('c') if ctrl => app.quit = true,
+                    KeyCode::Char('x') if ctrl => app.interrupt(false),
                     KeyCode::Esc => {
                         if app.show_slash {
                             app.show_slash = false;
+                        } else if app.awaiting {
+                            // Esc interrupts an in-flight turn first; press again
+                            // (when idle) to quit.
+                            app.interrupt(false);
                         } else {
                             app.quit = true;
                         }
@@ -408,7 +444,8 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_footer(f: &mut Frame, area: Rect, _app: &App) {
     let hint = Line::from(vec![Span::styled(
-        " Enter send · Alt+Enter newline · / commands · PgUp/PgDn scroll · Esc quit ",
+        " Enter send · Alt+Enter newline · / commands · PgUp/PgDn scroll · \
+         Esc/Ctrl+X interrupt · Ctrl+C quit ",
         Style::default().fg(Color::DarkGray),
     )]);
     f.render_widget(Paragraph::new(hint), area);
