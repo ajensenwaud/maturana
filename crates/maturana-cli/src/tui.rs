@@ -36,20 +36,15 @@ struct ChatMsg {
     text: String,
 }
 
-/// Local slash commands handled by the TUI itself (channel-level commands like
-/// /reset live in the channel runners, not the local console).
-const SLASH: &[(&str, &str)] = &[
-    ("/help", "show commands and keybindings"),
-    ("/status", "agent, harness, and connection info"),
-    ("/clear", "clear the transcript view"),
-    ("/quit", "exit the chat"),
-];
+// Slash commands are sourced from `channels::console_command_catalog()` so the
+// console TUI stays at parity with the Telegram command menu.
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 struct App {
     home: MaturanaHome,
     agent_id: String,
+    session_id: String,
     harness: String,
     timeout_seconds: u64,
     messages: Vec<ChatMsg>,
@@ -77,9 +72,14 @@ impl App {
         })
         .unwrap_or("unknown")
         .to_string();
+        // Match the agent's guest worker session so commands (status, /session,
+        // feedback) target the same queue the turns use.
+        let session_id = crate::infer_agent_session_id(home, agent_id)
+            .unwrap_or_else(|_| "telegram-main".to_string());
         let mut app = Self {
             home: MaturanaHome::new(home.root().to_path_buf()),
             agent_id: agent_id.to_string(),
+            session_id,
             harness,
             timeout_seconds,
             messages: Vec::new(),
@@ -106,10 +106,9 @@ impl App {
 
     fn slash_matches(&self) -> Vec<(&'static str, &'static str)> {
         let q = self.input.trim();
-        SLASH
-            .iter()
+        crate::channels::console_command_catalog()
+            .into_iter()
             .filter(|(name, _)| name.starts_with(q))
-            .copied()
             .collect()
     }
 
@@ -144,17 +143,20 @@ impl App {
         self.scrollback = 0;
 
         if text.starts_with('/') {
-            // Local commands run without disturbing an in-flight turn.
+            // Slash commands run through the shared channel command pipeline
+            // (parity with Telegram) without disturbing an in-flight turn.
             self.handle_slash(&text);
             return;
         }
+        self.send_turn(text);
+    }
 
-        // Interrupt-and-redirect: a new message while a reply is pending
-        // abandons the in-flight turn and starts this one.
+    /// Send `text` to the agent as a normal turn, interrupting any in-flight
+    /// reply (interrupt-and-redirect).
+    fn send_turn(&mut self, text: String) {
         if self.awaiting {
             self.interrupt(true);
         }
-
         self.messages.push(ChatMsg {
             role: Role::User,
             text: text.clone(),
@@ -175,31 +177,25 @@ impl App {
     }
 
     fn handle_slash(&mut self, cmd: &str) {
-        match cmd {
-            "/help" => self.messages.push(ChatMsg {
+        use crate::channels::ConsoleCommand;
+        // The shared dispatcher reuses the exact handlers the Telegram channel
+        // uses, so the console TUI exposes the same command set.
+        match crate::channels::run_console_command(&self.home, &self.agent_id, &self.session_id, cmd)
+        {
+            ConsoleCommand::Reply(text) => self.messages.push(ChatMsg {
                 role: Role::System,
-                text: "Commands: /help /status /clear /quit\n\
-                       Keys: Enter send · Alt+Enter or Ctrl+J newline · \
-                       PgUp/PgDn scroll · / command menu\n\
-                       While the agent is replying: Esc or Ctrl+X interrupts; \
-                       just type a new message + Enter to interrupt and redirect. \
-                       Ctrl+C quits."
-                    .to_string(),
+                text,
             }),
-            "/status" => self.messages.push(ChatMsg {
-                role: Role::System,
-                text: format!(
-                    "agent: {}\nharness: {}\ntransport: sessiond (enqueue + wait)\n\
-                     reply timeout: {}s",
-                    self.agent_id, self.harness, self.timeout_seconds
-                ),
-            }),
-            "/clear" => self.messages.clear(),
-            "/quit" | "/exit" => self.quit = true,
-            other => self.messages.push(ChatMsg {
-                role: Role::System,
-                text: format!("Unknown command '{other}'. Try /help."),
-            }),
+            ConsoleCommand::Prompt(text) => self.send_turn(text),
+            ConsoleCommand::Clear => self.messages.clear(),
+            ConsoleCommand::NewSession => {
+                self.messages.clear();
+                self.messages.push(ChatMsg {
+                    role: Role::System,
+                    text: "New session started.".to_string(),
+                });
+            }
+            ConsoleCommand::Quit => self.quit = true,
         }
     }
 
