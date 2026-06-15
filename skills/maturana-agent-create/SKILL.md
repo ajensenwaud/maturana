@@ -132,6 +132,27 @@ build the whole agent in one go without stopping to re-confirm. Concretely:
    `maturana-image-gen`, `maturana-voice`, `maturana-graph` / `maturana-wiki`,
    `maturana-schedule`. Only enable what they ask for (least privilege), and add
    the matching `network.egress_allowlist` hosts each tool needs.
+
+   **Collect each tool's credential now — don't defer it.** A tool that needs an
+   API key is dead weight until the key is in pipelock, so for every selected
+   tool that requires one, ask for it in the same breath and store it via
+   `maturana pipelock set <key> --value <token>`, then reference it in the spec
+   (never paste the raw value in). Read the tool's own SKILL.md for the exact key
+   and wiring. Common ones:
+   - **Notion** → ask for the integration token (`ntn_…`):
+     `maturana pipelock set notion/integration-token --value <ntn_…>`, and declare
+     the MCP server in the spec: `mcp_servers: [{ name: notion, command: npx,
+     args: ["-y","@notionhq/notion-mcp-server"], env: [{ name: NOTION_TOKEN,
+     source: "pipelock:notion/integration-token" }], egress_hosts: ["api.notion.com"] }]`.
+   - **Web search** → Brave or Tavily key (`pipelock:search/brave-key` or
+     `search/tavily-key`).
+   - **GitHub** → a PAT (`pipelock:github/token`).
+   - **Image-gen / Voice** → the provider key (e.g. OpenAI, ElevenLabs) under the
+     key the tool's skill documents.
+   If the user doesn't have a key yet, point them at where to create it (e.g.
+   Notion: Settings → Connections → develop/integrations), and only enable the
+   tool once the key is stored. Read it with `read -s`-style secrecy — never echo
+   tokens back or write them anywhere but pipelock.
 7. **Memory, wiki, schedules.** Enable memory + wiki paths. Offer schedules
    (e.g. a morning brief) via the `maturana-schedule` skill.
 8. **Backups (snapshots).** In plain terms: offer automatic backups so you can
