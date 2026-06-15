@@ -26,6 +26,9 @@ sha2.workspace = true
 ureq = { version = "2.10.1", features = ["json"] }
 # Slack Socket Mode is a client WebSocket (Telegram/AgentMail are HTTP-pollable).
 tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+# Console TUI (`maturana agent chat`). ratatui re-exports crossterm, so we don't
+# pin a second copy.
+ratatui = "0.29"
 
 [features]
 default = []

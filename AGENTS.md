@@ -58,7 +58,7 @@ Codex is the product surface for defining, configuring, building, and running th
 - Maturana supports headless Chrome inside the microVM for browsing.
 - Maturan provides a shared context graph based on Karpathy's LLM wiki pattern (see https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f). Every agent exposes a skill for updating the wiki. It loaded into agent memory on-demand.
 - All agents are always-on agents with heartbeat, contex,t scheduling, and notifications.
-- Agents communicate with users through a consoloe TUI, Telegram, and Discord.
+- Agents communicate with users through a console TUI (`maturana agent chat <id>`), Telegram, and Discord.
 - Credentials (except OAuth tokens for OpenAI and Claude Code) are handled through a Pipelock-style egress governance and credentials handling module.  
 - Maturana can stop, snaphot and rewind an agent to a desired snapshot in case of a fault or compromise. This is done using skills that invoke system calls through Rust runtime.
 - Maturana supports guest VM agent harnesses (Claude Code, Codex) that use OAuth (subscription) for authentication. OAuth credentials need to be injected into to the VMs from the hos at runtime.
