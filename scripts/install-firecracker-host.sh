@@ -60,10 +60,26 @@ else
   say "e2fsprogs, cloud-image-utils, iproute2 and iptables yourself, then re-run"
 fi
 
-# libguestfs on some distros needs a readable kernel to build its appliance.
-if [ -f "/boot/vmlinuz-$(uname -r)" ] && [ ! -r "/boot/vmlinuz-$(uname -r)" ]; then
-  say "making /boot/vmlinuz readable for libguestfs"
-  $SUDO chmod 0644 "/boot/vmlinuz-$(uname -r)" || true
+# libguestfs (supermin) builds its appliance from the host kernel and picks the
+# NEWEST /boot/vmlinuz-*, which Ubuntu ships mode 0600. As a non-root user the
+# firecracker image build then dies with a cryptic "supermin exited with error
+# status 1". Make ALL installed kernels readable — not just the running one: a
+# pending-reboot kernel upgrade is exactly when newest != $(uname -r), which is
+# the case that slips through a $(uname -r)-only fix. Then install a kernel
+# postinst hook so a future upgrade can't silently re-break it.
+if ls /boot/vmlinuz-* >/dev/null 2>&1; then
+  say "making /boot/vmlinuz-* readable for libguestfs"
+  $SUDO chmod 0644 /boot/vmlinuz-* 2>/dev/null || true
+fi
+if [ -d /etc/kernel/postinst.d ]; then
+  $SUDO tee /etc/kernel/postinst.d/zz-maturana-readable-vmlinuz >/dev/null <<'HOOK' 2>/dev/null || true
+#!/bin/sh
+# maturana: keep /boot/vmlinuz-* world-readable so the non-root firecracker
+# image build (libguestfs/supermin) can read the host kernel after a kernel
+# upgrade. See scripts/firecracker-prepare-assets.sh.
+chmod 0644 /boot/vmlinuz-* 2>/dev/null || true
+HOOK
+  $SUDO chmod 0755 /etc/kernel/postinst.d/zz-maturana-readable-vmlinuz 2>/dev/null || true
 fi
 
 # 3. extract-vmlinux: prepare-assets uses it to unpack the guest kernel; it's a
