@@ -522,9 +522,35 @@ fn validate_firecracker_prerequisites(
 fn ensure_kvm_ready() -> anyhow::Result<()> {
     let path = Path::new("/dev/kvm");
     if !path.exists() {
-        // Vendor-agnostic: this only means the kvm module isn't loaded (works the
-        // same for Intel vmx and AMD svm). Point at the enabler rather than a
-        // bare failure.
+        // /dev/kvm is missing from THIS process's view, which has two very
+        // different causes: (a) KVM genuinely isn't enabled on the host, or
+        // (b) the command is running inside a harness/agent SANDBOX (e.g. a
+        // sandboxed `codex` command) that hides device nodes — the host has KVM
+        // but this process can't see it. Probe the host cheaply so the message
+        // points at the right fix instead of sending people to kvm-enable.sh
+        // when KVM is already on.
+        let kvm_loaded = fs::read_to_string("/proc/modules")
+            .map(|m| {
+                m.lines().any(|l| {
+                    l.starts_with("kvm ")
+                        || l.starts_with("kvm_intel")
+                        || l.starts_with("kvm_amd")
+                })
+            })
+            .unwrap_or(false);
+        let virt_capable = fs::read_to_string("/proc/cpuinfo")
+            .map(|c| c.contains("vmx") || c.contains("svm"))
+            .unwrap_or(false);
+        if kvm_loaded || virt_capable {
+            anyhow::bail!(
+                "/dev/kvm is not visible to this process, but the host has KVM \
+                 (kvm module loaded or VT-x/AMD-V present). The likely cause is that \
+                 this command is running inside a harness/agent SANDBOX that hides \
+                 device nodes. Run the agent launch OUTSIDE the sandbox - directly in \
+                 a shell, not via a sandboxed `codex`/agent command. (If this really \
+                 is a bare host with no KVM, run scripts/kvm-enable.sh.)"
+            );
+        }
         anyhow::bail!(
             "/dev/kvm does not exist - KVM is not enabled on this host. \
              Run scripts/kvm-enable.sh (it loads the kvm_intel/kvm_amd module \

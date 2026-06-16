@@ -26,6 +26,13 @@ validate, materialize, apply, and verify. Do not skip straight to live launch.
 - Confirm required host prerequisites exist:
   - Windows: hostd scheduled task, Ubuntu VHDX, SSH key, and Hyper-V enabled.
   - Linux: Firecracker binary, `/dev/kvm`, TAP device, kernel, and rootfs.
+- Linux only — run the launch OUTSIDE the harness sandbox. The launch opens
+  `/dev/kvm` and runs `sudo` for the per-agent TAP, which a sandboxed `codex`/
+  agent command cannot do. If you see `/dev/kvm does not exist` (or `is not
+  visible to this process`) while the host clearly has KVM (`ls -l /dev/kvm`
+  works in a plain shell), the sandbox is hiding the device node — re-run the
+  launch unsandboxed (a plain shell, or the harness with its sandbox bypassed).
+  Do NOT run `kvm-enable.sh`; KVM is already on.
 - Confirm harness auth source exists for Codex/Claude/OpenCode OAuth-based
   runtimes before launch.
 - Confirm a replacement launch is intentional before setting force flags.
