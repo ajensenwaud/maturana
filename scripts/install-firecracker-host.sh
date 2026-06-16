@@ -111,10 +111,25 @@ say "enabling IPv4 forwarding (persistent)"
 $SUDO sysctl -w net.ipv4.ip_forward=1 >/dev/null
 echo 'net.ipv4.ip_forward=1' | $SUDO tee /etc/sysctl.d/99-maturana.conf >/dev/null
 
-# 6. Passwordless sudo reminder — the per-agent TAP setup needs it.
-if ! sudo -n true 2>/dev/null && [ "$(id -u)" -ne 0 ]; then
-  say "NOTE: firecracker-setup-tap.sh needs passwordless sudo. Add a late-ordering rule:"
-  say "      echo '$USER ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/90-maturana"
+# 6. SCOPED passwordless sudo for the per-agent TAP/NAT setup, so agent launches
+#    don't block on an interactive password. This grants NOPASSWD for ONLY the
+#    exact net commands firecracker-setup-tap.sh runs (ip / iptables / sysctl) —
+#    NOT a blanket "NOPASSWD: ALL". Paths are resolved on this host so the rule
+#    matches what the script actually executes, and validated with visudo (a
+#    malformed sudoers file is dangerous, so roll back on parse error).
+if [ "$(id -u)" -ne 0 ]; then
+  ip_bin="$(command -v ip || echo /usr/sbin/ip)"
+  iptables_bin="$(command -v iptables || echo /usr/sbin/iptables)"
+  sysctl_bin="$(command -v sysctl || echo /usr/sbin/sysctl)"
+  say "granting scoped passwordless sudo for TAP setup (ip, iptables, sysctl)"
+  printf '%s ALL=(root) NOPASSWD: %s, %s, %s\n' \
+    "$USER" "$ip_bin" "$iptables_bin" "$sysctl_bin" \
+    | $SUDO tee /etc/sudoers.d/90-maturana-net >/dev/null
+  $SUDO chmod 0440 /etc/sudoers.d/90-maturana-net
+  if ! $SUDO visudo -cf /etc/sudoers.d/90-maturana-net >/dev/null 2>&1; then
+    say "WARNING: sudoers validation failed; removing the rule (fix paths and re-run)"
+    $SUDO rm -f /etc/sudoers.d/90-maturana-net
+  fi
 fi
 
 say "firecracker host ready"

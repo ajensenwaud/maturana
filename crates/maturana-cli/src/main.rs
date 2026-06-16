@@ -3059,13 +3059,15 @@ fn start_linux_graph(home: &MaturanaHome, bind: &str, token: &str) -> anyhow::Re
 }
 
 fn setup_firecracker_tap(profile: &FirecrackerHarnessProfile) -> anyhow::Result<()> {
-    // Invoke through `bash` rather than executing the script directly: the repo
-    // is often checked out from Windows (no +x bit tracked), so a direct
-    // `sudo ./script.sh` fails with EACCES — and this is exactly the boot-
-    // recovery path that must work unattended.
+    // Run the script AS THE USER (through `bash`, since a Windows checkout tracks
+    // no +x bit) — NOT wrapped in `sudo`. The script elevates per command via
+    // `sudo -n ip/iptables/sysctl`, which the scoped /etc/sudoers.d/90-maturana-net
+    // rule (from install-firecracker-host.sh) allows passwordless. Wrapping the
+    // whole script in `sudo bash` would instead require NOPASSWD on bash, defeating
+    // the scoping; running as root (boot recovery) still works — priv() runs the
+    // commands directly.
     run_checked_process(
-        ProcessCommand::new("sudo")
-            .arg("bash")
+        ProcessCommand::new("bash")
             .arg("./scripts/firecracker-setup-tap.sh")
             .arg(profile.tap_name)
             .arg(format!("{}/30", profile.host_ip))
