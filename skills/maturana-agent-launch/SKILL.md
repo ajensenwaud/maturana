@@ -196,6 +196,43 @@ The three ready profiles are `codex-firecracker`, `claude-firecracker`,
 `opencode-firecracker`. Custom-named agents reuse one of those three networking
 slots; Maturana does not allocate new subnets per agent.
 
+### Inspect before you relaunch (don't cycle a healthy VM)
+
+Re-running `setup firecracker-harnesses` **stops and relaunches** the agent's
+Firecracker VM. Don't do that to a working agent: a needless relaunch can hit a
+transient Firecracker death (e.g. a guest RTC-port error flood), briefly taking
+the agent down. First check live state and only (re)provision if it's actually
+down:
+
+```bash
+maturana agent inspect <agent-id> --live        # look at live.state
+# running        -> healthy; do NOT relaunch. Just submit turns.
+# stale-pid / stopped / running-missing-socket -> then:
+maturana setup firecracker-harnesses --agent-id <agent-id> --skip-services --skip-assets
+```
+
+If a relaunch does leave the VM dead (`inspect` shows `stale-pid`, TAP
+`DOWN`/`NO-CARRIER`, guest unpingable), just relaunch once more — it is normally
+a one-off; confirm the firecracker pid is stable for ~25s before declaring
+success.
+
+### Driving setup/verify through Codex
+
+To drive the install/verify **through Codex** on the host, Codex must run
+**unsandboxed** — the flow opens `/dev/kvm`, reaches `sessiond` on localhost, and
+`sudo`s for the TAP, all of which the default sandbox blocks (you'd see the
+misleading `/dev/kvm does not exist`). Use `codex exec
+--dangerously-bypass-approvals-and-sandbox -C <repo>` (or a `[profiles.*]` with
+`sandbox_mode = "danger-full-access"`, `network_access = true`,
+`approval_policy = "never"`). **Over SSH, redirect stdin from `/dev/null`** —
+otherwise `codex exec` prints `Reading additional input from stdin...` and hangs
+until timeout reading the never-closed pipe:
+
+```bash
+ssh host 'cd <repo> && codex exec --dangerously-bypass-approvals-and-sandbox \
+  -C <repo> "follow maturana-agent-launch to inspect + verify <agent-id>" < /dev/null'
+```
+
 On `aidev`, use specs with `vm.provider: firecracker` and explicit
 `vm.firecracker.kernel_image`, `rootfs_image`, `tap_name`, `host_ip`, and
 `guest_ip`. The spec is the source of truth for Firecracker addressing; do not
