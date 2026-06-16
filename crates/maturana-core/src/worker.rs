@@ -415,8 +415,41 @@ def post(kind, text):
     except Exception:
         pass
 
+US = "\x1f"  # separates the tool key from its detail in a "tool" progress event
+
 def first_line(s, n):
     return (s or "").strip().split("\n", 1)[0][:n]
+
+def detail_of(item, *keys):
+    for k in keys:
+        v = item.get(k)
+        if isinstance(v, str) and v.strip():
+            return first_line(v, 200)
+        if isinstance(v, (int, float)):
+            return str(v)
+        if isinstance(v, dict):
+            inner = detail_of(v, "query", "command", "path", "url", "name")
+            if inner:
+                return inner
+    return ""
+
+def files_of(item):
+    changes = item.get("changes") or item.get("files") or []
+    out = []
+    if isinstance(changes, list):
+        for c in changes:
+            if isinstance(c, dict):
+                p = c.get("path") or c.get("file")
+                if p:
+                    out.append(p)
+            elif isinstance(c, str):
+                out.append(c)
+    return ", ".join(out)[:200]
+
+def emit_tool(key, detail):
+    # Structured tool line: the host maps the key to an icon + title and renders
+    # the detail in monospace (OpenClaw-style rich progress).
+    post("tool", key + US + (detail or ""))
 
 for line in sys.stdin:
     line = line.strip()
@@ -429,16 +462,36 @@ for line in sys.stdin:
     t = ev.get("type", "")
     item = ev.get("item", {}) if isinstance(ev.get("item"), dict) else {}
     it = item.get("type", "")
-    if t == "item.started" and it == "command_execution":
-        post("tool", "running: " + first_line(item.get("command"), 120))
-    elif t == "item.completed" and it == "command_execution":
-        code = item.get("exit_code")
-        label = "done" if code == 0 else "failed (%s)" % code
-        post("tool", label + ": " + first_line(item.get("command"), 80))
-    elif t == "item.completed" and it == "agent_message":
-        txt = item.get("text") or ""
-        final.append(txt)
-        post("text", txt[:3500])
+    if t == "item.started":
+        if it == "command_execution":
+            emit_tool("bash", detail_of(item, "command"))
+        elif it == "web_search":
+            emit_tool("web_search", detail_of(item, "query", "search_query", "action"))
+        elif it == "file_change":
+            emit_tool("edit", detail_of(item, "path") or files_of(item))
+        elif it in ("mcp_tool_call", "tool_call", "function_call"):
+            emit_tool("tool_call", detail_of(item, "tool", "name", "server", "invocation"))
+        elif it in ("patch_apply", "apply_patch"):
+            emit_tool("apply_patch", detail_of(item, "path") or files_of(item))
+        elif it in ("agent_message", "reasoning"):
+            pass  # surfaced on completion below
+        elif it:
+            emit_tool(it, detail_of(item, "command", "query", "path", "url", "name", "tool"))
+    elif t == "item.completed":
+        if it == "command_execution":
+            code = item.get("exit_code")
+            if code not in (0, None):
+                emit_tool("bash", "exit %s: %s" % (code, detail_of(item, "command")))
+        elif it == "agent_message":
+            txt = item.get("text") or ""
+            final.append(txt)
+            post("text", txt[:3500])
+        elif it == "reasoning":
+            txt = item.get("text") or item.get("summary") or ""
+            if isinstance(txt, list):
+                txt = " ".join(str(x) for x in txt)
+            if (txt or "").strip():
+                post("thinking", first_line(txt, 240))
     elif t in ("turn.failed", "error"):
         post("status", "error")
 
