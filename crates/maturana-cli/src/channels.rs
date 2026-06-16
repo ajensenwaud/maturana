@@ -9,7 +9,7 @@ use maturana_core::{
     secrets::resolve_secret_source_with_home,
     session_db::{
         claim_delivery, clear_progress, ensure_session, insert_inbound, list_undelivered,
-        mark_delivered, session_paths, SessionPaths,
+        mark_delivered, read_progress, session_paths, unclaim_delivery, ProgressEvent, SessionPaths,
     },
     spec::{AgentSpec, HarnessRuntime},
     state::MaturanaHome,
@@ -32,6 +32,13 @@ use crate::session::{message_text, run_session_once, RunnerOptions};
 const TELEGRAM_PAIR_CODE: &str = "telegram/pair-code";
 const TELEGRAM_CHAT_ID: &str = "telegram/chat-id";
 const MAX_RESPONSE_CHARS: usize = 3500;
+/// The 1s background delivery thread only backstops a telegram reply once it is
+/// older than this — comfortably past the inline streaming loop's own deadline
+/// (`STREAM_TURN_TIMEOUT`), so the two never edit the live message concurrently.
+const STREAM_BACKSTOP_AGE: Duration = Duration::from_secs(360);
+/// How long the inline streaming loop animates + waits for a turn's reply before
+/// handing the (undelivered) reply off to the background backstop.
+const STREAM_TURN_TIMEOUT: Duration = Duration::from_secs(300);
 const IDENTITY_CONTEXT_CHARS: usize = 4000;
 const SOUL_CONTEXT_CHARS: usize = 4000;
 const CONTRACT_CONTEXT_CHARS: usize = 5000;
@@ -566,12 +573,16 @@ fn serve_telegram(home: &MaturanaHome, config: TelegramServe) -> anyhow::Result<
             let home = MaturanaHome::new(deliver_root);
             loop {
                 if let Some(chat_id) = current_paired_telegram_chat_id(&home, &deliver_agent) {
+                    // Backstop only: never deliver a reply whose inline streaming
+                    // loop may still be live (it owns the single live message).
+                    // STREAM_BACKSTOP_AGE exceeds the streamer's whole deadline.
                     let _ = deliver_telegram_outbox(
                         &home,
                         &deliver_token,
                         &deliver_agent,
                         &deliver_session,
                         chat_id,
+                        Some(STREAM_BACKSTOP_AGE),
                     );
                 }
                 thread::sleep(Duration::from_secs(1));
@@ -651,6 +662,7 @@ fn serve_telegram(home: &MaturanaHome, config: TelegramServe) -> anyhow::Result<
                     &config.agent_id,
                     &config.session_id,
                     chat_id,
+                    None,
                 )?;
             }
             break;
@@ -897,7 +909,9 @@ fn handle_telegram_update(
             // "working…" placeholder. The loop marks the final outbound delivered
             // so the delivery thread doesn't re-send; on timeout it leaves the late
             // final to that thread.
-            stream_turn_to_telegram(
+            // Best-effort: a streamer error must not stop the trailing delivery
+            // (which is what actually gets the reply out for this turn).
+            if let Err(error) = stream_turn_to_telegram(
                 home,
                 token,
                 config,
@@ -905,9 +919,13 @@ fn handle_telegram_update(
                 &inbound_id,
                 reply_to_message_id,
                 &paths,
-                Duration::from_secs(300),
-            )?;
-            deliver_telegram_outbox(home, token, &config.agent_id, &config.session_id, chat_id)?;
+                STREAM_TURN_TIMEOUT,
+            ) {
+                eprintln!("telegram streamer error (delivering anyway): {error:#}");
+            }
+            // The streaming loop already owned delivery; this trailing call is a
+            // same-thread fallback for the timed-out / errored case, so deliver now.
+            deliver_telegram_outbox(home, token, &config.agent_id, &config.session_id, chat_id, None)?;
             Ok(())
         }
     }
@@ -1067,12 +1085,20 @@ pub(crate) fn run_console_command(
     }
 }
 
+/// Deliver pending telegram replies. `min_age` gates how old an outbound must be
+/// before this path will deliver it: the inline path (the streaming loop already
+/// returned) passes `None` to deliver immediately, while the concurrent 1s
+/// background thread passes a value LARGER than the streamer's whole deadline, so
+/// it only ever acts as a backstop for a turn whose streamer died — it never edits
+/// the live message while a streamer is still animating it (which would race the
+/// answer back to a spinner).
 fn deliver_telegram_outbox(
     home: &MaturanaHome,
     token: &str,
     agent_id: &str,
     session_id: &str,
     chat_id: i64,
+    min_age: Option<Duration>,
 ) -> anyhow::Result<usize> {
     let paths = session_paths(&home.agent_dir(agent_id), session_id);
     ensure_session(&paths)?;
@@ -1081,36 +1107,86 @@ fn deliver_telegram_outbox(
         if message.channel != "telegram" || message.platform_id != chat_id.to_string() {
             continue;
         }
-        // Atomic claim: the streaming render loop / inline fallback also deliver,
-        // so claim first or the same reply goes out multiple times.
+        // Backstop gate: skip replies younger than `min_age` so the concurrent
+        // background thread never delivers a reply whose streaming loop is still
+        // live (which owns the single live message). Stale replies — a turn whose
+        // streamer died — fall through and get delivered here.
+        if let Some(min_age) = min_age {
+            if (Utc::now() - message.created_at)
+                .to_std()
+                .map(|age| age < min_age)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+        }
+        // Atomic claim: the streaming render loop and this delivery thread both
+        // deliver, so claim first or the same reply goes out multiple times.
         if !claim_delivery(&paths, &message.id)? {
             continue;
         }
-        let response = truncate_for_telegram(&message_text(&message.content)?);
-        // A proactive self-check that decided there's nothing worth saying emits
-        // the silence sentinel: already claimed above, so just skip messaging.
+        // Drop an unparseable outbound rather than spinning on it forever (the
+        // parse error is deterministic; leaving it claimed-and-unhandled would wedge).
+        let response = match message_text(&message.content) {
+            Ok(text) => truncate_for_telegram(&text),
+            Err(error) => {
+                eprintln!("telegram: dropping unparseable outbound {}: {error:#}", message.id);
+                let _ = mark_delivered(&paths, &message.id, None);
+                continue;
+            }
+        };
+        // The streaming loop leaves a single live "working…" message for this turn
+        // (its id recorded in the marker). Whoever wins the claim turns THAT same
+        // message into the final reply by editing it in place — so the progress
+        // animation becomes the answer, one clean message, never a duplicate. Peek
+        // (don't consume) the marker so a failed attempt can retry the same message.
+        let inbound = message.in_reply_to.as_deref();
+        let live_id = inbound.and_then(|inbound| peek_telegram_status(&paths, inbound));
+        // A self-check that decided there's nothing worth saying emits the silence
+        // sentinel: remove any live message (best-effort) and finalize regardless, so
+        // a failed delete can never wedge the turn into an endless retry.
         if response.trim() == crate::proactive::SILENCE_SENTINEL {
+            if let Some(id) = live_id {
+                let _ = delete_telegram_message(token, chat_id, id);
+            }
+            if let Some(inbound) = inbound {
+                clear_telegram_status(&paths, inbound);
+            }
+            let _ = mark_delivered(&paths, &message.id, None);
             continue;
         }
         let reply_to_message_id = message
             .thread_id
             .as_deref()
             .and_then(|value| value.parse::<i64>().ok());
-        let platform_message_id =
-            send_telegram(token, &chat_id.to_string(), &response, reply_to_message_id)?;
-        append_channel_turn(home, agent_id, chat_id, "assistant", &response)?;
-        mark_delivered(
-            &paths,
-            &message.id,
-            platform_message_id.map(|id| id.to_string()).as_deref(),
-        )?;
-        audit_channel_event(
-            home,
-            agent_id,
-            "channel.telegram.outbound",
-            "sent telegram response",
-        )?;
-        delivered += 1;
+        match finalize_reply(token, chat_id, live_id, &response, reply_to_message_id) {
+            Ok(platform_message_id) => {
+                // Finalize the claim (the row already exists from claim_delivery, so a
+                // mark_delivered hiccup can't re-open it for a duplicate send).
+                let _ = mark_delivered(
+                    &paths,
+                    &message.id,
+                    platform_message_id.map(|id| id.to_string()).as_deref(),
+                );
+                if let Some(inbound) = inbound {
+                    clear_telegram_status(&paths, inbound);
+                }
+                let _ = append_channel_turn(home, agent_id, chat_id, "assistant", &response);
+                let _ = audit_channel_event(
+                    home,
+                    agent_id,
+                    "channel.telegram.outbound",
+                    "sent telegram response",
+                );
+                delivered += 1;
+            }
+            Err(error) => {
+                // Could not deliver without risking a duplicate: release the claim
+                // so a later pass retries, instead of dropping the reply forever.
+                eprintln!("telegram delivery failed, will retry: {error:#}");
+                unclaim_delivery(&paths, &message.id)?;
+            }
+        }
     }
     if delivered > 0 {
         println!("telegram outbound responses sent: {delivered}");
@@ -2217,10 +2293,35 @@ fn send_telegram(
     message: &str,
     reply_to_message_id: Option<i64>,
 ) -> anyhow::Result<Option<i64>> {
+    send_telegram_with(token, chat_id, message, reply_to_message_id, None)
+}
+
+/// Send an HTML-formatted message (Telegram `parse_mode: "HTML"`), used for the
+/// rich live progress draft (bold tool titles + monospace detail). All dynamic
+/// content MUST be passed through `html_escape` by the caller.
+fn send_telegram_html(
+    token: &str,
+    chat_id: &str,
+    html: &str,
+    reply_to_message_id: Option<i64>,
+) -> anyhow::Result<Option<i64>> {
+    send_telegram_with(token, chat_id, html, reply_to_message_id, Some("HTML"))
+}
+
+fn send_telegram_with(
+    token: &str,
+    chat_id: &str,
+    message: &str,
+    reply_to_message_id: Option<i64>,
+    parse_mode: Option<&str>,
+) -> anyhow::Result<Option<i64>> {
     let mut body = serde_json::json!({
         "chat_id": chat_id,
         "text": message,
     });
+    if let Some(mode) = parse_mode {
+        body["parse_mode"] = serde_json::json!(mode);
+    }
     if let Some(message_id) = reply_to_message_id {
         body["reply_parameters"] = serde_json::json!({
             "message_id": message_id,
@@ -2374,14 +2475,203 @@ fn send_telegram_chat_action(token: &str, chat_id: &str, action: &str) -> anyhow
 /// Run a registered wasm tool from Telegram with an OpenClaw-style animated
 /// status message, post its output, and capture the run as a self-improvement
 /// trajectory (so `/good` / `/bad` can reward it afterwards).
-/// Render the live progress side-lane into one Telegram status message: the
-/// recent tool lines plus the agent's streamed text so far. Plain text
-/// (editMessageText carries no parse_mode), bounded to Telegram's message size.
-/// Wait for a turn's reply and deliver it to Telegram exactly once
-/// (`claim_delivery` guards against the 1s delivery thread racing it). It does
-/// not post a separate in-progress status message — doing so left an orphaned
-/// progress message next to the reply whenever the delivery thread won the race.
-/// Live progress still streams to the sessiond side-lane for the web cockpit.
+/// Escape text for Telegram `parse_mode: "HTML"` (only `&`, `<`, `>` are special).
+fn html_escape(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Collapse internal whitespace/newlines so a multi-line command renders as a
+/// single compact progress line.
+fn collapse_ws(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Title-case an unknown tool key (`record_voice` → `Record Voice`) for the
+/// fallback display, mirroring OpenClaw's `defaultTitle`.
+fn titleize(key: &str) -> String {
+    key.split(|c| c == '_' || c == '-' || c == ' ')
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Map a tool key to its (emoji, title) — ported from OpenClaw's
+/// `tool-display.json` so the live progress reads the same way: a glanceable icon
+/// plus a human title. Unknown keys fall back to 🧩 + a title-cased key.
+fn tool_display(key: &str) -> (&'static str, String) {
+    let known: Option<(&str, &str)> = match key.trim().to_ascii_lowercase().as_str() {
+        "bash" | "exec" | "shell" | "command" | "command_execution" => Some(("🛠️", "Bash")),
+        "process" => Some(("🧰", "Process")),
+        "read" => Some(("📖", "Read")),
+        "write" => Some(("✍️", "Write")),
+        "edit" | "file_change" | "apply_patch" | "patch" => Some(("📝", "Edit")),
+        "attach" => Some(("📎", "Attach")),
+        "browser" | "browse" => Some(("🌐", "Browser")),
+        "web_search" | "search" | "websearch" => Some(("🔎", "Web Search")),
+        "web_fetch" | "fetch" => Some(("📄", "Web Fetch")),
+        "code_execution" => Some(("🧮", "Code Execution")),
+        "update_plan" | "plan" | "todo_list" | "todo" => Some(("🗺️", "Update Plan")),
+        "memory_search" => Some(("🗄️", "Memory Search")),
+        "memory_get" => Some(("📓", "Memory Get")),
+        "image" | "image_generate" => Some(("🎨", "Image")),
+        "mcp_tool_call" | "tool_call" | "tool_call_update" => Some(("🧰", "Tool Call")),
+        "message" => Some(("✉️", "Message")),
+        _ => None,
+    };
+    match known {
+        Some((emoji, title)) => (emoji, title.to_string()),
+        None => ("🧩", titleize(key)),
+    }
+}
+
+/// A worker tool event carries `"<toolkey>\u{1f}<detail>"` (new) or a legacy
+/// `"running: <cmd>" / "done: <cmd>"` string (old guest worker). Parse either into
+/// `(toolkey, detail)`.
+fn parse_tool_event(text: &str) -> (String, String) {
+    if let Some((key, detail)) = text.split_once('\u{1f}') {
+        return (key.trim().to_string(), detail.to_string());
+    }
+    let detail = text
+        .strip_prefix("running: ")
+        .or_else(|| text.strip_prefix("done: "))
+        .or_else(|| text.find("): ").map(|i| &text[i + 3..]))
+        .unwrap_or(text);
+    ("bash".to_string(), detail.to_string())
+}
+
+/// Render the live progress side-lane as ONE OpenClaw-style draft: a single
+/// monospace block (Telegram `<pre>` — the "different font") of the tools the
+/// agent is running, e.g.
+/// ```text
+/// 🛠️ rg foo
+/// 🔎 Web Search: L:Ron:Harald top songs
+/// ```
+/// Empty when there's nothing to show yet. Sent with `parse_mode: "HTML"`; the
+/// block content is HTML-escaped. No "thinking"/brain chatter — just the tools.
+fn render_progress_html(events: &[ProgressEvent]) -> String {
+    let mut lines: Vec<(String, String)> = Vec::new();
+    let mut text = "";
+    let mut errored = false;
+    for event in events {
+        match event.kind.as_str() {
+            "tool" => lines.push(parse_tool_event(&event.text)),
+            "text" => text = event.text.as_str(),
+            "status" if event.text == "error" => errored = true,
+            // "thinking" is intentionally ignored — show actions, not a brain-dump.
+            _ => {}
+        }
+    }
+    let mut block = String::new();
+    for (key, detail) in lines.iter().rev().take(8).rev() {
+        let (emoji, title) = tool_display(key);
+        let detail = collapse_ws(detail.trim());
+        let line = if key == "bash" || key == "exec" {
+            // Shell commands: just the icon + command (OpenClaw drops the label).
+            if detail.is_empty() {
+                format!("{emoji} {title}")
+            } else {
+                format!("{emoji} {detail}")
+            }
+        } else if detail.is_empty() {
+            format!("{emoji} {title}")
+        } else {
+            format!("{emoji} {title}: {detail}")
+        };
+        block.push_str(&truncate_chars(&line, 160));
+        block.push('\n');
+    }
+    let block = block.trim_end();
+    if !block.is_empty() {
+        // Whole block in monospace — the "different font" the live progress reads in.
+        truncate_for_telegram(&format!("<pre>{}</pre>", html_escape(block)))
+    } else if !text.trim().is_empty() {
+        html_escape(&truncate_chars(text.trim(), 3000))
+    } else if errored {
+        "<pre>error</pre>".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// The live progress message id for a turn is recorded in a marker file so that
+/// whichever path delivers the reply (the streaming loop or the 1s delivery
+/// thread) can edit that exact message into the final answer — one clean message,
+/// no orphan, no duplicate.
+fn telegram_status_path(paths: &SessionPaths, inbound_id: &str) -> PathBuf {
+    let safe: String = inbound_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    paths.dir.join("progress").join(format!("{safe}.tgstatus"))
+}
+
+fn set_telegram_status(paths: &SessionPaths, inbound_id: &str, message_id: i64) {
+    let path = telegram_status_path(paths, inbound_id);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, message_id.to_string());
+}
+
+/// Read the live message id for a turn WITHOUT removing the marker, so a delivery
+/// attempt that fails can be retried against the same live message.
+fn peek_telegram_status(paths: &SessionPaths, inbound_id: &str) -> Option<i64> {
+    let path = telegram_status_path(paths, inbound_id);
+    std::fs::read_to_string(&path).ok()?.trim().parse::<i64>().ok()
+}
+
+/// Drop the live-message marker once the turn is finalized (delivered or
+/// intentionally silenced), so no later pass touches that message again.
+fn clear_telegram_status(paths: &SessionPaths, inbound_id: &str) {
+    let _ = std::fs::remove_file(telegram_status_path(paths, inbound_id));
+}
+
+/// Turn the live progress message into the final reply as exactly ONE message:
+/// edit it in place; if the edit fails, delete the stale live message and only
+/// then send a fresh copy — but if that delete cannot be confirmed, return `Err`
+/// WITHOUT sending, so a failed delete can never leave two messages in the chat.
+/// On `Err` the caller releases the claim and a later pass retries.
+fn finalize_reply(
+    token: &str,
+    chat_id: i64,
+    live_id: Option<i64>,
+    reply: &str,
+    reply_to: Option<i64>,
+) -> anyhow::Result<Option<i64>> {
+    match live_id {
+        Some(id) => match edit_telegram_message(token, chat_id, id, reply) {
+            Ok(()) => Ok(Some(id)),
+            Err(edit_err) => {
+                delete_telegram_message(token, chat_id, id).map_err(|del_err| {
+                    anyhow::anyhow!(
+                        "edit failed ({edit_err}); refusing to send a duplicate because the stale live message could not be removed ({del_err})"
+                    )
+                })?;
+                send_telegram(token, &chat_id.to_string(), reply, reply_to)
+            }
+        },
+        None => send_telegram(token, &chat_id.to_string(), reply, reply_to),
+    }
+}
+
+/// OpenClaw-style live progress for a turn: post ONE message immediately, tick a
+/// spinner on it while the agent works (showing the tools it runs + streamed
+/// text), then — the instant the reply lands — edit that SAME message in place
+/// into the final answer. The progress animation literally becomes the reply, so
+/// there is exactly one message per turn: it cannot orphan a status message and
+/// cannot duplicate the reply.
+///
+/// Delivery is still gated by `claim_delivery` (the atomic single-send gate), and
+/// the message id is recorded in a marker so that if the 1s delivery thread wins
+/// the claim instead of this loop, it edits the very same message. Whoever wins
+/// the claim turns the live message into the answer; the loser just exits.
 fn stream_turn_to_telegram(
     home: &MaturanaHome,
     token: &str,
@@ -2392,41 +2682,152 @@ fn stream_turn_to_telegram(
     paths: &SessionPaths,
     timeout: Duration,
 ) -> anyhow::Result<()> {
-    // Wait for the agent's reply and deliver it exactly once. We intentionally do
-    // NOT post a separate in-progress "status" message on Telegram: a status
-    // message that the 1s delivery thread then races (it delivers the reply as its
-    // own message before this loop sees the now-delivered outbound) is left
-    // orphaned next to the reply — i.e. two messages. Progress still streams to the
-    // sessiond side-lane for the web cockpit; Telegram just shows the single reply.
     let deadline = std::time::Instant::now() + timeout;
+    // The single live progress draft for this turn, created lazily once there's
+    // something to show. No spinner — liveness is the native Telegram "typing…"
+    // action plus the rich tool lines appearing as work happens (OpenClaw style).
+    let mut message_id: Option<i64> = None;
+    // Track exactly what the draft currently shows so a real change is never skipped
+    // as a no-op; `last_edit_ok` re-sends after a failed update so a transient outage
+    // resolves the instant Telegram recovers.
+    let mut last_render = String::new();
+    let mut last_edit_ok = true;
+    let started = std::time::Instant::now();
+    let mut last_typing = started
+        .checked_sub(Duration::from_secs(10))
+        .unwrap_or(started);
     loop {
-        if let Some(final_msg) = list_undelivered(paths)?
-            .into_iter()
-            .find(|m| m.channel == "telegram" && m.in_reply_to.as_deref() == Some(inbound_id))
-        {
-            // Atomic claim: if the delivery thread already took it, it is sending
-            // the reply — we do nothing (no status message to clean up).
+        // Final reply ready? Tolerate a transient DB read so a hiccup never leaves
+        // the live spinner orphaned — just keep animating and re-check next tick.
+        let final_msg = match list_undelivered(paths) {
+            Ok(list) => list.into_iter().find(|m| {
+                m.channel == "telegram" && m.in_reply_to.as_deref() == Some(inbound_id)
+            }),
+            Err(error) => {
+                eprintln!("telegram: list_undelivered failed (retrying): {error:#}");
+                None
+            }
+        };
+        if let Some(final_msg) = final_msg {
+            // Lost the claim → the delivery thread owns delivery and will edit the
+            // live message (via the marker) into the answer. Just drop our state.
             if !claim_delivery(paths, &final_msg.id)? {
                 let _ = clear_progress(paths, inbound_id);
                 return Ok(());
             }
-            let reply = truncate_for_telegram(&message_text(&final_msg.content)?);
-            let sent = send_telegram(token, &chat_id.to_string(), &reply, reply_to)?;
-            append_channel_turn(home, &config.agent_id, chat_id, "assistant", &reply)?;
-            mark_delivered(paths, &final_msg.id, sent.map(|id| id.to_string()).as_deref())?;
-            let _ = clear_progress(paths, inbound_id);
-            audit_channel_event(
-                home,
-                &config.agent_id,
-                "channel.telegram.outbound",
-                "sent telegram response",
-            )?;
+            // Won the claim: this turn's live message (our local id == the marker)
+            // is ours to finalize. Drop an unparseable outbound rather than spinning
+            // on it forever (the parse error is deterministic).
+            let reply = match message_text(&final_msg.content) {
+                Ok(text) => truncate_for_telegram(&text),
+                Err(error) => {
+                    eprintln!(
+                        "telegram: dropping unparseable outbound {}: {error:#}",
+                        final_msg.id
+                    );
+                    clear_telegram_status(paths, inbound_id);
+                    let _ = mark_delivered(paths, &final_msg.id, None);
+                    let _ = clear_progress(paths, inbound_id);
+                    return Ok(());
+                }
+            };
+            // A turn that decided there's nothing worth saying emits the silence
+            // sentinel: remove the live message (best-effort) and finalize regardless
+            // — a failed delete must never wedge the turn into an endless retry.
+            if reply.trim() == crate::proactive::SILENCE_SENTINEL {
+                if let Some(id) = message_id {
+                    let _ = delete_telegram_message(token, chat_id, id);
+                }
+                clear_telegram_status(paths, inbound_id);
+                let _ = mark_delivered(paths, &final_msg.id, None);
+                let _ = clear_progress(paths, inbound_id);
+                return Ok(());
+            }
+            // Edit the live message in place into the answer (the progress
+            // disappears, the answer stays — one clean message). finalize_reply
+            // guarantees a failed edit never leaves two messages.
+            match finalize_reply(token, chat_id, message_id, &reply, reply_to) {
+                Ok(platform_id) => {
+                    // Finalize the claim (the row already exists from claim_delivery,
+                    // so a mark_delivered hiccup can't re-open it for a duplicate).
+                    let _ = mark_delivered(
+                        paths,
+                        &final_msg.id,
+                        platform_id.map(|id| id.to_string()).as_deref(),
+                    );
+                    clear_telegram_status(paths, inbound_id);
+                    let _ =
+                        append_channel_turn(home, &config.agent_id, chat_id, "assistant", &reply);
+                    let _ = clear_progress(paths, inbound_id);
+                    let _ = audit_channel_event(
+                        home,
+                        &config.agent_id,
+                        "channel.telegram.outbound",
+                        "sent telegram response",
+                    );
+                }
+                Err(error) => {
+                    // Could not deliver without risking a duplicate: release the
+                    // claim (marker left intact) so the backstop retries the same
+                    // live message instead of dropping the reply forever.
+                    eprintln!("telegram delivery failed, will retry: {error:#}");
+                    unclaim_delivery(paths, &final_msg.id)?;
+                }
+            }
             return Ok(());
+        }
+        // No reply yet. Keep the native "typing…" indicator alive (it expires after
+        // ~5s) so the chat shows liveness even before the first tool line — no spinner.
+        if last_typing.elapsed() >= Duration::from_secs(4) {
+            let _ = send_telegram_chat_action(token, &chat_id.to_string(), "typing");
+            last_typing = std::time::Instant::now();
+        }
+        // Render the rich tool/thinking draft. Only fall back to a minimal heading
+        // after a short delay with nothing streamed, so the turn is never silent but
+        // we don't post a bare "Working…" for turns that immediately show real tools.
+        let mut rendered =
+            render_progress_html(&read_progress(paths, inbound_id).unwrap_or_default());
+        if rendered.is_empty() && started.elapsed() >= Duration::from_secs(3) {
+            rendered = "<pre>working…</pre>".to_string();
+        }
+        // Re-send when the content changed OR the previous update failed. Advance
+        // last_render only on a landed update so a failure can't desync us.
+        if !rendered.is_empty() && (rendered != last_render || !last_edit_ok) {
+            match message_id {
+                Some(id) => match edit_telegram_message_html(token, chat_id, id, &rendered) {
+                    Ok(()) => {
+                        last_render = rendered;
+                        last_edit_ok = true;
+                    }
+                    Err(error) => {
+                        if last_edit_ok {
+                            eprintln!(
+                                "telegram: live progress update failing, will keep retrying: {error:#}"
+                            );
+                        }
+                        last_edit_ok = false;
+                    }
+                },
+                None => {
+                    message_id =
+                        send_telegram_html(token, &chat_id.to_string(), &rendered, reply_to)
+                            .unwrap_or(None);
+                    if let Some(id) = message_id {
+                        set_telegram_status(paths, inbound_id, id);
+                        last_render = rendered;
+                        last_edit_ok = true;
+                    } else {
+                        last_edit_ok = false;
+                    }
+                }
+            }
         }
         if std::time::Instant::now() >= deadline {
+            // Gave up waiting; leave the (undelivered) reply to the delivery thread,
+            // which will edit this same live message via the marker.
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(300));
+        thread::sleep(Duration::from_millis(900));
     }
 }
 
@@ -2570,11 +2971,35 @@ fn edit_telegram_message(
     message_id: i64,
     text: &str,
 ) -> anyhow::Result<()> {
-    let body = serde_json::json!({
+    edit_telegram_message_with(token, chat_id, message_id, text, None)
+}
+
+/// Edit a message as HTML (Telegram `parse_mode: "HTML"`) — used to update the
+/// rich live progress draft. Caller must `html_escape` dynamic content.
+fn edit_telegram_message_html(
+    token: &str,
+    chat_id: i64,
+    message_id: i64,
+    html: &str,
+) -> anyhow::Result<()> {
+    edit_telegram_message_with(token, chat_id, message_id, html, Some("HTML"))
+}
+
+fn edit_telegram_message_with(
+    token: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+    parse_mode: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut body = serde_json::json!({
         "chat_id": chat_id,
         "message_id": message_id,
         "text": text,
     });
+    if let Some(mode) = parse_mode {
+        body["parse_mode"] = serde_json::json!(mode);
+    }
     let response: TelegramOkResponse = ureq::post(&format!(
         "https://api.telegram.org/bot{token}/editMessageText"
     ))
@@ -2588,6 +3013,30 @@ fn edit_telegram_message(
     })?;
     if !response.ok {
         anyhow::bail!("Telegram editMessageText returned ok=false");
+    }
+    Ok(())
+}
+
+/// Delete an ephemeral message (the live progress status) once the real reply is
+/// ready, so the channel ends up showing only the clean answer — OpenClaw-style.
+fn delete_telegram_message(token: &str, chat_id: i64, message_id: i64) -> anyhow::Result<()> {
+    let body = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+    });
+    let response: TelegramOkResponse = ureq::post(&format!(
+        "https://api.telegram.org/bot{token}/deleteMessage"
+    ))
+    .set("content-type", "application/json")
+    .send_string(&body.to_string())
+    .map_err(|error| anyhow::anyhow!("Telegram deleteMessage failed: {error}"))
+    .and_then(|response| {
+        response.into_json().map_err(|error| {
+            anyhow::anyhow!("failed to parse Telegram deleteMessage response: {error}")
+        })
+    })?;
+    if !response.ok {
+        anyhow::bail!("Telegram deleteMessage returned ok=false");
     }
     Ok(())
 }
@@ -4640,25 +5089,43 @@ mod tests {
     }
 
     #[test]
-    fn turn_progress_renders_tools_and_streamed_text() {
-        // Nothing to show yet → empty (no placeholder; caller posts no status).
-        assert_eq!(render_turn_progress(&[]), "");
+    fn progress_html_renders_monospace_tool_block() {
+        // Nothing to show yet → empty (no placeholder; caller posts no draft).
+        assert_eq!(render_progress_html(&[]), "");
 
+        // Structured tool events render as ONE monospace <pre> block: web_search
+        // labelled, bash shown as just icon + command. No brain/thinking chrome.
         let events = vec![
-            ProgressEvent { seq: 0, kind: "tool".into(), text: "running: rg foo".into() },
-            ProgressEvent { seq: 1, kind: "tool".into(), text: "done: rg foo".into() },
-            ProgressEvent { seq: 2, kind: "text".into(), text: "Here is the answer.".into() },
+            ProgressEvent { seq: 0, kind: "tool".into(), text: "web_search\u{1f}L:Ron:Harald top songs".into() },
+            ProgressEvent { seq: 1, kind: "tool".into(), text: "bash\u{1f}rg foo".into() },
         ];
-        let rendered = render_turn_progress(&events);
-        assert!(rendered.contains("🔧 running: rg foo"));
-        assert!(rendered.contains("🔧 done: rg foo"));
-        assert!(rendered.contains("Here is the answer."));
-        // No "working…" chrome.
-        assert!(!rendered.contains("working"));
+        let rendered = render_progress_html(&events);
+        assert!(rendered.starts_with("<pre>") && rendered.ends_with("</pre>"), "{rendered}");
+        assert!(rendered.contains("🔎 Web Search: L:Ron:Harald top songs"), "{rendered}");
+        assert!(rendered.contains("🛠️ rg foo"), "{rendered}");
+        assert!(!rendered.contains('🧠'), "no brain emoji: {rendered}");
 
-        // Error with nothing else → a minimal marker.
-        let errored = vec![ProgressEvent { seq: 0, kind: "status".into(), text: "error".into() }];
-        assert_eq!(render_turn_progress(&errored), "⚠️");
+        // Legacy "running: <cmd>" events still map to a bash line for back-compat.
+        let legacy = vec![ProgressEvent { seq: 0, kind: "tool".into(), text: "running: ls -la".into() }];
+        assert!(render_progress_html(&legacy).contains("🛠️ ls -la"));
+
+        // HTML-special characters in the detail are escaped inside the <pre>.
+        let unsafe_detail = vec![ProgressEvent { seq: 0, kind: "tool".into(), text: "bash\u{1f}grep <foo> & bar".into() }];
+        let escaped = render_progress_html(&unsafe_detail);
+        assert!(escaped.contains("grep &lt;foo&gt; &amp; bar"), "{escaped}");
+
+        // "thinking" events are ignored (no brain-dump); final text shows plain.
+        let mixed = vec![
+            ProgressEvent { seq: 0, kind: "thinking".into(), text: "Looking it up".into() },
+            ProgressEvent { seq: 1, kind: "text".into(), text: "Here is the answer.".into() },
+        ];
+        let r = render_progress_html(&mixed);
+        assert!(r.contains("Here is the answer."));
+        assert!(!r.contains("Looking it up"), "thinking suppressed: {r}");
+
+        // Unknown tool key falls back to 🧩 + title-cased key.
+        let unknown = vec![ProgressEvent { seq: 0, kind: "tool".into(), text: "record_voice\u{1f}cue".into() }];
+        assert!(render_progress_html(&unknown).contains("🧩 Record Voice: cue"));
     }
 
     impl TempDir {

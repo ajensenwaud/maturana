@@ -394,6 +394,22 @@ pub fn claim_delivery(paths: &SessionPaths, message_id: &str) -> anyhow::Result<
     Ok(changed > 0)
 }
 
+/// Release a claim that did NOT result in a delivered message, so a later pass
+/// can retry it. Only removes an un-finalized claim (NULL platform id), so a
+/// reply that was actually sent (and `mark_delivered` recorded a platform id) is
+/// never accidentally un-claimed and re-sent. Use this when a `claim_delivery`
+/// winner fails to reach Telegram, instead of leaving the reply claimed-but-unsent
+/// (which would drop it from `list_undelivered` forever).
+pub fn unclaim_delivery(paths: &SessionPaths, message_id: &str) -> anyhow::Result<()> {
+    let db = open_rw(&paths.inbound_db)?;
+    ensure_inbound_schema(&db)?;
+    db.execute(
+        "DELETE FROM delivered WHERE message_id = ?1 AND platform_message_id IS NULL",
+        params![message_id],
+    )?;
+    Ok(())
+}
+
 /// One distilled progress event for an in-flight turn, written by the guest
 /// worker as the harness streams its work. Stored in a per-message JSONL
 /// side-lane SEPARATE from the inbound/outbound queues, so turn delivery and
@@ -720,6 +736,30 @@ mod tests {
         assert!(!claim_delivery(&paths, &id).unwrap());
         assert!(!claim_delivery(&paths, &id).unwrap());
         // A claimed outbound is no longer undelivered.
+        assert!(list_undelivered(&paths).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unclaim_reopens_an_undelivered_claim_but_not_a_delivered_one() {
+        let temp = temp_dir();
+        let paths = session_paths(&temp, "telegram-main");
+        ensure_session(&paths).unwrap();
+        write_outbound(&paths, Some("in-1"), "chat", "telegram", "chat-1", None, r#"{"text":"hi"}"#)
+            .unwrap();
+        let id = list_undelivered(&paths).unwrap()[0].id.clone();
+
+        // A claim that failed to actually send is released → the reply is
+        // retryable again, never silently dropped.
+        assert!(claim_delivery(&paths, &id).unwrap());
+        assert!(list_undelivered(&paths).unwrap().is_empty());
+        unclaim_delivery(&paths, &id).unwrap();
+        assert_eq!(list_undelivered(&paths).unwrap().len(), 1);
+
+        // Once it is actually delivered (a real platform id recorded), unclaim is a
+        // no-op: a sent reply is never re-opened for a duplicate send.
+        assert!(claim_delivery(&paths, &id).unwrap());
+        mark_delivered(&paths, &id, Some("telegram-99")).unwrap();
+        unclaim_delivery(&paths, &id).unwrap();
         assert!(list_undelivered(&paths).unwrap().is_empty());
     }
 
