@@ -115,9 +115,22 @@ if [ -z "$BIN" ]; then
   BIN="$HOME/.local/bin/maturana"
 fi
 
+# Ensure ~/.local/bin (where the binary lands) is on PATH — and PERSIST it, not
+# just nag. Without this a fresh shell can't find `maturana` (the classic
+# "installed but command not found", especially for zsh users whose login shells
+# don't source ~/.profile). Append an idempotent guard to whichever rc files
+# exist; it's a no-op once the dir is already on PATH.
 case ":$PATH:" in
   *":$HOME/.local/bin:"*) ;;
-  *) say "add ~/.local/bin to PATH" ;;
+  *)
+    export PATH="$HOME/.local/bin:$PATH"
+    line='export PATH="$HOME/.local/bin:$PATH"'
+    for rc in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshrc"; do
+      [ -e "$rc" ] || { [ "$rc" = "$HOME/.profile" ] && : > "$rc" || continue; }
+      grep -qF '.local/bin' "$rc" 2>/dev/null || printf '\n# maturana\n%s\n' "$line" >> "$rc"
+    done
+    say "added ~/.local/bin to PATH (open a new shell, or: . ~/.local/bin/env)"
+    ;;
 esac
 
 # 4b. KVM: agents run in Firecracker microVMs, which need /dev/kvm. Check +

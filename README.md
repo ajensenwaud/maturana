@@ -56,6 +56,111 @@ thumb: **if it's a `.ps1`/`.sh` you typed, it's only ever `install`/`uninstall`;
 anything else is `maturana …`.** (`maturana setup` was historically `maturana
 repair`, which still works as an alias.)
 
+### Run your first agent on Linux (Firecracker)
+
+Verified end-to-end. After `install.sh --firecracker` above:
+
+1. **Open a fresh login shell** so the new `kvm` group and `~/.local/bin` PATH
+   take effect (the installer adds you to `kvm` and installs the binary to
+   `~/.local/bin`; both only apply in a new session — or run `newgrp kvm` and
+   `. ~/.local/bin/env`). Sanity check: `ls -l /dev/kvm` is group-readable and
+   `maturana --help` resolves.
+
+2. **Stage harness credentials** for the runtime you want — e.g. for Claude Code,
+   copy your signed-in `~/.claude` into `.maturana/host-auth/claude-code/` (codex
+   → `.maturana/host-auth/codex/`).
+
+3. **Build the image + boot the microVM.** Run this in a **plain shell — NOT
+   inside a sandboxed agent.** Firecracker opens `/dev/kvm`, which a harness
+   sandbox (e.g. Codex's default) hides; if you drive Maturana from Codex, run it
+   unsandboxed (`codex --dangerously-bypass-approvals-and-sandbox`, or a
+   `[profiles.maturana]` with `sandbox_mode = "danger-full-access"`) — otherwise
+   you get a misleading `/dev/kvm does not exist`. Three profiles ship ready:
+   `codex-firecracker`, `claude-firecracker`, `opencode-firecracker`.
+
+   ```bash
+   maturana setup firecracker-harnesses --agent-id claude-firecracker
+   ```
+
+   This builds the rootfs + kernel, creates the TAP, boots Firecracker, and
+   installs the in-guest worker. It is idempotent — re-run any time (the TAP is
+   recreated fresh each launch, so repeat launches never hit "Resource busy").
+
+4. **Confirm the runtime plane is up** (sessiond + channels + schedules).
+   `install.sh` already registered **and started** it as a systemd user service —
+   don't run `maturana up` by hand (it's a foreground supervisor that would fight
+   the service for the port). Just check it:
+
+   ```bash
+   maturana service status up
+   ```
+
+5. **Talk to it.** Host-side turn:
+
+   ```bash
+   maturana agent run claude-firecracker --prompt "say hi" --wait
+   ```
+
+   Or pair Telegram — **one bot per agent** (two agents on the same token collide
+   with a Telegram 409):
+
+   ```bash
+   maturana pipelock set telegram/claude-bot-token --value-file /path/to/token
+   maturana channel pair telegram start --agent-id claude-firecracker \
+     --token-source pipelock:telegram/claude-bot-token
+   # then send the printed  /pair <CODE>  to your bot
+   ```
+
+### Run your first agent on Windows (Hyper-V)
+
+Verified end-to-end. `install.ps1` above already provisioned hostd, the Ubuntu
+VHDX, the agent SSH key, and the `maturana up`/`web` boot services — so launching
+an agent is just:
+
+1. **Stage harness credentials** for the runtime you want — copy your signed-in
+   `~\.codex` into `.maturana\host-auth\codex\` (Claude Code →
+   `.maturana\host-auth\claude-code\`). The launcher injects these into the guest;
+   they are never baked into the image.
+
+2. **Confirm the plane is up.** `install.ps1` already registered **and started**
+   the `up` plane as a boot task — don't run `maturana up` by hand on Windows
+   (it's a foreground supervisor that would fight the service for the port). Just
+   check it:
+
+   ```powershell
+   maturana service status up
+   ```
+
+3. **Launch the agent.** Two ship ready: `examples\MATURANA.codex-hyperv.md`
+   (id `codex-demo`) and `examples\MATURANA.claude-hyperv.md` (id `claude-demo`).
+   Validate, then apply:
+
+   ```powershell
+   maturana spec validate examples\MATURANA.codex-hyperv.md
+   maturana agent launch examples\MATURANA.codex-hyperv.md --apply
+   ```
+
+   The CLI talks to hostd (SYSTEM), which creates + starts the Hyper-V VM; Rust
+   then provisions the guest worker, injects auth, and starts the in-guest
+   service over SSH. Re-launching an existing VM needs an explicit override:
+   `$env:MATURANA_HYPERV_FORCE = "true"` before `--apply`.
+
+4. **Talk to it.** Host-side turn:
+
+   ```powershell
+   maturana agent run codex-demo --prompt "say hi" --wait
+   ```
+
+   Telegram pairing is identical to Linux — **one bot per agent** (two agents on
+   the same token collide with a Telegram 409):
+
+   ```powershell
+   maturana pipelock set telegram/codex-bot-token --value-file C:\path\to\token
+   maturana channel pair telegram start --agent-id codex-demo `
+     --token-source pipelock:telegram/codex-bot-token
+   # then send the printed  /pair <CODE>  to your bot
+   ```
+
 ### Releases, verification & signing
 
 Tagging `v*` runs `.github/workflows/release.yml`, which builds
