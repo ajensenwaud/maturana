@@ -9,7 +9,7 @@ use maturana_core::{
     secrets::resolve_secret_source_with_home,
     session_db::{
         claim_delivery, clear_progress, ensure_session, insert_inbound, list_undelivered,
-        mark_delivered, read_progress, session_paths, ProgressEvent, SessionPaths,
+        mark_delivered, session_paths, SessionPaths,
     },
     spec::{AgentSpec, HarnessRuntime},
     state::MaturanaHome,
@@ -2377,44 +2377,11 @@ fn send_telegram_chat_action(token: &str, chat_id: &str, action: &str) -> anyhow
 /// Render the live progress side-lane into one Telegram status message: the
 /// recent tool lines plus the agent's streamed text so far. Plain text
 /// (editMessageText carries no parse_mode), bounded to Telegram's message size.
-fn render_turn_progress(events: &[ProgressEvent]) -> String {
-    let mut tools: Vec<&str> = Vec::new();
-    let mut text = "";
-    let mut errored = false;
-    for event in events {
-        match event.kind.as_str() {
-            "tool" => tools.push(event.text.as_str()),
-            "text" => text = event.text.as_str(),
-            "status" if event.text == "error" => errored = true,
-            _ => {}
-        }
-    }
-    // No placeholder chrome: show the actual work — recent tool lines and the
-    // streamed text. Empty when there's nothing to show yet (the caller then
-    // doesn't post a status message at all).
-    let mut out = String::new();
-    for tool in tools.iter().rev().take(6).rev() {
-        out.push_str("🔧 ");
-        out.push_str(&truncate_chars(tool, 80));
-        out.push('\n');
-    }
-    if !text.is_empty() {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(&truncate_chars(text, 3500));
-    } else if errored && out.is_empty() {
-        out.push_str("⚠️");
-    }
-    truncate_for_telegram(out.trim_end())
-}
-
-/// Stream a turn's live progress into a status message (created lazily on the
-/// first real progress, edited in place), then finalize it into the reply. No
-/// "working…" placeholder: a turn with nothing to show (a fast conversational
-/// reply with no tools and no streamed deltas) posts only the final message. The
-/// outbox is polled tightly so this loop wins the finalize over the 1s delivery
-/// thread; `claim_delivery` guarantees a single send either way.
+/// Wait for a turn's reply and deliver it to Telegram exactly once
+/// (`claim_delivery` guards against the 1s delivery thread racing it). It does
+/// not post a separate in-progress status message — doing so left an orphaned
+/// progress message next to the reply whenever the delivery thread won the race.
+/// Live progress still streams to the sessiond side-lane for the web cockpit.
 fn stream_turn_to_telegram(
     home: &MaturanaHome,
     token: &str,
@@ -2425,43 +2392,26 @@ fn stream_turn_to_telegram(
     paths: &SessionPaths,
     timeout: Duration,
 ) -> anyhow::Result<()> {
+    // Wait for the agent's reply and deliver it exactly once. We intentionally do
+    // NOT post a separate in-progress "status" message on Telegram: a status
+    // message that the 1s delivery thread then races (it delivers the reply as its
+    // own message before this loop sees the now-delivered outbound) is left
+    // orphaned next to the reply — i.e. two messages. Progress still streams to the
+    // sessiond side-lane for the web cockpit; Telegram just shows the single reply.
     let deadline = std::time::Instant::now() + timeout;
-    // The status message is created only once there's something to show.
-    let mut status_id: Option<i64> = None;
-    let mut last_render = String::new();
-    // Allow an immediate first render.
-    let mut last_edit = std::time::Instant::now()
-        .checked_sub(Duration::from_secs(1))
-        .unwrap_or_else(std::time::Instant::now);
     loop {
-        // Final reply ready? (polled every tick so this loop beats the delivery thread)
         if let Some(final_msg) = list_undelivered(paths)?
             .into_iter()
             .find(|m| m.channel == "telegram" && m.in_reply_to.as_deref() == Some(inbound_id))
         {
-            // Claim atomically. If the delivery thread already claimed it, it is
-            // sending the reply as its own message — drop our orphaned progress
-            // status (if any) so there's no duplicate, then stop.
+            // Atomic claim: if the delivery thread already took it, it is sending
+            // the reply — we do nothing (no status message to clean up).
             if !claim_delivery(paths, &final_msg.id)? {
-                if let Some(id) = status_id {
-                    let _ = delete_telegram_message(token, chat_id, id);
-                }
                 let _ = clear_progress(paths, inbound_id);
                 return Ok(());
             }
             let reply = truncate_for_telegram(&message_text(&final_msg.content)?);
-            let sent = match status_id {
-                // A status message exists (we streamed progress into it): finalize
-                // it into the reply, best-effort. A "message is not modified" no-op
-                // (the streamed status already shows this exact text) is NOT a
-                // reason to send a second message — keep this one as the reply.
-                Some(id) => {
-                    let _ = edit_telegram_message(token, chat_id, id, &reply);
-                    Some(id)
-                }
-                // No status was ever posted (fast reply, no progress to show) → send it.
-                None => send_telegram(token, &chat_id.to_string(), &reply, reply_to)?,
-            };
+            let sent = send_telegram(token, &chat_id.to_string(), &reply, reply_to)?;
             append_channel_turn(home, &config.agent_id, chat_id, "assistant", &reply)?;
             mark_delivered(paths, &final_msg.id, sent.map(|id| id.to_string()).as_deref())?;
             let _ = clear_progress(paths, inbound_id);
@@ -2472,22 +2422,6 @@ fn stream_turn_to_telegram(
                 "sent telegram response",
             )?;
             return Ok(());
-        }
-        // Refresh the in-flight progress view, throttled (~1s) for rate limits and
-        // only when the rendered text actually changed. The status message is
-        // created on the first non-empty render, not before.
-        if last_edit.elapsed() >= Duration::from_millis(1000) {
-            let rendered = render_turn_progress(&read_progress(paths, inbound_id)?);
-            if !rendered.is_empty() && rendered != last_render {
-                match status_id {
-                    Some(id) => {
-                        let _ = edit_telegram_message(token, chat_id, id, &rendered);
-                    }
-                    None => status_id = send_telegram(token, &chat_id.to_string(), &rendered, reply_to)?,
-                }
-                last_render = rendered;
-            }
-            last_edit = std::time::Instant::now();
         }
         if std::time::Instant::now() >= deadline {
             return Ok(());
@@ -2655,20 +2589,6 @@ fn edit_telegram_message(
     if !response.ok {
         anyhow::bail!("Telegram editMessageText returned ok=false");
     }
-    Ok(())
-}
-
-/// Delete a Telegram message (used to clean up an orphaned progress status when
-/// another delivery path sent the reply). Best-effort; the caller ignores errors.
-fn delete_telegram_message(token: &str, chat_id: i64, message_id: i64) -> anyhow::Result<()> {
-    let body = serde_json::json!({ "chat_id": chat_id, "message_id": message_id });
-    let _: TelegramOkResponse = ureq::post(&format!(
-        "https://api.telegram.org/bot{token}/deleteMessage"
-    ))
-    .set("content-type", "application/json")
-    .send_string(&body.to_string())
-    .map_err(|error| anyhow::anyhow!("Telegram deleteMessage failed: {error}"))?
-    .into_json()?;
     Ok(())
 }
 
