@@ -446,6 +446,86 @@ post("status", "done")
 sys.stdout.write("\n".join(final))
 PYEOF
 
+# Claude streamer: reads `claude --output-format stream-json --include-partial-messages`
+# and POSTs *real* text deltas (token streaming) + tool-use to the progress lane,
+# throttled so we don't curl per token. Prints the final text to stdout.
+cat > /tmp/maturana-stream-claude.py <<'PYEOF'
+import json, os, subprocess, sys, time
+
+url = os.environ.get("SESSIOND_URL", "")
+token = os.environ.get("MATURANA_SESSIOND_TOKEN", "")
+agent = os.environ.get("MATURANA_AGENT_ID", "")
+session = os.environ.get("MATURANA_SESSION_ID", "")
+msg = os.environ.get("MSG_ID", "")
+seq = 0
+text = []
+last_post = 0.0
+final = None
+
+def post(kind, body_text):
+    global seq
+    if not url or not msg:
+        return
+    body = json.dumps({"agent_id": agent, "session_id": session,
+                       "message_id": msg, "seq": seq, "kind": kind, "text": body_text})
+    seq += 1
+    args = ["curl", "-fsS", "-X", "POST", url + "/session/progress",
+            "-H", "content-type: application/json"]
+    if token:
+        args += ["-H", "x-maturana-session-token: " + token]
+    args += ["--data", body]
+    try:
+        subprocess.run(args, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=5)
+    except Exception:
+        pass
+
+def post_text(force=False):
+    global last_post
+    now = time.time()
+    if text and (force or now - last_post >= 0.4):
+        post("text", "".join(text)[:3500])
+        last_post = now
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        ev = json.loads(line)
+    except Exception:
+        continue
+    t = ev.get("type", "")
+    if t == "stream_event":
+        e = ev.get("event", {}) or {}
+        et = e.get("type", "")
+        if et == "content_block_delta":
+            d = e.get("delta", {}) or {}
+            if d.get("type") == "text_delta":
+                text.append(d.get("text", ""))
+                post_text()
+        elif et == "content_block_start":
+            cb = e.get("content_block", {}) or {}
+            if cb.get("type") == "tool_use":
+                post("tool", "using: " + (cb.get("name") or "tool"))
+    elif t == "assistant":
+        # Non-partial fallback: a whole assistant message in one event.
+        for block in (ev.get("message", {}) or {}).get("content", []) or []:
+            if block.get("type") == "text" and not text:
+                text.append(block.get("text", ""))
+            elif block.get("type") == "tool_use":
+                post("tool", "using: " + (block.get("name") or "tool"))
+        post_text(force=True)
+    elif t == "result":
+        r = ev.get("result")
+        if isinstance(r, str):
+            final = r
+
+post_text(force=True)
+post("status", "done")
+sys.stdout.write(final if final is not None else "".join(text))
+PYEOF
+
 while true; do
   date -Is > /var/log/maturana/heartbeat
   heartbeat idle
@@ -506,7 +586,7 @@ PY
     # prints the final agent text. `set -o pipefail` makes a codex failure fail
     # the pipeline so the else branch's fallback applies.
     : > /tmp/maturana-session-response.txt
-    if run_harness codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C /workspace "$(cat /tmp/maturana-session-prompt.txt)" 2>>/var/log/maturana/worker.err.log \
+    if run_harness codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C /workspace "$(cat /tmp/maturana-session-prompt.txt)" </dev/null 2>>/var/log/maturana/worker.err.log \
         | SESSIOND_URL="$sessiond_url" MSG_ID="$msg_id" python3 /tmp/maturana-stream-progress.py > /tmp/maturana-session-response.txt 2>>/var/log/maturana/worker.err.log; then
       response="$(cat /tmp/maturana-session-response.txt)"
     else
@@ -516,10 +596,17 @@ PY
       fi
     fi
   elif [ "${MATURANA_HARNESS}" = "claude-code" ]; then
-    if run_harness claude -p "$(cat /tmp/maturana-session-prompt.txt)" >/tmp/maturana-session-response.txt 2>>/var/log/maturana/worker.err.log; then
+    # Real token streaming: claude emits text deltas in stream-json, which the
+    # claude streamer POSTs to the progress lane as they arrive.
+    : > /tmp/maturana-session-response.txt
+    if run_harness claude -p --output-format stream-json --include-partial-messages --verbose "$(cat /tmp/maturana-session-prompt.txt)" </dev/null 2>>/var/log/maturana/worker.err.log \
+        | SESSIOND_URL="$sessiond_url" MSG_ID="$msg_id" python3 /tmp/maturana-stream-claude.py > /tmp/maturana-session-response.txt 2>>/var/log/maturana/worker.err.log; then
       response="$(cat /tmp/maturana-session-response.txt)"
     else
-      response="I hit an error while processing that message."
+      response="$(cat /tmp/maturana-session-response.txt)"
+      if [ -z "$response" ]; then
+        response="I hit an error while processing that message."
+      fi
     fi
   elif [ "${MATURANA_HARNESS}" = "opencode" ]; then
     opencode_args=(run)
