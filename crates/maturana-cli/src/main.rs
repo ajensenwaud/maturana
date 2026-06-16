@@ -1880,12 +1880,20 @@ fn build_orchestrator_config(
         );
     }
     // claude-code agents get the host-owned OAuth refresh daemon.
+    // Host-side claude token refresh is for agents that CANNOT refresh their own
+    // OAuth token. Firecracker claude guests self-refresh against the allowlisted
+    // `platform.claude.com`, and they own the (single-use) refresh-token lineage;
+    // a host-side refresh of the same seed only races the guest and can consume
+    // the token out from under it (-> guest 401). So exclude self-refreshing
+    // firecracker profiles — the guest is the sole refresher, and reboot recovery
+    // never re-pushes auth, so the seed going stale is harmless.
     let claude_refresh_agents = agent_ids
         .iter()
         .filter(|id| {
             AgentSpec::from_maturana_markdown(&home.agent_dir(id).join("MATURANA.md"))
                 .map(|spec| spec.runtime.harness == HarnessRuntime::ClaudeCode)
                 .unwrap_or(false)
+                && firecracker_profile_for(id.as_str()).is_none()
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -2222,7 +2230,17 @@ fn repush_claude_auth(home: &MaturanaHome, agent_id: &str) -> anyhow::Result<()>
         home,
         GuestWorkerInstall {
             agent_id: agent_id.to_string(),
-            session_id: format!("{agent_id}-main"),
+            // Use the SAME canonical session id as the launch/repair path
+            // (`profile.session_id`, e.g. `claude-main`), not `{agent_id}-main`.
+            // The claude-refresh daemon re-renders the guest worker + the
+            // materialized `sessiond.env` every idle cycle; if it used a
+            // different session id than the one the guest worker actually
+            // claims from, it silently repoints the host plane (and Telegram)
+            // at a dead session while the guest answers on the original one —
+            // i.e. the agent stops responding even though everything is "up".
+            session_id: firecracker_profile_for(agent_id)
+                .map(|profile| profile.session_id.to_string())
+                .unwrap_or_else(|| format!("{agent_id}-main")),
             harness: HarnessRuntime::ClaudeCode,
             guest_ip: ip,
             ssh_user: "ubuntu".to_string(),
@@ -2230,7 +2248,16 @@ fn repush_claude_auth(home: &MaturanaHome, agent_id: &str) -> anyhow::Result<()>
             harness_auth_guest_path: "/home/ubuntu/.claude".to_string(),
             sessiond_url: "__MATURANA_DEFAULT_SESSIOND_URL__".to_string(),
             sessiond_token_path: home.root().join("sessiond/token"),
-            auth_source: Some(PathBuf::from(".maturana/host-auth/claude-code")),
+            // Do NOT re-push host-auth over a live guest. Claude Code rotates its
+            // OAuth refresh token on every self-refresh (against the allowlisted
+            // platform.claude.com), so the guest's `.credentials.json` is newer
+            // than the host staging copy. Overwriting it hands the guest an
+            // already-consumed, single-use refresh token → hard `401 Invalid
+            // authentication credentials`, killing a working agent every refresh
+            // cycle. The guest owns its refresh lineage; the daemon only keeps the
+            // host seed fresh + re-renders env/runner. To intentionally re-seed a
+            // *dead* guest, run `repair guest-worker --auth-source …` by hand once.
+            auth_source: None,
             install_harness: false,
         },
     )
