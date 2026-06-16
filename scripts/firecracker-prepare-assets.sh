@@ -67,6 +67,33 @@ need mkfs.ext4
 need truncate
 need ssh-keygen
 
+# libguestfs/supermin builds its appliance from the host kernel and picks the
+# NEWEST /boot/vmlinuz-* (sort -V). Ubuntu ships those mode 0600, so when this
+# script runs libguestfs as a non-root user every virt-* call dies with
+# "supermin exited with error status 1" — and the failure only surfaces minutes
+# later as a cryptic "could not find vmlinuz-* in the Ubuntu image" after the
+# (empty) virt-copy-out. Catch it up front: auto-fix with passwordless sudo if
+# available, otherwise fail FAST with the exact remedy.
+ensure_guest_build_kernel_readable() {
+  local newest
+  newest="$(ls -1 /boot/vmlinuz-* 2>/dev/null | sort -V | tail -n 1)"
+  [[ -n "$newest" && -e "$newest" ]] || return 0   # no host kernel here — leave it to libguestfs
+  [[ -r "$newest" ]] && return 0                    # already readable
+  if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    echo "making /boot/vmlinuz-* readable for libguestfs (sudo)" >&2
+    sudo chmod 0644 /boot/vmlinuz-* 2>/dev/null || true
+  fi
+  if [[ ! -r "$newest" ]]; then
+    echo "libguestfs cannot read the host kernel $newest." >&2
+    echo "Ubuntu ships /boot/vmlinuz-* mode 0600; the firecracker image build runs" >&2
+    echo "libguestfs as your user and needs it readable. Fix once and re-run:" >&2
+    echo "  sudo chmod 0644 /boot/vmlinuz-*" >&2
+    echo "(scripts/install-firecracker-host.sh also makes this durable across kernel upgrades.)" >&2
+    exit 1
+  fi
+}
+ensure_guest_build_kernel_readable
+
 require_file "$sessiond_env_path" "MATURANA_SESSIOND_ENV_PATH"
 require_file "$run_agent_path" "MATURANA_RUN_AGENT_PATH"
 require_file "$agent_service_path" "MATURANA_AGENT_SERVICE_PATH"
