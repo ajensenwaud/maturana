@@ -221,6 +221,35 @@ cp "$firecracker_bootstrap_path" "$work_dir/firecracker-bootstrap.sh"
 cp "$host_key_path" "$work_dir/ssh_host_ed25519_key"
 cp "$host_key_path.pub" "$work_dir/ssh_host_ed25519_key.pub"
 
+# Extract the guest kernel BEFORE customizing. The Ubuntu cloud image keeps /boot
+# on a SEPARATE partition (label BOOT), and the bootstrap below strips /boot from
+# the image's fstab (the firecracker guest has no separate /boot). virt-copy-out
+# mounts via the guest fstab, so extracting AFTER the strip yields an empty /boot
+# and the misleading "could not find vmlinuz-*". Do it here, while fstab still
+# mounts the /boot partition.
+reuse_kernel="${MATURANA_REUSE_KERNEL_IMAGE:-}"
+if [[ -z "$reuse_kernel" && -f ".maturana/images/firecracker/vmlinux.bin" && "$kernel_out" != ".maturana/images/firecracker/vmlinux.bin" ]]; then
+  reuse_kernel=".maturana/images/firecracker/vmlinux.bin"
+fi
+if [[ -n "$reuse_kernel" ]]; then
+  echo "Reusing Firecracker kernel: $reuse_kernel"
+  cp "$reuse_kernel" "$kernel_out"
+else
+  rm -rf "$work_dir/boot"
+  virt-copy-out -a "$work_img" /boot "$work_dir"
+  kernel_candidate="$(find "$work_dir/boot" -maxdepth 1 -type f -name 'vmlinuz-*' | sort -V | tail -n 1)"
+  if [[ -z "$kernel_candidate" ]]; then
+    echo "could not find vmlinuz-* in the Ubuntu image" >&2
+    exit 1
+  fi
+  "$extract_vmlinux" "$kernel_candidate" > "$kernel_out"
+fi
+if ! file "$kernel_out" | grep -q 'ELF'; then
+  echo "failed to extract an ELF vmlinux from ${kernel_candidate:-$reuse_kernel}" >&2
+  file "$kernel_out" >&2 || true
+  exit 1
+fi
+
 echo "Customizing Ubuntu image offline..."
 virt-copy-in -a "$work_img" "$work_dir/firecracker-bootstrap.sh" /tmp
 virt-customize -a "$work_img" \
@@ -253,27 +282,8 @@ if [[ -d "$auth_source" ]]; then
   virt-copy-in -a "$work_img" "$work_dir/.codex" /home/ubuntu
 fi
 
-reuse_kernel="${MATURANA_REUSE_KERNEL_IMAGE:-}"
-if [[ -z "$reuse_kernel" && -f ".maturana/images/firecracker/vmlinux.bin" && "$kernel_out" != ".maturana/images/firecracker/vmlinux.bin" ]]; then
-  reuse_kernel=".maturana/images/firecracker/vmlinux.bin"
-fi
-if [[ -n "$reuse_kernel" ]]; then
-  echo "Reusing Firecracker kernel: $reuse_kernel"
-  cp "$reuse_kernel" "$kernel_out"
-else
-  virt-copy-out -a "$work_img" /boot "$work_dir"
-  kernel_candidate="$(find "$work_dir/boot" -maxdepth 1 -type f -name 'vmlinuz-*' | sort -V | tail -n 1)"
-  if [[ -z "$kernel_candidate" ]]; then
-    echo "could not find vmlinuz-* in the Ubuntu image" >&2
-    exit 1
-  fi
-  "$extract_vmlinux" "$kernel_candidate" > "$kernel_out"
-fi
-if ! file "$kernel_out" | grep -q 'ELF'; then
-  echo "failed to extract an ELF vmlinux from $kernel_candidate" >&2
-  file "$kernel_out" >&2 || true
-  exit 1
-fi
+# (Guest kernel was already extracted above, before the bootstrap stripped /boot
+# from the image fstab — see the extraction block ahead of "Customizing ...".)
 
 virt-customize -a "$work_img" \
   --run-command 'chmod 0600 /etc/netplan/50-maturana-firecracker.yaml' \
