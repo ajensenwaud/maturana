@@ -10,6 +10,19 @@ Repo path:
 
 ## Deploy
 
+Two preflight gotchas bite on a fresh host (both produce a misleading
+`/dev/kvm` error even though KVM is fine):
+
+1. **Run the setup/launch unsandboxed.** It opens `/dev/kvm` and `sudo`s for the
+   per-agent TAP. A sandboxed `codex`/agent command hides the device node and
+   reports `/dev/kvm does not exist`. Use a plain shell or bypass the harness
+   sandbox. Do **not** run `kvm-enable.sh` — KVM is already on.
+2. **Use a fresh login shell after `install.sh`.** The `kvm` group and
+   `~/.local/bin` PATH only apply to a new session; otherwise you get
+   `Permission denied` opening `/dev/kvm` (or `maturana: command not found`).
+   Without relogin: `newgrp kvm` + `. ~/.local/bin/env`. Check: `id` lists
+   `kvm` and `[ -r /dev/kvm ] && [ -w /dev/kvm ]`.
+
 Sync the repo to `aidev`, copy harness auth directories into `.maturana/host-auth`, build, then run:
 
 ```bash

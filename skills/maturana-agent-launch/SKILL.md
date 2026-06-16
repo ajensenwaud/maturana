@@ -33,6 +33,14 @@ validate, materialize, apply, and verify. Do not skip straight to live launch.
   works in a plain shell), the sandbox is hiding the device node — re-run the
   launch unsandboxed (a plain shell, or the harness with its sandbox bypassed).
   Do NOT run `kvm-enable.sh`; KVM is already on.
+- Linux only — the **very first launch after `install.sh` must be in a fresh
+  login shell**. The installer adds you to the `kvm` group and drops the binary
+  in `~/.local/bin`; neither applies to the shell that ran the install. Symptoms
+  of skipping this: `maturana: command not found` (PATH) or `failed to open
+  /dev/kvm: Permission denied` even though `ls -l /dev/kvm` shows the device
+  (group not active). Fix without relogin: `newgrp kvm` and
+  `. ~/.local/bin/env`. Sanity check before launch: `id` lists `kvm`, and
+  `[ -r /dev/kvm ] && [ -w /dev/kvm ] && echo kvm-ok`.
 - Confirm harness auth source exists for Codex/Claude/OpenCode OAuth-based
   runtimes before launch.
 - Confirm a replacement launch is intentional before setting force flags.
@@ -166,6 +174,27 @@ Each successful live push, run, and fetch appends an event to
 `.maturana/audit/<agent-id>.jsonl`.
 
 ## Linux Firecracker
+
+**Verified first-run order on a fresh host** (each step is idempotent; do them in
+this order):
+
+1. Fresh login shell (see Preflight — `kvm` group + `~/.local/bin` PATH).
+2. Stage harness auth into `.maturana/host-auth/<harness>/` (e.g.
+   `claude-code/`, `codex/`).
+3. `maturana setup firecracker-harnesses --agent-id <profile>` — builds rootfs +
+   kernel, creates the TAP, boots Firecracker, installs the guest worker. Run
+   **unsandboxed**. Re-runnable: the TAP is recreated fresh each launch, so a
+   repeat never hits "Resource busy".
+4. `maturana up` (or `maturana service install up`) — sessiond + channels +
+   schedules.
+5. Prove a turn: `maturana agent run <profile> --prompt "say hi" --wait`.
+6. (Optional) Pair a channel. **One bot per agent.** Two agents sharing the same
+   Telegram token collide with a Telegram **409 Conflict** (two pollers, one
+   token) and neither answers — give each agent its own bot/token.
+
+The three ready profiles are `codex-firecracker`, `claude-firecracker`,
+`opencode-firecracker`. Custom-named agents reuse one of those three networking
+slots; Maturana does not allocate new subnets per agent.
 
 On `aidev`, use specs with `vm.provider: firecracker` and explicit
 `vm.firecracker.kernel_image`, `rootfs_image`, `tap_name`, `host_ip`, and
