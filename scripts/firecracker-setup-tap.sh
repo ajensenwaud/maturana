@@ -27,16 +27,17 @@ if [[ "$(id -u)" -ne 0 ]] && ! sudo -n true 2>/dev/null; then
   exit 1
 fi
 
-# Read-only probes don't need privilege; only the mutating ops go through priv().
-if ! ip link show "$tap_name" >/dev/null 2>&1; then
-  priv ip tuntap add dev "$tap_name" mode tap
+# Always (re)create the TAP fresh. A TAP left behind by a crashed or orphaned
+# firecracker stays "Resource busy" and the NEXT launch fails to open it
+# (Firecracker: TapOpen ... ResourceBusy) — the single most common repeat-launch
+# failure. The launch stops this agent's firecracker before calling us, so the
+# per-agent TAP is safe to delete; `ip link del` also detaches any stale holder.
+if ip link show "$tap_name" >/dev/null 2>&1; then
+  priv ip link del "$tap_name"
 fi
+priv ip tuntap add dev "$tap_name" mode tap
 
-if ! ip addr show "$tap_name" | grep -q "$host_cidr"; then
-  priv ip addr flush dev "$tap_name"
-  priv ip addr add "$host_cidr" dev "$tap_name"
-fi
-
+priv ip addr add "$host_cidr" dev "$tap_name"
 priv ip link set "$tap_name" up
 
 priv sysctl -w net.ipv4.ip_forward=1 >/dev/null
