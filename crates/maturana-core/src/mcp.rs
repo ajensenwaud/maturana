@@ -24,6 +24,58 @@ pub struct RenderedMcpConfig {
     pub contents: String,
 }
 
+/// npm's global bin dir in the guest (ubuntu + nodejs, prefix `/usr/local`).
+const GUEST_NPM_GLOBAL_BIN: &str = "/usr/local/bin";
+
+/// Map an `npx`-launched MCP package to its globally-installed (resident) guest
+/// binary. Launching the resident binary directly avoids `npx`'s per-spawn
+/// package resolution, which codex/claude/opencode otherwise re-pay on **every
+/// model turn** (~4.5s/turn measured for `@notionhq/notion-mcp-server`, since
+/// each `codex exec` re-spawns the MCP server). The package is pre-installed in
+/// the guest at provisioning time (see `install_guest_worker`). Unmapped
+/// packages fall back to `npx` unchanged — still correct, just not warm.
+fn resident_npm_bin(pkg: &str) -> Option<&'static str> {
+    match pkg {
+        "@notionhq/notion-mcp-server" => Some("notion-mcp-server"),
+        _ => None,
+    }
+}
+
+/// Strip an explicit `@version` from an npm package spec, preserving a leading
+/// scope `@`. `@scope/name@1.2.3` → `@scope/name`; `name@1` → `name`.
+fn strip_npm_version(pkg: &str) -> &str {
+    match pkg.rfind('@') {
+        Some(idx) if idx > 0 => &pkg[..idx],
+        _ => pkg,
+    }
+}
+
+/// Extract the npm package spec (with any version) from an `npx [-flags] <pkg>
+/// [server-args…]` invocation. Returns `None` when the command isn't `npx`.
+/// Used both to rewrite the launch (see [`launch_invocation`]) and to know which
+/// packages to pre-install in the guest.
+pub fn npx_package(command: Option<&str>, args: &[String]) -> Option<String> {
+    if command != Some("npx") {
+        return None;
+    }
+    args.iter().find(|a| !a.starts_with('-')).cloned()
+}
+
+/// Resolve the `(command, args)` a harness should use to launch a stdio MCP
+/// server, rewriting `npx -y <pkg> …` to the resident global binary when the
+/// package is known (and thus pre-installed). Server-specific trailing args are
+/// preserved.
+fn launch_invocation(command: &str, args: &[String]) -> (String, Vec<String>) {
+    if command == "npx" {
+        if let Some(pos) = args.iter().position(|a| !a.starts_with('-')) {
+            if let Some(bin) = resident_npm_bin(strip_npm_version(&args[pos])) {
+                return (format!("{GUEST_NPM_GLOBAL_BIN}/{bin}"), args[pos + 1..].to_vec());
+            }
+        }
+    }
+    (command.to_string(), args.to_vec())
+}
+
 /// Render the MCP config for `harness`. `host_auth_dir` is the host-side
 /// `.maturana/host-auth/<harness>/` directory whose existing config (if any) is
 /// merged so operator settings survive. Returns `None` when there are no
@@ -87,15 +139,12 @@ fn render_codex(
         let mut entry = toml::map::Map::new();
         match server.transport {
             McpTransport::Stdio => {
-                entry.insert(
-                    "command".into(),
-                    toml::Value::String(server.command.clone().unwrap_or_default()),
-                );
+                let (command, args) =
+                    launch_invocation(&server.command.clone().unwrap_or_default(), &server.args);
+                entry.insert("command".into(), toml::Value::String(command));
                 entry.insert(
                     "args".into(),
-                    toml::Value::Array(
-                        server.args.iter().cloned().map(toml::Value::String).collect(),
-                    ),
+                    toml::Value::Array(args.into_iter().map(toml::Value::String).collect()),
                 );
             }
             McpTransport::Http => {
@@ -145,12 +194,11 @@ fn render_claude(
         let mut entry = serde_json::Map::new();
         match server.transport {
             McpTransport::Stdio => {
+                let (command, args) =
+                    launch_invocation(&server.command.clone().unwrap_or_default(), &server.args);
                 entry.insert("type".into(), "stdio".into());
-                entry.insert(
-                    "command".into(),
-                    server.command.clone().unwrap_or_default().into(),
-                );
-                entry.insert("args".into(), serde_json::json!(server.args));
+                entry.insert("command".into(), command.into());
+                entry.insert("args".into(), serde_json::json!(args));
                 let env = resolve_env(server, home_root)?;
                 if !env.is_empty() {
                     entry.insert("env".into(), serde_json::Value::Object(env));
@@ -176,8 +224,10 @@ fn render_opencode(servers: &[McpServer], home_root: &Path) -> anyhow::Result<Re
         match server.transport {
             McpTransport::Stdio => {
                 entry.insert("type".into(), "local".into());
-                let mut command = vec![server.command.clone().unwrap_or_default()];
-                command.extend(server.args.iter().cloned());
+                let (cmd, args) =
+                    launch_invocation(&server.command.clone().unwrap_or_default(), &server.args);
+                let mut command = vec![cmd];
+                command.extend(args);
                 entry.insert("command".into(), serde_json::json!(command));
                 let env = resolve_env(server, home_root)?;
                 if !env.is_empty() {
@@ -245,7 +295,11 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&rendered.contents).unwrap();
         let n = &v["mcpServers"]["notion"];
         assert_eq!(n["type"], "stdio");
-        assert_eq!(n["command"], "npx");
+        // `npx -y @notionhq/notion-mcp-server` is rewritten to the resident bin
+        // (pre-installed in the guest) so the harness doesn't re-resolve via npx
+        // on every turn.
+        assert_eq!(n["command"], "/usr/local/bin/notion-mcp-server");
+        assert_eq!(n["args"], serde_json::json!([]));
         assert_eq!(n["env"]["NOTION_TOKEN"], "ntn_secret");
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -268,13 +322,45 @@ mod tests {
         // Operator settings and the pre-existing server survive.
         assert_eq!(doc["model"].as_str(), Some("gpt-5.5"));
         assert_eq!(doc["mcp_servers"]["existing"]["command"].as_str(), Some("keep"));
-        // Ours is added with resolved env.
-        assert_eq!(doc["mcp_servers"]["notion"]["command"].as_str(), Some("npx"));
+        // Ours is added with resolved env, rewritten to the resident binary.
+        assert_eq!(
+            doc["mcp_servers"]["notion"]["command"].as_str(),
+            Some("/usr/local/bin/notion-mcp-server")
+        );
+        assert!(doc["mcp_servers"]["notion"]["args"].as_array().unwrap().is_empty());
         assert_eq!(
             doc["mcp_servers"]["notion"]["env"]["NOTION_TOKEN"].as_str(),
             Some("ntn_secret")
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn npx_package_and_launch_rewrite() {
+        // Known package → resident binary, npx flags dropped, trailing args kept.
+        let (cmd, args) = launch_invocation(
+            "npx",
+            &["-y".into(), "@notionhq/notion-mcp-server".into(), "--verbose".into()],
+        );
+        assert_eq!(cmd, "/usr/local/bin/notion-mcp-server");
+        assert_eq!(args, vec!["--verbose".to_string()]);
+
+        // Versioned spec still maps.
+        let (cmd, _) =
+            launch_invocation("npx", &["-y".into(), "@notionhq/notion-mcp-server@1.2.3".into()]);
+        assert_eq!(cmd, "/usr/local/bin/notion-mcp-server");
+
+        // Unknown package → unchanged npx fallback.
+        let (cmd, args) = launch_invocation("npx", &["-y".into(), "@acme/other-mcp".into()]);
+        assert_eq!(cmd, "npx");
+        assert_eq!(args, vec!["-y".to_string(), "@acme/other-mcp".to_string()]);
+
+        // Package extraction for pre-install.
+        assert_eq!(
+            npx_package(Some("npx"), &["-y".into(), "@notionhq/notion-mcp-server".into()]),
+            Some("@notionhq/notion-mcp-server".to_string())
+        );
+        assert_eq!(npx_package(Some("notion-mcp-server"), &[]), None);
     }
 
     #[test]

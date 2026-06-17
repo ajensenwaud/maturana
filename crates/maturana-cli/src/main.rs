@@ -3940,6 +3940,38 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
                 )?;
                 println!("installed MCP config ({} servers) at {guest_path}", spec.mcp_servers.len());
             }
+            // Pre-install npx-launched MCP servers globally so the harness runs
+            // the resident binary the config now points at (see
+            // mcp::launch_invocation) instead of re-resolving via `npx` on every
+            // model turn (~4.5s/turn saved). Idempotent; tolerate transient npm
+            // failures (a re-provision repairs it) rather than abort the agent.
+            let npm_pkgs: Vec<String> = spec
+                .mcp_servers
+                .iter()
+                .filter_map(|s| maturana_core::mcp::npx_package(s.command.as_deref(), &s.args))
+                .collect();
+            if !npm_pkgs.is_empty() {
+                let quoted = npm_pkgs.iter().map(|p| shell_quote(p)).collect::<Vec<_>>().join(" ");
+                match run_ssh_with_stdin(
+                    &install.guest_ip,
+                    &install.ssh_user,
+                    &ssh_key,
+                    &host_key,
+                    &format!("sudo npm install -g {quoted}"),
+                    None,
+                ) {
+                    Ok(_) => println!(
+                        "pre-installed {} resident MCP server(s): {}",
+                        npm_pkgs.len(),
+                        npm_pkgs.join(", ")
+                    ),
+                    Err(e) => eprintln!(
+                        "warning: failed to pre-install resident MCP server(s) [{}]: {e} — \
+                         the harness may be slow or the server unavailable until re-provisioned",
+                        npm_pkgs.join(", ")
+                    ),
+                }
+            }
         }
     }
 
@@ -4734,6 +4766,7 @@ fn enqueue_agent_run(
         "text": prompt,
         "prompt": prompt,
         "model": crate::channels::channel_model(home, agent_id),
+        "reasoning": crate::channels::channel_reasoning(home, agent_id),
     })
     .to_string();
     let message_id = insert_inbound(&paths, "chat", "cli", "agent-run", None, &content)?;

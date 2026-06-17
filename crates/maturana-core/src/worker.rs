@@ -644,6 +644,22 @@ PY
   model_args=()
   [ -n "$model" ] && model_args=(--model "$model")
 
+  # Reasoning effort (codex/gpt-5). Default to `low` — it keeps turns light
+  # (0 reasoning tokens on simple turns) while staying compatible with the
+  # web_search/image_gen tools (`minimal` is rejected by the API when those tools
+  # are enabled). The `/reasoning` channel command overrides this per agent.
+  reasoning="$(python3 - <<'PY'
+import json
+try:
+    d=json.load(open("/tmp/maturana-session-claim.json"))
+    c=json.loads(d["messages"][0]["content"])
+    print((c.get("reasoning") or "").strip())
+except Exception:
+    print("")
+PY
+)"
+  [ -z "$reasoning" ] && reasoning="low"
+
   response=""
   harness_timeout="${MATURANA_HARNESS_TIMEOUT_SECONDS:-240}"
   run_harness() {
@@ -654,7 +670,7 @@ PY
     # prints the final agent text. `set -o pipefail` makes a codex failure fail
     # the pipeline so the else branch's fallback applies.
     : > /tmp/maturana-session-response.txt
-    if run_harness codex exec --json "${model_args[@]}" --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C /workspace "$(cat /tmp/maturana-session-prompt.txt)" </dev/null 2>>/var/log/maturana/worker.err.log \
+    if run_harness codex exec --json -c model_reasoning_effort="$reasoning" "${model_args[@]}" --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C /workspace "$(cat /tmp/maturana-session-prompt.txt)" </dev/null 2>>/var/log/maturana/worker.err.log \
         | SESSIOND_URL="$sessiond_url" MSG_ID="$msg_id" python3 /tmp/maturana-stream-progress.py > /tmp/maturana-session-response.txt 2>>/var/log/maturana/worker.err.log; then
       response="$(cat /tmp/maturana-session-response.txt)"
     else

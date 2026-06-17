@@ -894,9 +894,10 @@ fn handle_telegram_update(
                     "text": text,
                     "prompt": prompt,
                     "telegram_reply_to": reply_to_message_id,
-                    // Per-turn model override: the guest worker passes this to the
-                    // harness as `--model`/`-m`. None => harness default.
+                    // Per-turn model + reasoning overrides: the guest worker passes
+                    // these to the harness. None => harness/worker default.
                     "model": load_channel_settings(home, &config.agent_id).model,
+                    "reasoning": load_channel_settings(home, &config.agent_id).reasoning,
                 })
                 .to_string(),
             )?;
@@ -1075,7 +1076,7 @@ pub(crate) fn run_console_command(
             }
         }
         // Everything else with a text reply goes through the shared handler.
-        "commands" | "tools" | "models" | "model" | "stop" | "compact" | "session"
+        "commands" | "tools" | "models" | "model" | "reasoning" | "stop" | "compact" | "session"
         | "subagents" | "graph-query" | "graph-insert" | "tts" | "tts-provider" | "onboard"
         | "skill" | "emerge" => {
             match handle_channel_command(home, agent_id, session_id, console_chat_key(), &name, args)
@@ -1490,7 +1491,7 @@ fn classify_telegram_update(
                 text: format!("Use the `{skill}` skill. {rest}").trim().to_string(),
             }
         }
-        "/commands" | "/tools" | "/models" | "/model" | "/reset" | "/stop" | "/compact"
+        "/commands" | "/tools" | "/models" | "/model" | "/reasoning" | "/reset" | "/stop" | "/compact"
         | "/session" | "/subagents" | "/graph-query" | "/graph-insert" | "/tts"
         | "/tts-provider" | "/emerge" | "/skill" | "/onboard" => InboundAction::Command {
             chat_id,
@@ -1602,6 +1603,10 @@ fn slugify_channel_id(value: &str) -> String {
 struct ChannelSettings {
     #[serde(default)]
     model: Option<String>,
+    /// Reasoning effort for reasoning-capable harnesses (codex/gpt-5):
+    /// low|medium|high. None => the worker's fast default (low).
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     tts_enabled: bool,
     #[serde(default)]
@@ -1636,6 +1641,20 @@ pub(crate) fn channel_model(home: &MaturanaHome, agent_id: &str) -> Option<Strin
     load_channel_settings(home, agent_id).model
 }
 
+/// The agent's current `/reasoning` effort (low|medium|high), if set.
+/// Attached to inbound messages; the codex worker maps it to
+/// `model_reasoning_effort`. None => the worker's fast default (low).
+pub(crate) fn channel_reasoning(home: &MaturanaHome, agent_id: &str) -> Option<String> {
+    load_channel_settings(home, agent_id).reasoning
+}
+
+/// Reasoning levels offered by `/reasoning` (codex/gpt-5). `low` is snappy;
+/// `high` reasons deepest. Validated against this list before storing.
+/// `minimal` is intentionally excluded: the codex agent enables the
+/// `web_search`/`image_gen` tools, and the API rejects `reasoning.effort
+/// minimal` (HTTP 400) whenever those tools are present.
+const REASONING_LEVELS: &[&str] = &["low", "medium", "high"];
+
 fn save_channel_settings(
     home: &MaturanaHome,
     agent_id: &str,
@@ -1667,6 +1686,7 @@ const COMMAND_GROUPS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("/model", "show or set the model (/model <id>)"),
             ("/models", "list available models"),
+            ("/reasoning", "codex reasoning effort (low|medium|high)"),
         ],
     ),
     (
@@ -1741,15 +1761,17 @@ fn status_text(home: &MaturanaHome, agent_id: &str, session_id: &str, channel: &
     let settings = load_channel_settings(home, agent_id);
     let harness = harness_label(home, agent_id);
     let model = settings.model.unwrap_or_else(|| "(harness default)".to_string());
+    let reasoning = settings.reasoning.unwrap_or_else(|| "low (default)".to_string());
     let now = Utc::now().format("%Y-%m-%d %H:%M UTC");
     format!(
-        "Status\n  agent: {}\n  channel: {} (session {})\n  presence: {}\n  harness: {}\n  model: {}\n  OS: {}\n  time: {}\n  idle: {}",
+        "Status\n  agent: {}\n  channel: {} (session {})\n  presence: {}\n  harness: {}\n  model: {}\n  reasoning: {}\n  OS: {}\n  time: {}\n  idle: {}",
         agent_id,
         channel,
         session_id,
         channel_presence(home, agent_id),
         harness,
         model,
+        reasoning,
         std::env::consts::OS,
         now,
         if settings.idle { "on" } else { "off" },
@@ -2033,6 +2055,23 @@ fn handle_channel_command(
                 format!("Model set to `{}` (applies to new turns).", args.trim())
             }
         }
+        "reasoning" => {
+            let mut settings = load_channel_settings(home, &config.agent_id);
+            let arg = args.trim().to_lowercase();
+            if arg.is_empty() {
+                format!(
+                    "Reasoning effort: {} (codex/gpt-5). Set with /reasoning <{}>",
+                    settings.reasoning.clone().unwrap_or_else(|| "low (default)".to_string()),
+                    REASONING_LEVELS.join("|"),
+                )
+            } else if REASONING_LEVELS.contains(&arg.as_str()) {
+                settings.reasoning = Some(arg.clone());
+                save_channel_settings(home, &config.agent_id, &settings)?;
+                format!("Reasoning effort set to `{arg}` (applies to new turns; codex/gpt-5).")
+            } else {
+                format!("Unknown level `{arg}`. Choose one of: {}", REASONING_LEVELS.join(", "))
+            }
+        }
         "reset" => {
             reset_channel_context(home, &config.agent_id, chat_id)?;
             "Session reset — durable memory and wiki are preserved.".to_string()
@@ -2181,6 +2220,20 @@ fn command_selector(
                 1,
             ))
         }
+        "reasoning" => {
+            let current = settings
+                .reasoning
+                .unwrap_or_else(|| "low (default)".to_string());
+            let buttons: Vec<(String, String)> = REASONING_LEVELS
+                .iter()
+                .map(|lvl| (lvl.to_string(), format!("reasoning:{lvl}")))
+                .collect();
+            Some((
+                format!("Reasoning effort: {current} (codex/gpt-5)\nTap a level:"),
+                buttons,
+                2,
+            ))
+        }
         "tts-provider" => {
             let current = settings.tts_provider.unwrap_or_else(|| "(none)".to_string());
             let buttons = TTS_PROVIDERS
@@ -2249,6 +2302,14 @@ fn handle_telegram_callback(
             (
                 format!("Model: {value}"),
                 format!("Model set to `{value}` (applies to new turns)."),
+            )
+        }
+        "reasoning" => {
+            settings.reasoning = Some(value.to_string());
+            save_channel_settings(home, &config.agent_id, &settings)?;
+            (
+                format!("Reasoning: {value}"),
+                format!("Reasoning effort set to `{value}` (applies to new turns)."),
             )
         }
         "ttsprov" => {
