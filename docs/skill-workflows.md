@@ -8,7 +8,7 @@ Use this pattern when creating or reviewing a skill.
 Validate the bundled skill pack with:
 
 ```powershell
-.\scripts\maturana.ps1 skill validate skills
+maturana skill validate skills
 ```
 
 CI runs the same validator so skill workflow drift fails the normal local gate.
@@ -68,7 +68,7 @@ piece of evidence:
 - `.maturana/agents/<agent-id>/sessions/...` for channel/session flow.
 - Snapshot metadata plus restore test output for snapshot behavior.
 - Rust test output for library or CLI behavior.
-- Linux `aidev` output for Firecracker changes.
+- Live output from a Linux Firecracker host for Firecracker changes.
 
 ## Recovery Style
 

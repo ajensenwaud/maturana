@@ -6,10 +6,10 @@ adapters only where the hypervisor requires them.
 ## Commands
 
 ```powershell
-.\scripts\maturana.ps1 snapshot list <agent-id>
-.\scripts\maturana.ps1 snapshot take <agent-id> <snapshot-name>
-.\scripts\maturana.ps1 snapshot take <agent-id> <snapshot-name> --live
-.\scripts\maturana.ps1 snapshot restore <agent-id> <snapshot-name> --live
+maturana snapshot list <agent-id>
+maturana snapshot take <agent-id> <snapshot-name>
+maturana snapshot take <agent-id> <snapshot-name> --live
+maturana snapshot restore <agent-id> <snapshot-name> --live
 ```
 
 Without `--live`, `snapshot take` creates a local marker record only. Local

@@ -19,12 +19,42 @@ agent session and optionally waits for the matching outbound response. It does
 not write `/agent/prompt.txt`, write `/agent/run-command`, or restart the guest
 service for normal turns.
 
+## Launch your first agent
+
+`install.ps1` already provisioned hostd, the Ubuntu VHDX, the agent SSH key, and
+the `up` boot service — so launching an agent is just:
+
+```powershell
+cd ~\maturana
+
+# 1. Stage harness auth (Codex shown; Claude Code → host-auth\claude-code).
+mkdir .maturana\host-auth -Force
+Copy-Item -Recurse ~\.codex .maturana\host-auth\codex
+
+# 2. The installer already started the runtime plane — confirm it.
+maturana service status up
+
+# 3. Validate, then launch the bundled demo (id codex-demo).
+maturana spec validate examples\MATURANA.codex-hyperv.md
+maturana agent launch examples\MATURANA.codex-hyperv.md --apply
+
+# 4. Talk to it.
+maturana agent run codex-demo --prompt "say hi" --wait
+```
+
+The CLI talks to hostd (running as SYSTEM), which creates and starts the Hyper-V
+VM; Rust then provisions the guest worker, injects auth, and starts the in-guest
+service over SSH. Re-launching an existing VM needs an explicit override — set
+`$env:MATURANA_HYPERV_FORCE = "true"` before `--apply`. A second bundled spec,
+`examples\MATURANA.claude-hyperv.md` (id `claude-demo`), runs the Claude Code
+harness.
+
 ## Health
 
 Run:
 
 ```powershell
-.\target\x86_64-pc-windows-msvc\debug\maturana.exe doctor
+maturana doctor
 ```
 
 The doctor checks:
@@ -37,14 +67,14 @@ The doctor checks:
 Use JSON for automation:
 
 ```powershell
-.\target\x86_64-pc-windows-msvc\debug\maturana.exe doctor --json
+maturana doctor --json
 ```
 
 Inspect one live VM and, when needed, its guest harness state:
 
 ```powershell
-.\scripts\maturana.ps1 agent inspect codex-demo --live
-.\scripts\maturana.ps1 agent inspect codex-demo --live --guest
+maturana agent inspect codex-demo --live
+maturana agent inspect codex-demo --live --guest
 ```
 
 `--guest` runs the narrow SSH diagnostic from Rust: harness versions, systemd
@@ -57,13 +87,13 @@ Restart the local session bridge, refresh guest workers, start Telegram channel
 runners, and run doctor:
 
 ```powershell
-.\scripts\maturana.ps1 setup windows-harnesses
+maturana setup windows-harnesses
 ```
 
 Install persistent scheduled tasks instead of direct background processes:
 
 ```powershell
-.\scripts\maturana.ps1 setup windows-harnesses --register-tasks
+maturana setup windows-harnesses --register-tasks
 ```
 
 The repair command does not rebuild VMs. It owns the repair decision path and

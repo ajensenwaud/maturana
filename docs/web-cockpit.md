@@ -1,5 +1,10 @@
 # Maturana Web Cockpit
 
+> **Status: disabled for now.** The web cockpit is not part of the currently
+> supported surface. This document is kept for reference and for when the
+> interface is re-enabled; the README and architecture do not feature it. Use the
+> Codex CLI control plane and the `maturana` commands instead.
+
 `maturana web` serves a browser-based control surface for the platform. It
 **complements** the Codex CLI control plane — it never replaces it. Both
 surfaces drive the same contract: the cockpit's prompt console spawns the

@@ -1,5 +1,9 @@
 # MVP Plan
 
+> **Historical roadmap.** This records the original milestone plan and is kept for
+> context. It is not a current how-to — see the [documentation index](README.md)
+> for guides that track the shipped system.
+
 ## Milestone 1: Windows Control Plane
 
 - Parse and validate `MATURANA.md`.

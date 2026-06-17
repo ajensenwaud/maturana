@@ -75,42 +75,42 @@ responses. No channel path should restart systemd or shell out per message.
 Initialize personal-agent files:
 
 ```powershell
-.\scripts\maturana.ps1 personal init codex-demo --spec .\examples\MATURANA.codex-hyperv.md
+maturana personal init codex-demo --spec .\examples\MATURANA.codex-hyperv.md
 ```
 
 Initialize and ingest shared wiki context:
 
 ```powershell
-.\scripts\maturana.ps1 wiki init
-.\scripts\maturana.ps1 wiki ingest .\AGENTS.md --title Repo-Agents
-.\scripts\maturana.ps1 wiki search secure --limit 5
+maturana wiki init
+maturana wiki ingest .\AGENTS.md --title Repo-Agents
+maturana wiki search secure --limit 5
 ```
 
 Write and inspect heartbeat:
 
 ```powershell
-.\scripts\maturana.ps1 heartbeat beat codex-demo --status alive --message "ready"
-.\scripts\maturana.ps1 heartbeat status codex-demo
+maturana heartbeat beat codex-demo --status alive --message "ready"
+maturana heartbeat status codex-demo
 ```
 
 Add and list schedules:
 
 ```powershell
-.\scripts\maturana.ps1 schedule add codex-demo morning `
+maturana schedule add codex-demo morning `
   --cron "0 9 * * *" `
   --prompt "Send a morning brief" `
   --channel telegram
 
-.\scripts\maturana.ps1 schedule list codex-demo
+maturana schedule list codex-demo
 ```
 
 Deploy a skill or tool into a running guest:
 
 ```powershell
-.\scripts\maturana.ps1 deploy skill codex-demo .\skills\maturana-pipelock `
+maturana deploy skill codex-demo .\skills\maturana-pipelock `
   --ip 172.26.x.y
 
-.\scripts\maturana.ps1 deploy tool codex-demo .\target\x86_64-pc-windows-gnu\debug\maturana.exe `
+maturana deploy tool codex-demo .\target\x86_64-pc-windows-gnu\debug\maturana.exe `
   --ip 172.26.x.y `
   --guest-path /agent/tools/maturana.exe
 ```
@@ -120,15 +120,15 @@ Deploy a skill or tool into a running guest:
 Telegram:
 
 ```powershell
-.\scripts\maturana.ps1 channel pair telegram start
+maturana channel pair telegram start
 # Send the printed `/pair CODE` message to the bot from Telegram.
-.\scripts\maturana.ps1 channel pair telegram complete
-.\scripts\maturana.ps1 channel serve telegram --agent-id codex-demo
+maturana channel pair telegram complete
+maturana channel serve telegram --agent-id codex-demo
 
 # Local session smoke test without a harness:
-.\scripts\maturana.ps1 channel serve telegram --agent-id codex-demo --run-once-provider echo
+maturana channel serve telegram --agent-id codex-demo --run-once-provider echo
 
-.\scripts\maturana.ps1 notify telegram `
+maturana notify telegram `
   --token-source pipelock:telegram/bot-token `
   --message "Maturana is alive"
 ```
@@ -185,14 +185,14 @@ relevant wiki chunks into a fresh manifest.
 Session CLI:
 
 ```powershell
-.\scripts\maturana.ps1 session init codex-demo --session-id telegram-main
-.\scripts\maturana.ps1 session enqueue codex-demo `
+maturana session init codex-demo --session-id telegram-main
+maturana session enqueue codex-demo `
   --session-id telegram-main `
   --channel telegram `
   --platform-id 12345 `
   --text "hello"
-.\scripts\maturana.ps1 session run-once codex-demo --session-id telegram-main --provider echo
-.\scripts\maturana.ps1 session outbox codex-demo --session-id telegram-main --mark-delivered
+maturana session run-once codex-demo --session-id telegram-main --provider echo
+maturana session outbox codex-demo --session-id telegram-main --mark-delivered
 ```
 
 `echo` is only a smoke-test provider. Real turns are handled by the long-lived
@@ -202,7 +202,7 @@ Codex/Claude Code/OpenCode inside the VM, and writes outbound rows.
 Discord webhook:
 
 ```powershell
-.\scripts\maturana.ps1 notify discord `
+maturana notify discord `
   --webhook-source pipelock:discord/webhook `
   --message "Maturana is alive"
 ```

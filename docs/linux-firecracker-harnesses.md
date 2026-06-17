@@ -1,12 +1,10 @@
 # Linux Firecracker harnesses
 
-Host: `aj@aidev`
-
-Repo path:
-
-```bash
-/var/tmp/maturana-aidev
-```
+Operating Maturana agents in Firecracker microVMs on a Linux host. After
+`install.sh --firecracker`, the `maturana` binary is on your `PATH` and the repo
+lives at `~/maturana` (the commands below assume that as the working directory).
+Paths, IPs, TAP names, and session ids shown are examples from the bundled specs —
+substitute your own.
 
 ## Deploy
 
@@ -23,18 +21,22 @@ Two preflight gotchas bite on a fresh host (both produce a misleading
    Without relogin: `newgrp kvm` + `. ~/.local/bin/env`. Check: `id` lists
    `kvm` and `[ -r /dev/kvm ] && [ -w /dev/kvm ]`.
 
-Sync the repo to `aidev`, copy harness auth directories into `.maturana/host-auth`, build, then run:
+Copy harness auth directories into `.maturana/host-auth` (see the project README),
+then build the images and launch every bundled agent:
 
 ```bash
-cd /var/tmp/maturana-aidev
-cargo build -p maturana-cli
-target/debug/maturana setup firecracker-harnesses
+cd ~/maturana
+maturana setup firecracker-harnesses
 ```
+
+> Building from source instead of the prebuilt binary? Run `cargo build -p
+> maturana-cli` once and use `maturana` in place of `maturana` in the
+> commands below.
 
 To resume one agent:
 
 ```bash
-target/debug/maturana setup firecracker-harnesses --agent-id opencode-firecracker
+maturana setup firecracker-harnesses --agent-id opencode-firecracker
 ```
 
 Agents:
@@ -51,8 +53,8 @@ schedule runners) and let `repair` only build assets, launch VMs, and install
 guest workers:
 
 ```bash
-target/debug/maturana service install up web
-target/debug/maturana setup firecracker-harnesses --skip-services
+maturana service install up web
+maturana setup firecracker-harnesses --skip-services
 ```
 
 `--skip-services` keeps `repair` from starting its own sessiond/graph (which
@@ -73,7 +75,7 @@ microVMs, whose TAP devices are wiped on reboot. Register the boot-time fleet
 relauncher so the VMs come back too, with no interactive login:
 
 ```bash
-target/debug/maturana service install fleet
+maturana service install fleet
 ```
 
 This installs a systemd **oneshot** (`maturana-fleet.service`) ordered
@@ -98,9 +100,9 @@ boot unit no-ops cleanly on a host that hasn't built images yet).
 Firecracker lifecycle is Rust-owned. Use the CLI for launch and stop:
 
 ```bash
-target/debug/maturana agent launch examples/MATURANA.codex-firecracker.md --apply
-target/debug/maturana agent inspect codex-firecracker --live
-target/debug/maturana agent stop codex-firecracker --live
+maturana agent launch examples/MATURANA.codex-firecracker.md --apply
+maturana agent inspect codex-firecracker --live
+maturana agent stop codex-firecracker --live
 ```
 
 Shell scripts remain host setup adapters for image preparation, TAP creation,
@@ -160,7 +162,7 @@ match the selected Firecracker profile.
 ## Refresh Worker
 
 ```bash
-target/debug/maturana setup guest-worker \
+maturana setup guest-worker \
   --agent-id codex-firecracker \
   --session-id codex-main \
   --harness codex \
@@ -180,22 +182,22 @@ inspect when recovering a broken materialized spec.
 ## Test
 
 ```bash
-target/debug/maturana session enqueue codex-firecracker \
+maturana session enqueue codex-firecracker \
   --session-id codex-main \
   --channel health \
   --platform-id doctor \
   --text "Reply exactly: linux-codex-health"
 
-target/debug/maturana session outbox codex-firecracker --session-id codex-main
+maturana session outbox codex-firecracker --session-id codex-main
 ```
 
 ## Cron
 
 ```bash
-target/debug/maturana schedule add codex-firecracker every-minute \
+maturana schedule add codex-firecracker every-minute \
   --cron "* * * * *" \
   --prompt "Reply exactly: schedule-health" \
   --channel health
 
-target/debug/maturana schedule run-due codex-firecracker --session-id codex-main
+maturana schedule run-due codex-firecracker --session-id codex-main
 ```

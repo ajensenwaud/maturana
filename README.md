@@ -1,694 +1,258 @@
 # Maturana
 
-Secure agentic orchestration built around Codex skills and hardware-isolated
-worker agents.
+> *A secure agent harness that runs every agent in its own hardware-isolated microVM. Lightweight, built to be read and understood, and completely yours to customize from Codex.*
 
-## Install
+Maturana turns a single `MATURANA.md` file into a running, always-on AI agent inside its own
+Firecracker (Linux) or Hyper-V (Windows) microVM — with a bounded filesystem, an egress
+allowlist, encrypted secrets, durable shared memory, and one-command snapshot/rewind. You
+define and operate everything from Codex.
 
-One-liners. Both download the **signed prebuilt `maturana` binary** from the
-latest [GitHub Release](https://github.com/ajensenwaud/maturana/releases) (no
-Rust/C/MSYS2 toolchain on your machine), verify its SHA256, clone the repo for
-the skills/scripts/orientation files, and register the `maturana up` runtime
-plane + `maturana web` cockpit as services:
+---
+
+## Motivation
+
+There is no shortage of agent harnesses. Most optimize for features, not security. The powerful
+ones have grown so large and so flexible that their attack surface is enormous — large enough
+that vendors now ship hardened shells just to make them safe to run. Others isolate agents in
+containers, which is the right instinct, but bind themselves tightly to a single vendor's
+ecosystem.
+
+I wanted something different: a harness I can actually read, that is secure because of how it is
+*built*, not because of a wall of permission checks bolted on afterward. I also just enjoy
+engineering with Codex. So Maturana is a lean harness on the Codex ecosystem, with
+**hardware-level** isolation for every agent — Firecracker on Linux, Hyper-V on Windows — and
+zero-trust wired through the whole thing.
+
+It combines the elegance of Unix, the agentic workflow of Codex, and the isolation of a
+hypervisor. The core is a small Rust runtime; everything else is a skill or a tool you can read,
+swap, or write yourself.
+
+**Maturana is not** a chat UI competing with Codex, a generic multi-control-plane framework,
+Docker orchestration, or multi-tenant SaaS. It is a single-operator, security-first agent
+harness.
+
+---
+
+## Why Maturana
+
+**Secure by design.** Agents are isolated with real hardware virtualization — a Firecracker or
+Hyper-V microVM per agent — for maximum security, not just a container.
+
+**Zero-trust.** Pipelock keeps secrets like API keys and credit-card numbers out of an agent's
+reach, and an egress proxy controls exactly which systems it can talk to. Treat every agent as an
+adversary and lock it down.
+
+**Build anything.** Maturana is built on and for Codex, the premier OpenAI agent-engineering
+environment. Everything is a skill — from agent creation to tools — so you customise your agents
+with prompts and nothing else.
+
+**Self-evolving.** An internal WASM engine lets agents build their own tools on the fly, safely
+sandboxed with no ambient authority.
+
+**Shared knowledge.** Maturana ships with a shared knowledge graph that scales past markdown
+files. Agents build their own memory, so you don't have to.
+
+**Lean and fast.** Maturana is built in Rust with a modular core from the start. Skills are
+extensions to that core — you run only what you need.
+
+---
+
+## Getting started
+
+### Install
+
+One line. It downloads the signed prebuilt `maturana` binary (no Rust toolchain needed),
+verifies its checksum, clones the repo for the skills/examples, and registers the runtime plane
+as a service.
 
 ```sh
-# Linux (control plane: CLI + web cockpit)
-curl -fsSL https://raw.githubusercontent.com/ajensenwaud/maturana/main/scripts/install.sh | bash
+# Linux — control plane only
+curl -fsSL https://www.maturana.sh/install.sh | bash
 
-# Linux that will also RUN isolated agents — add the Firecracker microVM host:
-curl -fsSL https://raw.githubusercontent.com/ajensenwaud/maturana/main/scripts/install.sh | bash -s -- --firecracker
-
-# Build locally from source instead of downloading the prebuilt binary:
-curl -fsSL .../scripts/install.sh | bash -s -- --from-source
+# Linux that will also RUN isolated agents — add the Firecracker microVM host
+curl -fsSL https://www.maturana.sh/install.sh | bash -s -- --firecracker
 ```
 
 ```powershell
-# Windows (Hyper-V) — downloads the signed maturana.exe, then installs.
-# Self-elevates (one UAC) and prompts for your Windows password (for the
-# no-login boot tasks). See "Zero-touch reboot recovery" below.
+# Windows (Hyper-V) — self-elevates once, prompts for your Windows password (for the no-login boot tasks)
 irm https://www.maturana.sh/install.ps1 | iex
 ```
 
-Or clone this repo and run `scripts/install.sh` / `scripts/install.ps1`
-directly. The Windows installer downloads the prebuilt binary by default; pass
-`-FromSource` to build with the Rust MSVC toolchain instead. On Linux,
-`--firecracker` (or
-running `scripts/install-firecracker-host.sh` standalone) provisions the microVM
-substrate — the `firecracker` binary, KVM access, the libguestfs/qemu
-image-build toolchain, and guest-egress NAT — then `maturana setup
-firecracker-harnesses` builds the images and launches agents (see
-[docs/linux-firecracker-harnesses.md](docs/linux-firecracker-harnesses.md)).
+Build from source instead with `--from-source` (Linux) / `-FromSource` (Windows). Uninstall any
+time with `scripts/uninstall.sh` / `scripts/uninstall-windows.ps1` — add `--purge` / `-Purge` to
+also delete your agents and secrets.
 
-#### Script vs. tool — what *you* run
-
-There are only **two things you ever run by hand**:
-
-1. **`install.sh` / `install.ps1`** — the one-time bootstrap (download the
-   binary, set up the host). Run it once per machine.
-2. **`maturana <command>`** — everything after that: `maturana up`,
-   `maturana agent …`, `maturana channel …`, `maturana setup …`, `maturana web`.
-   The Rust CLI owns all the logic.
-
-Every other file in `scripts/` (`install-hostd-task.ps1`,
-`install-firecracker-host.sh`, `firecracker-*.sh`, …) is an **internal adapter**
-the installer or the CLI calls for you — you don't invoke them directly. Rule of
-thumb: **if it's a `.ps1`/`.sh` you typed, it's only ever `install`/`uninstall`;
-anything else is `maturana …`.** (`maturana setup` was historically `maturana
-repair`, which still works as an alias.)
-
-### Run your first agent on Linux (Firecracker)
-
-Verified end-to-end. After `install.sh --firecracker` above:
-
-1. **Open a fresh login shell** so the new `kvm` group and `~/.local/bin` PATH
-   take effect (the installer adds you to `kvm` and installs the binary to
-   `~/.local/bin`; both only apply in a new session — or run `newgrp kvm` and
-   `. ~/.local/bin/env`). Sanity check: `ls -l /dev/kvm` is group-readable and
-   `maturana --help` resolves.
-
-2. **Stage harness credentials** for the runtime you want — e.g. for Claude Code,
-   copy your signed-in `~/.claude` into `.maturana/host-auth/claude-code/` (codex
-   → `.maturana/host-auth/codex/`).
-
-3. **Build the image + boot the microVM.** Run this in a **plain shell — NOT
-   inside a sandboxed agent.** Firecracker opens `/dev/kvm`, which a harness
-   sandbox (e.g. Codex's default) hides; if you drive Maturana from Codex, run it
-   unsandboxed (`codex --dangerously-bypass-approvals-and-sandbox`, or a
-   `[profiles.maturana]` with `sandbox_mode = "danger-full-access"`) — otherwise
-   you get a misleading `/dev/kvm does not exist`. Three profiles ship ready:
-   `codex-firecracker`, `claude-firecracker`, `opencode-firecracker`.
-
-   ```bash
-   maturana setup firecracker-harnesses --agent-id claude-firecracker
-   ```
-
-   This builds the rootfs + kernel, creates the TAP, boots Firecracker, and
-   installs the in-guest worker. It is idempotent — re-run any time (the TAP is
-   recreated fresh each launch, so repeat launches never hit "Resource busy").
-
-4. **Confirm the runtime plane is up** (sessiond + channels + schedules).
-   `install.sh` already registered **and started** it as a systemd user service —
-   don't run `maturana up` by hand (it's a foreground supervisor that would fight
-   the service for the port). Just check it:
-
-   ```bash
-   maturana service status up
-   ```
-
-5. **Talk to it.** Host-side turn:
-
-   ```bash
-   maturana agent run claude-firecracker --prompt "say hi" --wait
-   ```
-
-   Or pair Telegram — **one bot per agent** (two agents on the same token collide
-   with a Telegram 409):
-
-   ```bash
-   maturana pipelock set telegram/claude-bot-token --value-file /path/to/token
-   maturana channel pair telegram start --agent-id claude-firecracker \
-     --token-source pipelock:telegram/claude-bot-token
-   # then send the printed  /pair <CODE>  to your bot
-   ```
-
-### Run your first agent on Windows (Hyper-V)
-
-Verified end-to-end. `install.ps1` above already provisioned hostd, the Ubuntu
-VHDX, the agent SSH key, and the `maturana up`/`web` boot services — so launching
-an agent is just:
-
-1. **Stage harness credentials** for the runtime you want — copy your signed-in
-   `~\.codex` into `.maturana\host-auth\codex\` (Claude Code →
-   `.maturana\host-auth\claude-code\`). The launcher injects these into the guest;
-   they are never baked into the image.
-
-2. **Confirm the plane is up.** `install.ps1` already registered **and started**
-   the `up` plane as a boot task — don't run `maturana up` by hand on Windows
-   (it's a foreground supervisor that would fight the service for the port). Just
-   check it:
-
-   ```powershell
-   maturana service status up
-   ```
-
-3. **Launch the agent.** Two ship ready: `examples\MATURANA.codex-hyperv.md`
-   (id `codex-demo`) and `examples\MATURANA.claude-hyperv.md` (id `claude-demo`).
-   Validate, then apply:
-
-   ```powershell
-   maturana spec validate examples\MATURANA.codex-hyperv.md
-   maturana agent launch examples\MATURANA.codex-hyperv.md --apply
-   ```
-
-   The CLI talks to hostd (SYSTEM), which creates + starts the Hyper-V VM; Rust
-   then provisions the guest worker, injects auth, and starts the in-guest
-   service over SSH. Re-launching an existing VM needs an explicit override:
-   `$env:MATURANA_HYPERV_FORCE = "true"` before `--apply`.
-
-4. **Talk to it.** Host-side turn:
-
-   ```powershell
-   maturana agent run codex-demo --prompt "say hi" --wait
-   ```
-
-   Telegram pairing is identical to Linux — **one bot per agent** (two agents on
-   the same token collide with a Telegram 409):
-
-   ```powershell
-   maturana pipelock set telegram/codex-bot-token --value-file C:\path\to\token
-   maturana channel pair telegram start --agent-id codex-demo `
-     --token-source pipelock:telegram/codex-bot-token
-   # then send the printed  /pair <CODE>  to your bot
-   ```
-
-### Releases, verification & signing
-
-Tagging `v*` runs `.github/workflows/release.yml`, which builds
-`maturana-x86_64-unknown-linux-gnu.tar.gz` and
-`maturana-x86_64-pc-windows-msvc.zip`, publishes them with a `SHA256SUMS`
-manifest, and (when the signing secrets are configured) **Authenticode-signs the
-Windows `.exe`** and **GPG-signs `SHA256SUMS`**. The installers always verify the
-SHA256; signature verification is best-effort until the certs are wired in:
-
-- Windows code signing: add repo secrets `WINDOWS_PFX_BASE64` (base64 of the
-  code-signing `.pfx`) + `WINDOWS_PFX_PASSWORD`.
-- Linux checksum signing: add `GPG_PRIVATE_KEY` (ASCII-armored) + `GPG_PASSPHRASE`;
-  verify with `gpg --verify SHA256SUMS.asc SHA256SUMS`.
-
-Manual verification:
+### Your first agent (Linux / Firecracker)
 
 ```sh
-sha256sum -c --ignore-missing SHA256SUMS         # Linux
-```
-```powershell
-(Get-AuthenticodeSignature maturana.exe).Status  # Windows (Valid once signed)
+cd ~/maturana
+
+# 1. Open a fresh login shell first, so the `kvm` group + ~/.local/bin PATH apply.
+#    Sanity check: `ls -l /dev/kvm` is group-readable and `maturana --help` resolves.
+
+# 2. Stage harness auth for the runtime you want (Codex shown; Claude Code → host-auth/claude-code).
+mkdir -p .maturana/host-auth && cp -r ~/.codex .maturana/host-auth/codex
+
+# 3. Build the image + boot the microVM. Run this in a PLAIN shell, not inside a sandboxed agent
+#    (Firecracker needs /dev/kvm, which a sandbox hides). Idempotent — re-run any time.
+maturana setup firecracker-harnesses --agent-id codex-firecracker
+
+# 4. The installer already started the runtime plane as a service — just confirm it.
+maturana service status up
+
+# 5. Talk to it.
+maturana agent run codex-firecracker --prompt "say hi" --wait
 ```
 
-> The public site will live at **www.maturana.sh**; the install URLs will move
-> there once it's up. For now they point at GitHub.
+That's the whole loop: stage auth → boot → talk. See
+[docs/linux-firecracker-harnesses.md](docs/linux-firecracker-harnesses.md) for the full Linux
+guide and [docs/harness-operations.md](docs/harness-operations.md) for Windows / Hyper-V.
 
-Maturana is **Codex-native** — everything flows from Codex. After installing,
-start building agents from Codex (it's oriented by the repo's `AGENTS.md` +
-`skills/`):
+Prefer to let Codex drive? `cd ~/maturana && codex`, then ask it to create and launch your first
+agent — it's oriented by `AGENTS.md` and the `skills/` pack.
+
+---
+
+## Using it
+
+A Maturana agent is one `MATURANA.md` spec — identity, runtime, VM, mounts, egress, memory,
+channels, schedules, snapshots. Codex writes it; you can read and edit it. (Full field
+reference: [docs/maturana-spec.md](docs/maturana-spec.md).)
 
 ```sh
-cd <install-dir> && codex      # then ask it to create + launch your first agent
+maturana spec validate examples/MATURANA.codex-firecracker.md   # check before launch
+maturana agent launch examples/MATURANA.codex-firecracker.md --apply
+maturana agent inspect codex-firecracker --live                 # health, logs, status
 ```
 
-`codex login` authenticates your subscription on first run. The web cockpit at
-`http://<host>:47836` (token via `maturana web token`; see
-[docs/web-cockpit.md](docs/web-cockpit.md)) is an optional, complementary
-surface. Manage services with `maturana service install|uninstall|status|restart
-[up|web|fleet]`.
+**Talk to an agent**
 
-### Uninstall
+- Console TUI: `maturana tui` (agent picker) or `maturana agent chat <id>`
+- Host turn: `maturana agent run <id> --prompt "…" --wait`
+- Telegram / Discord — pair a bot, then chat from your phone (one bot per agent):
 
-Removes the services, running processes, and agent VMs. By default it **keeps
-your data** (the repo + `.maturana`, which holds credentials/agents); add
-`--purge` / `-Purge` to remove everything:
+  ```sh
+  maturana pipelock set telegram/bot-token --value-file ./token
+  maturana channel pair telegram start --agent-id <id> --token-source pipelock:telegram/bot-token
+  # send the printed  /pair <CODE>  to your bot
+  ```
+
+**Always-on** — agents have a heartbeat, run cron-style schedules, and push notifications:
 
 ```sh
-# Linux
-curl -fsSL https://raw.githubusercontent.com/ajensenwaud/maturana/main/scripts/uninstall.sh | bash
-curl -fsSL .../scripts/uninstall.sh | bash -s -- --purge
-```
-```powershell
-# Windows (self-elevates)
-irm https://raw.githubusercontent.com/ajensenwaud/maturana/main/scripts/uninstall-windows.ps1 | iex
-# from a clone, to also delete data:  .\scripts\uninstall-windows.ps1 -Purge
+maturana schedule add <id> morning --cron "0 9 * * *" --prompt "Send a morning brief" --channel telegram
 ```
 
-This repository is at MVP stage, but the product path is Rust-owned and
-provider-aware. The current implementation provides:
+**Capabilities** — skills give agents the web and your tools: browse (headless Chrome), web
+search, image generation, voice (speech-to-text / text-to-speech), and GitHub / Notion / Slack /
+email integrations.
 
-- a Rust CLI named `maturana`
-- `MATURANA.md` parsing with YAML front matter
-- spec validation for runtimes, mounts, egress, credentials, channels, and VM
-  settings
-- Windows Hyper-V launch planning and apply mode through fixed host adapters
-- dry-run and applied agent materialization under `.maturana/agents/<agent-id>`
-- generated guest `AGENTS.md`, `SOUL.md`, launch plan, audit log, workspace,
-  memory, and snapshot directories
-- Linux Firecracker launch, stop, inspect, and snapshot/restore paths owned by
-  Rust, with shell scripts kept as image/TAP setup adapters
-- Maturana skills shaped as operational workflows with grounding, preflight,
-  evidence, recovery, and boundaries rather than thin CLI wrappers
+**Govern** — read the audit trail, then snapshot and rewind:
 
-## Secret Handling
-
-Do not place OAuth tokens, Telegram bot tokens, Discord webhooks, or other
-secrets in `MATURANA.md`.
-
-Harness OAuth for Codex and Claude Code is injected directly into the guest VM
-filesystem because those CLIs expect local subscription auth state. Put host-side
-copies under ignored paths such as:
-
-```text
-.maturana/host-auth/codex
-.maturana/host-auth/claude-code
+```sh
+maturana audit list <id> --limit 10
+maturana snapshot take <id> before-change --live
+maturana snapshot restore <id> before-change --live
 ```
 
-For the current local deployment path, non-harness credentials use `env:`,
-`file:`, or `pipelock:`
-references instead of raw secrets. `pipelock:` resolves from a local Maturana
-vault under `.maturana/pipelock`. It is for ordinary API tokens and bot tokens,
-not Codex or Claude OAuth state.
+---
 
-```yaml
-credentials:
-  - name: telegram-bot-token
-    source: pipelock:telegram/bot-token
+## Customising it
 
-channels:
-  telegram:
-    token_source: pipelock:telegram/bot-token
-    chat_id_source: env:MATURANA_TELEGRAM_CHAT_ID
+**Tailor it to your exact needs with Codex.** Because every capability is a skill, extending
+Maturana is a conversation: ask Codex to write a new skill or tool, test it, and deploy it into
+a running guest. The skill pack already includes `maturana-skill-create`, `maturana-tool-create`,
+`maturana-develop`, and `maturana-skill-deploy` for exactly this.
+
+**Self-mutation with WASM.** Agents can author, build, register, and run their own tools at
+runtime — no host rebuild. A tool is one WebAssembly module plus a manifest, executed in a
+capability-gated sandbox with **no ambient authority**: fuel metering, a wall-clock timeout, a
+memory ceiling, and only the filesystem/network the manifest opts into. It is the Maturana
+answer to on-the-fly tool creation, made safe by default.
+
+```sh
+maturana tool register weather --wasm weather.wasm --manifest tool.json
+maturana tool run weather --input '{"city":"oslo"}'
 ```
 
-Basic pipelock use:
+See [docs/wasm-tools.md](docs/wasm-tools.md) and the `maturana-self-forge` skill.
 
-```powershell
-.\scripts\maturana.ps1 pipelock init
-.\scripts\maturana.ps1 pipelock set telegram/bot-token --value "<token>"
-.\scripts\maturana.ps1 pipelock list
-.\scripts\maturana.ps1 channel pair telegram start
-# Send the printed /pair CODE to the bot in Telegram.
-.\scripts\maturana.ps1 channel pair telegram complete
-.\scripts\maturana.ps1 channel serve telegram --agent-id codex-demo
-.\scripts\maturana.ps1 notify telegram `
-  --token-source pipelock:telegram/bot-token `
-  --message "Maturana agent is alive" `
-  --dry-run
+---
+
+## Requirements
+
+|              | Linux                              | Windows                                   |
+| ------------ | ---------------------------------- | ----------------------------------------- |
+| OS           | x86_64 with KVM                    | 11 Pro / Enterprise / Workstations        |
+| Hypervisor   | Firecracker (`--firecracker`)      | Hyper-V                                    |
+| Guest harness| A Codex, Claude Code, or OpenCode subscription (OAuth injected into the VM at runtime) | same |
+| Build        | Prebuilt signed binary by default; Rust toolchain only for `--from-source` | same |
+| Optional     | Telegram/Discord tokens, integration API keys — all via pipelock | same |
+
+macOS is not supported yet.
+
+---
+
+## Architecture
+
+Codex orchestrates from the host. A small set of long-lived Rust processes — the **runtime
+plane**, supervised as one restart-on-failure group by `maturana up` — own channels, schedules,
+the session queue, egress, and shared memory. Each agent runs inside its own VM, where the
+selected harness executes the turn.
+
+```
+        you ── Codex (control plane) ──────────────────────────────┐
+                                                                   │ define / launch / govern
+  ┌──────────────────────────── host runtime plane ────────────────┴─────────────┐
+  │  maturana up  (supervises every process, restarts on failure)                 │
+  │                                                                               │
+  │   sessiond :47834        channel bridges          schedule runners            │
+  │   per-agent SQLite       (Telegram / Discord)     (cron → queue)              │
+  │                                                                               │
+  │   pipelock proxy :47833      MaturanaGraph :47835      hostd :47832 (Windows) │
+  │   egress allowlist +         knowledge graph +         fixed Hyper-V          │
+  │   credential injection       GraphRAG                  lifecycle              │
+  └───────────────┬───────────────────────────────────────────────────────────────┘
+                  │   session queue (HTTP)   +   governed SSH
+        ┌─────────┴──────────┐   ┌────────────────────┐   ┌─ … one microVM per agent
+        │  microVM: agent A  │   │  microVM: agent B  │
+        │  harness            │   │  harness …         │
+        │  (codex / claude-   │   │                    │
+        │   code / opencode)  │   │                    │
+        │  run-agent.sh loop  │   │                    │
+        └─────────────────────┘   └────────────────────┘
+   Firecracker (Linux) / Hyper-V (Windows) — hardware isolation per agent
 ```
 
-The local pipelock vault uses a random key at `.maturana/pipelock/key` and encrypted
-entries in `.maturana/pipelock/vault.json`. Both files stay under ignored local
-runtime state. A future egress proxy can use the same source names without
-changing specs.
+One Telegram turn travels the queue and back, so channels never touch the harness lifecycle:
 
-Run the simple HTTP egress proxy:
-
-```powershell
-.\scripts\maturana.ps1 pipelock proxy --spec .\examples\MATURANA.codex-hyperv.md
+```
+Telegram → channel bridge → inbound (sqlite) ← (HTTP) ← guest worker → harness
+                                  ↑                          ↓
+Telegram ← channel bridge ← outbound (sqlite) ← (HTTP) ──────┘
 ```
 
-Or run it with explicit one-off policy flags:
+**Ports**
 
-```powershell
-.\scripts\maturana.ps1 pipelock proxy `
-  --bind 127.0.0.1:47833 `
-  --allow api.example.test `
-  --inject-header api.example.test:Authorization=pipelock:api/token
-```
+| Port  | Service                     | Bind         |
+| ----- | --------------------------- | ------------ |
+| 47832 | hostd (Hyper-V, Windows)    | 127.0.0.1    |
+| 47833 | pipelock egress proxy       | guest-facing |
+| 47834 | sessiond (session queue)    | 0.0.0.0      |
+| 47835 | MaturanaGraph               | 0.0.0.0      |
 
-The proxy accepts ordinary HTTP proxy requests such as
-`GET http://api.example.test/path HTTP/1.1`, enforces the allowlist, injects
-configured headers from pipelock, and writes audit events to
-`.maturana/audit/*-pipelock-proxy.jsonl` or
-`.maturana/audit/pipelock-proxy.jsonl` for one-off runs. HTTPS `CONNECT`
-traffic is normally tunneled, but hosts with `network.proxy.inject_headers`
-are intercepted with a local Maturana CA so headers can be injected inside
-TLS. Codex and Claude OAuth still stay directly injected into the guest.
+The host never casually exposes its filesystem to a guest: workspace, memory, wiki, schedules,
+tools, audit, and snapshots all live under per-agent directories with governed mounts. Deeper
+detail in [docs/orchestration.md](docs/orchestration.md),
+[docs/script-boundary.md](docs/script-boundary.md), and the
+[documentation index](docs/README.md).
 
-Create or inspect the public Maturana pipelock CA:
+---
 
-```powershell
-.\scripts\maturana.ps1 pipelock ca-cert
-```
+## Community
 
-Test the proxy from the running Hyper-V guest:
+Questions, ideas, or want to share an agent? **Join the Discord — find the invite at
+[maturana.sh](https://maturana.sh).**
 
-```powershell
-.\scripts\test-pipelock-proxy-live.ps1
-```
-
-The live test starts a fake HTTPS host upstream, starts the pipelock proxy, has
-the guest call through the proxy with `curl`, and verifies the upstream received
-the header value loaded from pipelock and that the audit log recorded TLS
-interception.
-
-Run the same live verification against the running Firecracker guest on `aidev`:
-
-```powershell
-.\scripts\test-pipelock-proxy-aidev.ps1
-```
-
-See `docs/pipelock-live-verification.md` for the exact Windows and Linux
-success criteria.
-
-## Session Runner
-
-Interactive channels use a NanoClaw-style session boundary:
-
-```text
-channel adapter -> inbound.sqlite -> warm runner -> outbound.sqlite -> delivery
-```
-
-The host adapter owns pairing, polling, audit, and delivery. The runner owns the
-harness call. This keeps Telegram/Discord out of the harness lifecycle and
-avoids per-message service restarts.
-
-Smoke-test the session layer without a real harness:
-
-```powershell
-.\scripts\maturana.ps1 session init codex-demo --session-id telegram-main
-.\scripts\maturana.ps1 session enqueue codex-demo --session-id telegram-main --channel telegram --platform-id chat-1 --text "hello"
-.\scripts\maturana.ps1 session run-once codex-demo --session-id telegram-main --provider echo
-.\scripts\maturana.ps1 session outbox codex-demo --session-id telegram-main --mark-delivered
-```
-
-The NanoClaw reference used for this design is kept locally at
-`.maturana/reference/nanoclaw`.
-
-## Personal Agent Layer
-
-Initialize durable personal-agent files:
-
-```powershell
-.\scripts\maturana.ps1 personal init codex-demo --spec .\examples\MATURANA.codex-hyperv.md
-```
-
-Ingest shared markdown context into the local LLM wiki:
-
-```powershell
-.\scripts\maturana.ps1 wiki ingest .\AGENTS.md --title Repo-Agents
-.\scripts\maturana.ps1 wiki search secure --limit 5
-```
-
-Write heartbeat and schedule records:
-
-```powershell
-.\scripts\maturana.ps1 heartbeat beat codex-demo --status alive --message "ready"
-.\scripts\maturana.ps1 schedule add codex-demo morning `
-  --cron "0 9 * * *" `
-  --prompt "Send a morning brief" `
-  --channel telegram
-```
-
-Deploy new skills and tools into a running guest:
-
-```powershell
-.\scripts\maturana.ps1 deploy skill codex-demo .\skills\maturana-wiki --ip 172.26.x.y
-.\scripts\maturana.ps1 deploy tool codex-demo .\target\x86_64-pc-windows-gnu\debug\maturana.exe --ip 172.26.x.y --guest-path /agent/tools/maturana.exe
-```
-
-See `docs/personal-agent-mvp.md` for the personal-agent file layout and current
-personal-agent boundary.
-
-Local runtime state is ignored in `.maturana/`.
-
-## Windows Hyper-V
-
-Install Rust, then run:
-
-```powershell
-cargo build
-.\scripts\maturana.ps1 spec validate examples/MATURANA.codex-demo.md
-.\scripts\maturana.ps1 agent launch examples/MATURANA.codex-demo.md
-.\scripts\maturana.ps1 agent inspect codex-demo
-```
-
-The default launch is a dry run. It materializes the agent and writes a
-Hyper-V launch plan without creating a VM.
-
-If MSVC Build Tools are not available yet, use the GNU toolchain path:
-
-```powershell
-.\scripts\build-windows-gnu.ps1
-.\scripts\maturana.ps1 spec validate examples/MATURANA.codex-demo.md
-.\scripts\maturana.ps1 agent launch examples/MATURANA.codex-demo.md
-.\scripts\maturana.ps1 agent inspect codex-demo
-```
-
-For day-to-day Windows commands, use the wrapper that builds/runs the GNU CLI
-and avoids the default MSVC linker path:
-
-```powershell
-.\scripts\maturana.ps1 --help
-```
-
-If MSVC Build Tools are installed but `link.exe` is not on `PATH`, initialize
-the Visual C++ environment with `vcvarsall.bat`:
-
-```powershell
-.\scripts\build-windows-msvc.ps1 -Test -CheckFormat
-
-# Equivalent raw command:
-cmd.exe /d /c 'call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64 && cargo test --target x86_64-pc-windows-msvc'
-```
-
-On this host, `cl.exe` and `link.exe` are under
-`C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64`.
-
-Run the full local repeatability check:
-
-```powershell
-.\scripts\ci.ps1
-```
-
-Validate the bundled skill workflows directly:
-
-```powershell
-.\scripts\maturana.ps1 skill validate skills
-```
-
-Real Hyper-V launch is guarded behind `--apply`. On Windows, `maturana agent
-launch --apply` talks to the privileged localhost Rust hostd, which then
-runs the fixed Ubuntu cloud-image launcher. Codex remains non-elevated during
-normal operation.
-
-Prepare Windows once from a normal PowerShell session. The last step may show a
-single UAC prompt to install the privileged scheduled-task host daemon:
-
-```powershell
-.\scripts\install.ps1
-```
-
-Or run the steps separately. Prepare the official Ubuntu cloud image once:
-
-```powershell
-winget install --id cloudbase.qemu-img --exact
-.\scripts\maturana.ps1 setup ubuntu-cloudimg
-.\scripts\maturana.ps1 setup ssh-key
-```
-
-Install the privileged host daemon once. From a normal shell this requests UAC;
-from an elevated shell it installs directly:
-
-```powershell
-.\scripts\install-hostd-task.ps1
-```
-
-If Codex cannot see or approve the UAC prompt, open PowerShell as Administrator
-in the repo and run:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-hostd-task.ps1 -NoElevate
-```
-
-Check hostd from a normal shell:
-
-```powershell
-.\scripts\maturana.ps1 hostd status
-.\scripts\maturana.ps1 hostd status --json
-```
-
-Launch the Codex Hyper-V demo VM from a normal shell through the Rust CLI:
-
-```powershell
-$env:MATURANA_HYPERV_FORCE = "true" # only when replacing an existing demo VM
-.\scripts\maturana.ps1 agent launch .\examples\MATURANA.codex-hyperv.md --apply
-```
-
-The CLI validates and materializes the agent, renders the guest artifacts, asks
-hostd to create/start the Hyper-V VM, then provisions the guest over SSH from
-Rust. Hostd and PowerShell do not install harnesses or copy auth state.
-
-The direct launcher is only a Hyper-V debugging adapter. It creates/starts the
-VM, waits for IPv4 and SSH, expands the root filesystem, and prints
-`MATURANA_RESULT_JSON` with the guest IP:
-
-```powershell
-.\scripts\launch-ubuntu-cloudimg-hyperv.ps1 `
-  -AgentId codex-demo `
-  -BaseVhdxPath .\.maturana\images\ubuntu-noble\noble-server-cloudimg-amd64.vhdx `
-  -SshUser ubuntu `
-  -SshKeyPath .\.maturana\keys\maturana-agent-ed25519 `
-  -CloudInitUserDataPath .\.maturana\agents\codex-demo\state\cloud-init\user-data `
-  -CloudInitMetaDataPath .\.maturana\agents\codex-demo\state\cloud-init\meta-data `
-  -Force
-```
-
-Verify the running VM and guest from the Rust CLI:
-
-```powershell
-.\scripts\maturana.ps1 agent inspect codex-demo --live --guest
-```
-
-Rust hostd exposes only narrow localhost operations such as health, VM
-inspection, fixed Ubuntu launch, stop, and Hyper-V checkpoint operations. It
-requires the local token in `.maturana/hostd/token` for privileged operations.
-It is not a general command runner and it does not use a queue.
-
-Check VM state later with:
-
-```powershell
-.\scripts\maturana.ps1 agent inspect codex-demo --live
-```
-
-If the current shell cannot use Hyper-V cmdlets or hostd to discover VM state,
-inspect the guest directly over SSH through the Rust CLI:
-
-```powershell
-.\scripts\maturana.ps1 agent inspect codex-demo `
-  --live `
-  --guest `
-  --ip 172.26.183.108
-```
-
-Read known guest logs without arbitrary file access:
-
-```powershell
-.\scripts\maturana.ps1 agent logs codex-demo `
-  --ip 172.26.183.108 `
-  --kind agent `
-  --lines 80
-
-.\scripts\maturana.ps1 agent logs codex-demo `
-  --ip 172.26.183.108 `
-  --kind last-message
-```
-
-Send another live task to the guest harness through the session queue. This is
-a direct agent operation, not a hostd command queue:
-
-```powershell
-.\scripts\maturana.ps1 agent run codex-demo `
-  --prompt "Inspect /agent/MATURANA.md and summarize your current status." `
-  --wait
-```
-
-`agent run` writes to the same `sessiond` queue used by Telegram/Discord and
-waits for a matching outbound response when `--wait` is set. It does not write
-ad hoc prompt files into the guest.
-
-```powershell
-.\scripts\maturana.ps1 agent run codex-demo `
-  --prompt "Write Maturana live run OK to /workspace/live-run.txt." `
-  --wait
-```
-
-Push input files into the guest workspace:
-
-```powershell
-.\scripts\maturana.ps1 agent push codex-demo `
-  .\.maturana\agents\codex-demo\workspace\host-input.txt `
-  /workspace/host-input.txt `
-  --ip 172.26.183.108
-```
-
-Fetch an artifact back from the guest workspace:
-
-```powershell
-.\scripts\maturana.ps1 agent fetch codex-demo `
-  /workspace/live-run.txt `
-  .\.maturana\agents\codex-demo\workspace\live-run.txt `
-  --ip 172.26.183.108
-```
-
-Together, `agent push`, `agent run`, and `agent fetch` form the simple live
-guest work loop for the Windows Hyper-V path.
-
-Live file transfers are intentionally bounded to `/workspace`, `/memory`,
-`/wiki`, and declared `filesystem.mounts[*].guest_path` roots inside the guest.
-
-Live inspect, logs, run, push, fetch, stop, and snapshot operations append
-per-agent audit events to `.maturana/audit/<agent-id>.jsonl`.
-
-Read recent per-agent audit events through the CLI:
-
-```powershell
-.\scripts\maturana.ps1 audit list codex-demo --limit 10
-.\scripts\maturana.ps1 audit list codex-demo --limit 10 --json
-```
-
-Stop, checkpoint, list checkpoints, and restore through hostd:
-
-```powershell
-.\scripts\maturana.ps1 snapshot take codex-demo before-change --live
-.\scripts\maturana.ps1 snapshot list codex-demo --live
-.\scripts\maturana.ps1 snapshot restore codex-demo before-change --live
-.\scripts\maturana.ps1 agent stop codex-demo --live
-```
-
-Telegram notifications use secret references:
-
-```powershell
-.\scripts\maturana.ps1 channel pair telegram start
-# Send the printed /pair CODE to the bot in Telegram.
-.\scripts\maturana.ps1 channel pair telegram complete
-.\scripts\maturana.ps1 channel serve telegram --agent-id codex-demo
-.\scripts\maturana.ps1 notify telegram `
-  --token-source pipelock:telegram/bot-token `
-  --message "Maturana agent is alive"
-```
-
-## Linux Firecracker on aidev
-
-Use `vm.provider: firecracker` in the spec and run the same CLI on `aidev`.
-The Firecracker provider materializes a concrete config under
-`.maturana/agents/<agent-id>/state/firecracker-config.json` plus metadata and a
-launch plan.
-
-Prepare a Firecracker-compatible kernel and rootfs at the paths declared in the
-spec:
-
-```yaml
-vm:
-  provider: firecracker
-  firecracker:
-    kernel_image: .maturana/images/firecracker/vmlinux.bin
-    rootfs_image: .maturana/images/firecracker/ubuntu-rootfs.ext4
-    tap_name: tap-maturana0
-```
-
-Prepare the standard harness image/assets through the Rust-owned repair path:
-
-```bash
-sudo apt-get install -y qemu-utils libguestfs-tools
-cargo build -p maturana-cli
-target/debug/maturana setup firecracker-harnesses --agent-id codex-firecracker
-```
-
-The repair command starts `sessiond`, creates the host TAP device, renders the
-guest worker artifacts in Rust, calls the image-prep adapter, materializes the
-spec, launches Firecracker, waits for SSH, and refreshes the guest worker. The
-image-prep and TAP scripts are leaf adapters; do not use them as the normal
-orchestration path.
-
-For a custom Firecracker spec, prepare matching image assets and TAP through a
-small Rust repair command or a one-off adapter invocation with Rust-rendered
-worker files, then launch from the spec:
-
-```bash
-cargo run -p maturana-cli -- spec validate examples/MATURANA.firecracker-demo.md
-cargo run -p maturana-cli -- agent launch examples/MATURANA.firecracker-demo.md
-cargo run -p maturana-cli -- agent launch examples/MATURANA.firecracker-demo.md --apply
-cargo run -p maturana-cli -- agent inspect firecracker-demo --live
-```
-
-For the built-in aidev harnesses:
-
-```bash
-target/debug/maturana setup firecracker-harnesses
-```
-
-The Linux Firecracker image-prep adapter injects SSH, static guest networking,
-the Maturana agent files, harness auth state from `.maturana/host-auth/*`, and
-the Rust-rendered `sessiond.env`, `run-agent.sh`, and
-`maturana-agent.service`.
-
-Rust owns Firecracker lifecycle decisions: prerequisite checks, idempotent
-start, stop, live inspect, pid tracking, socket cleanup, and launch metadata.
-The remaining Firecracker scripts are host setup adapters for image prep and
-TAP creation only.
+- **Docs:** start with the [documentation index](docs/README.md).
+- **License:** BSD 3-Clause — see [LICENSE](LICENSE).

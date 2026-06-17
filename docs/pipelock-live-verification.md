@@ -3,12 +3,16 @@
 This document records the repeatable checks for declaring the pipelock MVP
 working on both supported host families.
 
+> Host names, repo paths (e.g. `/var/tmp/maturana-…`), SSH key paths, and guest/host
+> IPs below are examples from one test environment. Substitute the values from your
+> own host and agent spec.
+
 ## What Must Pass
 
 Before calling pipelock done for the MVP, verify both paths:
 
 - Windows host with Hyper-V guest.
-- Linux host with Firecracker guest on `aidev`.
+- Linux host with a Firecracker guest.
 
 Each live test must prove:
 
@@ -49,7 +53,7 @@ audit: ...\pipelock-live-test-pipelock-proxy.jsonl
 
 ## Linux / Firecracker
 
-The known-good Firecracker runtime on `aidev` is under:
+On the reference test host the Firecracker runtime is under:
 
 ```text
 /var/tmp/maturana-aidev
@@ -69,7 +73,7 @@ From Windows, run the wrapper:
 .\scripts\test-pipelock-proxy-aidev.ps1
 ```
 
-From `aidev`, run the Linux script directly:
+From the Linux host, run the script directly:
 
 ```bash
 cd /home/aj/maturana
@@ -105,7 +109,7 @@ To confirm the existing VM is running:
 
 ```bash
 cd /var/tmp/maturana-aidev
-target/debug/maturana agent inspect firecracker-demo --live
+maturana agent inspect firecracker-demo --live
 ssh -i .maturana/images/firecracker/maturana-firecracker.id_rsa ubuntu@172.30.0.2 \
   'cat /workspace/firecracker-run.txt; date -Is'
 ```
@@ -131,7 +135,7 @@ Only refresh Firecracker assets when the kernel or rootfs is actually missing
 or intentionally being rebuilt. Use the Rust-owned repair flow first:
 
 ```bash
-target/debug/maturana setup firecracker-harnesses --agent-id codex-firecracker
+maturana setup firecracker-harnesses --agent-id codex-firecracker
 ```
 
 Run `scripts/firecracker-prepare-assets.sh` directly only for adapter-level
