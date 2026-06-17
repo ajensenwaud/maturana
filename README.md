@@ -84,32 +84,50 @@ also delete your agents and secrets.
 
 ### Your first agent (Linux / Firecracker)
 
+Maturana is **Codex-native** — you don't hand-assemble an agent from CLI flags. You tell Codex to
+build one, and it runs the **`maturana-agent-create`** skill as a guided setup wizard: it
+interviews you (the agent's name, who you are, how you'll reach it, what it can do), writes its
+`IDENTITY.md` / `SOUL.md` / `MATURANA.md`, then launches it into a Firecracker microVM and
+validates a live turn — driving the `maturana-agent-create → -launch → -validate` skills end to
+end. That conversation **is** the product.
+
 ```sh
-cd ~/maturana
+# 1. Open a fresh login shell so the `kvm` group + ~/.local/bin PATH apply
+#    (sanity: `ls -l /dev/kvm` is group-readable, `maturana --help` resolves).
 
-# 1. Open a fresh login shell first, so the `kvm` group + ~/.local/bin PATH apply.
-#    Sanity check: `ls -l /dev/kvm` is group-readable and `maturana --help` resolves.
+# 2. Log in to the harness your agent will run on (at least one):
+codex login          # or:  claude   (then /login inside it)
 
-# 2. Stage harness auth for the runtime you want (Codex shown; Claude Code → host-auth/claude-code).
-mkdir -p .maturana/host-auth && cp -r ~/.codex .maturana/host-auth/codex
-
-# 3. Build the image + boot the microVM. Run this in a PLAIN shell, not inside a sandboxed agent
-#    (Firecracker needs /dev/kvm, which a sandbox hides). Idempotent — re-run any time.
-maturana setup firecracker-harnesses --agent-id codex-firecracker
-
-# 4. The installer already started the runtime plane as a service — just confirm it.
-maturana service status up
-
-# 5. Talk to it.
-maturana agent run codex-firecracker --prompt "say hi" --wait
+# 3. Hand Codex the wheel — it's oriented by AGENTS.md + the skills/ pack:
+cd ~/maturana && codex
 ```
 
-That's the whole loop: stage auth → boot → talk. See
-[docs/linux-firecracker-harnesses.md](docs/linux-firecracker-harnesses.md) for the full Linux
-guide and [docs/harness-operations.md](docs/harness-operations.md) for Windows / Hyper-V.
+Then just tell it what you want:
 
-Prefer to let Codex drive? `cd ~/maturana && codex`, then ask it to create and launch your first
-agent — it's oriented by `AGENTS.md` and the `skills/` pack.
+> **create and launch a new agent**
+
+…or invoke the skill directly — type `/skills`, or `$maturana-agent-create`. Codex runs the
+wizard, builds the image, boots the microVM, and tells you when your agent is up and reachable (a
+few minutes). All 31 skills ship as Codex skills under `~/.agents/skills`.
+
+**Note:** run this in a **plain shell**, not inside a sandboxed agent — Firecracker needs
+`/dev/kvm`, which a sandbox hides.
+
+<details>
+<summary>Rather drive the CLI yourself? The skill just orchestrates these steps.</summary>
+
+```sh
+cd ~/maturana
+mkdir -p .maturana/host-auth && cp -r ~/.codex .maturana/host-auth/codex   # stage harness auth
+maturana setup firecracker-harnesses --agent-id codex-firecracker          # build image + boot microVM (idempotent)
+maturana service status up                                                 # runtime plane already runs as a service
+maturana agent run codex-firecracker --prompt "say hi" --wait              # talk to it
+```
+
+</details>
+
+See [docs/linux-firecracker-harnesses.md](docs/linux-firecracker-harnesses.md) for the full Linux
+guide and [docs/harness-operations.md](docs/harness-operations.md) for Windows / Hyper-V.
 
 ---
 
