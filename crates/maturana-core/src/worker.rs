@@ -679,7 +679,13 @@ PY
   elif [ "${MATURANA_HARNESS}" = "opencode" ]; then
     opencode_args=(run)
     if [ -n "$model" ]; then
-      opencode_args+=(-m "$model")
+      # OpenCode routes OpenRouter models as `openrouter/<vendor>/<model>`. The
+      # /model picker stores the raw catalog id (e.g. google/gemini-2.5-pro), so
+      # prefix `openrouter/` unless the user already gave a provider-qualified id.
+      case "$model" in
+        openrouter/*) opencode_args+=(-m "$model") ;;
+        *) opencode_args+=(-m "openrouter/$model") ;;
+      esac
     elif [ -n "${OPENROUTER_API_KEY:-}" ]; then
       opencode_args+=(-m openrouter/anthropic/claude-sonnet-4.5)
     fi
