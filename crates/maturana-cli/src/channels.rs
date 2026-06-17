@@ -1818,15 +1818,139 @@ fn subagents_text(home: &MaturanaHome, agent_id: &str) -> String {
     }
 }
 
-/// Curated model ids per harness. Codex/Claude don't expose a subscription-aware
-/// catalog API, so we ship a current short list (OpenCode uses the live
-/// OpenRouter catalog instead). Keep these in sync with the latest releases.
-const CODEX_MODELS: &[&str] = &["gpt-5-codex", "gpt-5", "gpt-5-mini"];
+/// Curated codex model ids, split by auth mode because the OpenAI backend gates
+/// the catalog on it. A ChatGPT (OAuth) login — what the firecracker codex agent
+/// uses — only accepts `gpt-5.5`; every other id (gpt-5, gpt-5-codex, gpt-5-mini,
+/// gpt-5.5-codex, gpt-5.1, o3, o4-mini, …) returns HTTP 400 "not supported when
+/// using Codex with a ChatGPT account" (live-verified 2026-06-17, codex-cli
+/// 0.140). On a ChatGPT account the model is fixed and you vary effort via
+/// `/reasoning`. An API-key login can use the wider catalog. `codex_models()`
+/// also unions in the operator's seeded default (config.toml `model`) so the
+/// picker stays correct if the supported id changes without a code bump.
+const CODEX_MODELS_CHATGPT: &[&str] = &["gpt-5.5"];
+const CODEX_MODELS_APIKEY: &[&str] =
+    &["gpt-5.5", "gpt-5.5-codex", "gpt-5", "gpt-5-codex", "gpt-5-mini"];
 // Claude Code resolves these aliases to the current model versions (opus -> Opus
 // 4.8, sonnet -> Sonnet 4.6, haiku -> Haiku 4.5). Use the aliases, NOT invented
 // dotted ids like "claude-sonnet-4.6" — `claude --model` rejects those.
 const CLAUDE_MODELS: &[&str] = &["opus", "sonnet", "haiku"];
 const TTS_PROVIDERS: &[&str] = &["elevenlabs", "openai", "deepgram"];
+
+/// How the agent's codex login authenticates, read from the host-side `auth.json`
+/// its `harness_auth` entry points at. The OpenAI backend accepts a different
+/// model set per mode (see [`CODEX_MODELS_CHATGPT`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexAuthMode {
+    ChatGpt,
+    ApiKey,
+    Unknown,
+}
+
+/// Resolve the host-side codex auth/config directory for `agent_id` from its
+/// spec's `harness_auth` (the same dir maturana pushes into the guest's
+/// `~/.codex`).
+fn codex_host_auth_dir(home: &MaturanaHome, agent_id: &str) -> Option<PathBuf> {
+    let spec =
+        AgentSpec::from_maturana_markdown(home.agent_dir(agent_id).join("MATURANA.md")).ok()?;
+    let auth = spec
+        .harness_auth
+        .iter()
+        .find(|a| a.runtime == HarnessRuntime::Codex)?;
+    let source = PathBuf::from(&auth.source_path);
+    if source.is_absolute() {
+        return Some(source);
+    }
+    // `source_path` is conventionally relative to the maturana project root (the
+    // parent of the `.maturana` home dir), e.g. ".maturana/host-auth/codex". The
+    // long-running channel daemon's cwd is the user's $HOME (systemd default),
+    // not the project root, so resolve against the home root's parent first and
+    // only fall back to cwd (for launch-time callers run from the project root).
+    let project_root = home.root().parent().map(|p| p.join(&source));
+    let cwd_relative = std::env::current_dir().ok().map(|c| c.join(&source));
+    [project_root.clone(), cwd_relative]
+        .into_iter()
+        .flatten()
+        .find(|p| p.join("auth.json").exists())
+        .or(project_root)
+}
+
+/// Detect the codex auth mode from `<dir>/auth.json`. Prefers codex's explicit
+/// `auth_mode` field; falls back to which credential is populated (a ChatGPT
+/// login carries `tokens`, an API-key login carries `OPENAI_API_KEY`). Never
+/// reads or returns any secret material — only the mode discriminator.
+fn codex_auth_mode_from_dir(dir: &Path) -> CodexAuthMode {
+    let Ok(raw) = fs::read_to_string(dir.join("auth.json")) else {
+        return CodexAuthMode::Unknown;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return CodexAuthMode::Unknown;
+    };
+    if let Some(mode) = value.get("auth_mode").and_then(|m| m.as_str()) {
+        match mode.to_ascii_lowercase().as_str() {
+            "chatgpt" => return CodexAuthMode::ChatGpt,
+            "apikey" => return CodexAuthMode::ApiKey,
+            _ => {}
+        }
+    }
+    let has_tokens = value.get("tokens").map(|t| !t.is_null()).unwrap_or(false);
+    let has_api_key = value
+        .get("OPENAI_API_KEY")
+        .and_then(|k| k.as_str())
+        .map(|k| !k.is_empty())
+        .unwrap_or(false);
+    if has_tokens {
+        CodexAuthMode::ChatGpt
+    } else if has_api_key {
+        CodexAuthMode::ApiKey
+    } else {
+        CodexAuthMode::Unknown
+    }
+}
+
+/// The operator's seeded default model from `<dir>/config.toml` (top-level
+/// `model = "..."`). Unioning it into the picker keeps the offered set correct
+/// even if the curated lists drift from what the account actually accepts.
+fn codex_default_model(dir: &Path) -> Option<String> {
+    let raw = fs::read_to_string(dir.join("config.toml")).ok()?;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            break; // top-level keys precede the first table header
+        }
+        if let Some((key, val)) = line.split_once('=') {
+            if key.trim() == "model" {
+                let val = val.trim().trim_matches(|c| c == '"' || c == '\'');
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Codex model ids to offer for `agent_id`, gated by its auth mode.
+fn codex_models(home: &MaturanaHome, agent_id: &str) -> Vec<String> {
+    codex_models_for_auth(codex_host_auth_dir(home, agent_id).as_deref())
+}
+
+/// Curated codex model set for a host-auth `dir`, unioned with the seeded
+/// default. Unknown/unreadable auth falls back to the ChatGPT-safe set because
+/// `gpt-5.5` is the one id that works under both auth modes.
+fn codex_models_for_auth(dir: Option<&Path>) -> Vec<String> {
+    let mode = dir.map(codex_auth_mode_from_dir).unwrap_or(CodexAuthMode::Unknown);
+    let base: &[&str] = match mode {
+        CodexAuthMode::ApiKey => CODEX_MODELS_APIKEY,
+        CodexAuthMode::ChatGpt | CodexAuthMode::Unknown => CODEX_MODELS_CHATGPT,
+    };
+    let mut out: Vec<String> = base.iter().map(|s| s.to_string()).collect();
+    if let Some(def) = dir.and_then(codex_default_model) {
+        if !out.iter().any(|m| m == &def) {
+            out.insert(0, def);
+        }
+    }
+    out
+}
 
 /// Models offered as tappable buttons in the interactive selector. For OpenCode
 /// we surface the top of the live OpenRouter catalog; the full list stays in the
@@ -1837,7 +1961,7 @@ fn model_button_choices(home: &MaturanaHome, agent_id: &str) -> Vec<String> {
             .map(|ids| popular_openrouter_subset(&ids, 8))
             .unwrap_or_default(),
         "claude-code" => CLAUDE_MODELS.iter().map(|s| s.to_string()).collect(),
-        _ => CODEX_MODELS.iter().map(|s| s.to_string()).collect(),
+        _ => codex_models(home, agent_id),
     }
 }
 
@@ -1902,10 +2026,22 @@ fn models_text(home: &MaturanaHome, agent_id: &str) -> String {
             Err(error) => format!("Could not fetch OpenRouter catalog: {error:#}"),
         }
     } else if harness == "codex" {
-        format!(
-            "Codex models: {}\n(your Codex subscription decides availability)",
-            CODEX_MODELS.join(", ")
-        )
+        let dir = codex_host_auth_dir(home, agent_id);
+        let mode = dir
+            .as_deref()
+            .map(codex_auth_mode_from_dir)
+            .unwrap_or(CodexAuthMode::Unknown);
+        let models = codex_models_for_auth(dir.as_deref()).join(", ");
+        let note = match mode {
+            CodexAuthMode::ChatGpt => {
+                "ChatGPT login: only gpt-5.5 is accepted — vary effort with /reasoning"
+            }
+            CodexAuthMode::ApiKey => "API-key login: any catalog id also works via /model <id>",
+            CodexAuthMode::Unknown => {
+                "could not read codex auth; showing the ChatGPT-safe default"
+            }
+        };
+        format!("Codex models: {models}\n({note})")
     } else {
         format!("claude-code models: {}", CLAUDE_MODELS.join(", "))
     };
@@ -4840,6 +4976,54 @@ mod tests {
             assert!(help.contains(cmd), "help missing {cmd}");
             assert!(commands_text().contains(cmd), "commands missing {cmd}");
         }
+    }
+
+    #[test]
+    fn codex_models_track_auth_mode() {
+        let temp = temp_dir("codex-auth");
+        let dir = temp.path();
+
+        // ChatGPT (OAuth) login → only gpt-5.5 is offered (live-verified: every
+        // other id 400s on a ChatGPT account).
+        fs::write(
+            dir.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"access_token":"x"}}"#,
+        )
+        .unwrap();
+        assert_eq!(codex_auth_mode_from_dir(dir), CodexAuthMode::ChatGpt);
+        assert_eq!(codex_models_for_auth(Some(dir)), vec!["gpt-5.5".to_string()]);
+
+        // API-key login → the wider catalog.
+        fs::write(
+            dir.join("auth.json"),
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-test","tokens":null}"#,
+        )
+        .unwrap();
+        assert_eq!(codex_auth_mode_from_dir(dir), CodexAuthMode::ApiKey);
+        assert!(codex_models_for_auth(Some(dir)).contains(&"gpt-5".to_string()));
+
+        // No explicit auth_mode → infer from which credential is populated.
+        fs::write(
+            dir.join("auth.json"),
+            r#"{"OPENAI_API_KEY":null,"tokens":{"access_token":"x"}}"#,
+        )
+        .unwrap();
+        assert_eq!(codex_auth_mode_from_dir(dir), CodexAuthMode::ChatGpt);
+
+        // The operator's seeded default is unioned in and de-duplicated (and not
+        // confused with `model_reasoning_effort`).
+        fs::write(
+            dir.join("config.toml"),
+            "model = \"gpt-6-preview\"\nmodel_reasoning_effort = \"low\"\n[tui]\n",
+        )
+        .unwrap();
+        let models = codex_models_for_auth(Some(dir));
+        assert_eq!(models.first().map(String::as_str), Some("gpt-6-preview"));
+        assert!(models.contains(&"gpt-5.5".to_string()));
+
+        // Unreadable / unknown auth → the ChatGPT-safe default set.
+        assert_eq!(codex_auth_mode_from_dir(temp.path().join("missing").as_path()), CodexAuthMode::Unknown);
+        assert_eq!(codex_models_for_auth(None), vec!["gpt-5.5".to_string()]);
     }
 
     #[test]
