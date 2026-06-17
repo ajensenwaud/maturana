@@ -683,7 +683,7 @@ PY
     # Real token streaming: claude emits text deltas in stream-json, which the
     # claude streamer POSTs to the progress lane as they arrive.
     : > /tmp/maturana-session-response.txt
-    if run_harness claude -p "${model_args[@]}" --output-format stream-json --include-partial-messages --verbose "$(cat /tmp/maturana-session-prompt.txt)" </dev/null 2>>/var/log/maturana/worker.err.log \
+    if run_harness claude -p "${model_args[@]}" --permission-mode bypassPermissions --output-format stream-json --include-partial-messages --verbose "$(cat /tmp/maturana-session-prompt.txt)" </dev/null 2>>/var/log/maturana/worker.err.log \
         | SESSIOND_URL="$sessiond_url" MSG_ID="$msg_id" python3 /tmp/maturana-stream-claude.py > /tmp/maturana-session-response.txt 2>>/var/log/maturana/worker.err.log; then
       response="$(cat /tmp/maturana-session-response.txt)"
     else
@@ -833,6 +833,9 @@ mod tests {
         let runner = render_run_agent();
         assert!(runner.contains("codex exec"));
         assert!(runner.contains("claude -p"));
+        // Claude must run with tool autonomy in the VM sandbox, else MCP/tools
+        // are permission-gated and silently denied in headless `-p` mode.
+        assert!(runner.contains("--permission-mode bypassPermissions"));
         assert!(runner.contains("opencode"));
         assert!(runner.contains("/session/heartbeat"));
         assert!(runner.contains("/session/outbound"));

@@ -97,7 +97,14 @@ pub fn render_mcp_config(
     Ok(Some(rendered))
 }
 
-/// Resolve each `env` source to a literal `{NAME: value}` map, host-side.
+/// Resolve each `env` source to a literal `{NAME: value}` map, host-side. Also
+/// injects `NO_PROXY`/`no_proxy` for the server's declared `egress_hosts` so the
+/// stdio MCP server reaches its API host(s) **directly** rather than through the
+/// in-guest egress proxy. The proxy CONNECT-tunnels plain GETs fine but drops
+/// the notion server's `undici` POSTs ("socket hang up"), making the tool
+/// unusable; the hosts are already an intentional allowlist entry and the
+/// server is single-purpose, so a direct path is the bounded, working choice.
+/// (Proper long-term fix: repair the proxy's tunneling of keep-alive POSTs.)
 fn resolve_env(
     server: &McpServer,
     home_root: &Path,
@@ -110,6 +117,11 @@ fn resolve_env(
             var.name.clone(),
             serde_json::Value::String(value.expose_for_runtime().to_string()),
         );
+    }
+    if !server.egress_hosts.is_empty() {
+        let no_proxy = server.egress_hosts.join(",");
+        env.insert("NO_PROXY".into(), serde_json::Value::String(no_proxy.clone()));
+        env.insert("no_proxy".into(), serde_json::Value::String(no_proxy));
     }
     Ok(env)
 }
@@ -154,9 +166,10 @@ fn render_codex(
                 );
             }
         }
-        if !server.env.is_empty() {
+        let resolved_env = resolve_env(server, home_root)?;
+        if !resolved_env.is_empty() {
             let mut env_tbl = toml::map::Map::new();
-            for (k, v) in resolve_env(server, home_root)? {
+            for (k, v) in resolved_env {
                 env_tbl.insert(k, toml::Value::String(v.as_str().unwrap_or("").to_string()));
             }
             entry.insert("env".into(), toml::Value::Table(env_tbl));
@@ -301,6 +314,9 @@ mod tests {
         assert_eq!(n["command"], "/usr/local/bin/notion-mcp-server");
         assert_eq!(n["args"], serde_json::json!([]));
         assert_eq!(n["env"]["NOTION_TOKEN"], "ntn_secret");
+        // Declared egress host is set as NO_PROXY so the server reaches notion
+        // directly (the in-guest proxy drops its POSTs).
+        assert_eq!(n["env"]["NO_PROXY"], "api.notion.com");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -331,6 +347,10 @@ mod tests {
         assert_eq!(
             doc["mcp_servers"]["notion"]["env"]["NOTION_TOKEN"].as_str(),
             Some("ntn_secret")
+        );
+        assert_eq!(
+            doc["mcp_servers"]["notion"]["env"]["NO_PROXY"].as_str(),
+            Some("api.notion.com")
         );
         let _ = std::fs::remove_dir_all(&home);
     }
