@@ -1812,11 +1812,57 @@ const TTS_PROVIDERS: &[&str] = &["elevenlabs", "openai", "deepgram"];
 fn model_button_choices(home: &MaturanaHome, agent_id: &str) -> Vec<String> {
     match harness_label(home, agent_id).as_str() {
         "opencode" => fetch_openrouter_models()
-            .map(|ids| ids.into_iter().take(8).collect())
+            .map(|ids| popular_openrouter_subset(&ids, 8))
             .unwrap_or_default(),
         "claude-code" => CLAUDE_MODELS.iter().map(|s| s.to_string()).collect(),
         _ => CODEX_MODELS.iter().map(|s| s.to_string()).collect(),
     }
+}
+
+/// Pick a small mainstream-provider subset of the LIVE OpenRouter catalog for the
+/// tappable buttons. Matched against `ids` so we only ever surface models that
+/// actually exist in the catalog (never an invented id); the full catalog stays
+/// reachable via `/model <id>` and `/models`. Flagship coding models first, then
+/// any id from a mainstream provider to fill up to `n`.
+fn popular_openrouter_subset(ids: &[String], n: usize) -> Vec<String> {
+    const PREFERRED: &[&str] = &[
+        "anthropic/claude-sonnet",
+        "anthropic/claude-opus",
+        "openai/gpt-5",
+        "google/gemini-2.5-pro",
+        "deepseek/deepseek-chat",
+        "x-ai/grok",
+        "openai/gpt-4o",
+        "google/gemini-2.0-flash",
+        "meta-llama/llama-3.3",
+        "qwen/qwen",
+        "mistralai/mistral",
+    ];
+    const PROVIDERS: &[&str] = &[
+        "anthropic/", "openai/", "google/", "deepseek/", "x-ai/", "meta-llama/",
+        "mistralai/", "qwen/",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for pat in PREFERRED {
+        if out.len() >= n {
+            break;
+        }
+        if let Some(id) = ids.iter().find(|id| id.contains(pat) && !out.contains(id)) {
+            out.push(id.clone());
+        }
+    }
+    if out.len() < n {
+        for id in ids {
+            if out.len() >= n {
+                break;
+            }
+            if PROVIDERS.iter().any(|p| id.starts_with(p)) && !out.contains(id) {
+                out.push(id.clone());
+            }
+        }
+    }
+    out.truncate(n);
+    out
 }
 
 /// Live OpenRouter catalog for OpenCode/OpenRouter; a short curated set otherwise.
@@ -2129,7 +2175,11 @@ fn command_selector(
             if buttons.is_empty() {
                 return None;
             }
-            Some((format!("Current model: {current}\nPick one:"), buttons, 1))
+            Some((
+                format!("Current model: {current}\nTap a popular model, or send /model <id> for any model:"),
+                buttons,
+                1,
+            ))
         }
         "tts-provider" => {
             let current = settings.tts_provider.unwrap_or_else(|| "(none)".to_string());
@@ -4476,6 +4526,39 @@ fn generate_pair_code() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openrouter_subset_prefers_mainstream_and_only_real_ids() {
+        // A catalog whose head is niche/newest (like the live API returns).
+        let catalog: Vec<String> = [
+            "z-ai/glm-5.2",
+            "openrouter/fusion",
+            "nvidia/nemotron-3-ultra",
+            "anthropic/claude-fable-5",
+            "anthropic/claude-sonnet-4.5",
+            "openai/gpt-5",
+            "google/gemini-2.5-pro",
+            "deepseek/deepseek-chat",
+            "moonshotai/kimi-k2.7-code",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let picked = popular_openrouter_subset(&catalog, 5);
+        // Flagship coding models surface first, in priority order...
+        assert_eq!(picked[0], "anthropic/claude-sonnet-4.5");
+        assert_eq!(picked[1], "openai/gpt-5");
+        assert_eq!(picked[2], "google/gemini-2.5-pro");
+        assert_eq!(picked[3], "deepseek/deepseek-chat");
+        // ...never the niche head of the catalog.
+        assert!(!picked.contains(&"z-ai/glm-5.2".to_string()));
+        assert!(!picked.contains(&"openrouter/fusion".to_string()));
+        // Only ids that actually exist in the catalog are ever returned.
+        for id in &picked {
+            assert!(catalog.contains(id), "invented id: {id}");
+        }
+        assert!(picked.len() <= 5);
+    }
 
     #[test]
     fn classifies_pair_before_authorization() {
