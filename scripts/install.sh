@@ -219,7 +219,7 @@ echo "     cd $DEST"
 echo "     codex"
 echo "   then ask Codex: \"create and launch a new agent\","
 echo "   or invoke a skill directly: type /skills, or \$maturana-agent-create"
-echo "   (all 31 skills are installed as Codex skills under ~/.agents/skills)."
+echo "   (all skills are installed as Codex skills under ~/.agents/skills)."
 echo
 echo "Web cockpit:  experimental, off by default. To try it once you're ready:"
 echo "     maturana service install web   (then: http://$(hostname):47836)"

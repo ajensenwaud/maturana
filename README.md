@@ -4,8 +4,11 @@
 
 Maturana turns a single `MATURANA.md` file into a running, always-on AI agent inside its own
 Firecracker (Linux) or Hyper-V (Windows) microVM — with a bounded filesystem, an egress
-allowlist, encrypted secrets, durable shared memory, and one-command snapshot/rewind. You
-define and operate everything from Codex.
+allowlist, encrypted secrets, durable shared memory, and one-command snapshot/rewind.
+
+You operate it by talking to the **Codex CLI** on your host: describe what you want in plain
+language and Codex runs the right skills to build, launch, and govern your agents. The `maturana`
+commands shown below are the machinery underneath — rarely your day-to-day interface.
 
 ---
 
@@ -25,7 +28,8 @@ zero-trust wired through the whole thing.
 
 It combines the elegance of Unix, the agentic workflow of Codex, and the isolation of a
 hypervisor. The core is a small Rust runtime; everything else is a skill or a tool you can read,
-swap, or write yourself.
+swap, or write yourself. *(The name nods to Humberto Maturana, who coined* autopoiesis *—
+self-producing systems — which is what these agents do as they build their own tools and memory.)*
 
 **Maturana is not** a chat UI competing with Codex, a generic multi-control-plane framework,
 Docker orchestration, or multi-tenant SaaS. It is a single-operator, security-first agent
@@ -61,9 +65,9 @@ extensions to that core — you run only what you need.
 
 ### Install
 
-One line. It downloads the signed prebuilt `maturana` binary (no Rust toolchain needed),
-verifies its checksum, clones the repo for the skills/examples, and registers the runtime plane
-as a service.
+One line. It downloads the prebuilt `maturana` binary (no Rust toolchain needed), verifies its
+SHA-256 against the published checksum, clones the repo for the skills/examples, and registers the
+runtime plane as a service.
 
 ```sh
 # Linux — control plane only
@@ -81,6 +85,17 @@ irm https://www.maturana.sh/install.ps1 | iex
 Build from source instead with `--from-source` (Linux) / `-FromSource` (Windows). Uninstall any
 time with `scripts/uninstall.sh` / `scripts/uninstall-windows.ps1` — add `--purge` / `-Purge` to
 also delete your agents and secrets.
+
+**Verify it worked** — open a new shell, then:
+
+```sh
+maturana --help            # resolves on PATH
+maturana service status    # the runtime plane is registered and healthy
+```
+
+Most first-run failures are virtualization not being available: on Linux, no `/dev/kvm` means
+enabling virtualization in BIOS (and use `--firecracker` only on a KVM-capable host); on Windows,
+enable **Hyper-V** first (Windows 11 Pro / Enterprise / Workstations only).
 
 ### Your first agent (Linux / Firecracker)
 
@@ -107,8 +122,10 @@ Then just tell it what you want:
 > **create and launch a new agent**
 
 …or invoke the skill directly — type `/skills`, or `$maturana-agent-create`. Codex runs the
-wizard, builds the image, boots the microVM, and tells you when your agent is up and reachable (a
-few minutes). All 31 skills ship as Codex skills under `~/.agents/skills`.
+wizard, builds the image, boots the microVM, and tells you when your agent is up and reachable
+(the first build downloads/builds the guest image, ~5–15 min on a cold cache; later launches are
+seconds — Codex streams progress as it goes). Every skill in `skills/` ships as a Codex skill
+under `~/.agents/skills`.
 
 **Note:** run this in a **plain shell**, not inside a sandboxed agent — Firecracker needs
 `/dev/kvm`, which a sandbox hides.
@@ -120,14 +137,76 @@ few minutes). All 31 skills ship as Codex skills under `~/.agents/skills`.
 cd ~/maturana
 mkdir -p .maturana/host-auth && cp -r ~/.codex .maturana/host-auth/codex   # stage harness auth
 maturana setup firecracker-harnesses --agent-id codex-firecracker          # build image + boot microVM (idempotent)
-maturana service status up                                                 # runtime plane already runs as a service
+maturana service status                                                    # plane already runs as a service — confirm it's healthy
 maturana agent run codex-firecracker --prompt "say hi" --wait              # talk to it
 ```
 
 </details>
 
-See [docs/linux-firecracker-harnesses.md](docs/linux-firecracker-harnesses.md) for the full Linux
-guide and [docs/harness-operations.md](docs/harness-operations.md) for Windows / Hyper-V.
+See [docs/linux-firecracker-harnesses.md](docs/linux-firecracker-harnesses.md) for the full Linux guide.
+
+### Your first agent (Windows / Hyper-V)
+
+Maturana is **Codex-native** on Windows too — you don't hand-assemble an agent from CLI flags. You
+tell Codex to build one, and it runs the **`maturana-agent-create`** skill as a guided setup
+wizard: it interviews you (the agent's name, who you are, how you'll reach it, what it can do),
+writes its `IDENTITY.md` / `SOUL.md` / `MATURANA.md`, then launches it into a **Hyper-V microVM**
+and validates a live turn — driving the `maturana-agent-create → -launch → -validate` skills end
+to end. That conversation **is** the product.
+
+```powershell
+# 1. Open a NEW PowerShell as Administrator. New, so the User-scope PATH the installer set picks
+#    up bin\maturana.exe; elevated, because launching a Hyper-V VM needs admin.
+#    (sanity: `maturana --help` resolves.)
+
+# 2. Log in to the harness your agent will run on (at least one):
+codex login          # or:  claude   (then /login inside it)
+
+# 3. Hand Codex the wheel — it's oriented by AGENTS.md + the skills/ pack:
+cd $env:USERPROFILE\maturana ; codex
+```
+
+Then just tell it what you want:
+
+> **create and launch a new agent**
+
+…or invoke the skill directly — type `/skills`, or `$maturana-agent-create`. Codex runs the
+wizard, builds the image, boots the microVM, and tells you when your agent is up and reachable
+(first build can take ~5–15 min on a cold cache; later launches are seconds). Every skill in
+`skills/` ships as a Codex skill under `~/.agents/skills`.
+
+**Note:** Hyper-V is Windows 11 Pro / Enterprise / Workstations only, and launching a VM needs an
+**elevated** shell. You don't manage the hypervisor yourself — the privileged **`hostd`** daemon
+(installed as SYSTEM, port 47832) owns the fixed Hyper-V lifecycle, and `install.ps1` already
+registered the no-login **boot tasks**, so the runtime plane and your VMs come back after a reboot
+without an interactive login. The installer also already prepared the Ubuntu VHDX image and the
+agent SSH key, so the first launch has nothing left to download.
+
+<details>
+<summary>Rather drive the CLI yourself? The skill just orchestrates these steps.</summary>
+
+```powershell
+cd $env:USERPROFILE\maturana
+
+# Stage harness auth where the spec reads it (Codex shown; Claude Code → host-auth\claude-code).
+mkdir .maturana\host-auth -Force
+Copy-Item -Recurse $env:USERPROFILE\.codex .maturana\host-auth\codex
+
+maturana service status                                            # plane already runs as a service — confirm it's healthy
+maturana spec validate examples\MATURANA.codex-hyperv.md           # check before launch (id: codex-demo)
+maturana agent launch examples\MATURANA.codex-hyperv.md --apply    # hostd creates + boots the Hyper-V microVM, then provisions the guest
+maturana agent run codex-demo --prompt "say hi" --wait             # talk to it
+```
+
+Re-launching an existing VM needs an explicit override: set `$env:MATURANA_HYPERV_FORCE = "true"`
+before `--apply`. A second bundled spec, `examples\MATURANA.claude-hyperv.md` (id `claude-demo`),
+runs the Claude Code harness. If a running VM stops replying, `maturana doctor` then
+`maturana setup windows-harnesses` refreshes the guest workers and channels without rebuilding the
+VM.
+
+</details>
+
+See [docs/harness-operations.md](docs/harness-operations.md) for the full Windows / Hyper-V guide.
 
 ---
 
@@ -203,8 +282,8 @@ See [docs/wasm-tools.md](docs/wasm-tools.md) and the `maturana-self-forge` skill
 | ------------ | ---------------------------------- | ----------------------------------------- |
 | OS           | x86_64 with KVM                    | 11 Pro / Enterprise / Workstations        |
 | Hypervisor   | Firecracker (`--firecracker`)      | Hyper-V                                    |
-| Guest harness| A Codex, Claude Code, or OpenCode subscription (OAuth injected into the VM at runtime) | same |
-| Build        | Prebuilt signed binary by default; Rust toolchain only for `--from-source` | same |
+| Guest harness| Codex / Claude Code / OpenCode subscription, run *inside* the agent's VM (OAuth injected at runtime) — distinct from the control-plane Codex you drive on the host | same |
+| Build        | Prebuilt binary (SHA-256 verified) by default; Rust toolchain only for `--from-source` | same |
 | Optional     | Telegram/Discord tokens, integration API keys — all via pipelock | same |
 
 macOS is not supported yet.
