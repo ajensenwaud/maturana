@@ -1338,7 +1338,13 @@ fn main() -> anyhow::Result<()> {
             Some(WebSubcommand::Token) => {
                 println!("{}", maturana_web::login_token(home.root())?);
             }
-            None => maturana_web::run_web(home.root().to_path_buf(), &command.bind)?,
+            None => {
+                eprintln!(
+                    "note: the web cockpit is experimental and not yet stabilized; \
+                     it is not installed or started by default."
+                );
+                maturana_web::run_web(home.root().to_path_buf(), &command.bind)?
+            }
         },
         Command::Search(command) => run_search(&home, command)?,
         Command::Service(command) => service::handle_service(command, &home)?,

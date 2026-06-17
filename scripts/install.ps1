@@ -205,7 +205,7 @@ if (-not $SkipHostd) {
     Log-Milestone 'hostd' 'skipped'
 }
 
-# 7. Boot services (up + web) via a stored password; clear stale launchers; VM autostart.
+# 7. Boot services (up) via a stored password; clear stale launchers; VM autostart.
 if (-not $SkipServices) {
     # Remove stale Startup-folder launchers from the old per-logon approach.
     $startupDir = [Environment]::GetFolderPath('Startup')
@@ -217,8 +217,8 @@ if (-not $SkipServices) {
     $sec = Read-Host -AsSecureString
     $pw = [System.Net.NetworkCredential]::new("", $sec).Password
     if ([string]::IsNullOrEmpty($pw)) { throw "A Windows password is required to register boot services (or pass -SkipServices)." }
-    Say "registering Maturana boot services (up + web)"
-    try { & $Exe service install up web --windows-password $pw }
+    Say "registering Maturana boot services (up)"
+    try { & $Exe service install up --windows-password $pw }
     finally { $pw = $null; [System.GC]::Collect() }
     # Make existing maturana-* Hyper-V VMs auto-boot with the host (staggered to
     # avoid a boot thundering-herd). New VMs get this from the Hyper-V launcher.
@@ -266,7 +266,6 @@ function Test-Harness($cli, $authPath, $loginHint, $installHint) {
 }
 $codexStatus  = Test-Harness 'codex'  "$env:USERPROFILE\.codex\auth.json" 'codex login' 'npm install -g @openai/codex'
 $claudeStatus = Test-Harness 'claude' "$env:USERPROFILE\.claude\.credentials.json" 'claude (then /login)' 'npm install -g @anthropic-ai/claude-code'
-$token = Get-Content (Join-Path $Dir ".maturana\web\token") -ErrorAction SilentlyContinue | Select-Object -First 1
 
 Write-Host ""
 Write-Host "==================== Maturana ready ===================="
@@ -283,8 +282,8 @@ Write-Host "     codex"
 Write-Host "   then ask Codex: ""create and launch a new agent"", or invoke a"
 Write-Host "   skill directly: type /skills, or `$maturana-agent-create"
 Write-Host ""
-Write-Host "Web cockpit:  http://localhost:47836"
-if ($token) { Write-Host "     token:  $token" } else { Write-Host "     token:  (run: maturana web token)" }
+Write-Host "Web cockpit:  experimental, off by default. To try it once you're ready:"
+Write-Host "     maturana service install web   (then: http://localhost:47836)"
 Write-Host ""
 Write-Host "Help:  maturana --help        (open a new terminal first)"
 Write-Host "Docs:  $Dir\docs"

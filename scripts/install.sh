@@ -143,7 +143,7 @@ if [ "$(uname -s)" = "Linux" ] && [ "$WITH_FIRECRACKER" = "0" ]; then
   if ! bash "$DEST/scripts/kvm-enable.sh"; then
     say "WARNING: KVM is not enabled — agents need it to launch. Fix the cause"
     say "above (firmware virtualization / nested virt), then re-run"
-    say "'$DEST/scripts/kvm-enable.sh'. The CLI and web cockpit still installed."
+    say "'$DEST/scripts/kvm-enable.sh'. The CLI is still installed."
   fi
 fi
 
@@ -181,8 +181,8 @@ else
   say "skills kept in the repo (Codex loads them on demand via AGENTS.md)"
 fi
 
-say "registering services (maturana up + maturana web)"
-"$BIN" service install up web
+say "registering services (maturana up)"
+"$BIN" service install up
 # Firecracker hosts also get the boot-time fleet relauncher (zero-touch reboot
 # recovery): a systemd oneshot that recreates the TAP + relaunches the microVMs
 # from the baked rootfs after a reboot, with no interactive login.
@@ -204,7 +204,6 @@ harness_status() {
 }
 codex_status="$(harness_status codex "$HOME/.codex/auth.json" 'codex login' 'npm install -g @openai/codex')"
 claude_status="$(harness_status claude "$HOME/.claude/.credentials.json" 'claude (then /login)' 'npm install -g @anthropic-ai/claude-code')"
-token="$(head -1 "$DEST/.maturana/web/token" 2>/dev/null || echo '(run: maturana web token)')"
 
 echo
 echo "==================== Maturana ready ===================="
@@ -222,8 +221,8 @@ echo "   then ask Codex: \"create and launch a new agent\","
 echo "   or invoke a skill directly: type /skills, or \$maturana-agent-create"
 echo "   (all 31 skills are installed as Codex skills under ~/.agents/skills)."
 echo
-echo "Web cockpit:  http://$(hostname):47836"
-echo "     token:  $token"
+echo "Web cockpit:  experimental, off by default. To try it once you're ready:"
+echo "     maturana service install web   (then: http://$(hostname):47836)"
 if [ "$WITH_FIRECRACKER" = "1" ]; then
   echo
   echo "Firecracker microVM host ready; isolated agents relaunch after reboot."

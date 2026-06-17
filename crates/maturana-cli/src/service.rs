@@ -19,9 +19,11 @@ pub struct ServiceCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ServiceSubcommand {
-    /// Register and start host services (default: up + web).
+    /// Register and start host services (default: up). The `web` cockpit is
+    /// experimental and opt-in until stabilized — install it explicitly with
+    /// `maturana service install web` to try it.
     Install {
-        #[arg(default_values_t = vec!["up".to_string(), "web".to_string()])]
+        #[arg(default_values_t = vec!["up".to_string()])]
         services: Vec<String>,
         /// Windows only: the current user's Windows password. Registers the
         /// task with logon type Password so it runs at boot in the user profile
@@ -33,17 +35,17 @@ pub enum ServiceSubcommand {
     },
     /// Stop and unregister host services.
     Uninstall {
-        #[arg(default_values_t = vec!["up".to_string(), "web".to_string()])]
+        #[arg(default_values_t = vec!["up".to_string()])]
         services: Vec<String>,
     },
     /// Show registration/run state.
     Status {
-        #[arg(default_values_t = vec!["up".to_string(), "web".to_string()])]
+        #[arg(default_values_t = vec!["up".to_string()])]
         services: Vec<String>,
     },
     /// Restart registered services.
     Restart {
-        #[arg(default_values_t = vec!["up".to_string(), "web".to_string()])]
+        #[arg(default_values_t = vec!["up".to_string()])]
         services: Vec<String>,
     },
 }
