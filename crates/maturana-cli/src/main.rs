@@ -4733,6 +4733,7 @@ fn enqueue_agent_run(
     let content = serde_json::json!({
         "text": prompt,
         "prompt": prompt,
+        "model": crate::channels::channel_model(home, agent_id),
     })
     .to_string();
     let message_id = insert_inbound(&paths, "chat", "cli", "agent-run", None, &content)?;

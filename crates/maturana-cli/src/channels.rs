@@ -894,6 +894,9 @@ fn handle_telegram_update(
                     "text": text,
                     "prompt": prompt,
                     "telegram_reply_to": reply_to_message_id,
+                    // Per-turn model override: the guest worker passes this to the
+                    // harness as `--model`/`-m`. None => harness default.
+                    "model": load_channel_settings(home, &config.agent_id).model,
                 })
                 .to_string(),
             )?;
@@ -1625,6 +1628,12 @@ fn load_channel_settings(home: &MaturanaHome, agent_id: &str) -> ChannelSettings
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default()
+}
+
+/// The agent's current `/model` override (set via the model channel command), if
+/// any. Attached to inbound messages so the guest worker passes it to the harness.
+pub(crate) fn channel_model(home: &MaturanaHome, agent_id: &str) -> Option<String> {
+    load_channel_settings(home, agent_id).model
 }
 
 fn save_channel_settings(

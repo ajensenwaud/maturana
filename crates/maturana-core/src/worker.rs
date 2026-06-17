@@ -629,6 +629,21 @@ c=json.loads(d["messages"][0]["content"])
 print(c.get("prompt") or c.get("text") or "")
 PY
 
+  # Per-turn model override from the `/model` channel command: the host attaches
+  # the agent's current model to the inbound message. Empty => harness default.
+  model="$(python3 - <<'PY'
+import json
+try:
+    d=json.load(open("/tmp/maturana-session-claim.json"))
+    c=json.loads(d["messages"][0]["content"])
+    print((c.get("model") or "").strip())
+except Exception:
+    print("")
+PY
+)"
+  model_args=()
+  [ -n "$model" ] && model_args=(--model "$model")
+
   response=""
   harness_timeout="${MATURANA_HARNESS_TIMEOUT_SECONDS:-240}"
   run_harness() {
@@ -639,7 +654,7 @@ PY
     # prints the final agent text. `set -o pipefail` makes a codex failure fail
     # the pipeline so the else branch's fallback applies.
     : > /tmp/maturana-session-response.txt
-    if run_harness codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C /workspace "$(cat /tmp/maturana-session-prompt.txt)" </dev/null 2>>/var/log/maturana/worker.err.log \
+    if run_harness codex exec --json "${model_args[@]}" --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C /workspace "$(cat /tmp/maturana-session-prompt.txt)" </dev/null 2>>/var/log/maturana/worker.err.log \
         | SESSIOND_URL="$sessiond_url" MSG_ID="$msg_id" python3 /tmp/maturana-stream-progress.py > /tmp/maturana-session-response.txt 2>>/var/log/maturana/worker.err.log; then
       response="$(cat /tmp/maturana-session-response.txt)"
     else
@@ -652,7 +667,7 @@ PY
     # Real token streaming: claude emits text deltas in stream-json, which the
     # claude streamer POSTs to the progress lane as they arrive.
     : > /tmp/maturana-session-response.txt
-    if run_harness claude -p --output-format stream-json --include-partial-messages --verbose "$(cat /tmp/maturana-session-prompt.txt)" </dev/null 2>>/var/log/maturana/worker.err.log \
+    if run_harness claude -p "${model_args[@]}" --output-format stream-json --include-partial-messages --verbose "$(cat /tmp/maturana-session-prompt.txt)" </dev/null 2>>/var/log/maturana/worker.err.log \
         | SESSIOND_URL="$sessiond_url" MSG_ID="$msg_id" python3 /tmp/maturana-stream-claude.py > /tmp/maturana-session-response.txt 2>>/var/log/maturana/worker.err.log; then
       response="$(cat /tmp/maturana-session-response.txt)"
     else
@@ -663,7 +678,9 @@ PY
     fi
   elif [ "${MATURANA_HARNESS}" = "opencode" ]; then
     opencode_args=(run)
-    if [ -n "${OPENROUTER_API_KEY:-}" ]; then
+    if [ -n "$model" ]; then
+      opencode_args+=(-m "$model")
+    elif [ -n "${OPENROUTER_API_KEY:-}" ]; then
       opencode_args+=(-m openrouter/anthropic/claude-sonnet-4.5)
     fi
     opencode_args+=("$(cat /tmp/maturana-session-prompt.txt)")
