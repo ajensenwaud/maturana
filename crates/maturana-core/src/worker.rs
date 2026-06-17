@@ -677,7 +677,20 @@ PY
       fi
     fi
   elif [ "${MATURANA_HARNESS}" = "opencode" ]; then
-    opencode_args=(run)
+    # Warm server: keep a headless `opencode serve` running and ATTACH each turn,
+    # so the heavy Node/runtime boot (~5s) is paid once, not per turn. The attached
+    # run streams into the server's session (empty stdout), so the reply is read
+    # from opencode.db by the empty-stdout fallback below.
+    oc_port="${MATURANA_OPENCODE_PORT:-5599}"
+    if ! curl -fsS "http://127.0.0.1:${oc_port}/global/health" >/dev/null 2>&1; then
+      nohup opencode serve --port "${oc_port}" --hostname 127.0.0.1 \
+        >>/var/log/maturana/opencode-serve.log 2>&1 &
+      for _ in $(seq 1 40); do
+        curl -fsS "http://127.0.0.1:${oc_port}/global/health" >/dev/null 2>&1 && break
+        sleep 0.5
+      done
+    fi
+    opencode_args=(run --attach "http://127.0.0.1:${oc_port}")
     if [ -n "$model" ]; then
       # OpenCode routes OpenRouter models as `openrouter/<vendor>/<model>`. The
       # /model picker stores the raw catalog id (e.g. google/gemini-2.5-pro), so
