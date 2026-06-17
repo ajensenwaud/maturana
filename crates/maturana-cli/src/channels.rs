@@ -1800,7 +1800,10 @@ fn subagents_text(home: &MaturanaHome, agent_id: &str) -> String {
 /// catalog API, so we ship a current short list (OpenCode uses the live
 /// OpenRouter catalog instead). Keep these in sync with the latest releases.
 const CODEX_MODELS: &[&str] = &["gpt-5-codex", "gpt-5", "gpt-5-mini"];
-const CLAUDE_MODELS: &[&str] = &["claude-opus-4.8", "claude-sonnet-4.6", "claude-haiku-4.5"];
+// Claude Code resolves these aliases to the current model versions (opus -> Opus
+// 4.8, sonnet -> Sonnet 4.6, haiku -> Haiku 4.5). Use the aliases, NOT invented
+// dotted ids like "claude-sonnet-4.6" — `claude --model` rejects those.
+const CLAUDE_MODELS: &[&str] = &["opus", "sonnet", "haiku"];
 const TTS_PROVIDERS: &[&str] = &["elevenlabs", "openai", "deepgram"];
 
 /// Models offered as tappable buttons in the interactive selector. For OpenCode
