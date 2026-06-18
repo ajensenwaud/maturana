@@ -1109,13 +1109,24 @@ fn main() -> anyhow::Result<()> {
                 if let Ok(store) = maturana_core::improvement::TrajectoryStore::open(
                     &maturana_core::improvement::TrajectoryStore::store_path(home.root()),
                 ) {
-                    let _ = store.reward_latest(
+                    // Session-agnostic: the rollback knows the agent, not the
+                    // session id the bad turn was recorded under, so penalize the
+                    // agent's most recent turn across sessions. Surface (don't
+                    // swallow) the no-match / error cases.
+                    match store.reward_latest_for_agent(
                         &agent_id,
-                        &format!("{agent_id}-main"),
                         "snapshot",
                         maturana_core::improvement::signals::SNAPSHOT_ROLLBACK,
                         Some(&format!("rollback to {name}")),
-                    );
+                    ) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => eprintln!(
+                            "[maturana] note: no recorded turn for agent {agent_id}; rollback penalty not applied"
+                        ),
+                        Err(error) => eprintln!(
+                            "[maturana] warning: could not record rollback penalty: {error:#}"
+                        ),
+                    }
                 }
             }
         },

@@ -188,6 +188,32 @@ impl TrajectoryStore {
         Ok(id)
     }
 
+    /// Like [`reward_latest`](Self::reward_latest) but session-agnostic: attach a
+    /// reward to the most recent trajectory for an agent regardless of which
+    /// session recorded it. Snapshot rollback uses this — it knows the agent
+    /// being rolled back but not the exact session id the bad turn was logged
+    /// under (channel turns record under e.g. `codex-main`, not `<agent>-main`).
+    pub fn reward_latest_for_agent(
+        &self,
+        agent_id: &str,
+        source: &str,
+        value: f64,
+        note: Option<&str>,
+    ) -> anyhow::Result<Option<String>> {
+        let id: Option<String> = self
+            .db
+            .query_row(
+                "SELECT id FROM trajectories WHERE agent_id = ?1 ORDER BY seq DESC LIMIT 1",
+                params![agent_id],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(id) = &id {
+            self.attach_reward(id, source, value, note)?;
+        }
+        Ok(id)
+    }
+
     pub fn reward_summary(&self, trajectory_id: &str) -> anyhow::Result<RewardSummary> {
         let (total, count): (Option<f64>, i64) = self.db.query_row(
             "SELECT SUM(value), COUNT(*) FROM rewards WHERE trajectory_id = ?1",
@@ -416,6 +442,28 @@ mod tests {
             .unwrap();
         assert_eq!(target.as_deref(), Some(second.as_str()));
         assert_eq!(store.reward_summary(&second).unwrap().count, 1);
+    }
+
+    #[test]
+    fn reward_latest_for_agent_is_session_agnostic() {
+        let store = store();
+        store.record("agent", "codex-main", "chat", "q", "a", "[]").unwrap();
+        let newest = store
+            .record("agent", "telegram-main", "chat", "q2", "b", "[]")
+            .unwrap();
+        // The old snapshot-rollback bug targeted "<agent>-main", which never
+        // matches the real session id → no penalty applied.
+        assert!(store
+            .reward_latest("agent", "agent-main", "snapshot", signals::SNAPSHOT_ROLLBACK, None)
+            .unwrap()
+            .is_none());
+        // The session-agnostic call lands on the agent's most recent turn
+        // regardless of which session recorded it.
+        let target = store
+            .reward_latest_for_agent("agent", "snapshot", signals::SNAPSHOT_ROLLBACK, None)
+            .unwrap();
+        assert_eq!(target.as_deref(), Some(newest.as_str()));
+        assert_eq!(store.reward_summary(&newest).unwrap().count, 1);
     }
 
     #[test]

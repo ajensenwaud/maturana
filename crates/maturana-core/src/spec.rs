@@ -365,6 +365,19 @@ pub struct Capabilities {
     pub self_forge: bool,
 }
 
+impl Capabilities {
+    /// Egress hosts an enabled capability needs reachable through the pipelock
+    /// proxy. The operator still injects the key via `network.proxy.inject_headers`
+    /// — these are just the hostnames the guest must be allowed to reach.
+    pub fn egress_defaults(&self) -> Vec<&'static str> {
+        let mut hosts = Vec::new();
+        if self.image_gen {
+            hosts.push("api.openai.com");
+        }
+        hosts
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TelegramChannel {
@@ -406,7 +419,28 @@ impl AgentSpec {
     pub fn from_maturana_markdown(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let raw = fs::read_to_string(path)?;
         let frontmatter = extract_yaml_frontmatter(&raw)?;
-        Ok(serde_yaml::from_str(frontmatter)?)
+        let mut spec: Self = serde_yaml::from_str(frontmatter)?;
+        spec.apply_capability_defaults();
+        Ok(spec)
+    }
+
+    /// Realize the egress defaults that opt-in capabilities promise (see
+    /// [`Capabilities`]): e.g. `image_gen: true` reaches the OpenAI images API,
+    /// so `api.openai.com` must be allowed through the egress proxy. Added only
+    /// if the spec didn't already list it; the operator still supplies the key
+    /// via a proxy `inject_headers` entry (the key never enters the guest), as
+    /// the maturana-image-gen skill documents.
+    fn apply_capability_defaults(&mut self) {
+        for host in self.capabilities.egress_defaults() {
+            if !self
+                .network
+                .egress_allowlist
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(host))
+            {
+                self.network.egress_allowlist.push(host.to_string());
+            }
+        }
     }
 }
 
@@ -529,5 +563,44 @@ channels:
         assert_eq!(slack.bot_token_source, "pipelock:slack/bot-token");
         let mail = spec.channels.agentmail.unwrap();
         assert_eq!(mail.inbox.as_deref(), Some("agent@agentmail.to"));
+    }
+
+    #[test]
+    fn image_gen_capability_adds_openai_egress_default() {
+        // The capability declares the host it needs reachable…
+        let caps = Capabilities {
+            image_gen: true,
+            ..Default::default()
+        };
+        assert!(caps.egress_defaults().contains(&"api.openai.com"));
+
+        // …and loading a spec realizes it on the egress allowlist.
+        let dir = std::env::temp_dir().join("maturana-spec-imagegen-egress");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("MATURANA.md");
+        std::fs::write(
+            &path,
+            "---\nidentity: { id: i, name: N, purpose: P }\nruntime: { harness: codex }\nvm: { provider: firecracker, guest_os: linux }\ncapabilities: { image_gen: true }\n---\n# body\n",
+        )
+        .unwrap();
+        let spec = AgentSpec::from_maturana_markdown(&path).unwrap();
+        assert!(spec
+            .network
+            .egress_allowlist
+            .iter()
+            .any(|h| h == "api.openai.com"));
+
+        // Off by default: no capability → no injected host.
+        std::fs::write(
+            &path,
+            "---\nidentity: { id: i, name: N, purpose: P }\nruntime: { harness: codex }\nvm: { provider: firecracker, guest_os: linux }\n---\n# body\n",
+        )
+        .unwrap();
+        let plain = AgentSpec::from_maturana_markdown(&path).unwrap();
+        assert!(!plain
+            .network
+            .egress_allowlist
+            .iter()
+            .any(|h| h == "api.openai.com"));
     }
 }

@@ -83,6 +83,22 @@ pub fn insert_inbound(
     Ok(id)
 }
 
+/// Cancel queued (not-yet-claimed) inbound work for a session, returning how
+/// many pending messages were dropped. A message already being processed by a
+/// worker is left alone — the in-guest turn runs to completion — so this clears
+/// a backlog without corrupting an in-flight turn. Used by the channel `/stop`
+/// command to drop queued messages the user no longer wants answered.
+pub fn cancel_pending_inbound(paths: &SessionPaths) -> anyhow::Result<usize> {
+    let db = open_rw(&paths.inbound_db)?;
+    ensure_inbound_schema(&db)?;
+    let now = Utc::now().to_rfc3339();
+    let n = db.execute(
+        "UPDATE messages_in SET status = 'failed', status_changed = ?1 WHERE status = 'pending'",
+        params![now],
+    )?;
+    Ok(n)
+}
+
 /// Visibility / retry policy for the inbound work queue.
 ///
 /// A claimed message is leased for `lease_seconds`. If the worker that claimed
@@ -655,6 +671,27 @@ mod tests {
         assert_eq!(undelivered.len(), 1);
         mark_delivered(&paths, &undelivered[0].id, Some("telegram-1")).unwrap();
         assert!(list_undelivered(&paths).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancel_pending_inbound_drops_queued_but_not_in_flight() {
+        let temp = temp_dir();
+        let paths = session_paths(&temp, "telegram-main");
+        ensure_session(&paths).unwrap();
+
+        for text in ["a", "b", "c"] {
+            insert_inbound(&paths, "chat", "telegram", "chat-1", None, text).unwrap();
+        }
+        // One turn is already being processed by a worker…
+        let claimed = claim_pending_inbound(&paths, 1).unwrap();
+        assert_eq!(claimed.len(), 1);
+
+        // …/stop clears the two still-queued messages, leaving the in-flight one.
+        let cancelled = cancel_pending_inbound(&paths).unwrap();
+        assert_eq!(cancelled, 2);
+
+        // Nothing left to claim (the in-flight one stays in 'processing').
+        assert!(claim_pending_inbound(&paths, 10).unwrap().is_empty());
     }
 
     #[test]

@@ -8,8 +8,9 @@ use maturana_core::{
     pipelock::PipelockVault,
     secrets::resolve_secret_source_with_home,
     session_db::{
-        claim_delivery, clear_progress, ensure_session, insert_inbound, list_undelivered,
-        mark_delivered, read_progress, session_paths, unclaim_delivery, ProgressEvent, SessionPaths,
+        cancel_pending_inbound, claim_delivery, clear_progress, ensure_session, insert_inbound,
+        list_undelivered, mark_delivered, read_progress, session_paths, unclaim_delivery,
+        ProgressEvent, SessionPaths,
     },
     spec::{AgentSpec, HarnessRuntime},
     state::MaturanaHome,
@@ -822,14 +823,19 @@ fn handle_telegram_update(
             name,
             prompt,
         } => {
-            let subagent_id = spawn_subagent(home, &config.agent_id, &name, mode, &prompt)?;
-            send_telegram(
+            // Record the sub-task (so /subagents can list it), then run it as a
+            // real turn in the live session: the worker executes it and the reply
+            // streams back here. (Previously this queued the task into a
+            // subagent-<id> session that nothing polled — a silent no-op.)
+            let _ = create_subagent(home, &config.agent_id, &name, mode, &prompt);
+            run_channel_prompt(
+                home,
                 token,
-                &chat_id.to_string(),
-                &format!("Spawned sub-agent `{subagent_id}`."),
+                config,
+                chat_id,
+                &frame_subtask(&name, &prompt),
                 reply_to_message_id,
-            )?;
-            Ok(())
+            )
         }
         InboundAction::Feedback { chat_id, value } => {
             let store = TrajectoryStore::open(&TrajectoryStore::store_path(home.root()))?;
@@ -872,97 +878,91 @@ fn handle_telegram_update(
             reply_to_message_id,
         ),
         InboundAction::Prompt { chat_id, text } => {
-            audit_channel_event(
-                home,
-                &config.agent_id,
-                "channel.telegram.inbound",
-                "received telegram prompt",
-            )?;
-            println!("telegram inbound prompt accepted");
-            append_channel_turn(home, &config.agent_id, chat_id, "user", &text)?;
-            maybe_remember_user_message(home, &config.agent_id, &text)?;
-            let prompt = build_channel_prompt(home, &config.agent_id, chat_id, &text)?;
-            let paths = session_paths(&home.agent_dir(&config.agent_id), &config.session_id);
-            ensure_session(&paths)?;
-            let inbound_id = insert_inbound(
-                &paths,
-                "chat",
-                "telegram",
-                &chat_id.to_string(),
-                reply_to_message_id.map(|id| id.to_string()).as_deref(),
-                &serde_json::json!({
-                    "text": text,
-                    "prompt": prompt,
-                    "telegram_reply_to": reply_to_message_id,
-                    // Per-turn model + reasoning overrides: the guest worker passes
-                    // these to the harness. None => harness/worker default.
-                    "model": load_channel_settings(home, &config.agent_id).model,
-                    "reasoning": load_channel_settings(home, &config.agent_id).reasoning,
-                })
-                .to_string(),
-            )?;
-            send_telegram_chat_action(token, &chat_id.to_string(), "typing")?;
-            if let Some(provider) = &config.run_once_provider {
-                let options = RunnerOptions {
-                    provider: provider.to_string(),
-                };
-                run_session_once(&paths, &options, 20)?;
-            }
-            // Live progress: a status message is created lazily as the agent works
-            // (tool calls + streamed text), then finalized into the reply — no
-            // "working…" placeholder. The loop marks the final outbound delivered
-            // so the delivery thread doesn't re-send; on timeout it leaves the late
-            // final to that thread.
-            // Best-effort: a streamer error must not stop the trailing delivery
-            // (which is what actually gets the reply out for this turn).
-            if let Err(error) = stream_turn_to_telegram(
-                home,
-                token,
-                config,
-                chat_id,
-                &inbound_id,
-                reply_to_message_id,
-                &paths,
-                STREAM_TURN_TIMEOUT,
-            ) {
-                eprintln!("telegram streamer error (delivering anyway): {error:#}");
-            }
-            // The streaming loop already owned delivery; this trailing call is a
-            // same-thread fallback for the timed-out / errored case, so deliver now.
-            deliver_telegram_outbox(home, token, &config.agent_id, &config.session_id, chat_id, None)?;
-            Ok(())
+            run_channel_prompt(home, token, config, chat_id, &text, reply_to_message_id)
         }
     }
 }
 
-/// Create a sub-agent and seed its session with the task prompt; returns the
-/// sub-agent id. Shared by the Telegram channel and the console command dispatcher.
-fn spawn_subagent(
+/// Run one channel turn end-to-end: record the user message, enqueue it as an
+/// inbound for the live (polled) session, stream the agent's reply back to
+/// Telegram, and deliver. Shared by ordinary prompts and by /emerge + /spawn, so
+/// a queued sub-task actually runs and replies instead of vanishing into a
+/// session nothing polls.
+fn run_channel_prompt(
     home: &MaturanaHome,
-    agent_id: &str,
-    name: &str,
-    mode: SpawnMode,
-    prompt: &str,
-) -> anyhow::Result<String> {
-    let subagent_id = create_subagent(home, agent_id, name, mode, prompt)?;
-    let paths = session_paths(&home.agent_dir(agent_id), &format!("subagent-{subagent_id}"));
+    token: &str,
+    config: &TelegramServe,
+    chat_id: i64,
+    text: &str,
+    reply_to_message_id: Option<i64>,
+) -> anyhow::Result<()> {
+    audit_channel_event(
+        home,
+        &config.agent_id,
+        "channel.telegram.inbound",
+        "received telegram prompt",
+    )?;
+    println!("telegram inbound prompt accepted");
+    append_channel_turn(home, &config.agent_id, chat_id, "user", text)?;
+    maybe_remember_user_message(home, &config.agent_id, text)?;
+    let prompt = build_channel_prompt(home, &config.agent_id, chat_id, text)?;
+    let paths = session_paths(&home.agent_dir(&config.agent_id), &config.session_id);
     ensure_session(&paths)?;
-    insert_inbound(
+    let inbound_id = insert_inbound(
         &paths,
-        "spawn",
-        "subagent",
-        &subagent_id,
-        None,
+        "chat",
+        "telegram",
+        &chat_id.to_string(),
+        reply_to_message_id.map(|id| id.to_string()).as_deref(),
         &serde_json::json!({
-            "text": prompt,
+            "text": text,
             "prompt": prompt,
-            "subagent_id": subagent_id,
-            "parent_agent_id": agent_id,
+            "telegram_reply_to": reply_to_message_id,
+            // Per-turn model + reasoning overrides: the guest worker passes
+            // these to the harness. None => harness/worker default.
+            "model": load_channel_settings(home, &config.agent_id).model,
+            "reasoning": load_channel_settings(home, &config.agent_id).reasoning,
         })
         .to_string(),
     )?;
-    audit_channel_event(home, agent_id, "channel.spawn", "spawned sub-agent session")?;
-    Ok(subagent_id)
+    send_telegram_chat_action(token, &chat_id.to_string(), "typing")?;
+    if let Some(provider) = &config.run_once_provider {
+        let options = RunnerOptions {
+            provider: provider.to_string(),
+        };
+        run_session_once(&paths, &options, 20)?;
+    }
+    // Live progress: a status message is created lazily as the agent works
+    // (tool calls + streamed text), then finalized into the reply — no
+    // "working…" placeholder. The loop marks the final outbound delivered
+    // so the delivery thread doesn't re-send; on timeout it leaves the late
+    // final to that thread.
+    // Best-effort: a streamer error must not stop the trailing delivery
+    // (which is what actually gets the reply out for this turn).
+    if let Err(error) = stream_turn_to_telegram(
+        home,
+        token,
+        config,
+        chat_id,
+        &inbound_id,
+        reply_to_message_id,
+        &paths,
+        STREAM_TURN_TIMEOUT,
+    ) {
+        eprintln!("telegram streamer error (delivering anyway): {error:#}");
+    }
+    // The streaming loop already owned delivery; this trailing call is a
+    // same-thread fallback for the timed-out / errored case, so deliver now.
+    deliver_telegram_outbox(home, token, &config.agent_id, &config.session_id, chat_id, None)?;
+    Ok(())
+}
+
+/// Frame a spawned sub-task as a focused instruction for the agent's next turn.
+fn frame_subtask(name: &str, task: &str) -> String {
+    format!(
+        "You've been handed a focused sub-task labelled `{name}`. Work on it now \
+         and report back with the result when you're done.\n\nTask: {task}"
+    )
 }
 
 /// A stable per-channel "chat key" for the console TUI, so commands that key off
@@ -1064,16 +1064,11 @@ pub(crate) fn run_console_command(
         }
         // /emerge <task> spawns an ephemeral sub-agent on the task.
         "emerge" if !args.is_empty() => {
-            match spawn_subagent(
-                home,
-                agent_id,
-                &slugify_channel_id(args),
-                SpawnMode::Ephemeral,
-                args,
-            ) {
-                Ok(id) => ConsoleCommand::Reply(format!("Spawned sub-agent `{id}` on the task.")),
-                Err(error) => ConsoleCommand::Reply(format!("Spawn failed: {error:#}")),
-            }
+            // Record the sub-task, then run it as a real turn: ConsoleCommand::Prompt
+            // sends it to the agent (previously it queued into a session nothing ran).
+            let name = slugify_channel_id(args);
+            let _ = create_subagent(home, agent_id, &name, SpawnMode::Ephemeral, args);
+            ConsoleCommand::Prompt(frame_subtask(&name, args))
         }
         // Everything else with a text reply goes through the shared handler.
         "commands" | "tools" | "models" | "model" | "reasoning" | "stop" | "compact" | "session"
@@ -1176,6 +1171,7 @@ fn deliver_telegram_outbox(
                     clear_telegram_status(&paths, inbound);
                 }
                 let _ = append_channel_turn(home, agent_id, chat_id, "assistant", &response);
+                maybe_send_tts(home, token, agent_id, chat_id, &response, reply_to_message_id);
                 let _ = audit_channel_event(
                     home,
                     agent_id,
@@ -1811,10 +1807,13 @@ fn subagents_text(home: &MaturanaHome, agent_id: &str) -> String {
         }
     }
     if entries.is_empty() {
-        "No subagents yet. Spawn one with /emerge <task>.".to_string()
+        "No sub-tasks dispatched yet. Run one with /emerge <task>.".to_string()
     } else {
         entries.sort();
-        format!("Subagents:\n{}", entries.join("\n"))
+        format!(
+            "Sub-tasks dispatched via /emerge (each runs as a turn and replies here):\n{}",
+            entries.join("\n")
+        )
     }
 }
 
@@ -2212,8 +2211,36 @@ fn handle_channel_command(
             reset_channel_context(home, &config.agent_id, chat_id)?;
             "Session reset — durable memory and wiki are preserved.".to_string()
         }
-        "stop" => "Nothing to stop — channel turns run one at a time and finish on reply.".to_string(),
-        "compact" => "The conversation context is compacted automatically each turn (durable memory + wiki + recent transcript). Use /new to start fresh.".to_string(),
+        "stop" => {
+            // Drop queued-but-unclaimed turns for this session. A turn already
+            // being processed by the guest worker runs to completion (the in-guest
+            // shell worker has no mid-turn cancel), so we report that honestly.
+            let paths = session_paths(&home.agent_dir(&config.agent_id), &config.session_id);
+            match cancel_pending_inbound(&paths) {
+                Ok(0) => "Nothing queued to stop. A reply already in progress will finish on its own.".to_string(),
+                Ok(n) => format!(
+                    "Stopped {n} queued message{}. A reply already in progress will still finish.",
+                    if n == 1 { "" } else { "s" }
+                ),
+                Err(error) => format!("Couldn't clear the queue: {error:#}"),
+            }
+        }
+        "compact" => {
+            // The per-turn context is always the recent *tail* of the transcript
+            // (auto-bounded), so "compaction" here is housekeeping: truncate the
+            // on-disk transcript to that tail so it can't grow without bound.
+            // Durable facts already live in memory + the wiki, and recent context
+            // is preserved.
+            let path = channel_transcript_path(home, &config.agent_id, chat_id);
+            match compact_transcript_file(&path, TRANSCRIPT_CONTEXT_CHARS) {
+                Ok(0) => "Nothing to compact — the transcript is already within the live context window.".to_string(),
+                Ok(freed) => format!(
+                    "Compacted the stored transcript (freed ~{} KB). Recent context is preserved; durable facts live in memory + the wiki.",
+                    (freed + 1023) / 1024
+                ),
+                Err(error) => format!("Couldn't compact the transcript: {error:#}"),
+            }
+        }
         "session" => {
             let mut settings = load_channel_settings(home, &config.agent_id);
             let sub = args.split_whitespace().next().unwrap_or("");
@@ -2544,6 +2571,134 @@ fn telegram_updates(
         anyhow::bail!("Telegram getUpdates returned ok=false");
     }
     Ok(response.result)
+}
+
+/// Read-aloud for channels: when /tts is enabled, synthesize the reply with the
+/// selected provider and send it as an audio message after the text. Always
+/// best-effort — a TTS failure (missing key, provider error) must never affect
+/// the text reply that was already delivered, so we log and move on.
+fn maybe_send_tts(
+    home: &MaturanaHome,
+    token: &str,
+    agent_id: &str,
+    chat_id: i64,
+    text: &str,
+    reply_to: Option<i64>,
+) {
+    let settings = load_channel_settings(home, agent_id);
+    if !settings.tts_enabled {
+        return;
+    }
+    let spoken = text.trim();
+    if spoken.is_empty() || spoken == crate::proactive::SILENCE_SENTINEL {
+        return;
+    }
+    // Bound the spoken text — providers and Telegram both cap upload size.
+    let spoken: String = spoken.chars().take(4000).collect();
+    let provider = settings.tts_provider.as_deref().unwrap_or("openai");
+    match synthesize_speech(home, provider, &spoken) {
+        Ok(audio) => {
+            if let Err(error) = send_telegram_audio(token, chat_id, &audio, reply_to) {
+                eprintln!("telegram tts send failed (text already delivered): {error:#}");
+            }
+        }
+        Err(error) => {
+            eprintln!("tts synthesis failed via {provider} (text already delivered): {error:#}");
+        }
+    }
+}
+
+/// Synthesize speech (mp3 bytes) host-side via the chosen provider. Keys come
+/// from pipelock and never reach the guest. Supported: openai (default),
+/// elevenlabs, deepgram — matching the /tts-provider picker.
+fn synthesize_speech(home: &MaturanaHome, provider: &str, text: &str) -> anyhow::Result<Vec<u8>> {
+    let resolve = |source: &str| -> anyhow::Result<String> {
+        Ok(resolve_secret_source_with_home(source, home.root())?
+            .expose_for_runtime()
+            .to_string())
+    };
+    let request = match provider.to_ascii_lowercase().as_str() {
+        "elevenlabs" => {
+            let key = resolve("pipelock:elevenlabs/api-key")?;
+            // Default multilingual voice ("Rachel").
+            ureq::post("https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM")
+                .set("xi-api-key", &key)
+                .set("accept", "audio/mpeg")
+                .timeout(Duration::from_secs(60))
+                .send_json(serde_json::json!({
+                    "text": text,
+                    "model_id": "eleven_multilingual_v2",
+                }))
+        }
+        "deepgram" => {
+            let key = resolve("pipelock:deepgram/api-key")?;
+            ureq::post("https://api.deepgram.com/v1/speak?model=aura-asteria-en")
+                .set("authorization", &format!("Token {key}"))
+                .set("content-type", "application/json")
+                .timeout(Duration::from_secs(60))
+                .send_json(serde_json::json!({ "text": text }))
+        }
+        _ => {
+            // OpenAI (default), matching the cockpit voice path.
+            let key = resolve("pipelock:openai/api-key")?;
+            ureq::post("https://api.openai.com/v1/audio/speech")
+                .set("authorization", &format!("Bearer {key}"))
+                .timeout(Duration::from_secs(60))
+                .send_json(serde_json::json!({
+                    "model": "tts-1",
+                    "input": text,
+                    "voice": "alloy",
+                    "response_format": "mp3",
+                }))
+        }
+    };
+    let response = request.map_err(|e| anyhow::anyhow!("{provider} tts request failed: {e}"))?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut response.into_reader(), &mut bytes)?;
+    if bytes.is_empty() {
+        anyhow::bail!("{provider} tts returned no audio");
+    }
+    Ok(bytes)
+}
+
+/// Upload mp3 audio to the chat via Telegram `sendAudio` (multipart/form-data).
+fn send_telegram_audio(
+    token: &str,
+    chat_id: i64,
+    audio: &[u8],
+    reply_to: Option<i64>,
+) -> anyhow::Result<()> {
+    let boundary = "maturanattsboundary7e3f";
+    let mut body: Vec<u8> = Vec::new();
+    let field = |name: &str, value: &str, body: &mut Vec<u8>| {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("content-disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    };
+    field("chat_id", &chat_id.to_string(), &mut body);
+    if let Some(id) = reply_to {
+        field("reply_to_message_id", &id.to_string(), &mut body);
+    }
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        b"content-disposition: form-data; name=\"audio\"; filename=\"reply.mp3\"\r\ncontent-type: audio/mpeg\r\n\r\n",
+    );
+    body.extend_from_slice(audio);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    let response = ureq::post(&format!("https://api.telegram.org/bot{token}/sendAudio"))
+        .set(
+            "content-type",
+            &format!("multipart/form-data; boundary={boundary}"),
+        )
+        .timeout(Duration::from_secs(60))
+        .send_bytes(&body)
+        .map_err(|e| anyhow::anyhow!("telegram sendAudio failed: {e}"))?;
+    let _ = response.into_string();
+    Ok(())
 }
 
 fn send_telegram(
@@ -3017,6 +3172,7 @@ fn stream_turn_to_telegram(
                     clear_telegram_status(paths, inbound_id);
                     let _ =
                         append_channel_turn(home, &config.agent_id, chat_id, "assistant", &reply);
+                    maybe_send_tts(home, token, &config.agent_id, chat_id, &reply, reply_to);
                     let _ = clear_progress(paths, inbound_id);
                     let _ = audit_channel_event(
                         home,
@@ -3769,6 +3925,34 @@ fn tail_context_file(path: &Path, limit: usize) -> anyhow::Result<String> {
             .skip(char_count.saturating_sub(limit))
             .collect::<String>()
     ))
+}
+
+/// Truncate an on-disk channel transcript to its most recent `keep_chars` (the
+/// same tail the per-turn context uses), returning the number of bytes freed.
+/// The live context is always the recent tail, so this bounds disk growth
+/// without dropping anything the agent would have seen this turn.
+fn compact_transcript_file(path: &Path, keep_chars: usize) -> anyhow::Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let contents = fs::read_to_string(path)?;
+    let char_count = contents.chars().count();
+    if char_count <= keep_chars {
+        return Ok(0);
+    }
+    let before = contents.len();
+    let tail: String = contents
+        .chars()
+        .skip(char_count.saturating_sub(keep_chars))
+        .collect();
+    // Align to the next line boundary so we never slice a transcript line in half.
+    let trimmed = match tail.find('\n') {
+        Some(idx) => &tail[idx + 1..],
+        None => tail.as_str(),
+    };
+    let new_contents = format!("[older transcript compacted]\n{trimmed}");
+    fs::write(path, &new_contents)?;
+    Ok(before.saturating_sub(new_contents.len()))
 }
 
 fn append_channel_turn(
@@ -4697,6 +4881,13 @@ where
             continue;
         }
         let response = truncate_for_telegram(&message_text(&message.content)?);
+        // A proactive self-check that decided there's nothing worth saying emits
+        // the silence sentinel; never surface it on a channel. Mark it delivered
+        // so it doesn't linger in the outbox or get retried.
+        if response.trim() == crate::proactive::SILENCE_SENTINEL {
+            mark_delivered(&paths, &message.id, None)?;
+            continue;
+        }
         let platform_message_id = send(&response, message.thread_id.as_deref())?;
         append_channel_turn(home, agent_id, key, "assistant", &response)?;
         mark_delivered(&paths, &message.id, platform_message_id.as_deref())?;

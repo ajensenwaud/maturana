@@ -137,10 +137,80 @@ fn provider_name(provider: &HostProvider) -> &'static str {
 }
 
 fn render_guest_agents(spec: &AgentSpec) -> String {
-    format!(
+    let mut out = format!(
         "# {}\n\nYou are a Maturana worker agent.\n\nPurpose: {}\n\nOperate only inside the mounted workspace and obey the MATURANA.md contract.\n",
         spec.identity.name, spec.identity.purpose
-    )
+    );
+
+    // The in-VM agent only knows a capability exists if its recipe is here — the
+    // skills/ library is installed on the host, not in the guest. So inline a
+    // concise, accurate invocation for each capability this agent actually has.
+    let mut recipes: Vec<String> = Vec::new();
+
+    if spec.knowledge_graph.enabled {
+        recipes.push(
+            "### Memory (MaturanaGraph)\nYou have a private knowledge graph + GraphRAG (service \
+             URL + token are in your worker env). Use the `maturana-graph` skill to store durable \
+             facts and recall them across turns instead of relying on the chat window."
+                .to_string(),
+        );
+    }
+
+    let egress = &spec.network.egress_allowlist;
+    let allows = |needle: &str| egress.iter().any(|h| h.contains(needle));
+    if allows("brave") || allows("tavily") {
+        recipes.push(
+            "### Web search\nFor live web facts, curl the allowlisted search API through the proxy \
+             — send NO key header, the pipelock proxy injects it:\n\
+             \x20   curl -fsS \"https://api.search.brave.com/res/v1/web/search?q=<terms>&count=5\" -H \"Accept: application/json\"\n\
+             \x20   # or Tavily:\n\
+             \x20   curl -fsS -X POST \"https://api.tavily.com/search\" -H \"content-type: application/json\" --data '{\"query\":\"<terms>\",\"max_results\":5}'\n\
+             Read web.results[].{title,url,description} (Brave) or results[].{title,url,content} (Tavily) and cite the URLs."
+                .to_string(),
+        );
+    }
+
+    if spec.browser.headless_chrome {
+        recipes.push(
+            "### Browse live pages\nA headless-Chrome driver is installed (one JSON arg in, one \
+             JSON line out). The target host must be in your egress allowlist:\n\
+             \x20   node /opt/maturana/bin/browse.js '{\"cmd\":\"text\",\"url\":\"https://example.com\",\"selector\":\"main\"}'\n\
+             \x20   node /opt/maturana/bin/browse.js '{\"cmd\":\"screenshot\",\"url\":\"https://example.com\",\"out\":\"/workspace/page.png\"}'\n\
+             Read ok, status, url, title, text from the JSON result."
+                .to_string(),
+        );
+    }
+
+    if spec.capabilities.image_gen {
+        recipes.push(
+            "### Generate images\nPOST the OpenAI images API through the proxy (key injected; send \
+             NO Authorization header). Save PNGs under /workspace:\n\
+             \x20   curl -fsS https://api.openai.com/v1/images/generations -H \"content-type: application/json\" --data '{\"model\":\"gpt-image-1\",\"prompt\":\"<prompt>\",\"size\":\"1024x1024\",\"n\":1}' | python3 -c 'import sys,json,base64; d=json.load(sys.stdin); open(\"/workspace/out.png\",\"wb\").write(base64.b64decode(d[\"data\"][0][\"b64_json\"]))'\n\
+             Report the saved path."
+                .to_string(),
+        );
+    }
+
+    if !spec.mcp_servers.is_empty() {
+        let names = spec
+            .mcp_servers
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        recipes.push(format!(
+            "### MCP tools\nYour harness is wired (with host-resolved auth) to these \
+             Model-Context-Protocol servers: {names}. Use their tools natively through the harness."
+        ));
+    }
+
+    if !recipes.is_empty() {
+        out.push_str("\n## Capabilities available to you\n\n");
+        out.push_str(&recipes.join("\n\n"));
+        out.push('\n');
+    }
+
+    out
 }
 
 fn write_if_absent<F: FnOnce() -> String>(path: &std::path::Path, content: F) -> std::io::Result<()> {
