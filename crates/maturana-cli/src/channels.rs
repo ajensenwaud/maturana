@@ -325,6 +325,8 @@ struct TelegramMessage {
     caption: Option<String>,
     #[serde(default)]
     document: Option<TelegramDocument>,
+    #[serde(default)]
+    photo: Option<Vec<TelegramPhotoSize>>,
     chat: TelegramChat,
 }
 
@@ -337,6 +339,14 @@ struct TelegramDocument {
     file_name: Option<String>,
     #[serde(default)]
     file_size: Option<i64>,
+}
+
+/// One size of a Telegram photo upload. Telegram sends an ascending array of
+/// sizes (thumbnail → original); we OCR the largest. Extra fields (file_size,
+/// width, height) are ignored.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct TelegramPhotoSize {
+    file_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -388,6 +398,11 @@ enum InboundAction {
     Document {
         chat_id: i64,
         document: TelegramDocument,
+        caption: Option<String>,
+    },
+    Photo {
+        chat_id: i64,
+        file_id: String,
         caption: Option<String>,
     },
     Tool {
@@ -877,6 +892,19 @@ fn handle_telegram_update(
             caption.as_deref(),
             reply_to_message_id,
         ),
+        InboundAction::Photo {
+            chat_id,
+            file_id,
+            caption,
+        } => handle_telegram_photo(
+            home,
+            token,
+            config,
+            chat_id,
+            &file_id,
+            caption.as_deref(),
+            reply_to_message_id,
+        ),
         InboundAction::Prompt { chat_id, text } => {
             run_channel_prompt(home, token, config, chat_id, &text, reply_to_message_id)
         }
@@ -1313,6 +1341,154 @@ fn handle_telegram_document(
     Ok(())
 }
 
+/// A photo upload: download the largest size, OCR it with tesseract, and ingest
+/// the extracted text into the agent's knowledge graph (so the agent can answer
+/// from it later, exactly like an uploaded document).
+fn handle_telegram_photo(
+    home: &MaturanaHome,
+    token: &str,
+    config: &TelegramServe,
+    chat_id: i64,
+    file_id: &str,
+    caption: Option<&str>,
+    reply_to_message_id: Option<i64>,
+) -> anyhow::Result<()> {
+    let knowledge_graph = agent_knowledge_graph(home, &config.agent_id);
+    let graph_token = maturana_core::worker::read_graph_token(home.root());
+    let (graph_token, graph_name) = match (graph_token, knowledge_graph.enabled) {
+        (Some(value), true) => (value, crate::graph::agent_graph_name(&config.agent_id)),
+        _ => {
+            send_telegram(
+                token,
+                &chat_id.to_string(),
+                "I received the image, but my knowledge graph is not enabled, so I cannot store it. Enable `knowledge_graph` in MATURANA.md and set up the graph service.",
+                reply_to_message_id,
+            )?;
+            return Ok(());
+        }
+    };
+
+    send_telegram_chat_action(token, &chat_id.to_string(), "typing")?;
+    let inbox = home.agent_dir(&config.agent_id).join("inbox");
+    fs::create_dir_all(&inbox)?;
+    let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let image_dest = inbox.join(format!("{stamp}-photo.jpg"));
+    if let Err(error) = download_telegram_document(token, file_id, &image_dest) {
+        send_telegram(
+            token,
+            &chat_id.to_string(),
+            &format!("I couldn't download that image: {error:#}"),
+            reply_to_message_id,
+        )?;
+        return Ok(());
+    }
+
+    let text = match ocr_image_text(&image_dest) {
+        Ok(text) if !text.trim().is_empty() => text,
+        Ok(_) => {
+            send_telegram(
+                token,
+                &chat_id.to_string(),
+                "I read that image but couldn't find any text in it (OCR returned nothing).",
+                reply_to_message_id,
+            )?;
+            return Ok(());
+        }
+        Err(error) => {
+            audit_channel_event(
+                home,
+                &config.agent_id,
+                "channel.telegram.photo_error",
+                &format!("OCR failed: {error:#}"),
+            )?;
+            send_telegram(
+                token,
+                &chat_id.to_string(),
+                &format!("I couldn't OCR that image: {error:#}"),
+                reply_to_message_id,
+            )?;
+            return Ok(());
+        }
+    };
+
+    // Ingest the OCR'd text as a markdown note the graph can chunk + retrieve.
+    let text_dest = inbox.join(format!("{stamp}-photo-ocr.md"));
+    let heading = caption
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(|c| format!("# {c}\n\n"))
+        .unwrap_or_default();
+    fs::write(&text_dest, format!("{heading}{}", text.trim()))?;
+    let chars = text.trim().chars().count();
+    match crate::graph::ingest_file_into_service(
+        crate::graph::DEFAULT_LOCAL_URL,
+        &graph_token,
+        &graph_name,
+        &text_dest,
+        1800,
+    ) {
+        Ok(chunks) => {
+            audit_channel_event(
+                home,
+                &config.agent_id,
+                "channel.telegram.photo",
+                &format!("OCR'd image ({chars} chars) into graph '{graph_name}' ({chunks} chunks)"),
+            )?;
+            let note = match caption {
+                Some(c) if !c.trim().is_empty() => format!("[uploaded image, OCR'd] {}", c.trim()),
+                _ => "[uploaded image, OCR'd]".to_string(),
+            };
+            append_channel_turn(home, &config.agent_id, chat_id, "user", &note)?;
+            send_telegram(
+                token,
+                &chat_id.to_string(),
+                &format!(
+                    "Read the text from your image ({chars} characters) and added it to my knowledge graph `{graph_name}` ({chunks} chunks). Ask me about it any time."
+                ),
+                reply_to_message_id,
+            )?;
+        }
+        Err(error) => {
+            audit_channel_event(
+                home,
+                &config.agent_id,
+                "channel.telegram.photo_error",
+                &format!("failed to ingest OCR text: {error:#}"),
+            )?;
+            send_telegram(
+                token,
+                &chat_id.to_string(),
+                &format!("I read the image but couldn't store the text: {error:#}"),
+                reply_to_message_id,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// OCR an image to text by shelling out to the `tesseract` CLI — no API key, runs
+/// offline host-side. Returns the extracted text; errors clearly if tesseract is
+/// not installed.
+fn ocr_image_text(image_path: &Path) -> anyhow::Result<String> {
+    let output = std::process::Command::new("tesseract")
+        .arg(image_path)
+        .arg("stdout")
+        .output()
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "OCR needs the `tesseract` binary on the host (install it with \
+                 `sudo apt install -y tesseract-ocr`): {error}"
+            )
+        })?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "tesseract failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 #[derive(Debug, Deserialize)]
 struct TelegramGetFileResponse {
     ok: bool,
@@ -1411,6 +1587,19 @@ fn classify_telegram_update(
         return InboundAction::Document {
             chat_id,
             document: document.clone(),
+            caption: message.caption.clone(),
+        };
+    }
+    // Photo uploads (compressed images) arrive as an ascending size array, not a
+    // document, and carry no `text`. OCR the largest size into the graph. The
+    // pairing gate still applies — only the paired chat can feed the agent.
+    if let Some(largest) = message.photo.as_ref().and_then(|sizes| sizes.last()) {
+        if paired_chat_id != Some(chat_id) {
+            return InboundAction::Deny { chat_id };
+        }
+        return InboundAction::Photo {
+            chat_id,
+            file_id: largest.file_id.clone(),
             caption: message.caption.clone(),
         };
     }
@@ -5494,6 +5683,7 @@ mod tests {
                 text: Some(text.to_string()),
                 caption: None,
                 document: None,
+                photo: None,
                 chat: TelegramChat { id: chat_id },
             }),
             channel_post: None,
@@ -5513,11 +5703,52 @@ mod tests {
                     file_name: Some(file_name.to_string()),
                     file_size: Some(1024),
                 }),
+                photo: None,
                 chat: TelegramChat { id: chat_id },
             }),
             channel_post: None,
             callback_query: None,
         }
+    }
+
+    fn photo_update(chat_id: i64, caption: Option<&str>) -> TelegramUpdate {
+        TelegramUpdate {
+            update_id: 1,
+            message: Some(TelegramMessage {
+                message_id: 1,
+                text: None,
+                caption: caption.map(str::to_string),
+                document: None,
+                photo: Some(vec![
+                    TelegramPhotoSize {
+                        file_id: "photo-small".to_string(),
+                    },
+                    TelegramPhotoSize {
+                        file_id: "photo-large".to_string(),
+                    },
+                ]),
+                chat: TelegramChat { id: chat_id },
+            }),
+            channel_post: None,
+            callback_query: None,
+        }
+    }
+
+    #[test]
+    fn routes_photo_uploads_to_ocr_from_paired_chat_only() {
+        // The largest size is OCR'd; pairing gates the upload.
+        assert_eq!(
+            classify_telegram_update(&photo_update(7, Some("store this")), Some(7), None),
+            InboundAction::Photo {
+                chat_id: 7,
+                file_id: "photo-large".to_string(),
+                caption: Some("store this".to_string()),
+            }
+        );
+        assert_eq!(
+            classify_telegram_update(&photo_update(9, None), Some(7), None),
+            InboundAction::Deny { chat_id: 9 }
+        );
     }
 
     #[test]
