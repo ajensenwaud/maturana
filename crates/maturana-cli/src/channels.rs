@@ -1186,7 +1186,10 @@ fn deliver_telegram_outbox(
             .thread_id
             .as_deref()
             .and_then(|value| value.parse::<i64>().ok());
-        match finalize_reply(token, chat_id, live_id, &response, reply_to_message_id) {
+        // Fallback delivery (the streamer died/timed out): we don't have the
+        // draft's render here to tell a tool block from streamed answer text, so
+        // keep the safe edit-in-place path rather than risk a wrong swoosh.
+        match finalize_reply(token, chat_id, live_id, &response, reply_to_message_id, false) {
             Ok(platform_message_id) => {
                 // Finalize the claim (the row already exists from claim_delivery, so a
                 // mark_delivered hiccup can't re-open it for a duplicate send).
@@ -3236,20 +3239,34 @@ fn clear_telegram_status(paths: &SessionPaths, inbound_id: &str) {
     let _ = std::fs::remove_file(telegram_status_path(paths, inbound_id));
 }
 
-/// Turn the live progress message into the final reply as exactly ONE message:
-/// edit it in place; if the edit fails, delete the stale live message and only
-/// then send a fresh copy — but if that delete cannot be confirmed, return `Err`
-/// WITHOUT sending, so a failed delete can never leave two messages in the chat.
-/// On `Err` the caller releases the claim and a later pass retries.
+/// Finalize a turn's reply. Two modes, chosen by `swoosh`:
+///
+/// - `swoosh = true` (the live draft was an ephemeral tool/progress block):
+///   DELETE the draft so it visibly disappears — the "swoosh" — then deliver the
+///   answer as its own clean message. Single-send is guaranteed upstream by
+///   `claim_delivery` (only the claim winner reaches here), so delete-then-send
+///   cannot duplicate the reply. A failed delete is tolerated best-effort: we
+///   still send the answer rather than drop it over a lingering stale draft.
+/// - `swoosh = false` (the draft WAS the streamed answer text itself): edit it in
+///   place so the streamed text simply finalizes — no flicker. If the edit fails,
+///   delete then resend; but if the delete can't be confirmed return `Err`
+///   WITHOUT sending, so two messages can never linger. On `Err` the caller
+///   releases the claim and a later pass retries.
 fn finalize_reply(
     token: &str,
     chat_id: i64,
     live_id: Option<i64>,
     reply: &str,
     reply_to: Option<i64>,
+    swoosh: bool,
 ) -> anyhow::Result<Option<i64>> {
-    match live_id {
-        Some(id) => match edit_telegram_message(token, chat_id, id, reply) {
+    match (live_id, swoosh) {
+        (Some(id), true) => {
+            // Swoosh: the working/tool draft disappears, the answer arrives fresh.
+            let _ = delete_telegram_message(token, chat_id, id);
+            send_telegram(token, &chat_id.to_string(), reply, reply_to)
+        }
+        (Some(id), false) => match edit_telegram_message(token, chat_id, id, reply) {
             Ok(()) => Ok(Some(id)),
             Err(edit_err) => {
                 delete_telegram_message(token, chat_id, id).map_err(|del_err| {
@@ -3260,16 +3277,16 @@ fn finalize_reply(
                 send_telegram(token, &chat_id.to_string(), reply, reply_to)
             }
         },
-        None => send_telegram(token, &chat_id.to_string(), reply, reply_to),
+        (None, _) => send_telegram(token, &chat_id.to_string(), reply, reply_to),
     }
 }
 
-/// OpenClaw-style live progress for a turn: post ONE message immediately, tick a
-/// spinner on it while the agent works (showing the tools it runs + streamed
-/// text), then — the instant the reply lands — edit that SAME message in place
-/// into the final answer. The progress animation literally becomes the reply, so
-/// there is exactly one message per turn: it cannot orphan a status message and
-/// cannot duplicate the reply.
+/// OpenClaw-style live progress for a turn: post ONE draft message and stream the
+/// agent's tool/progress lines into it while it works. The instant the reply
+/// lands, finalize it: if the draft was a tool/progress block it is DELETED — the
+/// "swoosh" — and the clean answer is sent as its own fresh message; if the draft
+/// was the streamed answer text itself, it is edited in place (no flicker). Either
+/// way there is exactly one final message, gated by `claim_delivery`.
 ///
 /// Delivery is still gated by `claim_delivery` (the atomic single-send gate), and
 /// the message id is recorded in a marker so that if the 1s delivery thread wins
@@ -3346,10 +3363,12 @@ fn stream_turn_to_telegram(
                 let _ = clear_progress(paths, inbound_id);
                 return Ok(());
             }
-            // Edit the live message in place into the answer (the progress
-            // disappears, the answer stays — one clean message). finalize_reply
-            // guarantees a failed edit never leaves two messages.
-            match finalize_reply(token, chat_id, message_id, &reply, reply_to) {
+            // Finalize. If the live draft was an ephemeral tool/progress block
+            // (`<pre>…</pre>` — tools, "working…", or "error"), swoosh it away and
+            // send the answer as a fresh message (OpenClaw style). If it was the
+            // streamed answer text itself, edit it in place so it doesn't flicker.
+            let swoosh = last_render.starts_with("<pre>");
+            match finalize_reply(token, chat_id, message_id, &reply, reply_to, swoosh) {
                 Ok(platform_id) => {
                     // Finalize the claim (the row already exists from claim_delivery,
                     // so a mark_delivered hiccup can't re-open it for a duplicate).
