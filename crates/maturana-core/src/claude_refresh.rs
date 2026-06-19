@@ -22,7 +22,7 @@ use std::time::Duration;
 
 /// OAuth client id claude-code presents for the refresh grant.
 pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-pub const TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 /// Refresh this long before expiry so a turn never starts on a dead token.
 pub const REFRESH_SKEW: Duration = Duration::from_secs(15 * 60);
 
@@ -106,6 +106,8 @@ pub fn refresh_claude_token(creds: &ClaudeCreds) -> anyhow::Result<ClaudeCreds> 
     let (url, body) = refresh_request(&creds.refresh_token);
     let text = match ureq::post(&url)
         .timeout(Duration::from_secs(30))
+        .set("Accept", "application/json")
+        .set("anthropic-beta", "oauth-2025-04-20")
         .send_json(body)
     {
         Ok(response) => response.into_string()?,
