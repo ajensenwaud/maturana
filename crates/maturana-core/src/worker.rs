@@ -722,21 +722,49 @@ PY
     if run_harness opencode "${opencode_args[@]}" >/tmp/maturana-session-response.txt 2>>/var/log/maturana/worker.err.log; then
       response="$(cat /tmp/maturana-session-response.txt)"
       if [ -z "$response" ] && [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
-        response="$(python3 - <<'PY'
-import json, os, sqlite3
+        # `--attach` streams to the warm server and returns BEFORE the turn is
+        # finished, so reading the DB once catches a half-written preamble
+        # ("I'll search…"). Wait for completion the way NanoClaw does: poll the
+        # DB and accept the latest assistant text part only once it has stopped
+        # changing. While the most-recent part is a tool (or anything non-text)
+        # the turn is still running — that is what stops us settling on the
+        # preamble during a tool call.
+        response="$(MATURANA_OC_DEADLINE="${MATURANA_HARNESS_TIMEOUT_SECONDS:-240}" python3 - <<'PY'
+import json, os, sqlite3, time
 db = os.path.expanduser("~/.local/share/opencode/opencode.db")
-con = sqlite3.connect(db)
-rows = con.execute("""
-select part.data
-from part
-join message on message.id = part.message_id
-where json_extract(part.data, '$.type') = 'text'
-  and json_extract(message.data, '$.role') = 'assistant'
-order by part.time_updated desc
-limit 1
-""").fetchall()
-if rows:
-    print(json.loads(rows[0][0]).get("text", ""))
+def latest_part():
+    con = sqlite3.connect(db)
+    try:
+        rows = con.execute(
+            "select part.data from part "
+            "join message on message.id = part.message_id "
+            "where json_extract(message.data, '$.role') = 'assistant' "
+            "order by part.time_updated desc limit 1"
+        ).fetchall()
+    finally:
+        con.close()
+    if not rows:
+        return (None, "")
+    d = json.loads(rows[0][0])
+    t = d.get("type")
+    return (t, d.get("text", "") if t == "text" else "")
+deadline = time.time() + float(os.environ.get("MATURANA_OC_DEADLINE", "240"))
+last, stable_since, final = "", None, ""
+while time.time() < deadline:
+    typ, text = latest_part()
+    if typ == "text" and text.strip():
+        if text == last:
+            if stable_since is None:
+                stable_since = time.time()
+            elif time.time() - stable_since >= 3.0:
+                final = text
+                break
+        else:
+            last, stable_since = text, None
+    else:
+        last, stable_since = "", None
+    time.sleep(0.7)
+print(final or last)
 PY
 )"
       fi
