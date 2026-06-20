@@ -579,6 +579,139 @@ post("status", "done")
 sys.stdout.write(final if final is not None else "".join(text))
 PYEOF
 
+# opencode collapser: reads `opencode run --format json` JSONL on stdin (one
+# event per line, discriminated by `type`), POSTs distilled live progress to
+# sessiond, and on EOF prints the FINAL assistant text. NanoClaw model: process
+# exit (EOF) is the terminal signal (opencode exits at session.status=idle), the
+# final text is read WHOLE as the LAST complete `text` part — never accumulated
+# from deltas, never an earlier per-step preamble. reasoning/tool/step events are
+# ACTIVITY ONLY (liveness + progress lane) and contribute nothing to the answer.
+# The opencode sessionID is the opaque continuation token: captured the first
+# time we see it and persisted IMMEDIATELY so a mid-turn crash can still resume.
+cat > /tmp/maturana-stream-opencode.py <<'PYEOF'
+import json, os, subprocess, sys
+
+url = os.environ.get("SESSIOND_URL", "")
+token = os.environ.get("MATURANA_SESSIOND_TOKEN", "")
+agent = os.environ.get("MATURANA_AGENT_ID", "")
+session = os.environ.get("MATURANA_SESSION_ID", "")
+msg = os.environ.get("MSG_ID", "")
+session_file = os.environ.get("MATURANA_OC_SESSION_FILE", "")
+seq = 0
+texts = []          # one entry per completed text part, in stream order
+current = None       # id of the text part currently streaming, if any
+saved_sid = False
+
+def post(kind, body_text):
+    global seq
+    if not url or not msg:
+        return
+    body = json.dumps({"agent_id": agent, "session_id": session,
+                       "message_id": msg, "seq": seq, "kind": kind, "text": body_text})
+    seq += 1
+    args = ["curl", "-fsS", "-X", "POST", url + "/session/progress",
+            "-H", "content-type: application/json"]
+    if token:
+        args += ["-H", "x-maturana-session-token: " + token]
+    args += ["--data", body]
+    try:
+        subprocess.run(args, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=5)
+    except Exception:
+        pass
+
+def first_line(s, n):
+    return (s or "").strip().split("\n", 1)[0][:n]
+
+def save_session(sid):
+    # Persist the opaque continuation token immediately (NanoClaw init.continuation).
+    global saved_sid
+    if saved_sid or not sid or not session_file:
+        return
+    try:
+        tmp = session_file + ".tmp"
+        with open(tmp, "w") as fh:
+            fh.write(sid)
+        os.replace(tmp, session_file)
+        saved_sid = True
+    except Exception:
+        pass
+
+def sid_of(ev, part):
+    for src in (ev, part, ev.get("part") or {}, ev.get("properties") or {}):
+        if isinstance(src, dict):
+            v = src.get("sessionID") or src.get("session_id") or src.get("sessionId")
+            if v:
+                return v
+    return None
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        ev = json.loads(line)
+    except Exception:
+        continue
+    t = ev.get("type", "")
+    part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
+    pt = part.get("type", "")
+    sid = sid_of(ev, part)
+    if sid:
+        save_session(sid)
+
+    if pt == "text" or t == "text":
+        # A text part. opencode streams it incrementally then marks it complete
+        # with part.time.end. We REPLACE (never concatenate) the running value
+        # for this part id, so the slot always holds the whole part, and only
+        # commit it as a finished step-answer once part.time.end is set. The LAST
+        # committed text part is the final answer; earlier ones are per-step
+        # preambles ("I'll search…") that we deliberately discard.
+        body = part.get("text", "") if part else ev.get("text", "")
+        pid = part.get("id") if part else ev.get("id")
+        ended = bool(((part.get("time") or {}) if part else {}).get("end"))
+        if pid is not None and pid == current and texts:
+            texts[-1] = (pid, body, ended)
+        else:
+            texts.append((pid, body, ended))
+            current = pid
+        post("text", (body or "")[:3500])
+    elif pt == "reasoning" or t == "reasoning":
+        rt = (part.get("text") if part else ev.get("text")) or ""
+        if rt.strip():
+            post("thinking", first_line(rt, 240))
+    elif pt in ("tool", "tool_use") or t in ("tool", "tool_use", "tool_call"):
+        tname = (part.get("tool") if part else None) or ev.get("tool") or ev.get("name") or "tool"
+        post("tool", "using: " + str(tname))
+    elif t in ("error", "session.error") or pt == "error":
+        # An error event is still terminal-ish; surface it and let EOF end us.
+        emsg = ""
+        if isinstance(ev.get("error"), dict):
+            emsg = ev["error"].get("message") or ev["error"].get("name") or ""
+        elif isinstance(ev.get("error"), str):
+            emsg = ev["error"]
+        post("status", "error")
+        if emsg.strip() and not [x for x in texts if (x[1] or "").strip()]:
+            texts.append((None, emsg, True))
+    # step_start / step_finish / message.* etc. are activity-only: opencode has
+    # already exited at session idle when we hit EOF, so there is no separate
+    # terminal event to wait for — EOF is it. (step_finish can race out per
+    # opencode#26855; we do not depend on it.)
+
+# EOF == turn done (opencode exited at session.status=idle). Take the LAST
+# non-empty text part WHOLE — stream order is authoritative, so the final part is
+# the answer and earlier parts are per-step preambles. We do NOT gate on
+# part.time.end: under opencode#26855 the closing event can race out and leave the
+# real final part unmarked, so requiring `end` would wrongly fall back to an
+# earlier (ended) preamble. `end` is informational only.
+post("status", "done")
+final = ""
+for (pid, body, ended) in texts:
+    if (body or "").strip():
+        final = body
+sys.stdout.write(final)
+PYEOF
+
 while true; do
   date -Is > /var/log/maturana/heartbeat
   heartbeat idle
@@ -693,117 +826,100 @@ PY
       fi
     fi
   elif [ "${MATURANA_HARNESS}" = "opencode" ]; then
-    # Warm server: keep a headless `opencode serve` running and ATTACH each turn,
-    # so the heavy Node/runtime boot (~5s) is paid once, not per turn. The attached
-    # run streams into the server's session (empty stdout), so the reply is read
-    # from opencode.db by the empty-stdout fallback below.
-    oc_port="${MATURANA_OPENCODE_PORT:-5599}"
-    if ! curl -fsS "http://127.0.0.1:${oc_port}/global/health" >/dev/null 2>&1; then
-      nohup opencode serve --port "${oc_port}" --hostname 127.0.0.1 \
-        >>/var/log/maturana/opencode-serve.log 2>&1 &
-      for _ in $(seq 1 40); do
-        curl -fsS "http://127.0.0.1:${oc_port}/global/health" >/dev/null 2>&1 && break
-        sleep 0.5
-      done
-    fi
-    opencode_args=(run --attach "http://127.0.0.1:${oc_port}")
+    # NanoClaw model on the opencode CLI: run STANDALONE `opencode run --format
+    # json --continue`, which blocks until the turn reaches `session.status=idle`
+    # and then exits — process exit IS NanoClaw's terminal `result` event. We do
+    # NOT use `--attach` to a warm server: the attached run returns BEFORE idle
+    # with empty stdout, forcing a fragile opencode.db/SSE scrape that read the
+    # mid-stream PREAMBLE ("I'll search…") instead of the final answer. Standalone
+    # pays a per-turn Node boot (~5s) but reliably streams the whole turn's events
+    # to stdout, including the final assistant text, so we read it the NanoClaw
+    # way: collapse the JSONL event stream, take the LAST complete `text` part,
+    # never accumulate deltas, never settle on an earlier per-step preamble.
+    #
+    # Continuity: opencode is SQLite-backed, so `--continue` resumes the last
+    # session across separate `run` invocations. We capture the opencode sessionID
+    # from the first turn's stream (the opaque continuation token, NanoClaw's
+    # init.continuation) and persist it, then resume with `--session <id>` so a
+    # parallel/other session can never hand us the wrong thread. `--continue`
+    # bootstraps turn one (no id yet) and is a safe fallback if the id is lost.
+    oc_session_file="$HOME/.maturana-opencode-session"
+    oc_model_args=()
     if [ -n "$model" ]; then
       # OpenCode routes OpenRouter models as `openrouter/<vendor>/<model>`. The
       # /model picker stores the raw catalog id (e.g. google/gemini-2.5-pro), so
       # prefix `openrouter/` unless the user already gave a provider-qualified id.
       case "$model" in
-        openrouter/*) opencode_args+=(-m "$model") ;;
-        *) opencode_args+=(-m "openrouter/$model") ;;
+        openrouter/*) oc_model_args=(-m "$model") ;;
+        *) oc_model_args=(-m "openrouter/$model") ;;
       esac
     elif [ -n "${OPENROUTER_API_KEY:-}" ]; then
-      opencode_args+=(-m openrouter/anthropic/claude-sonnet-4.5)
+      oc_model_args=(-m openrouter/anthropic/claude-sonnet-4.5)
     fi
-    opencode_args+=("$(cat /tmp/maturana-session-prompt.txt)")
-    if run_harness opencode "${opencode_args[@]}" >/tmp/maturana-session-response.txt 2>>/var/log/maturana/worker.err.log; then
+    oc_prompt="$(cat /tmp/maturana-session-prompt.txt)"
+    # One turn = one standalone `opencode run --format json` piped through the
+    # NanoClaw collapser. $1 is the resume flag-pair ("--session <id>" or
+    # "--continue"). The collapser exits 0 even on harness error, so pipefail
+    # surfaces an opencode non-zero exit.
+    run_opencode_turn() {
+      : > /tmp/maturana-session-response.txt
+      set -o pipefail
+      local rc=0
+      run_harness opencode run --format json "$@" "${oc_model_args[@]}" "$oc_prompt" </dev/null \
+          2>>/var/log/maturana/worker.err.log \
+        | SESSIOND_URL="$sessiond_url" MSG_ID="$msg_id" \
+          MATURANA_OC_SESSION_FILE="$oc_session_file" \
+          python3 /tmp/maturana-stream-opencode.py > /tmp/maturana-session-response.txt 2>>/var/log/maturana/worker.err.log \
+        || rc=$?
+      set +o pipefail
+      return $rc
+    }
+    if [ -s "$oc_session_file" ]; then
+      run_opencode_turn --session "$(cat "$oc_session_file")" || true
       response="$(cat /tmp/maturana-session-response.txt)"
-      if [ -z "$response" ] && [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
-        # `--attach` streams the turn into the warm server and returns BEFORE the
-        # turn is finished (empty stdout), so the reply lives in opencode.db. The
-        # trap: an agentic turn is MANY assistant messages — one per step — and
-        # each step's message gets its own `time.completed` the moment that step's
-        # generation ends. So "latest assistant message is completed" is true right
-        # after the preamble+tool-call step, long before the post-tool answer
-        # message exists; reading then yields "I'll search…". The reliable
-        # turn-done signal is opencode's `session.idle` SSE event (NanoClaw's
-        # terminal "result" event): it fires only once the whole turn is quiescent.
-        # Wait for it on /event, THEN read the last assistant message's last text
-        # part. A completed+stable DB fallback covers instant/no-tool turns where
-        # idle may fire before we connect.
-        response="$(MATURANA_OC_DEADLINE="${MATURANA_HARNESS_TIMEOUT_SECONDS:-240}" MATURANA_OPENCODE_PORT="${oc_port}" python3 - <<'PY'
-import json, os, sqlite3, time, threading, urllib.request
+      # Self-heal a stale/invalid session id (opencode returns "Resource not
+      # found"): if the resume produced no text, drop the token and retry once
+      # with `--continue`, which the collapser will repopulate with a fresh id.
+      if [ -z "$response" ]; then
+        rm -f "$oc_session_file"
+        run_opencode_turn --continue || true
+        response="$(cat /tmp/maturana-session-response.txt)"
+      fi
+    else
+      run_opencode_turn --continue || true
+      response="$(cat /tmp/maturana-session-response.txt)"
+    fi
+    # Last-ditch fallback ONLY when the stream carried no text at all (e.g. the
+    # #26855 race exited before flushing, or a crash mid-stream). Read the last
+    # assistant message's last text part straight from opencode.db — the same
+    # "terminal message, terminal text part" selection, just from disk.
+    if [ -z "$response" ] && [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
+      response="$(python3 - <<'PY'
+import os, sqlite3
 db = os.path.expanduser("~/.local/share/opencode/opencode.db")
-port = os.environ.get("MATURANA_OPENCODE_PORT", "5599")
-idle = {"seen": False}
-def listen():
-    # opencode exposes the bus either at /event or /global/event depending on
-    # version; race both and stop on the first session.idle.
-    for path in ("/event", "/global/event"):
-        try:
-            resp = urllib.request.urlopen(
-                "http://127.0.0.1:%s%s" % (port, path), timeout=300)
-            for raw in resp:
-                if b'"session.idle"' in raw:
-                    idle["seen"] = True
-                    return
-        except Exception:
-            continue
-threading.Thread(target=listen, daemon=True).start()
-def final_text():
+try:
     con = sqlite3.connect(db)
-    try:
-        m = con.execute(
-            "select id, json_extract(data, '$.time.completed') c from message "
-            "where json_extract(data, '$.role') = 'assistant' "
-            "order by json_extract(data, '$.time.created') desc, rowid desc limit 1"
-        ).fetchone()
-        if not m:
-            return (False, "")
-        mid, completed = m
+    m = con.execute(
+        "select id from message "
+        "where json_extract(data, '$.role') = 'assistant' "
+        "order by json_extract(data, '$.time.created') desc, rowid desc limit 1"
+    ).fetchone()
+    if m:
         rows = con.execute(
             "select json_extract(data, '$.text') t from part "
             "where message_id = ? and json_extract(data, '$.type') = 'text' "
-            "order by time_updated asc", (mid,)
+            "order by time_updated asc", (m[0],)
         ).fetchall()
         texts = [r[0] for r in rows if r[0] and r[0].strip()]
-        return (completed is not None, texts[-1] if texts else "")
-    finally:
-        con.close()
-deadline = time.time() + float(os.environ.get("MATURANA_OC_DEADLINE", "240"))
-text = ""
-stable_val = None
-stable_since = 0.0
-while time.time() < deadline:
-    done, t = final_text()
-    if t:
-        text = t
-    if idle["seen"]:
-        # whole turn quiesced — let the final part flush, then take it
-        time.sleep(0.4)
-        _, t2 = final_text()
-        if t2:
-            text = t2
-        break
-    # fallback only when we never saw idle (fast/no-tool turn): require the
-    # latest message complete AND its text unchanged for a comfortable window,
-    # so we don't settle on a between-steps pause.
-    if done and t.strip():
-        if t == stable_val:
-            if time.time() - stable_since > 5.0:
-                break
-        else:
-            stable_val = t
-            stable_since = time.time()
-    time.sleep(0.5)
-print(text)
+        if texts:
+            print(texts[-1])
+    con.close()
+except Exception:
+    pass
 PY
 )"
-      fi
-    else
+    fi
+    if [ -z "$response" ]; then
       response="I hit an error while processing that message."
     fi
   else
@@ -899,7 +1015,14 @@ mod tests {
         // Claude must run with tool autonomy in the VM sandbox, else MCP/tools
         // are permission-gated and silently denied in headless `-p` mode.
         assert!(runner.contains("--permission-mode bypassPermissions"));
-        assert!(runner.contains("opencode"));
+        // opencode runs STANDALONE blocking `run --format json` (NanoClaw model:
+        // process exit at session idle = terminal event), NOT `--attach` to a
+        // warm server (which returns the mid-stream preamble). Continuity comes
+        // from the persisted opencode session id (`--session`/`--continue`).
+        assert!(runner.contains("opencode run --format json"));
+        assert!(!runner.contains("run --attach"));
+        assert!(runner.contains("maturana-stream-opencode.py"));
+        assert!(runner.contains(".maturana-opencode-session"));
         assert!(runner.contains("/session/heartbeat"));
         assert!(runner.contains("/session/outbound"));
         assert!(runner.contains("/agent/proxy.env"));
