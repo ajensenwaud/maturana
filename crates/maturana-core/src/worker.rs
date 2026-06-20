@@ -725,46 +725,44 @@ PY
         # `--attach` streams to the warm server and returns BEFORE the turn is
         # finished, so reading the DB once catches a half-written preamble
         # ("I'll search…"). Wait for completion the way NanoClaw does: poll the
-        # DB and accept the latest assistant text part only once it has stopped
-        # changing. While the most-recent part is a tool (or anything non-text)
-        # the turn is still running — that is what stops us settling on the
-        # preamble during a tool call.
+        # DB until opencode stamps the latest assistant message complete
+        # (time.completed in its schema), then take that message's LAST text
+        # part: the final answer, after any preamble / tool / retry parts.
         response="$(MATURANA_OC_DEADLINE="${MATURANA_HARNESS_TIMEOUT_SECONDS:-240}" python3 - <<'PY'
 import json, os, sqlite3, time
 db = os.path.expanduser("~/.local/share/opencode/opencode.db")
-def latest_part():
+def state():
     con = sqlite3.connect(db)
     try:
+        m = con.execute(
+            "select id, data from message "
+            "where json_extract(data, '$.role') = 'assistant' "
+            "order by json_extract(data, '$.time.created') desc, rowid desc limit 1"
+        ).fetchone()
+        if not m:
+            return (False, "")
+        mid, mdata = m
+        done = json.loads(mdata).get("time", {}).get("completed") is not None
         rows = con.execute(
-            "select part.data from part "
-            "join message on message.id = part.message_id "
-            "where json_extract(message.data, '$.role') = 'assistant' "
-            "order by part.time_updated desc limit 1"
+            "select data from part where message_id = ? "
+            "and json_extract(data, '$.type') = 'text' "
+            "order by time_updated asc", (mid,)
         ).fetchall()
+        texts = [json.loads(r[0]).get("text", "") for r in rows]
+        texts = [t for t in texts if t.strip()]
+        return (done, texts[-1] if texts else "")
     finally:
         con.close()
-    if not rows:
-        return (None, "")
-    d = json.loads(rows[0][0])
-    t = d.get("type")
-    return (t, d.get("text", "") if t == "text" else "")
 deadline = time.time() + float(os.environ.get("MATURANA_OC_DEADLINE", "240"))
-last, stable_since, final = "", None, ""
+text = ""
 while time.time() < deadline:
-    typ, text = latest_part()
-    if typ == "text" and text.strip():
-        if text == last:
-            if stable_since is None:
-                stable_since = time.time()
-            elif time.time() - stable_since >= 3.0:
-                final = text
-                break
-        else:
-            last, stable_since = text, None
-    else:
-        last, stable_since = "", None
+    done, t = state()
+    if t:
+        text = t
+    if done and t.strip():
+        break
     time.sleep(0.7)
-print(final or last)
+print(text)
 PY
 )"
       fi
