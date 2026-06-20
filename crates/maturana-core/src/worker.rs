@@ -645,7 +645,10 @@ def sid_of(ev, part):
                 return v
     return None
 
-for line in sys.stdin:
+# iter(readline, "") reads one line at a time WITHOUT CPython's stdin read-ahead
+# buffer, so each event's progress POST fires as opencode emits it (live drafts)
+# rather than batched at EOF.
+for line in iter(sys.stdin.readline, ""):
     line = line.strip()
     if not line:
         continue

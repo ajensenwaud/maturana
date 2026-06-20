@@ -3386,14 +3386,24 @@ fn stream_turn_to_telegram(
             let _ = send_telegram_chat_action(token, &chat_id.to_string(), "typing");
             last_typing = std::time::Instant::now();
         }
-        // Render the rich tool/thinking draft. Only fall back to a minimal heading
-        // after a short delay with nothing streamed, so the turn is never silent but
-        // we don't post a bare "Working…" for turns that immediately show real tools.
-        let mut rendered =
-            render_progress_html(&read_progress(paths, inbound_id).unwrap_or_default());
-        if rendered.is_empty() && started.elapsed() >= Duration::from_secs(3) {
-            rendered = "<pre>working…</pre>".to_string();
-        }
+        // Render the rich tool/thinking draft, plus an always-ticking elapsed clock
+        // so the user is NEVER staring at a frozen message. The clock is bucketed to
+        // 10s, so it (and therefore the draft) visibly updates at least every 10s even
+        // when the agent streams nothing — the per-turn node boot, a long quiet tool
+        // call, or sparse events no longer read as "stalled / dropped". Real progress
+        // still appears the instant it arrives (the content changes immediately).
+        let progress = render_progress_html(&read_progress(paths, inbound_id).unwrap_or_default());
+        let secs = (started.elapsed().as_secs() / 10) * 10;
+        let clock = format!("{}:{:02}", secs / 60, secs % 60);
+        let rendered = if progress.is_empty() {
+            if started.elapsed() >= Duration::from_secs(2) {
+                format!("<pre>⏳ Working… {clock}</pre>")
+            } else {
+                String::new()
+            }
+        } else {
+            format!("{progress}\n<pre>⏳ {clock}</pre>")
+        };
         // Re-send when the content changed OR the previous update failed. Advance
         // last_render only on a landed update so a failure can't desync us.
         if !rendered.is_empty() && (rendered != last_render || !last_edit_ok) {

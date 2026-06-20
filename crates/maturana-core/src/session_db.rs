@@ -116,11 +116,26 @@ pub struct ClaimPolicy {
 impl Default for ClaimPolicy {
     fn default() -> Self {
         Self {
-            lease_seconds: 300,
+            // Lease must comfortably exceed the in-guest harness timeout (240s) plus
+            // the per-turn node/runtime boot + curl/MCP retries, or a slow-but-alive
+            // turn gets reclaimed mid-flight and runs as a duplicate (and the user
+            // sees it "never finish"). 420s leaves ~3min of headroom over 240s.
+            lease_seconds: 420,
             max_tries: 5,
             backoff_seconds: 15,
         }
     }
+}
+
+/// A message that was just dead-lettered (set `failed` after exhausting retries).
+/// Returned by [`recover_stuck_inbound`] so the caller can notify the user instead
+/// of letting the request vanish silently.
+#[derive(Debug, Clone)]
+pub struct DeadLetteredInbound {
+    pub id: String,
+    pub channel: String,
+    pub platform_id: String,
+    pub thread_id: Option<String>,
 }
 
 pub fn claim_pending_inbound(
@@ -137,7 +152,24 @@ pub fn claim_pending_inbound_with_policy(
 ) -> anyhow::Result<Vec<InboundMessage>> {
     let db = open_rw(&paths.inbound_db)?;
     ensure_inbound_schema(&db)?;
-    recover_stuck_inbound(&db, policy)?;
+    // Reclaim stuck turns; anything that exhausted its retry budget is dead-lettered
+    // AND gets a synthetic reply so the request is never silently dropped — the user
+    // always hears back, even when a turn died without producing an answer.
+    for dead in recover_stuck_inbound(&db, policy)? {
+        let body = serde_json::json!({
+            "text": "⚠️ I couldn't finish your previous request — it failed after several attempts (it likely ran too long or the agent crashed mid-task). Please try again, ideally broken into a smaller step."
+        })
+        .to_string();
+        let _ = write_outbound(
+            paths,
+            Some(&dead.id),
+            "chat",
+            &dead.channel,
+            &dead.platform_id,
+            dead.thread_id.as_deref(),
+            &body,
+        );
+    }
     let messages = {
         let mut stmt = db.prepare(
             r#"
@@ -168,12 +200,15 @@ pub fn claim_pending_inbound_with_policy(
 /// budget go back to `pending` with a backoff; messages that have exhausted
 /// `max_tries` are dead-lettered to `failed` so they stop blocking the queue
 /// and become visible to operators via [`queue_stats`] / [`list_dead_letters`].
-fn recover_stuck_inbound(db: &Connection, policy: ClaimPolicy) -> anyhow::Result<i64> {
+fn recover_stuck_inbound(
+    db: &Connection,
+    policy: ClaimPolicy,
+) -> anyhow::Result<Vec<DeadLetteredInbound>> {
     let lease = policy.lease_seconds.max(0);
     let backoff = policy.backoff_seconds.max(0);
     let max_tries = policy.max_tries.max(1);
     let now = Utc::now().to_rfc3339();
-    let requeued = db.execute(
+    db.execute(
         &format!(
             r#"
             UPDATE messages_in
@@ -187,6 +222,31 @@ fn recover_stuck_inbound(db: &Connection, policy: ClaimPolicy) -> anyhow::Result
         ),
         params![now, max_tries],
     )?;
+    // Capture the rows about to be dead-lettered (same predicate as the failing
+    // UPDATE) so the caller can notify the user — otherwise an exhausted request
+    // just vanishes to `failed` with no reply ever delivered.
+    let dead: Vec<DeadLetteredInbound> = {
+        let mut stmt = db.prepare(&format!(
+            r#"
+            SELECT id, channel, platform_id, thread_id
+            FROM messages_in
+            WHERE status = 'processing'
+              AND tries >= ?1
+              AND datetime(status_changed, '+{lease} seconds') <= datetime('now')
+            "#
+        ))?;
+        let rows = stmt
+            .query_map(params![max_tries], |row| {
+                Ok(DeadLetteredInbound {
+                    id: row.get(0)?,
+                    channel: row.get(1)?,
+                    platform_id: row.get(2)?,
+                    thread_id: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
     db.execute(
         &format!(
             r#"
@@ -199,7 +259,7 @@ fn recover_stuck_inbound(db: &Connection, policy: ClaimPolicy) -> anyhow::Result
         ),
         params![now, max_tries],
     )?;
-    Ok(requeued as i64)
+    Ok(dead)
 }
 
 /// Aggregate counts per status, for `maturana doctor` / orchestrator health.
