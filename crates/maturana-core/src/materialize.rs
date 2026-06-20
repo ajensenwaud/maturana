@@ -159,15 +159,26 @@ fn render_guest_agents(spec: &AgentSpec) -> String {
     let egress = &spec.network.egress_allowlist;
     let allows = |needle: &str| egress.iter().any(|h| h.contains(needle));
     if allows("brave") || allows("tavily") {
-        recipes.push(
+        let mut s = String::from(
             "### Web search\nFor live web facts, curl the allowlisted search API through the proxy \
              — send NO key header, the pipelock proxy injects it:\n\
              \x20   curl -fsS \"https://api.search.brave.com/res/v1/web/search?q=<terms>&count=5\" -H \"Accept: application/json\"\n\
              \x20   # or Tavily:\n\
              \x20   curl -fsS -X POST \"https://api.tavily.com/search\" -H \"content-type: application/json\" --data '{\"query\":\"<terms>\",\"max_results\":5}'\n\
-             Read web.results[].{title,url,description} (Brave) or results[].{title,url,content} (Tavily) and cite the URLs."
-                .to_string(),
+             Read web.results[].{title,url,description} (Brave) or results[].{title,url,content} (Tavily) and cite the URLs.",
         );
+        if allows("duckduckgo") {
+            s.push_str(
+                "\nIf the API errors or is rate-limited, fall back to the no-JS DuckDuckGo HTML \
+                 endpoint and parse result links from the HTML:\n\
+                 \x20   curl -fsS \"https://html.duckduckgo.com/html/?q=<terms>\"",
+            );
+        }
+        s.push_str(
+            "\nOnly the hosts on your egress allowlist are reachable — do NOT try google.com, news \
+             sites, or arbitrary pages; they are blocked at the proxy.",
+        );
+        recipes.push(s);
     }
 
     if spec.browser.headless_chrome {
@@ -191,6 +202,24 @@ fn render_guest_agents(spec: &AgentSpec) -> String {
         );
     }
 
+    if spec.capabilities.self_forge {
+        recipes.push(
+            "### Self-forge — build a tool on the fly (self-mutation)\nWhen a task needs computation \
+             or transformation you don't already have, author a small WebAssembly capability and run \
+             it immediately, the same turn, in a fuel/memory/timeout sandbox — no host rebuild. Use \
+             the `maturana-forge` helper (WAT on stdin, or `--wasm <base64>`):\n\
+             \x20   maturana-forge <name> --input '{\"n\":7}' <<'WAT'\n\
+             \x20   (module ;; ... compute, write the result to stdout (fd 1) via wasi fd_write ...\n\
+             \x20     (func (export \"_start\") ...))\n\
+             \x20   WAT\n\
+             It returns the module's stdout (also a 🔨/⚙️ animation on the channel). The sandbox has \
+             NO network or filesystem — it is for pure computation/transforms only, so it cannot \
+             fetch URLs, read email, or call APIs. Forge sparingly; then say what you built and what \
+             it returned."
+                .to_string(),
+        );
+    }
+
     if !spec.mcp_servers.is_empty() {
         let names = spec
             .mcp_servers
@@ -209,6 +238,23 @@ fn render_guest_agents(spec: &AgentSpec) -> String {
         out.push_str(&recipes.join("\n\n"));
         out.push('\n');
     }
+
+    // Be explicit about the locked boundary so the agent fails fast + honestly on
+    // impossible asks (e.g. "check my iCloud email") instead of looping on blocked
+    // hosts or writing code that can't run here.
+    out.push_str(&format!(
+        "\n## Limits — be honest, don't stall\nYour network egress is locked to: {}. No other host \
+         is reachable (no arbitrary web pages, and no email/IMAP/SMTP unless a tool above provides \
+         it). You also cannot create a new *loadable skill* yourself — skills are installed \
+         host-side. When a request needs a capability or host you don't have, say so plainly in your \
+         first reply and offer the closest thing you can do; do NOT loop on blocked actions or \
+         produce code that can't run here.\n",
+        if egress.is_empty() {
+            "(nothing — fully offline)".to_string()
+        } else {
+            egress.join(", ")
+        }
+    ));
 
     out
 }

@@ -31,6 +31,21 @@ network:
   egress_allowlist:
     - openrouter.ai
     - github.com
+    - api.search.brave.com
+    - api.tavily.com
+    - duckduckgo.com
+    - en.wikipedia.org
+  proxy:
+    enabled: true
+    bind: 172.30.10.5:47833
+    inject_headers:
+      - host: api.search.brave.com
+        header: X-Subscription-Token
+        source: pipelock:brave/api-key
+capabilities:
+  # Allow the agent to author + run sandboxed WebAssembly tools at runtime
+  # (self-mutation via `maturana-forge` -> /session/forge). Off by default.
+  self_forge: true
 memory:
   wiki_path: .maturana/wiki
   agent_memory_path: .maturana/agents/opencode-firecracker/memory
