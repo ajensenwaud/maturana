@@ -722,46 +722,83 @@ PY
     if run_harness opencode "${opencode_args[@]}" >/tmp/maturana-session-response.txt 2>>/var/log/maturana/worker.err.log; then
       response="$(cat /tmp/maturana-session-response.txt)"
       if [ -z "$response" ] && [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
-        # `--attach` streams to the warm server and returns BEFORE the turn is
-        # finished, so reading the DB once catches a half-written preamble
-        # ("I'll search…"). Wait for completion the way NanoClaw does: poll the
-        # DB until opencode stamps the latest assistant message complete
-        # (time.completed in its schema), then take that message's LAST text
-        # part: the final answer, after any preamble / tool / retry parts.
-        response="$(MATURANA_OC_DEADLINE="${MATURANA_HARNESS_TIMEOUT_SECONDS:-240}" python3 - <<'PY'
-import json, os, sqlite3, time
+        # `--attach` streams the turn into the warm server and returns BEFORE the
+        # turn is finished (empty stdout), so the reply lives in opencode.db. The
+        # trap: an agentic turn is MANY assistant messages — one per step — and
+        # each step's message gets its own `time.completed` the moment that step's
+        # generation ends. So "latest assistant message is completed" is true right
+        # after the preamble+tool-call step, long before the post-tool answer
+        # message exists; reading then yields "I'll search…". The reliable
+        # turn-done signal is opencode's `session.idle` SSE event (NanoClaw's
+        # terminal "result" event): it fires only once the whole turn is quiescent.
+        # Wait for it on /event, THEN read the last assistant message's last text
+        # part. A completed+stable DB fallback covers instant/no-tool turns where
+        # idle may fire before we connect.
+        response="$(MATURANA_OC_DEADLINE="${MATURANA_HARNESS_TIMEOUT_SECONDS:-240}" MATURANA_OPENCODE_PORT="${oc_port}" python3 - <<'PY'
+import json, os, sqlite3, time, threading, urllib.request
 db = os.path.expanduser("~/.local/share/opencode/opencode.db")
-def state():
+port = os.environ.get("MATURANA_OPENCODE_PORT", "5599")
+idle = {"seen": False}
+def listen():
+    # opencode exposes the bus either at /event or /global/event depending on
+    # version; race both and stop on the first session.idle.
+    for path in ("/event", "/global/event"):
+        try:
+            resp = urllib.request.urlopen(
+                "http://127.0.0.1:%s%s" % (port, path), timeout=300)
+            for raw in resp:
+                if b'"session.idle"' in raw:
+                    idle["seen"] = True
+                    return
+        except Exception:
+            continue
+threading.Thread(target=listen, daemon=True).start()
+def final_text():
     con = sqlite3.connect(db)
     try:
         m = con.execute(
-            "select id, data from message "
+            "select id, json_extract(data, '$.time.completed') c from message "
             "where json_extract(data, '$.role') = 'assistant' "
             "order by json_extract(data, '$.time.created') desc, rowid desc limit 1"
         ).fetchone()
         if not m:
             return (False, "")
-        mid, mdata = m
-        done = json.loads(mdata).get("time", {}).get("completed") is not None
+        mid, completed = m
         rows = con.execute(
-            "select data from part where message_id = ? "
-            "and json_extract(data, '$.type') = 'text' "
+            "select json_extract(data, '$.text') t from part "
+            "where message_id = ? and json_extract(data, '$.type') = 'text' "
             "order by time_updated asc", (mid,)
         ).fetchall()
-        texts = [json.loads(r[0]).get("text", "") for r in rows]
-        texts = [t for t in texts if t.strip()]
-        return (done, texts[-1] if texts else "")
+        texts = [r[0] for r in rows if r[0] and r[0].strip()]
+        return (completed is not None, texts[-1] if texts else "")
     finally:
         con.close()
 deadline = time.time() + float(os.environ.get("MATURANA_OC_DEADLINE", "240"))
 text = ""
+stable_val = None
+stable_since = 0.0
 while time.time() < deadline:
-    done, t = state()
+    done, t = final_text()
     if t:
         text = t
-    if done and t.strip():
+    if idle["seen"]:
+        # whole turn quiesced — let the final part flush, then take it
+        time.sleep(0.4)
+        _, t2 = final_text()
+        if t2:
+            text = t2
         break
-    time.sleep(0.7)
+    # fallback only when we never saw idle (fast/no-tool turn): require the
+    # latest message complete AND its text unchanged for a comfortable window,
+    # so we don't settle on a between-steps pause.
+    if done and t.strip():
+        if t == stable_val:
+            if time.time() - stable_since > 5.0:
+                break
+        else:
+            stable_val = t
+            stable_since = time.time()
+    time.sleep(0.5)
 print(text)
 PY
 )"
