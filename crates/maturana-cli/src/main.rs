@@ -19,7 +19,10 @@ use maturana_core::{
     tools::{run_tool, Capabilities, ResourceLimits, ToolManifest, ToolRegistry},
     pipelock_proxy::{ensure_mitm_ca_cert, run_proxy, HeaderInjection, ProxyConfig},
     secrets::resolve_secret_source_with_home,
-    session_db::{ensure_session, insert_inbound, list_undelivered, mark_delivered, session_paths},
+    session_db::{
+        ensure_session, insert_inbound, list_recent_inbound, list_undelivered, mark_delivered,
+        queue_stats, session_paths,
+    },
     snapshots::{list_snapshots, restore_snapshot, take_snapshot, SnapshotRecord},
     spec::{AgentSpec, HarnessRuntime},
     state::MaturanaHome,
@@ -62,25 +65,53 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Validate a MATURANA.md agent spec (pre-flight check).
     Spec(SpecCommand),
+    /// Manage one agent: launch, inspect, stop, chat, run, logs, fetch/push.
     Agent(AgentCommand),
+    /// List, take, or restore agent VM snapshots.
     Snapshot(SnapshotCommand),
+    /// Show an agent's governed audit-log events.
     Audit(AuditCommand),
+    /// Windows SYSTEM daemon for Hyper-V VM lifecycle (machine-managed).
+    #[command(hide = true)]
     Hostd(HostdCommand),
+    /// Secret vault + egress proxy: init/set/get/list/delete/ca-cert.
     Pipelock(PipelockCommand),
+    /// Send a one-off Telegram or Discord message.
     Notify(NotifyCommand),
+    /// Scaffold a curated single-user personal agent (`personal init`).
     Personal(PersonalCommand),
+    /// Per-agent document wiki: init, ingest, keyword search.
     Wiki(WikiCommand),
+    /// Write or read an agent liveness record.
     Heartbeat(HeartbeatCommand),
+    /// Cron-style scheduled agent tasks: add, list, run-due.
     Schedule(ScheduleCommand),
+    /// Proactivity loop runner (machine-managed by `maturana up`).
+    #[command(hide = true)]
     Proactive(proactive::ProactiveCommand),
+    /// Push a skill or tool to a live agent over SSH.
     Deploy(DeployCommand),
+    /// Scaffold a new skill or tool locally under skills/ or tools/.
     Develop(DevelopCommand),
+    /// Validate skills and install them as native Codex skills.
     Skill(SkillCommand),
+    /// Pair chat channels and check channel health (`pair`, `status`).
     Channel(ChannelCommand),
+    /// Low-level session queue + sessiond (mostly machine-managed).
     Session(SessionCommand),
+    /// MaturanaGraph knowledge graph: ingest and query (GraphRAG).
     Graph(graph::GraphCommand),
     Up(UpCommand),
+    /// List materialized agents with a compact health snapshot (host-side
+    /// only, no guest SSH). Aliases: `ls`, `agents`.
+    #[command(visible_alias = "ls", visible_alias = "agents")]
+    List(ListCommand),
+    /// Plane + agents health dashboard: supervisor processes (sessiond / graph
+    /// / channels / proxies) and a per-agent snapshot. Alias: `st`.
+    #[command(visible_alias = "st")]
+    Status(StatusCommand),
     /// Interactive console TUI with an agent selector. `maturana tui` opens the
     /// selector; pass an agent id to jump straight in. Cycle agents with
     /// Ctrl+←/→ and reopen the selector with Ctrl+P.
@@ -96,11 +127,27 @@ enum Command {
     ClaudeRefresh(ClaudeRefreshCommand),
     Tool(ToolCommand),
     Improve(ImproveCommand),
+    /// Health-check the plane and agents (pass/fail audit; `--json` for
+    /// scripts). For a glanceable dashboard use `maturana status`.
     Doctor(DoctorCommand),
     /// Prepare host/guest prerequisites (Ubuntu image, SSH key, harness
     /// provisioning). Named `setup`; `repair` is kept as a back-compat alias.
     #[command(name = "setup", visible_alias = "repair")]
     Repair(RepairCommand),
+}
+
+#[derive(Debug, Args)]
+struct ListCommand {
+    /// Emit JSON instead of the table.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct StatusCommand {
+    /// Emit JSON instead of the dashboard.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Interactive console TUI with an agent selector and live agent switching.
@@ -266,8 +313,11 @@ struct SearchCommand {
     json: bool,
 }
 
-/// Supervise the host runtime plane (sessiond + per-agent channel bridges and
-/// schedule runners) as one coherent, restart-on-failure process group.
+/// Supervise the whole host runtime plane as one restart-on-failure process
+/// group: sessiond (:47834), optional MaturanaGraph (:47835) and claude-refresh,
+/// plus per-agent channel bridges, schedule + proactivity runners, and egress
+/// proxies. Writes <home>/up/state.json (read by `maturana status`). Does NOT
+/// boot the agent VMs (that's `agent launch`). Use --dry-run to print the plan.
 #[derive(Debug, Args)]
 struct UpCommand {
     /// Agents to run. Defaults to every materialized agent under the home.
@@ -1342,6 +1392,8 @@ fn main() -> anyhow::Result<()> {
         Command::Session(command) => handle_session(command, &home)?,
         Command::Graph(command) => graph::handle_graph(command, &home)?,
         Command::Up(command) => run_up(&home, command)?,
+        Command::List(command) => run_list(&home, command)?,
+        Command::Status(command) => run_status(&home, command)?,
         Command::Tui(command) => {
             tui::run_tui(&home, command.agent_id.as_deref(), command.timeout_seconds)?
         }
@@ -4245,6 +4297,210 @@ fn print_doctor_check(label: &str, check: &DoctorCheck) {
     }
 }
 
+/// One row of the `list` / `status` agent table — a host-side snapshot, no SSH.
+#[derive(Debug, Clone, serde::Serialize)]
+struct AgentRow {
+    agent: String,
+    harness: String,
+    vm: String,
+    queue: String,
+    last_turn: String,
+}
+
+fn humanize_age(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
+fn humanize_uptime(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+/// Build the per-agent snapshot rows shared by `list` and `status`. Every lookup
+/// is guarded so one broken agent can't blank the whole table.
+fn collect_agent_rows(home: &MaturanaHome) -> Vec<AgentRow> {
+    discover_agent_ids(home)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| {
+            let harness = AgentSpec::from_maturana_markdown(home.agent_dir(&id).join("MATURANA.md"))
+                .ok()
+                .map(|s| maturana_core::worker::harness_name(&s.runtime.harness).to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let vm = maturana_core::materialize::inspect_agent(home, &id)
+                .map(|s| s.state)
+                .unwrap_or_else(|_| "unknown".to_string());
+            let (queue, last_turn) = match infer_agent_session_id(home, &id) {
+                Ok(sid) => {
+                    let paths = session_paths(&home.agent_dir(&id), &sid);
+                    let queue = queue_stats(&paths)
+                        .map(|q| {
+                            if q.pending == 0 && q.processing == 0 {
+                                "idle".to_string()
+                            } else if q.processing == 0 {
+                                format!("{} pend", q.pending)
+                            } else {
+                                format!("{} pend/{} proc", q.pending, q.processing)
+                            }
+                        })
+                        .unwrap_or_else(|_| "idle".to_string());
+                    let last_turn = list_recent_inbound(&paths, 1)
+                        .ok()
+                        .and_then(|v| v.into_iter().next())
+                        .map(|m| {
+                            humanize_age((Utc::now() - m.created_at).num_seconds().max(0) as u64)
+                        })
+                        .unwrap_or_else(|| "—".to_string());
+                    (queue, last_turn)
+                }
+                Err(_) => ("idle".to_string(), "—".to_string()),
+            };
+            AgentRow {
+                agent: id,
+                harness,
+                vm,
+                queue,
+                last_turn,
+            }
+        })
+        .collect()
+}
+
+fn print_agent_table(rows: &[AgentRow], indent: &str) {
+    let headers = ["AGENT", "HARNESS", "VM", "QUEUE", "LAST TURN"];
+    let mut w: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    for r in rows {
+        for (i, cell) in [&r.agent, &r.harness, &r.vm, &r.queue]
+            .iter()
+            .enumerate()
+        {
+            w[i] = w[i].max(cell.chars().count());
+        }
+    }
+    let line = |c: [&str; 5]| {
+        format!(
+            "{indent}{:<aw$}  {:<hw$}  {:<vw$}  {:<qw$}  {}",
+            c[0],
+            c[1],
+            c[2],
+            c[3],
+            c[4],
+            aw = w[0],
+            hw = w[1],
+            vw = w[2],
+            qw = w[3],
+        )
+    };
+    println!("{}", line(headers));
+    for r in rows {
+        println!(
+            "{}",
+            line([&r.agent, &r.harness, &r.vm, &r.queue, &r.last_turn])
+        );
+    }
+}
+
+fn run_list(home: &MaturanaHome, command: ListCommand) -> anyhow::Result<()> {
+    let rows = collect_agent_rows(home);
+    if command.json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!(
+            "No agents found under {}.\nIf your agents live elsewhere, pass --home (or set \
+             MATURANA_HOME); otherwise create one with `maturana agent launch`.",
+            home.agents_dir().display()
+        );
+        return Ok(());
+    }
+    print_agent_table(&rows, "");
+    Ok(())
+}
+
+fn run_status(home: &MaturanaHome, command: StatusCommand) -> anyhow::Result<()> {
+    let rows = collect_agent_rows(home);
+    // The plane writes <home>/up/state.json every tick; its presence is the
+    // authoritative "is `maturana up` running" signal (same file the cockpit uses).
+    let up_state = fs::read_to_string(home.root().join("up").join("state.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    let sessiond = doctor_http_health("http://127.0.0.1:47834/health");
+    let graph = doctor_http_health("http://127.0.0.1:47835/health");
+
+    if command.json {
+        let out = serde_json::json!({
+            "plane": up_state,
+            "sessiond_ok": sessiond.ok,
+            "graph_ok": graph.ok,
+            "agents": rows,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    println!("PLANE");
+    match &up_state {
+        Some(state) => {
+            let pid = state.get("pid").and_then(|v| v.as_u64());
+            println!(
+                "  supervisor                          running{}",
+                pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
+            );
+            println!(
+                "  sessiond :47834                     {}",
+                if sessiond.ok { "ok" } else { "DOWN" }
+            );
+            println!(
+                "  graph    :47835                     {}",
+                if graph.ok { "ok" } else { "not running" }
+            );
+            if let Some(procs) = state.get("processes").and_then(|v| v.as_array()) {
+                for p in procs {
+                    let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                    if name == "sessiond" || name == "graph" {
+                        continue;
+                    }
+                    let restarts = p.get("restarts").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let up = p.get("uptime_seconds").and_then(|v| v.as_u64()).unwrap_or(0);
+                    println!(
+                        "  {name:<34}  running  restarts={restarts}  up={}",
+                        humanize_uptime(up)
+                    );
+                }
+            }
+        }
+        None => {
+            println!(
+                "  plane NOT running — start it with `maturana up` (or `maturana service install up`)."
+            );
+        }
+    }
+    println!();
+    println!("AGENTS");
+    if rows.is_empty() {
+        println!("  (none under {})", home.agents_dir().display());
+    } else {
+        print_agent_table(&rows, "  ");
+    }
+    Ok(())
+}
+
 pub(crate) fn discover_agent_ids(home: &MaturanaHome) -> anyhow::Result<Vec<String>> {
     let agents_dir = home.agents_dir();
     if !agents_dir.exists() {
@@ -6651,7 +6907,15 @@ Use this skill when testing.
 
         let cloud_cfg = fs::read_to_string(&artifacts.cloud_cfg).unwrap();
         assert_eq!(cloud_cfg, "network: {config: disabled}\n");
-        assert!(artifacts.proxy_env.is_none());
+        // The opencode example spec declares network.proxy (Brave injection), so
+        // the guest proxy.env IS rendered, pointing at the host-TAP proxy bind.
+        let proxy_env_path = artifacts
+            .proxy_env
+            .expect("proxy.env should be rendered for a spec with network.proxy");
+        let proxy_env = fs::read_to_string(&proxy_env_path).unwrap();
+        assert!(proxy_env.contains("MATURANA_USE_HOST_PROXY=1"));
+        assert!(proxy_env.contains("MATURANA_PROXY_HOST=172.30.10.5"));
+        assert!(proxy_env.contains("MATURANA_PROXY_PORT=47833"));
 
         let _ = fs::remove_dir_all(&temp);
     }
