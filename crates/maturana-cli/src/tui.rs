@@ -242,8 +242,9 @@ impl App {
             role: Role::User,
             text: text.clone(),
         });
-        // Persist to the same transcript Telegram uses so it survives a switch.
-        let _ = crate::channels::record_console_turn(&self.home, &self.agent_id, "user", &text);
+        // The user turn is recorded by the shared front door (channels::enqueue_turn,
+        // reached via agent_chat_turn below), so it is NOT recorded here — doing both
+        // would double-write it to the transcript.
         // Round-trip on a background thread so the UI keeps animating.
         let (tx, rx) = mpsc::channel();
         let home = MaturanaHome::new(self.home.root().to_path_buf());

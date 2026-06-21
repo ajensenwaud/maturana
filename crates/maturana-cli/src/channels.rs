@@ -949,28 +949,21 @@ fn run_channel_prompt(
         "received telegram prompt",
     )?;
     println!("telegram inbound prompt accepted");
-    append_channel_turn(home, &config.agent_id, chat_id, "user", text)?;
-    maybe_remember_user_message(home, &config.agent_id, text)?;
-    let prompt = build_channel_prompt(home, &config.agent_id, chat_id, text)?;
-    let paths = session_paths(&home.agent_dir(&config.agent_id), &config.session_id);
-    ensure_session(&paths)?;
-    let inbound_id = insert_inbound(
-        &paths,
-        "chat",
+    // Enqueue through the shared front door (records the turn, builds context,
+    // attaches model/reasoning). Telegram keys its transcript by the raw chat id
+    // and carries its reply-to as the channel-specific extra.
+    let inbound_id = enqueue_turn(
+        home,
+        &config.agent_id,
+        &config.session_id,
         "telegram",
         &chat_id.to_string(),
+        chat_id,
         reply_to_message_id.map(|id| id.to_string()).as_deref(),
-        &serde_json::json!({
-            "text": text,
-            "prompt": prompt,
-            "telegram_reply_to": reply_to_message_id,
-            // Per-turn model + reasoning overrides: the guest worker passes
-            // these to the harness. None => harness/worker default.
-            "model": load_channel_settings(home, &config.agent_id).model,
-            "reasoning": load_channel_settings(home, &config.agent_id).reasoning,
-        })
-        .to_string(),
+        text,
+        serde_json::json!({ "telegram_reply_to": reply_to_message_id }),
     )?;
+    let paths = session_paths(&home.agent_dir(&config.agent_id), &config.session_id);
     send_telegram_chat_action(token, &chat_id.to_string(), "typing")?;
     if let Some(provider) = &config.run_once_provider {
         let options = RunnerOptions {
@@ -5432,9 +5425,56 @@ pub(crate) fn stable_chat_key(platform_id: &str) -> i64 {
     (hasher.finish() >> 1) as i64 // positive
 }
 
-/// Enqueue a user message as a chat prompt for the guest worker, building the
-/// full channel context exactly like the Telegram path. Shared by Slack and
-/// AgentMail.
+/// THE single front door every chat surface enqueues through — Telegram, the
+/// console TUI, Discord, Slack, AgentMail, and the web cockpit. It does the three
+/// things that MUST happen identically on every channel, so none can drift:
+///   1. record the user turn in the channel transcript (`chat_key`),
+///   2. build the full channel context (transcript + memory + wiki + graph +
+///      learned examples) — this is what gives the agent turn-to-turn memory,
+///   3. enqueue the turn tagged with the real `channel`/`platform_id` so the
+///      reply routes back, carrying the agent's current model + reasoning.
+///
+/// `chat_key` is the transcript/context key: Telegram passes its raw chat id;
+/// other channels pass `stable_chat_key(platform_id)`. `extra` is merged into the
+/// content JSON for channel-specific fields (e.g. Telegram's reply-to). Returns
+/// the enqueued message id. Adding a new surface? Call THIS — never insert_inbound
+/// a chat turn yourself, or it silently loses memory/model/routing.
+pub(crate) fn enqueue_turn(
+    home: &MaturanaHome,
+    agent_id: &str,
+    session_id: &str,
+    channel: &str,
+    platform_id: &str,
+    chat_key: i64,
+    thread_id: Option<&str>,
+    text: &str,
+    extra: serde_json::Value,
+) -> anyhow::Result<String> {
+    append_channel_turn(home, agent_id, chat_key, "user", text)?;
+    maybe_remember_user_message(home, agent_id, text)?;
+    let prompt = build_channel_prompt(home, agent_id, chat_key, text)?;
+    let settings = load_channel_settings(home, agent_id);
+    let paths = session_paths(&home.agent_dir(agent_id), session_id);
+    ensure_session(&paths)?;
+    let mut content = serde_json::json!({
+        "text": text,
+        "prompt": prompt,
+        // Per-turn model + reasoning overrides for EVERY channel (the guest worker
+        // passes them to the harness; null => harness default).
+        "model": settings.model,
+        "reasoning": settings.reasoning,
+    });
+    if let (Some(obj), serde_json::Value::Object(extra_map)) = (content.as_object_mut(), extra) {
+        for (key, value) in extra_map {
+            obj.insert(key, value);
+        }
+    }
+    let id = insert_inbound(&paths, "chat", channel, platform_id, thread_id, &content.to_string())?;
+    Ok(id)
+}
+
+/// Enqueue a user message as a chat prompt for a text channel keyed by its string
+/// `platform_id` (Discord, Slack, AgentMail). Thin wrapper over [`enqueue_turn`].
 pub(crate) fn enqueue_channel_prompt(
     home: &MaturanaHome,
     agent_id: &str,
@@ -5444,19 +5484,16 @@ pub(crate) fn enqueue_channel_prompt(
     thread_id: Option<&str>,
     text: &str,
 ) -> anyhow::Result<()> {
-    let key = stable_chat_key(platform_id);
-    append_channel_turn(home, agent_id, key, "user", text)?;
-    maybe_remember_user_message(home, agent_id, text)?;
-    let prompt = build_channel_prompt(home, agent_id, key, text)?;
-    let paths = session_paths(&home.agent_dir(agent_id), session_id);
-    ensure_session(&paths)?;
-    insert_inbound(
-        &paths,
-        "chat",
+    enqueue_turn(
+        home,
+        agent_id,
+        session_id,
         channel,
         platform_id,
+        stable_chat_key(platform_id),
         thread_id,
-        &serde_json::json!({ "text": text, "prompt": prompt }).to_string(),
+        text,
+        serde_json::json!({}),
     )?;
     Ok(())
 }
@@ -5922,6 +5959,42 @@ mod tests {
         );
         assert!(prompt.contains("Hi Anders!"), "prompt is missing the prior assistant turn");
         assert!(prompt.contains("what's my name?"));
+    }
+
+    #[test]
+    fn enqueue_turn_is_the_single_front_door() {
+        // Every chat surface goes through enqueue_turn. It must, for ANY channel:
+        // record the user turn, inject the recent transcript (memory), attach
+        // model+reasoning, and enqueue tagged with the real channel/platform_id.
+        let temp = temp_dir("front-door");
+        let home = MaturanaHome::new(temp.path().join(".maturana"));
+        let agent_dir = home.agent_dir("agent");
+        fs::create_dir_all(agent_dir.join("memory")).unwrap();
+        fs::write(agent_dir.join("AGENTS.md"), "# Agent\n").unwrap();
+        fs::write(agent_dir.join("SOUL.md"), "# Soul\n").unwrap();
+        fs::write(agent_dir.join("MATURANA.md"), "# Contract\n").unwrap();
+        fs::write(agent_dir.join("memory/MEMORY.md"), "# Memory\n").unwrap();
+
+        // First turn establishes history; second must see it in its enriched prompt.
+        enqueue_turn(&home, "agent", "s", "telegram", "555", 555, None, "remember the blue door", serde_json::json!({"telegram_reply_to": 9})).unwrap();
+        let id = enqueue_turn(&home, "agent", "s", "telegram", "555", 555, None, "what did I say?", serde_json::json!({})).unwrap();
+        assert!(!id.is_empty());
+
+        let paths = session_paths(&home.agent_dir("agent"), "s");
+        let pending = maturana_core::session_db::claim_pending_inbound(&paths, 10).unwrap();
+        let msg = pending.iter().find(|m| m.id == id).expect("enqueued message present");
+        let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
+        let prompt = content["prompt"].as_str().unwrap();
+        assert!(
+            prompt.contains("remember the blue door"),
+            "front door must inject the prior turn (memory): {prompt}"
+        );
+        assert!(content.get("model").is_some(), "front door must attach model");
+        assert!(content.get("reasoning").is_some(), "front door must attach reasoning");
+        // The transcript is recorded under the channel chat key (555), not a sentinel.
+        let transcript = fs::read_to_string(channel_transcript_path(&home, "agent", 555)).unwrap();
+        assert!(transcript.contains("remember the blue door"));
+        assert!(transcript.contains("what did I say?"));
     }
 
     #[test]

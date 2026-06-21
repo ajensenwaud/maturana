@@ -5187,16 +5187,27 @@ pub(crate) fn agent_chat_turn(
     prompt: &str,
     timeout_seconds: u64,
 ) -> anyhow::Result<String> {
-    // The interactive console (TUI) records each turn under `console_chat_key`.
-    // Inject that recent transcript into the prompt — exactly like the Telegram
-    // bridge (`run_channel_prompt`) — so the agent has turn-to-turn memory instead
-    // of "starting fresh" every message. The raw `prompt` stays as `text` (the
-    // transcript record); the enriched form is what the harness runs. Falls back
-    // to the bare prompt if context assembly fails, so a turn is never lost.
-    let key = crate::channels::console_chat_key();
-    let enriched = crate::channels::build_channel_prompt(home, agent_id, key, prompt)
-        .unwrap_or_else(|_| prompt.to_string());
-    let queued = enqueue_agent_run(home, agent_id, prompt, &enriched)?;
+    // The console TUI goes through the SAME shared front door as every other
+    // channel (Telegram, Discord, web), so it gets identical behaviour: the user
+    // turn recorded under `console_chat_key`, the recent transcript injected
+    // (turn-to-turn memory), and the current model/reasoning attached. This is the
+    // single place channel turns are enqueued — see channels::enqueue_turn.
+    let session_id = infer_agent_session_id(home, agent_id)?;
+    let message_id = crate::channels::enqueue_turn(
+        home,
+        agent_id,
+        &session_id,
+        "console",
+        "console:tui",
+        crate::channels::console_chat_key(),
+        None,
+        prompt,
+        serde_json::json!({}),
+    )?;
+    let queued = QueuedAgentRun {
+        session_id,
+        message_id,
+    };
     let completed = wait_for_agent_run(home, agent_id, &queued, timeout_seconds)?;
     Ok(completed.text)
 }
