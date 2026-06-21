@@ -5229,7 +5229,9 @@ pub(crate) fn agent_chat_turn(
         message_id,
     };
     let completed = wait_for_agent_run(home, agent_id, &queued, timeout_seconds)?;
-    Ok(completed.text)
+    // Strip the onboarding-complete sentinel + end the interview if the agent
+    // signalled it (same as the telegram delivery paths).
+    Ok(crate::channels::finalize_onboarding_reply(home, agent_id, &completed.text))
 }
 
 pub(crate) fn infer_agent_session_id(home: &MaturanaHome, agent_id: &str) -> anyhow::Result<String> {

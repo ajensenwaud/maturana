@@ -237,6 +237,8 @@ struct ChannelContextBundle {
     learned_examples: String,
     /// Whether this agent may build + run WebAssembly capabilities on the fly.
     self_forge: bool,
+    /// Mid first-run onboarding interview → inject the "keep interviewing" directive.
+    onboarding_active: bool,
     transcript: String,
     transcript_path: PathBuf,
 }
@@ -1206,6 +1208,7 @@ pub(crate) fn dispatch_slash_command(
         // Telegram has its own InboundAction::Onboard for the same reason.
         "onboard" => {
             let _ = mark_onboarded(home, agent_id);
+            set_onboarding_active(home, agent_id);
             ConsoleCommand::Prompt(onboarding_prompt())
         }
         // Bare selector commands open a modal picker (parity with Telegram's
@@ -1318,7 +1321,7 @@ fn deliver_outbox(
         }
         // Drop an unparseable row rather than spinning on it forever (deterministic).
         let response = match message_text(&message.content) {
-            Ok(text) => truncate_for_telegram(&text),
+            Ok(text) => truncate_for_telegram(&finalize_onboarding_reply(home, agent_id, &text)),
             Err(error) => {
                 eprintln!("{channel}: dropping unparseable outbound {}: {error:#}", message.id);
                 let _ = mark_delivered(paths, &message.id, None);
@@ -2556,6 +2559,46 @@ fn mark_onboarded(home: &MaturanaHome, agent_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The agent's reply ends with this (on its own line) when it has finished the
+/// onboarding interview. The host clears the active state and strips it before the
+/// message goes out.
+const ONBOARDING_COMPLETE_SENTINEL: &str = "[[ONBOARDING_COMPLETE]]";
+
+/// While this marker exists the agent is MID-onboarding interview, so every channel
+/// turn re-injects a "keep interviewing" directive — otherwise the directive only
+/// reaches turn 1 and the agent answers once then goes quiet instead of asking the
+/// next question. Set when onboarding starts; cleared on the completion sentinel.
+fn onboarding_active_marker(home: &MaturanaHome, agent_id: &str) -> PathBuf {
+    home.agent_dir(agent_id).join("onboarding-active")
+}
+
+fn is_onboarding_active(home: &MaturanaHome, agent_id: &str) -> bool {
+    onboarding_active_marker(home, agent_id).exists()
+}
+
+fn set_onboarding_active(home: &MaturanaHome, agent_id: &str) {
+    let path = onboarding_active_marker(home, agent_id);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, Utc::now().to_rfc3339());
+}
+
+fn clear_onboarding_active(home: &MaturanaHome, agent_id: &str) {
+    let _ = fs::remove_file(onboarding_active_marker(home, agent_id));
+}
+
+/// If the agent signalled it finished onboarding, end the interview and strip the
+/// sentinel from the user-facing reply. Returns the text to actually send.
+pub(crate) fn finalize_onboarding_reply(home: &MaturanaHome, agent_id: &str, reply: &str) -> String {
+    if reply.contains(ONBOARDING_COMPLETE_SENTINEL) {
+        clear_onboarding_active(home, agent_id);
+        reply.replace(ONBOARDING_COMPLETE_SENTINEL, "").trim().to_string()
+    } else {
+        reply.to_string()
+    }
+}
+
 /// First contact: the agent greets the user and runs a short onboarding
 /// interview so it learns who they are (name, timezone, what they want help
 /// with) and records it to memory + IDENTITY.md.
@@ -2587,6 +2630,10 @@ fn enqueue_onboarding(
     ensure_session(&paths)?;
     let directive = onboarding_prompt();
     let prompt = build_channel_prompt(home, agent_id, chat_id, &directive)?;
+    // Turn 1 carries the directive as its message; mark the interview active so
+    // EVERY following turn re-injects the "keep interviewing" directive until the
+    // agent signals completion.
+    set_onboarding_active(home, agent_id);
     let settings = load_channel_settings(home, agent_id);
     insert_inbound(
         &paths,
@@ -3626,7 +3673,9 @@ fn stream_turn_to_telegram(
             // is ours to finalize. Drop an unparseable outbound rather than spinning
             // on it forever (the parse error is deterministic).
             let reply = match message_text(&final_msg.content) {
-                Ok(text) => truncate_for_telegram(&text),
+                Ok(text) => {
+                    truncate_for_telegram(&finalize_onboarding_reply(home, &config.agent_id, &text))
+                }
                 Err(error) => {
                     eprintln!(
                         "telegram: dropping unparseable outbound {}: {error:#}",
@@ -4034,6 +4083,7 @@ fn load_channel_context(
         self_forge: AgentSpec::from_maturana_markdown(agent_dir.join("MATURANA.md"))
             .map(|spec| spec.capabilities.self_forge)
             .unwrap_or(false),
+        onboarding_active: is_onboarding_active(home, agent_id),
         transcript,
         transcript_path,
     })
@@ -4117,6 +4167,23 @@ fn render_channel_prompt(context: &ChannelContextBundle, user_message: &str) -> 
             context.learned_examples
         )
     };
+    // While onboarding, drive the interview forward EVERY turn — without this the
+    // agent answers once and goes quiet instead of asking the next question.
+    let onboarding_section = if context.onboarding_active {
+        "\n## Onboarding in progress — KEEP THE INTERVIEW GOING\n\
+         You are still in your first-run onboarding interview with your owner. This \
+         is a short, warm conversation, not a one-off Q&A. After briefly acknowledging \
+         what they just told you, ASK THE NEXT THING you don't yet know — one question \
+         at a time — until you have learned ALL of: their name and how they'd like to \
+         be addressed; their timezone / working hours; and the main things they want \
+         your help with. Save durable facts to memory and fill IDENTITY.md's \"Who you \
+         are to me\" section as you learn them. Until you have all of that, your reply \
+         MUST end with the next question. Only when you genuinely have everything, give \
+         a short warm wrap-up and put [[ONBOARDING_COMPLETE]] on its own final line (it \
+         is removed before the message is sent).\n"
+    } else {
+        ""
+    };
     format!(
         r#"You are a Maturana personal agent running inside an isolated VM.
 
@@ -4125,7 +4192,7 @@ Use the durable memory and recent channel transcript for continuity.
 Do not say you cannot remember earlier messages if the transcript contains them.
 If the user asks you to remember something, acknowledge it briefly; the host has already stored the raw user memory note.
 Return only the message that should be sent back to Telegram.
-
+{onboarding_section}
 ## AGENTS.md
 {identity}
 
@@ -6193,6 +6260,44 @@ mod tests {
         let n2 = deliver_outbox(&home2, "agent", &paths2, "tg", "111", 111, Some(backstop), &mut sink2).unwrap();
         assert_eq!(n2, 0, "a young reply with a live streamer must be deferred");
         assert_eq!(sink2.0, 0);
+    }
+
+    #[test]
+    fn onboarding_interview_persists_every_turn_until_the_completion_sentinel() {
+        // The bug: the onboarding directive only reached turn 1, so the agent
+        // answered once and stopped asking. Now an active marker re-injects the
+        // "keep interviewing" directive on EVERY turn until the agent signals done.
+        let temp = temp_dir("onboarding-interview");
+        let home = MaturanaHome::new(temp.path().join(".maturana"));
+        let agent_dir = home.agent_dir("agent");
+        fs::create_dir_all(agent_dir.join("memory")).unwrap();
+        fs::write(agent_dir.join("AGENTS.md"), "# Agent\n").unwrap();
+        fs::write(agent_dir.join("SOUL.md"), "# Soul\n").unwrap();
+        fs::write(agent_dir.join("MATURANA.md"), "# Contract\n").unwrap();
+        fs::write(agent_dir.join("memory/MEMORY.md"), "# Memory\n").unwrap();
+
+        // Not onboarding → no directive.
+        let p = build_channel_prompt(&home, "agent", 7, "hi").unwrap();
+        assert!(!p.contains("KEEP THE INTERVIEW GOING"));
+
+        // Active → a LATER turn (not turn 1) still carries the directive.
+        set_onboarding_active(&home, "agent");
+        assert!(is_onboarding_active(&home, "agent"));
+        let p2 = build_channel_prompt(&home, "agent", 7, "My name is Anders").unwrap();
+        assert!(
+            p2.contains("KEEP THE INTERVIEW GOING"),
+            "onboarding directive must persist into follow-up turns"
+        );
+
+        // The completion sentinel ends the interview and is stripped from the reply.
+        let shown =
+            finalize_onboarding_reply(&home, "agent", "Great, all set!\n[[ONBOARDING_COMPLETE]]");
+        assert_eq!(shown, "Great, all set!", "sentinel stripped from the user-facing reply");
+        assert!(!is_onboarding_active(&home, "agent"), "sentinel clears the active state");
+
+        // Cleared → directive no longer injected.
+        let p3 = build_channel_prompt(&home, "agent", 7, "thanks").unwrap();
+        assert!(!p3.contains("KEEP THE INTERVIEW GOING"));
     }
 
     #[test]
