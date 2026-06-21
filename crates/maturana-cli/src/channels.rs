@@ -1251,6 +1251,12 @@ trait OutboundSink {
     fn on_silence(&mut self, _inbound_id: Option<&str>) {}
     /// After a successful send (e.g. speak it via TTS). No-op by default.
     fn after_delivered(&mut self, _text: &str, _reply_to: Option<&str>) {}
+    /// Is an inline streamer still potentially animating this turn's live message?
+    /// The backstop only defers young replies when true; replies with no streamer
+    /// (e.g. onboarding) deliver immediately. Default: false (no streaming).
+    fn has_pending_stream(&self, _inbound_id: Option<&str>) -> bool {
+        false
+    }
 }
 
 /// The ONE outbound delivery loop every async channel bridge shares — Telegram and
@@ -1275,12 +1281,19 @@ fn deliver_outbox(
         if message.channel != channel || message.platform_id != platform_id {
             continue;
         }
+        let inbound_id = message.in_reply_to.as_deref();
+        // Backstop gate: only DEFER a young reply while its inline streamer might
+        // still be animating the live message (a status marker exists for the
+        // inbound). A reply with no marker — e.g. the onboarding greeting enqueued
+        // at pairing, which never had a streamer — has nothing to race, so deliver
+        // it immediately instead of waiting out the full STREAM_BACKSTOP_AGE (the
+        // bug where "Paired!" was followed by minutes of silence).
         if let Some(min_age) = min_age {
-            if (Utc::now() - message.created_at)
+            let too_young = (Utc::now() - message.created_at)
                 .to_std()
                 .map(|age| age < min_age)
-                .unwrap_or(false)
-            {
+                .unwrap_or(false);
+            if too_young && sink.has_pending_stream(inbound_id) {
                 continue;
             }
         }
@@ -1297,7 +1310,6 @@ fn deliver_outbox(
                 continue;
             }
         };
-        let inbound_id = message.in_reply_to.as_deref();
         let reply_to = message.thread_id.as_deref();
         // A self-check that decided there's nothing worth saying emits the silence
         // sentinel; never surface it. Let the sink clean up any live placeholder.
@@ -1370,6 +1382,14 @@ impl OutboundSink for TelegramSink<'_> {
     fn after_delivered(&mut self, text: &str, reply_to: Option<&str>) {
         let reply_to = reply_to.and_then(|value| value.parse::<i64>().ok());
         maybe_send_tts(self.home, self.token, self.agent_id, self.chat_id, text, reply_to);
+    }
+
+    fn has_pending_stream(&self, inbound_id: Option<&str>) -> bool {
+        // A live "working…" status marker means an inline streamer set it and may
+        // still be editing that message; the backstop must not race it.
+        inbound_id
+            .and_then(|inbound| peek_telegram_status(self.paths, inbound))
+            .is_some()
     }
 }
 
@@ -6108,6 +6128,56 @@ mod tests {
             undelivered.iter().any(|m| m.content.contains("retry me")),
             "failed send must release the claim for retry, not wedge it"
         );
+    }
+
+    #[test]
+    fn deliver_outbox_does_not_make_unstreamed_replies_wait_the_backstop() {
+        // The "Paired! …silence" bug: the onboarding greeting (enqueued by pairing,
+        // no streamer) was deliverable only by the 6-min backstop. The age gate must
+        // ONLY defer a young reply whose streamer might still be live.
+        use maturana_core::session_db::write_outbound;
+        let backstop = std::time::Duration::from_secs(3600); // huge, like the real one
+
+        struct NoStream(usize);
+        impl OutboundSink for NoStream {
+            fn send(&mut self, _i: Option<&str>, _t: &str, _r: Option<&str>) -> anyhow::Result<Option<String>> {
+                self.0 += 1;
+                Ok(None)
+            }
+            // has_pending_stream defaults false (no streamer).
+        }
+        struct Streaming(usize);
+        impl OutboundSink for Streaming {
+            fn send(&mut self, _i: Option<&str>, _t: &str, _r: Option<&str>) -> anyhow::Result<Option<String>> {
+                self.0 += 1;
+                Ok(None)
+            }
+            fn has_pending_stream(&self, _i: Option<&str>) -> bool {
+                true
+            }
+        }
+        let body = serde_json::json!({ "text": "greeting" }).to_string();
+
+        // No streamer → a brand-new reply delivers immediately despite the backstop.
+        let temp = temp_dir("deliver-no-stream");
+        let home = MaturanaHome::new(temp.path().join(".maturana"));
+        let paths = session_paths(&home.agent_dir("agent"), "s");
+        ensure_session(&paths).unwrap();
+        write_outbound(&paths, Some("inb-1"), "chat", "tg", "111", None, &body).unwrap();
+        let mut sink = NoStream(0);
+        let n = deliver_outbox(&home, "agent", &paths, "tg", "111", 111, Some(backstop), &mut sink).unwrap();
+        assert_eq!(n, 1, "a no-streamer reply must deliver now, not wait the backstop");
+
+        // A live streamer → the same young reply is deferred (streamer owns it).
+        let temp2 = temp_dir("deliver-streaming");
+        let home2 = MaturanaHome::new(temp2.path().join(".maturana"));
+        let paths2 = session_paths(&home2.agent_dir("agent"), "s");
+        ensure_session(&paths2).unwrap();
+        write_outbound(&paths2, Some("inb-1"), "chat", "tg", "111", None, &body).unwrap();
+        let mut sink2 = Streaming(0);
+        let n2 = deliver_outbox(&home2, "agent", &paths2, "tg", "111", 111, Some(backstop), &mut sink2).unwrap();
+        assert_eq!(n2, 0, "a young reply with a live streamer must be deferred");
+        assert_eq!(sink2.0, 0);
     }
 
     #[test]
