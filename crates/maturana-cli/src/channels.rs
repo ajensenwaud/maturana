@@ -379,6 +379,10 @@ enum InboundAction {
     Help {
         chat_id: i64,
     },
+    /// (Re)run the first-run onboarding interview, routed back to this chat.
+    Onboard {
+        chat_id: i64,
+    },
     Status {
         chat_id: i64,
     },
@@ -745,7 +749,7 @@ fn handle_telegram_update(
             // agent learns who its owner is. The agent's greeting arrives via the
             // outbox delivery thread once the guest worker runs the turn.
             if !is_onboarded(home, &config.agent_id) {
-                enqueue_onboarding(home, &config.agent_id, &config.session_id)?;
+                enqueue_onboarding(home, &config.agent_id, &config.session_id, chat_id)?;
                 let _ = mark_onboarded(home, &config.agent_id);
                 send_telegram(
                     token,
@@ -762,6 +766,20 @@ fn handle_telegram_update(
                     reply_to_message_id,
                 )?;
             }
+            Ok(())
+        }
+        InboundAction::Onboard { chat_id } => {
+            // Enqueue the onboarding turn tagged with THIS chat so the agent's
+            // greeting routes back here, then tell the user it's starting.
+            enqueue_onboarding(home, &config.agent_id, &config.session_id, chat_id)?;
+            let _ = mark_onboarded(home, &config.agent_id);
+            send_telegram(
+                token,
+                &chat_id.to_string(),
+                "Starting onboarding — one moment while I introduce myself.",
+                reply_to_message_id,
+            )?;
+            send_telegram_chat_action(token, &chat_id.to_string(), "typing")?;
             Ok(())
         }
         InboundAction::Help { chat_id } => {
@@ -1173,6 +1191,14 @@ pub(crate) fn dispatch_slash_command(
             let sub = slugify_channel_id(args);
             let _ = create_subagent(home, agent_id, &sub, SpawnMode::Ephemeral, args);
             ConsoleCommand::Prompt(frame_subtask(&sub, args))
+        }
+        // /onboard runs the onboarding interview as a real turn. Returning a
+        // Prompt lets the surface enqueue it through its own correctly-routed path
+        // (real channel + chat id), so the agent's greeting comes back here —
+        // Telegram has its own InboundAction::Onboard for the same reason.
+        "onboard" => {
+            let _ = mark_onboarded(home, agent_id);
+            ConsoleCommand::Prompt(onboarding_prompt())
         }
         // Bare selector commands open a modal picker (parity with Telegram's
         // inline keyboard). `/model gpt-5` (non-empty args) falls through to the
@@ -1777,9 +1803,13 @@ fn classify_telegram_update(
                 text: format!("Use the `{skill}` skill. {rest}").trim().to_string(),
             }
         }
+        // /onboard runs the onboarding interview as a real turn, so it needs the
+        // chat's own routing (channel + platform_id) for the agent's greeting to
+        // come back. The generic Command path returns a text reply only.
+        "/onboard" => InboundAction::Onboard { chat_id },
         "/commands" | "/tools" | "/models" | "/model" | "/reasoning" | "/reset" | "/stop" | "/compact"
         | "/session" | "/subagents" | "/graph-query" | "/graph-insert" | "/tts"
-        | "/tts-provider" | "/emerge" | "/skill" | "/onboard" => InboundAction::Command {
+        | "/tts-provider" | "/emerge" | "/skill" => InboundAction::Command {
             chat_id,
             name: cmd.trim_start_matches('/').to_string(),
             args,
@@ -2454,21 +2484,37 @@ fn onboarding_prompt() -> String {
         .to_string()
 }
 
+/// Enqueue the onboarding turn for a telegram chat. Tagged with the REAL
+/// `telegram`/`chat_id` (NOT the old bogus `onboard`/`onboard`) so the agent's
+/// greeting — whose outbound row inherits the inbound's channel + platform_id —
+/// matches the telegram delivery loop and actually reaches the user. Wrapped with
+/// `build_channel_prompt` so the greeting carries the agent's context, mirroring a
+/// normal turn (`run_channel_prompt`), minus recording the system directive as
+/// user history.
 fn enqueue_onboarding(
     home: &MaturanaHome,
     agent_id: &str,
     session_id: &str,
+    chat_id: i64,
 ) -> anyhow::Result<()> {
     let paths = session_paths(&home.agent_dir(agent_id), session_id);
     ensure_session(&paths)?;
-    let prompt = onboarding_prompt();
+    let directive = onboarding_prompt();
+    let prompt = build_channel_prompt(home, agent_id, chat_id, &directive)?;
+    let settings = load_channel_settings(home, agent_id);
     insert_inbound(
         &paths,
-        "onboard",
-        "onboard",
-        &format!("onboard-{}", Utc::now().timestamp_millis()),
+        "chat",
+        "telegram",
+        &chat_id.to_string(),
         None,
-        &serde_json::json!({ "text": prompt, "prompt": prompt }).to_string(),
+        &serde_json::json!({
+            "text": directive,
+            "prompt": prompt,
+            "model": settings.model,
+            "reasoning": settings.reasoning,
+        })
+        .to_string(),
     )?;
     Ok(())
 }
@@ -2651,11 +2697,6 @@ fn handle_channel_command(
             }
         }
         "emerge" => "Usage: /emerge <task> — runs a sub-agent on the task.".to_string(),
-        "onboard" => {
-            enqueue_onboarding(home, &config.agent_id, &config.session_id)?;
-            let _ = mark_onboarded(home, &config.agent_id);
-            "Starting onboarding — I'll introduce myself and ask a few questions.".to_string()
-        }
         "skill" => {
             // No args: list skills so the user can pick one. With args, classify
             // routes it to a prompt instead, so this only handles the bare form.
@@ -5529,6 +5570,20 @@ mod tests {
         assert_eq!(
             classify_telegram_update(&update, Some(7), None),
             InboundAction::Deny { chat_id: 9 }
+        );
+    }
+
+    #[test]
+    fn classifies_onboard_as_its_own_action() {
+        // /onboard must route to its own action (not the generic Command path,
+        // which only returns a text reply) so the onboarding turn is enqueued with
+        // THIS chat's routing and the agent's greeting actually comes back.
+        // Regression: it used to enqueue with channel/platform_id "onboard" and the
+        // greeting was silently dropped.
+        let update = text_update(7, "/onboard");
+        assert_eq!(
+            classify_telegram_update(&update, Some(7), None),
+            InboundAction::Onboard { chat_id: 7 }
         );
     }
 
