@@ -14,6 +14,14 @@ pub enum Broadcast {
     Session(ServerMsg),
 }
 
+/// The shared channel front door, injected by maturana-cli (which owns the
+/// context builder). Args: home_root, agent_id, session_id, user text; returns
+/// the enqueued message id. The web cockpit calls THIS instead of inserting a raw
+/// inbound, so its turns get the same transcript memory + model/reasoning + routing
+/// as Telegram/TUI/Discord. See `channels::enqueue_turn` for the implementation.
+pub type EnqueueTurnFn =
+    Arc<dyn Fn(&std::path::Path, &str, &str, &str) -> anyhow::Result<String> + Send + Sync>;
+
 /// Shared application state. Cheap to clone (everything is Arc'd or a handle).
 #[derive(Clone)]
 pub struct AppState {
@@ -22,16 +30,19 @@ pub struct AppState {
     pub login_token: Arc<String>,
     pub sessions: SessionStore,
     pub dash_tx: broadcast::Sender<Broadcast>,
+    /// The shared channel front door (injected by the CLI).
+    pub enqueue: EnqueueTurnFn,
 }
 
 impl AppState {
-    pub fn new(home_root: PathBuf, login_token: String) -> Self {
+    pub fn new(home_root: PathBuf, login_token: String, enqueue: EnqueueTurnFn) -> Self {
         let (dash_tx, _) = broadcast::channel(256);
         Self {
             home_root,
             login_token: Arc::new(login_token),
             sessions: SessionStore::default(),
             dash_tx,
+            enqueue,
         }
     }
 }

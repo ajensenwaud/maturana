@@ -195,22 +195,12 @@ fn handle_client_msg(
             session_id,
             text,
         } => {
-            // Enqueue through the same queue the Telegram bridge feeds; the
-            // guest worker claims it like any other channel message. The
-            // outbound poller in server.rs delivers the reply back over WS.
-            let agent_dir = state.home_root.join("agents").join(&agent_id);
-            let result = (|| -> anyhow::Result<String> {
-                let paths = maturana_core::session_db::session_paths(&agent_dir, &session_id);
-                maturana_core::session_db::ensure_session(&paths)?;
-                maturana_core::session_db::insert_inbound(
-                    &paths,
-                    "chat",
-                    "web",
-                    "web",
-                    None,
-                    &serde_json::json!({ "text": text, "prompt": text }).to_string(),
-                )
-            })();
+            // Route through the SHARED channel front door (injected by the CLI),
+            // exactly like Telegram/TUI/Discord — so the cockpit turn gets the
+            // recent-transcript context (memory), model/reasoning, and routing
+            // instead of a bare prompt. The outbound poller delivers the reply
+            // back over WS.
+            let result = (state.enqueue)(&state.home_root, &agent_id, &session_id, &text);
             match result {
                 Ok(message_id) => Some(ServerMsg::SessionOutbound {
                     agent_id,
@@ -267,7 +257,11 @@ mod tests {
     use super::*;
 
     fn test_state() -> AppState {
-        AppState::new(std::env::temp_dir().join("mweb-ws-test"), "tok".into())
+        AppState::new(
+            std::env::temp_dir().join("mweb-ws-test"),
+            "tok".into(),
+            std::sync::Arc::new(|_, _, _, _| Ok("test-msg".to_string())),
+        )
     }
 
     #[test]

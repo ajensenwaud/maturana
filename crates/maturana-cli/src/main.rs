@@ -1421,7 +1421,29 @@ fn main() -> anyhow::Result<()> {
                     "note: the web cockpit is experimental and not yet stabilized; \
                      it is not installed or started by default."
                 );
-                maturana_web::run_web(home.root().to_path_buf(), &command.bind)?
+                // Inject the shared channel front door so cockpit turns get the
+                // same transcript memory + model/reasoning + routing as every other
+                // channel (the cli owns the context builder; the web crate can't).
+                let enqueue: maturana_web::EnqueueTurnFn = std::sync::Arc::new(
+                    |home_root: &std::path::Path,
+                     agent_id: &str,
+                     session_id: &str,
+                     text: &str| {
+                        let home = MaturanaHome::new(home_root.to_path_buf());
+                        crate::channels::enqueue_turn(
+                            &home,
+                            agent_id,
+                            session_id,
+                            "web",
+                            "web",
+                            crate::channels::stable_chat_key(&format!("web:{session_id}")),
+                            None,
+                            text,
+                            serde_json::json!({}),
+                        )
+                    },
+                );
+                maturana_web::run_web(home.root().to_path_buf(), &command.bind, enqueue)?
             }
         },
         Command::Search(command) => run_search(&home, command)?,

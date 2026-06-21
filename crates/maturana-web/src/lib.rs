@@ -16,14 +16,18 @@ mod server;
 mod state;
 mod ws;
 
+pub use state::EnqueueTurnFn;
+
 use std::path::Path;
 use std::path::PathBuf;
 
 /// Run the cockpit server, blocking the calling (sync) thread. The CLI calls
-/// this directly; the tokio runtime lives entirely inside.
-pub fn run_web(home_root: PathBuf, bind: &str) -> anyhow::Result<()> {
+/// this directly; the tokio runtime lives entirely inside. `enqueue` is the shared
+/// channel front door (the CLI owns the context builder), so the cockpit routes
+/// turns through the SAME path as every other channel.
+pub fn run_web(home_root: PathBuf, bind: &str, enqueue: EnqueueTurnFn) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(server::serve(home_root, bind))
+    runtime.block_on(server::serve(home_root, bind, enqueue))
 }
 
 /// Read the cockpit login token (`<home>/web/token`), generating it on first

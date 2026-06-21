@@ -11,11 +11,11 @@ use axum::middleware;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 
-use crate::state::{AppState, Broadcast};
+use crate::state::{AppState, Broadcast, EnqueueTurnFn};
 use crate::ws::protocol::{ServerMsg, Topic};
 use crate::{api, assets, auth, ws};
 
-pub async fn serve(home_root: PathBuf, bind: &str) -> anyhow::Result<()> {
+pub async fn serve(home_root: PathBuf, bind: &str, enqueue: EnqueueTurnFn) -> anyhow::Result<()> {
     let login_token = auth::ensure_web_token(&home_root)?;
     // Providers resolve several conventional paths (.maturana/keys, images,
     // host-auth, hostd token) relative to the repo root. Under a service the
@@ -33,7 +33,7 @@ pub async fn serve(home_root: PathBuf, bind: &str) -> anyhow::Result<()> {
         }
     }
     let token_for_banner = login_token.clone();
-    let state = AppState::new(home_root, login_token);
+    let state = AppState::new(home_root, login_token, enqueue);
 
     tokio::spawn(dashboard_poller(state.clone()));
     tokio::spawn(web_outbound_poller(state.clone()));
