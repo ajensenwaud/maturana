@@ -5056,50 +5056,84 @@ fn discord_gateway_session(
                                 .trim_start()
                                 .starts_with('/')
                             {
-                                match dispatch_slash_command(
-                                    home,
-                                    &config.agent_id,
-                                    &config.session_id,
-                                    stable_chat_key(&channel_id),
-                                    "discord",
-                                    &content,
-                                ) {
-                                    ConsoleCommand::Reply(text) => {
-                                        let _ = discord_post_message(&token, &chan, &text);
-                                        None
-                                    }
-                                    ConsoleCommand::Prompt(text) => Some(text),
-                                    ConsoleCommand::NewSession => {
-                                        let _ = discord_post_message(
-                                            &token,
-                                            &chan,
-                                            "New session started.",
-                                        );
-                                        None
-                                    }
-                                    ConsoleCommand::Clear => {
-                                        let _ = discord_post_message(&token, &chan, "Cleared.");
-                                        None
-                                    }
-                                    ConsoleCommand::Quit => {
-                                        let _ = discord_post_message(
-                                            &token,
-                                            &chan,
-                                            "`/quit` is console-only.",
-                                        );
-                                        None
-                                    }
-                                    // Discord (this transport) has no inline keyboard,
-                                    // so list the choices as text; the user picks by
-                                    // sending the command with a value (e.g. /model <id>).
-                                    ConsoleCommand::Select { title, options } => {
-                                        let mut msg =
-                                            title.lines().next().unwrap_or("Options").to_string();
-                                        for opt in &options {
-                                            msg.push_str(&format!("\n• {}", opt.label));
+                                // Bare selector commands (/model etc.) render native
+                                // Discord buttons; the click comes back via
+                                // INTERACTION_CREATE and applies the same way Telegram does.
+                                let trimmed = content.trim();
+                                let (head, sel_args) = trimmed
+                                    .split_once(char::is_whitespace)
+                                    .unwrap_or((trimmed, ""));
+                                let cmd = head
+                                    .trim_start_matches('/')
+                                    .replace('_', "-")
+                                    .to_ascii_lowercase();
+                                let is_selector = matches!(
+                                    cmd.as_str(),
+                                    "model" | "models" | "reasoning" | "tts-provider" | "session"
+                                );
+                                if is_selector && sel_args.trim().is_empty() {
+                                    match command_selector_buttons(home, &config.agent_id, &cmd) {
+                                        Some((prompt, buttons, cols)) => {
+                                            let _ = discord_post_message_with_buttons(
+                                                &token, &chan, &prompt, &buttons, cols,
+                                            );
                                         }
-                                        let _ = discord_post_message(&token, &chan, &msg);
-                                        None
+                                        None => {
+                                            let _ = discord_post_message(
+                                                &token,
+                                                &chan,
+                                                "No options available for that command.",
+                                            );
+                                        }
+                                    }
+                                    None
+                                } else {
+                                    match dispatch_slash_command(
+                                        home,
+                                        &config.agent_id,
+                                        &config.session_id,
+                                        stable_chat_key(&channel_id),
+                                        "discord",
+                                        &content,
+                                    ) {
+                                        ConsoleCommand::Reply(text) => {
+                                            let _ = discord_post_message(&token, &chan, &text);
+                                            None
+                                        }
+                                        ConsoleCommand::Prompt(text) => Some(text),
+                                        ConsoleCommand::NewSession => {
+                                            let _ = discord_post_message(
+                                                &token,
+                                                &chan,
+                                                "New session started.",
+                                            );
+                                            None
+                                        }
+                                        ConsoleCommand::Clear => {
+                                            let _ = discord_post_message(&token, &chan, "Cleared.");
+                                            None
+                                        }
+                                        ConsoleCommand::Quit => {
+                                            let _ = discord_post_message(
+                                                &token,
+                                                &chan,
+                                                "`/quit` is console-only.",
+                                            );
+                                            None
+                                        }
+                                        // Selectors are handled above; defensive text fallback.
+                                        ConsoleCommand::Select { title, options } => {
+                                            let mut msg = title
+                                                .lines()
+                                                .next()
+                                                .unwrap_or("Options")
+                                                .to_string();
+                                            for opt in &options {
+                                                msg.push_str(&format!("\n• {}", opt.label));
+                                            }
+                                            let _ = discord_post_message(&token, &chan, &msg);
+                                            None
+                                        }
                                     }
                                 }
                             } else {
@@ -5129,6 +5163,42 @@ fn discord_gateway_session(
                                     &channel_id,
                                     |reply, _| discord_post_message(&token, &chan, reply),
                                 )?;
+                            }
+                        }
+                    }
+                    "INTERACTION_CREATE" => {
+                        // A button tap on a /model-style picker (type 3 =
+                        // MESSAGE_COMPONENT). The custom_id carries our
+                        // `<action>:<value>`; apply it via the SAME path Telegram
+                        // uses, then update the message to the confirmation.
+                        let d = event.pointer("/d");
+                        let itype = d
+                            .and_then(|d| d.get("type"))
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        if itype == 3 {
+                            let iid = d
+                                .and_then(|d| d.get("id"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let itok = d
+                                .and_then(|d| d.get("token"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let custom_id = d
+                                .and_then(|d| d.pointer("/data/custom_id"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if !iid.is_empty() && !itok.is_empty() && !custom_id.is_empty() {
+                                let confirm =
+                                    apply_channel_selection(home, &config.agent_id, custom_id);
+                                let _ = discord_interaction_callback(iid, itok, &confirm);
+                                let _ = audit_channel_event(
+                                    home,
+                                    &config.agent_id,
+                                    "channel.discord.callback",
+                                    custom_id,
+                                );
                             }
                         }
                     }
@@ -5212,6 +5282,67 @@ fn discord_post_message(
             .map_err(|e| anyhow::anyhow!("discord send message failed: {e}"))?
             .into_json()?;
     Ok(resp.get("id").and_then(|v| v.as_str()).map(str::to_string))
+}
+
+/// Send a Discord message with an inline button keyboard (parity with Telegram's
+/// `/model` etc. picker). `buttons` are (label, custom_id) where custom_id is the
+/// same `<action>:<value>` callback data; Discord delivers it back via
+/// INTERACTION_CREATE on click. Packed into action rows (max 5 buttons/row, 5
+/// rows = 25 total) so everything fits.
+fn discord_post_message_with_buttons(
+    bot_token: &str,
+    channel_id: &str,
+    content: &str,
+    buttons: &[(String, String)],
+    columns: usize,
+) -> anyhow::Result<Option<String>> {
+    let buttons: Vec<&(String, String)> = buttons.iter().take(25).collect();
+    let per_row = columns.max(buttons.len().div_ceil(5)).clamp(1, 5);
+    let rows: Vec<serde_json::Value> = buttons
+        .chunks(per_row)
+        .map(|chunk| {
+            let comps: Vec<serde_json::Value> = chunk
+                .iter()
+                .map(|(label, data)| {
+                    serde_json::json!({
+                        "type": 2,   // button
+                        "style": 1,  // primary
+                        "label": label.chars().take(80).collect::<String>(),
+                        "custom_id": data,
+                    })
+                })
+                .collect();
+            serde_json::json!({ "type": 1, "components": comps }) // action row
+        })
+        .collect();
+    let content: String = content.chars().take(2000).collect();
+    let resp: serde_json::Value =
+        ureq::post(&format!("{DISCORD_API}/channels/{channel_id}/messages"))
+            .set("authorization", &format!("Bot {bot_token}"))
+            .send_json(serde_json::json!({ "content": content, "components": rows }))
+            .map_err(|e| anyhow::anyhow!("discord send buttons failed: {e}"))?
+            .into_json()?;
+    Ok(resp.get("id").and_then(|v| v.as_str()).map(str::to_string))
+}
+
+/// Respond to a Discord component interaction (button click) by editing the
+/// picker message into the confirmation and removing the buttons (type 7 =
+/// UPDATE_MESSAGE). The interaction token authorizes this — no bot auth header.
+fn discord_interaction_callback(
+    interaction_id: &str,
+    interaction_token: &str,
+    content: &str,
+) -> anyhow::Result<()> {
+    let content: String = content.chars().take(2000).collect();
+    ureq::post(&format!(
+        "{DISCORD_API}/interactions/{interaction_id}/{interaction_token}/callback"
+    ))
+    .send_json(serde_json::json!({
+        "type": 7, // UPDATE_MESSAGE
+        "data": { "content": content, "components": [] },
+    }))
+    .map_err(|e| anyhow::anyhow!("discord interaction callback failed: {e}"))?;
+    Ok(())
 }
 
 // ---- shared channel-state persistence (generic over channel name) ----
