@@ -12,7 +12,9 @@ restart-on-failure group with a single source of truth for session wiring.
 2. Read `docs/orchestration.md` for the runtime-plane model and message path.
 3. Read the target agent `MATURANA.md` for runtime, channels, and schedules.
 4. Confirm the guest worker's `MATURANA_SESSION_ID` and the channel session id.
-5. Inspect current health with `maturana doctor` before changing anything.
+5. Inspect current health before changing anything: `maturana status` for a
+   glanceable plane + agents dashboard (reads `<home>/up/state.json`), and
+   `maturana doctor` for the pass/fail audit.
 
 ## Preflight
 

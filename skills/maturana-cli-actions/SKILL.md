@@ -14,6 +14,10 @@ smallest Maturana command that changes or proves that state.
 3. If the user gave a spec path, read that spec before touching materialized
    state.
 4. Check current state before mutation:
+   - `maturana list` for a one-line-per-agent overview (id, harness, VM, queue,
+     last turn) — the fastest way to see what agents exist
+   - `maturana status` for the plane + agents health dashboard (supervisor,
+     sessiond/graph, per-process restarts/uptime)
    - `maturana doctor --agent-id <agent-id> --json` when the agent exists
    - `maturana agent inspect <agent-id> --live` for VM state
    - `maturana audit list <agent-id> --json` for recent governed operations
@@ -56,6 +60,9 @@ smallest Maturana command that changes or proves that state.
 
 Common commands:
 
+- List agents: `maturana list` (aliases `ls`, `agents`) — quick host-side table
+  (id, harness, VM, queue, last turn); add `--json` for machine use
+- Status: `maturana status` — plane + agents health dashboard (alias `st`)
 - Validate specs: `maturana spec validate <spec> [--json]`
 - Materialize or launch: `maturana agent launch <spec> [--apply]`
 - Inspect: `maturana agent inspect <agent-id> [--live] [--guest]`
