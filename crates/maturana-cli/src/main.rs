@@ -20,8 +20,7 @@ use maturana_core::{
     pipelock_proxy::{ensure_mitm_ca_cert, run_proxy, HeaderInjection, ProxyConfig},
     secrets::resolve_secret_source_with_home,
     session_db::{
-        ensure_session, insert_inbound, list_recent_inbound, list_undelivered, mark_delivered,
-        queue_stats, session_paths,
+        list_recent_inbound, list_undelivered, mark_delivered, queue_stats, session_paths,
     },
     snapshots::{list_snapshots, restore_snapshot, take_snapshot, SnapshotRecord},
     spec::{AgentSpec, HarnessRuntime},
@@ -959,9 +958,7 @@ fn main() -> anyhow::Result<()> {
                 timeout_seconds,
             } => {
                 let prompt = read_agent_prompt(prompt, prompt_file)?;
-                // Bare `agent run` is a one-off (no recorded transcript), so text
-                // and prompt are the same; the TUI uses agent_chat_turn for memory.
-                let queued = enqueue_agent_run(&home, &agent_id, &prompt, &prompt)?;
+                let queued = enqueue_agent_run(&home, &agent_id, &prompt)?;
                 audit_agent_event(
                     &home,
                     &agent_id,
@@ -5148,22 +5145,23 @@ fn enqueue_agent_run(
     home: &MaturanaHome,
     agent_id: &str,
     text: &str,
-    prompt: &str,
 ) -> anyhow::Result<QueuedAgentRun> {
+    // `agent run` is a chat surface too — route it through the SAME front door as
+    // every channel (records the turn, injects the recent transcript for memory,
+    // attaches model/reasoning), keyed `cli`/`agent-run`. So a multi-turn
+    // `agent run` conversation remembers, exactly like Telegram/TUI/web.
     let session_id = infer_agent_session_id(home, agent_id)?;
-    let paths = session_paths(&home.agent_dir(agent_id), &session_id);
-    ensure_session(&paths)?;
-    let content = serde_json::json!({
-        // `text` is the raw user message (for the transcript); `prompt` is what
-        // the harness actually runs — for interactive callers it carries the
-        // recent-transcript context so the agent has turn-to-turn memory.
-        "text": text,
-        "prompt": prompt,
-        "model": crate::channels::channel_model(home, agent_id),
-        "reasoning": crate::channels::channel_reasoning(home, agent_id),
-    })
-    .to_string();
-    let message_id = insert_inbound(&paths, "chat", "cli", "agent-run", None, &content)?;
+    let message_id = crate::channels::enqueue_turn(
+        home,
+        agent_id,
+        &session_id,
+        "cli",
+        "agent-run",
+        crate::channels::stable_chat_key("agent-run"),
+        None,
+        text,
+        serde_json::json!({}),
+    )?;
     Ok(QueuedAgentRun {
         session_id,
         message_id,
@@ -6507,7 +6505,7 @@ mod tests {
         )
         .unwrap();
 
-        let queued = enqueue_agent_run(&home, "agent", "hello from cli", "hello from cli").unwrap();
+        let queued = enqueue_agent_run(&home, "agent", "hello from cli").unwrap();
         assert_eq!(queued.session_id, "cli-main");
         let paths = session_paths(&home.agent_dir("agent"), "cli-main");
         let pending = maturana_core::session_db::claim_pending_inbound(&paths, 1).unwrap();

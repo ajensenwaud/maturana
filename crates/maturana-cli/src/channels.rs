@@ -1944,19 +1944,6 @@ fn load_channel_settings(home: &MaturanaHome, agent_id: &str) -> ChannelSettings
         .unwrap_or_default()
 }
 
-/// The agent's current `/model` override (set via the model channel command), if
-/// any. Attached to inbound messages so the guest worker passes it to the harness.
-pub(crate) fn channel_model(home: &MaturanaHome, agent_id: &str) -> Option<String> {
-    load_channel_settings(home, agent_id).model
-}
-
-/// The agent's current `/reasoning` effort (low|medium|high), if set.
-/// Attached to inbound messages; the codex worker maps it to
-/// `model_reasoning_effort`. None => the worker's fast default (low).
-pub(crate) fn channel_reasoning(home: &MaturanaHome, agent_id: &str) -> Option<String> {
-    load_channel_settings(home, agent_id).reasoning
-}
-
 /// Reasoning levels offered by `/reasoning` (codex/gpt-5). `low` is snappy;
 /// `high` reasons deepest. Validated against this list before storing.
 /// `minimal` is intentionally excluded: the codex agent enables the
