@@ -170,6 +170,7 @@ fn maybe_fire(
         chat_id,
         &prompt,
         "proactive",
+        serde_json::json!({}),
     )?;
     let mut state = load_state(home, agent_id);
     state.last_fired_ms = now_ms();
