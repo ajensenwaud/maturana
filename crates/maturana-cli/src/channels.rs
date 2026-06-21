@@ -616,6 +616,21 @@ fn serve_telegram(home: &MaturanaHome, config: TelegramServe) -> anyhow::Result<
     } else {
         config.timeout_seconds.clamp(1, 50)
     };
+    // Flush replies orphaned by a previous run BEFORE entering the poll loop. A
+    // bridge restart kills any in-flight streaming loop, leaving its reply
+    // written-but-undelivered with a now-stale "working…" marker — which would make
+    // the backstop defer it for the full STREAM_BACKSTOP_AGE (minutes of "stuck").
+    // On startup no streamer is live, so deliver everything pending immediately.
+    if !config.once {
+        if let Some(chat_id) = current_paired_telegram_chat_id(home, &config.agent_id) {
+            let flushed =
+                deliver_telegram_outbox(home, &token, &config.agent_id, &config.session_id, chat_id, None)
+                    .unwrap_or(0);
+            if flushed > 0 {
+                println!("telegram: flushed {flushed} reply(ies) orphaned by restart");
+            }
+        }
+    }
     loop {
         write_telegram_heartbeat(home, &config.agent_id, "polling", None)?;
         let updates = match telegram_updates(&token, state.offset, long_poll_secs) {
