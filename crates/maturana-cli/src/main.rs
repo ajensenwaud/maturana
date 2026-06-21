@@ -742,6 +742,12 @@ enum RepairSubcommand {
         auth_source: Option<PathBuf>,
         #[arg(long)]
         install_harness: bool,
+        /// Re-seed the guest's harness auth from --auth-source even if the guest
+        /// already has a live `.credentials.json`. Only for recovering a dead
+        /// guest: claude-code self-refreshes its single-use OAuth token in-guest,
+        /// so re-seeding a live guest clobbers it and logs the agent out.
+        #[arg(long)]
+        force_reseed_auth: bool,
     },
     FirecrackerHarnesses {
         #[arg(long = "agent-id")]
@@ -781,6 +787,13 @@ enum RepairSubcommand {
         no_install_harness: bool,
         #[arg(long, default_value_t = 120)]
         ssh_wait_seconds: u64,
+        /// Re-seed each guest's harness auth from the profile's host-auth even if
+        /// the guest already has a live `.credentials.json`. Default off: a
+        /// firecracker claude guest self-refreshes its own single-use OAuth token,
+        /// so a routine repair must NOT clobber it. Only set this to recover a
+        /// dead guest.
+        #[arg(long)]
+        force_reseed_auth: bool,
     },
 }
 
@@ -2334,6 +2347,8 @@ fn repush_claude_auth(home: &MaturanaHome, agent_id: &str) -> anyhow::Result<()>
             // *dead* guest, run `repair guest-worker --auth-source …` by hand once.
             auth_source: None,
             install_harness: false,
+            // Moot (auth_source is None), but explicit: the daemon never re-seeds.
+            force_reseed_auth: false,
         },
     )
 }
@@ -2465,6 +2480,7 @@ fn run_repair(home: &MaturanaHome, command: RepairCommand) -> anyhow::Result<()>
             sessiond_token_path,
             auth_source,
             install_harness,
+            force_reseed_auth,
         } => install_guest_worker(
             home,
             GuestWorkerInstall {
@@ -2479,6 +2495,7 @@ fn run_repair(home: &MaturanaHome, command: RepairCommand) -> anyhow::Result<()>
                 sessiond_token_path,
                 auth_source,
                 install_harness,
+                force_reseed_auth,
             },
         ),
         RepairSubcommand::FirecrackerHarnesses {
@@ -2493,6 +2510,7 @@ fn run_repair(home: &MaturanaHome, command: RepairCommand) -> anyhow::Result<()>
             skip_services,
             no_install_harness,
             ssh_wait_seconds,
+            force_reseed_auth,
         } => repair_firecracker_harnesses(
             home,
             FirecrackerHarnessRepair {
@@ -2507,6 +2525,7 @@ fn run_repair(home: &MaturanaHome, command: RepairCommand) -> anyhow::Result<()>
                 skip_services,
                 install_harness: !no_install_harness,
                 ssh_wait_seconds,
+                force_reseed_auth,
             },
         ),
     }
@@ -2803,6 +2822,7 @@ struct FirecrackerHarnessRepair {
     skip_services: bool,
     install_harness: bool,
     ssh_wait_seconds: u64,
+    force_reseed_auth: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3002,6 +3022,7 @@ fn repair_firecracker_harnesses(
                         sessiond_token_path: sessiond_token_path.clone(),
                         auth_source: Some(PathBuf::from(profile.auth_source)),
                         install_harness: repair.install_harness,
+                        force_reseed_auth: repair.force_reseed_auth,
                     },
                 )?;
             }
@@ -3853,6 +3874,8 @@ fn refresh_live_guest_worker(
             sessiond_token_path: home.root().join("sessiond/token"),
             auth_source: None,
             install_harness: false,
+            // Moot (auth_source is None): the live refresh never re-seeds auth.
+            force_reseed_auth: false,
         },
     )
 }
@@ -3869,6 +3892,36 @@ struct GuestWorkerInstall {
     sessiond_token_path: PathBuf,
     auth_source: Option<PathBuf>,
     install_harness: bool,
+    /// Override the re-seed guard: push host auth even if the guest already has a
+    /// live `.credentials.json`. Only for recovering a genuinely dead guest — see
+    /// `install_guest_worker`'s guard and `guest_has_live_harness_creds`.
+    force_reseed_auth: bool,
+}
+
+/// Existence-only probe (never reads the token back to the host) of whether the
+/// guest already holds its own `.credentials.json`. Used to refuse re-seeding a
+/// claude guest that self-refreshes its single-use OAuth lineage.
+fn guest_has_live_harness_creds(
+    ip: &str,
+    ssh_user: &str,
+    ssh_key: &PathBuf,
+    host_key: &GuestHostKey,
+    harness_auth_guest_path: &str,
+) -> bool {
+    let path = format!(
+        "{}/.credentials.json",
+        harness_auth_guest_path.trim_end_matches('/')
+    );
+    // `test -s` (present + non-empty) → "LIVE"; otherwise "ABSENT". The `|| echo`
+    // keeps the remote exit status 0 so SSH itself never errors on a missing file.
+    let cmd = format!("test -s {} && echo LIVE || echo ABSENT", shell_quote(&path));
+    match run_ssh_with_stdin(ip, ssh_user, ssh_key, host_key, &cmd, None) {
+        Ok(out) => out.trim() == "LIVE",
+        // Unreachable/edge: env + runner copies already proved SSH works by this
+        // point, so treat a probe failure as "can't confirm live" → allow the
+        // push (a truly unreachable guest can't be clobbered anyway).
+        Err(_) => false,
+    }
 }
 
 fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> anyhow::Result<()> {
@@ -3929,19 +3982,53 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
         "/tmp/run-agent.sh",
         false,
     )?;
-    if let Some(auth_source) = install.auth_source.as_ref() {
-        let auth_source = absolute_or_cwd(auth_source.clone())?;
-        if auth_source.exists() {
-            copy_path_to_guest(
-                &install.guest_ip,
-                &install.ssh_user,
-                &ssh_key,
-                &host_key,
-                &auth_source,
-                "/tmp/maturana-harness-auth",
-                true,
-            )?;
+    // Resolve + GUARD the auth re-seed exactly once. Pushing host creds over a
+    // guest that already self-refreshes its own (single-use, rotating) token hands
+    // it an already-consumed refresh token → hard 401, "logged out again". So for
+    // claude-code, refuse to clobber a guest that already has a live
+    // `.credentials.json` unless the operator explicitly forces a re-seed (only
+    // valid for a genuinely dead guest). Initial provisioning is unaffected: a
+    // fresh guest has no creds yet → the probe says ABSENT → the push proceeds.
+    let auth_push_path: Option<PathBuf> = match install.auth_source.as_ref() {
+        None => None,
+        Some(src) => {
+            let resolved = absolute_or_cwd(src.clone())?;
+            if !resolved.exists() {
+                None
+            } else if install.harness == HarnessRuntime::ClaudeCode
+                && !install.force_reseed_auth
+                && guest_has_live_harness_creds(
+                    &install.guest_ip,
+                    &install.ssh_user,
+                    &ssh_key,
+                    &host_key,
+                    &install.harness_auth_guest_path,
+                )
+            {
+                eprintln!(
+                    "guest-worker: NOT re-seeding claude auth for {} — guest {} already \
+                     has a live {}/.credentials.json (it self-refreshes its own OAuth \
+                     lineage). Overwriting it would consume a single-use refresh token \
+                     and log the agent out. Pass --force-reseed-auth to override (only \
+                     to recover a dead guest).",
+                    install.agent_id, install.guest_ip, install.harness_auth_guest_path,
+                );
+                None
+            } else {
+                Some(resolved)
+            }
         }
+    };
+    if let Some(auth_source) = auth_push_path.as_ref() {
+        copy_path_to_guest(
+            &install.guest_ip,
+            &install.ssh_user,
+            &ssh_key,
+            &host_key,
+            auth_source,
+            "/tmp/maturana-harness-auth",
+            true,
+        )?;
     }
     if install.install_harness {
         run_ssh_with_stdin(
@@ -3953,7 +4040,7 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
             None,
         )?;
     }
-    if install.auth_source.is_some() {
+    if auth_push_path.is_some() {
         run_ssh_with_stdin(
             &install.guest_ip,
             &install.ssh_user,
@@ -6492,6 +6579,7 @@ mod tests {
                         skip_services,
                         no_install_harness,
                         ssh_wait_seconds,
+                        force_reseed_auth,
                     },
             }) => FirecrackerHarnessRepair {
                 agent_ids,
@@ -6505,6 +6593,7 @@ mod tests {
                 skip_services,
                 install_harness: !no_install_harness,
                 ssh_wait_seconds,
+                force_reseed_auth,
             },
             other => panic!("unexpected command: {other:?}"),
         }
@@ -6525,6 +6614,61 @@ mod tests {
             "--skip-services",
         ]);
         assert!(with.skip_services);
+    }
+
+    #[test]
+    fn force_reseed_auth_defaults_false_and_parses() {
+        // Default off: a routine firecracker repair must NOT re-seed (clobber) a
+        // live claude guest's self-refreshing OAuth token. See install_guest_worker.
+        let without = parse_firecracker_repair(&["maturana", "repair", "firecracker-harnesses"]);
+        assert!(
+            !without.force_reseed_auth,
+            "--force-reseed-auth must default to false so repair never clobbers a live guest token"
+        );
+
+        let with = parse_firecracker_repair(&[
+            "maturana",
+            "repair",
+            "firecracker-harnesses",
+            "--force-reseed-auth",
+        ]);
+        assert!(with.force_reseed_auth);
+    }
+
+    #[test]
+    fn guest_worker_force_reseed_auth_flag_parses() {
+        // The manual `setup/repair guest-worker --auth-source …` path also gates
+        // the destructive re-seed behind --force-reseed-auth.
+        fn parse(args: &[&str]) -> bool {
+            match Cli::try_parse_from(args)
+                .expect("parse guest-worker")
+                .command
+            {
+                Command::Repair(RepairCommand {
+                    command: RepairSubcommand::GuestWorker {
+                        force_reseed_auth, ..
+                    },
+                }) => force_reseed_auth,
+                other => panic!("unexpected command: {other:?}"),
+            }
+        }
+        let base = [
+            "maturana",
+            "repair",
+            "guest-worker",
+            "--agent-id",
+            "claude-firecracker",
+            "--session-id",
+            "claude-main",
+            "--harness",
+            "claude-code",
+            "--harness-auth-guest-path",
+            "/home/ubuntu/.claude",
+        ];
+        assert!(!parse(&base), "guest-worker --force-reseed-auth defaults false");
+        let mut forced = base.to_vec();
+        forced.push("--force-reseed-auth");
+        assert!(parse(&forced));
     }
 
     #[test]
