@@ -119,6 +119,13 @@ Before claiming success, collect the evidence that matches the action:
 
 - Do not put OAuth credentials into pipelock. Inject Codex and Claude OAuth
   state directly into VMs.
+- Do not re-seed a live firecracker claude guest's auth. A claude guest
+  self-refreshes its own single-use OAuth token in-VM; copying the host login
+  over it (`guest-worker`/`firecracker-harnesses --auth-source`) consumes a
+  consumed token and logs the agent out. The CLI now refuses this by default —
+  pass `--force-reseed-auth` ONLY to recover a genuinely dead guest. If a repair
+  prints "NOT re-seeding claude auth … guest already has a live …credentials",
+  that is correct, not an error.
 - Do not add a generic command queue or broker for guest execution.
 - Do not add generic host command execution to hostd.
 - Do not implement provider state machines in PowerShell or bash.
