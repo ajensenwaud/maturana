@@ -710,7 +710,7 @@ fn serve_telegram(home: &MaturanaHome, config: TelegramServe) -> anyhow::Result<
     Ok(())
 }
 
-fn current_paired_telegram_chat_id(home: &MaturanaHome, agent_id: &str) -> Option<i64> {
+pub(crate) fn current_paired_telegram_chat_id(home: &MaturanaHome, agent_id: &str) -> Option<i64> {
     let vault = PipelockVault::new(home.pipelock_dir());
     vault
         .get(&telegram_chat_id_key(agent_id))
@@ -5633,6 +5633,47 @@ pub(crate) fn enqueue_turn(
     Ok(id)
 }
 
+/// Enqueue a SYSTEM-initiated turn (proactivity, scheduler) tagged for the
+/// agent's real outreach channel (Telegram), so the agent's reply is delivered by
+/// the normal outbox loop — the whole point being that a reply tagged `proactive`
+/// is filtered out by every channel's delivery loop (`deliver_outbox` matches on
+/// channel+platform_id) and can NEVER reach the user.
+///
+/// Unlike [`enqueue_turn`], it does NOT record the directive as a user turn: a
+/// `[PROACTIVE CHECK]` the user never sent must not pollute the visible transcript
+/// or seed every future prompt's recent-history context with a fake user message.
+/// The agent still gets full context (memory + transcript + graph) so it can
+/// decide whether there is anything worth saying; its reply is recorded and
+/// delivered like any other channel turn.
+pub(crate) fn enqueue_outreach_turn(
+    home: &MaturanaHome,
+    agent_id: &str,
+    session_id: &str,
+    chat_id: i64,
+    directive: &str,
+    kind: &str,
+) -> anyhow::Result<String> {
+    let prompt = build_channel_prompt(home, agent_id, chat_id, directive)?;
+    let settings = load_channel_settings(home, agent_id);
+    let paths = session_paths(&home.agent_dir(agent_id), session_id);
+    ensure_session(&paths)?;
+    let content = serde_json::json!({
+        "text": directive,
+        "prompt": prompt,
+        // Same per-turn model/reasoning overrides as a normal channel turn.
+        "model": settings.model,
+        "reasoning": settings.reasoning,
+    });
+    insert_inbound(
+        &paths,
+        kind,
+        "telegram",
+        &chat_id.to_string(),
+        None,
+        &content.to_string(),
+    )
+}
+
 /// Enqueue a user message as a chat prompt for a text channel keyed by its string
 /// `platform_id` (Discord, Slack, AgentMail). Thin wrapper over [`enqueue_turn`].
 pub(crate) fn enqueue_channel_prompt(
@@ -6150,6 +6191,53 @@ mod tests {
         let transcript = fs::read_to_string(channel_transcript_path(&home, "agent", 555)).unwrap();
         assert!(transcript.contains("remember the blue door"));
         assert!(transcript.contains("what did I say?"));
+    }
+
+    #[test]
+    fn outreach_turn_is_tagged_for_the_real_chat_and_keeps_the_directive_invisible() {
+        // The proactive-outreach bug: a turn tagged "proactive" had its reply
+        // filtered out by deliver_outbox (channel mismatch) and never reached the
+        // user. enqueue_outreach_turn must tag the turn for the REAL telegram chat
+        // so the reply delivers — while NOT recording the system directive as a
+        // user turn (which would pollute the transcript + every future prompt).
+        let temp = temp_dir("outreach-turn");
+        let home = MaturanaHome::new(temp.path().join(".maturana"));
+        let agent_dir = home.agent_dir("agent");
+        fs::create_dir_all(agent_dir.join("memory")).unwrap();
+        fs::write(agent_dir.join("AGENTS.md"), "# Agent\n").unwrap();
+        fs::write(agent_dir.join("SOUL.md"), "# Soul\n").unwrap();
+        fs::write(agent_dir.join("MATURANA.md"), "# Contract\n").unwrap();
+        fs::write(agent_dir.join("memory/MEMORY.md"), "# Memory\n").unwrap();
+
+        let id = enqueue_outreach_turn(
+            &home,
+            "agent",
+            "s",
+            8566198884,
+            "[PROACTIVE CHECK] anything worth saying?",
+            "proactive",
+        )
+        .unwrap();
+
+        let paths = session_paths(&home.agent_dir("agent"), "s");
+        let pending = maturana_core::session_db::claim_pending_inbound(&paths, 10).unwrap();
+        let msg = pending.iter().find(|m| m.id == id).expect("enqueued");
+        // Tagged for the real telegram chat => the telegram delivery loop (which
+        // matches channel=="telegram" && platform_id==chat_id) WILL pick the reply up.
+        assert_eq!(msg.channel, "telegram", "must route via the telegram channel");
+        assert_eq!(msg.platform_id, "8566198884", "must target the paired chat id");
+        let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
+        assert!(content.get("prompt").is_some(), "context prompt attached");
+        assert!(content.get("model").is_some(), "model override attached");
+        assert!(content.get("reasoning").is_some(), "reasoning override attached");
+
+        // The directive must NOT appear as a user turn in the visible transcript.
+        let recorded =
+            fs::read_to_string(channel_transcript_path(&home, "agent", 8566198884)).unwrap_or_default();
+        assert!(
+            !recorded.contains("PROACTIVE CHECK"),
+            "the system directive must not pollute the transcript as a fake user turn"
+        );
     }
 
     #[test]
