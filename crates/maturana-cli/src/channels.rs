@@ -999,6 +999,53 @@ fn console_chat_key() -> i64 {
     stable_chat_key("console:tui")
 }
 
+/// Persist one console-TUI turn into the same Markdown transcript the Telegram
+/// channel writes (keyed by `console_chat_key()`), so the conversation survives
+/// an agent switch and feeds the next turn's context exactly like Telegram.
+pub(crate) fn record_console_turn(
+    home: &MaturanaHome,
+    agent_id: &str,
+    role: &str,
+    text: &str,
+) -> anyhow::Result<()> {
+    append_channel_turn(home, agent_id, console_chat_key(), role, text)
+}
+
+/// Read the console transcript back as ordered (role, body) pairs to repopulate
+/// the TUI view on agent switch. Parses the `## <rfc3339> <role>` section format
+/// `append_channel_turn` writes; non-`## ` lines (reset banners, notices) are
+/// skipped because they carry no role header.
+pub(crate) fn read_console_transcript(home: &MaturanaHome, agent_id: &str) -> Vec<(String, String)> {
+    let path = channel_transcript_path(home, agent_id, console_chat_key());
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut role: Option<String> = None;
+    let mut body: Vec<String> = Vec::new();
+    let flush = |role: &Option<String>, body: &[String], out: &mut Vec<(String, String)>| {
+        if let Some(r) = role {
+            let t = body.join("\n").trim().to_string();
+            if !t.is_empty() {
+                out.push((r.clone(), t));
+            }
+        }
+    };
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("## ") {
+            flush(&role, &body, &mut out);
+            body.clear();
+            // Header is `<rfc3339-ts> <role>`; the role is the last whitespace token.
+            role = rest.split_whitespace().last().map(|s| s.to_string());
+        } else if role.is_some() {
+            body.push(line.to_string());
+        }
+    }
+    flush(&role, &body, &mut out);
+    out
+}
+
 /// The full slash-command catalog the console TUI advertises (autocomplete +
 /// /help) — the Telegram command menu plus the TUI-local commands.
 pub(crate) fn console_command_catalog() -> Vec<(&'static str, &'static str)> {
@@ -1020,6 +1067,13 @@ pub(crate) fn console_command_catalog() -> Vec<(&'static str, &'static str)> {
 }
 
 /// What a console slash command resolves to; the TUI renders/acts on this.
+/// One pickable option in a console Select overlay. `apply` runs the SAME save
+/// path the Telegram inline-keyboard callback uses and returns a confirmation.
+pub(crate) struct SelectOption {
+    pub label: String,
+    pub apply: Box<dyn FnOnce() -> String + Send>,
+}
+
 pub(crate) enum ConsoleCommand {
     /// Show this text in the transcript (no agent turn).
     Reply(String),
@@ -1031,6 +1085,12 @@ pub(crate) enum ConsoleCommand {
     NewSession,
     /// Exit the TUI.
     Quit,
+    /// Open a modal picker (parity with Telegram's inline keyboard); on selection
+    /// the chosen option's `apply` persists the choice.
+    Select {
+        title: String,
+        options: Vec<SelectOption>,
+    },
 }
 
 /// Dispatch a slash command typed in the console TUI, reusing the same handlers
@@ -1113,6 +1173,34 @@ pub(crate) fn dispatch_slash_command(
             let sub = slugify_channel_id(args);
             let _ = create_subagent(home, agent_id, &sub, SpawnMode::Ephemeral, args);
             ConsoleCommand::Prompt(frame_subtask(&sub, args))
+        }
+        // Bare selector commands open a modal picker (parity with Telegram's
+        // inline keyboard). `/model gpt-5` (non-empty args) falls through to the
+        // text handler below and sets directly.
+        "model" | "models" | "reasoning" | "tts-provider" | "session" if args.is_empty() => {
+            match command_selector_buttons(home, agent_id, &name) {
+                Some((title, buttons, _cols)) => {
+                    let options = buttons
+                        .into_iter()
+                        .map(|(label, data)| {
+                            let home = MaturanaHome::new(home.root().to_path_buf());
+                            let agent = agent_id.to_string();
+                            SelectOption {
+                                label,
+                                apply: Box::new(move || {
+                                    apply_channel_selection(&home, &agent, &data)
+                                }),
+                            }
+                        })
+                        .collect();
+                    ConsoleCommand::Select { title, options }
+                }
+                None => match handle_channel_command(home, agent_id, session_id, chat_id, &name, args)
+                {
+                    Ok(reply) => ConsoleCommand::Reply(reply),
+                    Err(error) => ConsoleCommand::Reply(format!("Command failed: {error:#}")),
+                },
+            }
         }
         // Every other slash command routes to the shared channel handler — the
         // SAME one Telegram uses — so no surface lags the command set. A new
@@ -1976,18 +2064,64 @@ fn status_text(home: &MaturanaHome, agent_id: &str, session_id: &str, channel: &
     )
 }
 
-fn tools_text(home: &MaturanaHome) -> String {
+fn tools_text(home: &MaturanaHome, agent_id: &str) -> String {
+    let mut sections: Vec<String> = Vec::new();
+
+    // The agent's real tools live in its spec — MCP servers + opt-in capabilities
+    // (the same set render_guest_agents writes into AGENTS.md). The WASM registry
+    // below is separate (forged/installed tools) and is usually empty.
+    if let Ok(spec) =
+        AgentSpec::from_maturana_markdown(home.agent_dir(agent_id).join("MATURANA.md"))
+    {
+        if !spec.mcp_servers.is_empty() {
+            let names = spec
+                .mcp_servers
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            sections.push(format!("MCP servers: {names}"));
+        }
+        let egress = &spec.network.egress_allowlist;
+        let allows = |needle: &str| egress.iter().any(|h| h.contains(needle));
+        let mut caps: Vec<&str> = Vec::new();
+        if allows("brave") || allows("tavily") {
+            caps.push("web search");
+        }
+        if spec.browser.headless_chrome {
+            caps.push("browse (headless Chrome)");
+        }
+        if spec.knowledge_graph.enabled {
+            caps.push("knowledge graph (GraphRAG)");
+        }
+        if spec.capabilities.image_gen {
+            caps.push("image generation");
+        }
+        if spec.capabilities.self_forge {
+            caps.push("self-forge (build WASM tools)");
+        }
+        if !caps.is_empty() {
+            sections.push(format!("Capabilities: {}", caps.join(", ")));
+        }
+    }
+
     match ToolRegistry::new(home.root().join("tools")).list() {
         Ok(tools) if !tools.is_empty() => {
-            let mut out = String::from("Runtime tools:\n");
+            let mut out = String::from("Runtime (WASM) tools:\n");
             for t in tools {
                 let desc = t.description.lines().next().unwrap_or("").trim();
                 out.push_str(&format!("  {} — {}\n", t.name, truncate_inline(desc, 80)));
             }
-            out
+            sections.push(out.trim_end().to_string());
         }
-        Ok(_) => "No runtime tools installed yet. Build one with the maturana-tool-create or maturana-wasm-tool skill.".to_string(),
-        Err(error) => format!("Could not list tools: {error:#}"),
+        Ok(_) => {}
+        Err(error) => sections.push(format!("Could not list runtime tools: {error:#}")),
+    }
+
+    if sections.is_empty() {
+        "No tools or capabilities configured for this agent yet.".to_string()
+    } else {
+        sections.join("\n")
     }
 }
 
@@ -2376,7 +2510,7 @@ fn handle_channel_command(
     };
     let reply = match name {
         "commands" => commands_text(),
-        "tools" => tools_text(home),
+        "tools" => tools_text(home, &config.agent_id),
         "subagents" => subagents_text(home, &config.agent_id),
         "models" => models_text(home, &config.agent_id),
         "model" => {
@@ -2561,14 +2695,25 @@ fn command_selector(
     if !args.trim().is_empty() {
         return None;
     }
-    let settings = load_channel_settings(home, &config.agent_id);
+    command_selector_buttons(home, &config.agent_id, name)
+}
+
+/// The button source shared by the Telegram inline keyboard and the console TUI
+/// picker. Returns (prompt, [(label, callback_data)], columns); `None` for
+/// non-selectable commands. callback_data is always `<action>:<value>`.
+fn command_selector_buttons(
+    home: &MaturanaHome,
+    agent_id: &str,
+    name: &str,
+) -> Option<(String, Vec<(String, String)>, usize)> {
+    let settings = load_channel_settings(home, agent_id);
     match name {
         "models" | "model" => {
             let current = settings
                 .model
                 .unwrap_or_else(|| "(harness default)".to_string());
             // callback_data is capped at 64 bytes; drop any id that wouldn't fit.
-            let buttons: Vec<(String, String)> = model_button_choices(home, &config.agent_id)
+            let buttons: Vec<(String, String)> = model_button_choices(home, agent_id)
                 .into_iter()
                 .map(|id| {
                     let data = format!("model:{id}");
@@ -2641,6 +2786,55 @@ fn command_selector(
 
 /// Apply an inline-keyboard button tap: persist the chosen setting, clear the
 /// client spinner with a toast, and replace the menu message with a confirmation.
+/// Apply one `<action>:<value>` selection: set exactly one ChannelSettings field
+/// and persist it. Shared by the Telegram inline-keyboard callback and the
+/// console TUI picker so the two can't drift. Returns a confirmation string.
+pub(crate) fn apply_channel_selection(home: &MaturanaHome, agent_id: &str, data: &str) -> String {
+    let (action, value) = data.split_once(':').unwrap_or((data, ""));
+    let mut settings = load_channel_settings(home, agent_id);
+    let save = |settings: &ChannelSettings| save_channel_settings(home, agent_id, settings);
+    match action {
+        "model" => {
+            settings.model = Some(value.to_string());
+            match save(&settings) {
+                Ok(_) => format!("Model set to `{value}` (applies to new turns)."),
+                Err(e) => format!("Could not save: {e:#}"),
+            }
+        }
+        "reasoning" => {
+            settings.reasoning = Some(value.to_string());
+            match save(&settings) {
+                Ok(_) => format!("Reasoning effort set to `{value}` (applies to new turns)."),
+                Err(e) => format!("Could not save: {e:#}"),
+            }
+        }
+        "ttsprov" => {
+            settings.tts_provider = Some(value.to_string());
+            match save(&settings) {
+                Ok(_) => format!("TTS provider set to `{value}`."),
+                Err(e) => format!("Could not save: {e:#}"),
+            }
+        }
+        "tts" => {
+            settings.tts_enabled = value == "on";
+            let state = if settings.tts_enabled { "ENABLED" } else { "disabled" };
+            match save(&settings) {
+                Ok(_) => format!("Text-to-speech {state}."),
+                Err(e) => format!("Could not save: {e:#}"),
+            }
+        }
+        "session" => {
+            settings.idle = value == "idle";
+            let state = if settings.idle { "idle" } else { "active" };
+            match save(&settings) {
+                Ok(_) => format!("Session set to {state}."),
+                Err(e) => format!("Could not save: {e:#}"),
+            }
+        }
+        _ => "Unknown selection.".to_string(),
+    }
+}
+
 fn handle_telegram_callback(
     home: &MaturanaHome,
     token: &str,
@@ -2659,46 +2853,16 @@ fn handle_telegram_callback(
     }
     let data = callback.data.clone().unwrap_or_default();
     let (action, value) = data.split_once(':').unwrap_or((data.as_str(), ""));
-    let mut settings = load_channel_settings(home, &config.agent_id);
-    let (toast, updated) = match action {
-        "model" => {
-            settings.model = Some(value.to_string());
-            save_channel_settings(home, &config.agent_id, &settings)?;
-            (
-                format!("Model: {value}"),
-                format!("Model set to `{value}` (applies to new turns)."),
-            )
-        }
-        "reasoning" => {
-            settings.reasoning = Some(value.to_string());
-            save_channel_settings(home, &config.agent_id, &settings)?;
-            (
-                format!("Reasoning: {value}"),
-                format!("Reasoning effort set to `{value}` (applies to new turns)."),
-            )
-        }
-        "ttsprov" => {
-            settings.tts_provider = Some(value.to_string());
-            save_channel_settings(home, &config.agent_id, &settings)?;
-            (
-                format!("Provider: {value}"),
-                format!("TTS provider set to `{value}`."),
-            )
-        }
-        "tts" => {
-            settings.tts_enabled = value == "on";
-            save_channel_settings(home, &config.agent_id, &settings)?;
-            let state = if settings.tts_enabled { "ENABLED" } else { "disabled" };
-            (format!("TTS {state}"), format!("Text-to-speech {state}."))
-        }
-        "session" => {
-            settings.idle = value == "idle";
-            save_channel_settings(home, &config.agent_id, &settings)?;
-            let state = if settings.idle { "idle" } else { "active" };
-            (format!("Session {state}"), format!("Session set to {state}."))
-        }
-        _ => (String::new(), "Unknown selection.".to_string()),
+    // Telegram-only toast; the actual persist is shared with the console picker.
+    let toast = match action {
+        "model" => format!("Model: {value}"),
+        "reasoning" => format!("Reasoning: {value}"),
+        "ttsprov" => format!("Provider: {value}"),
+        "tts" => format!("TTS {}", if value == "on" { "ENABLED" } else { "disabled" }),
+        "session" => format!("Session {value}"),
+        _ => String::new(),
     };
+    let updated = apply_channel_selection(home, &config.agent_id, &data);
     answer_callback_query(token, &callback.id, Some(&toast))?;
     // Replacing the text also strips the keyboard, so the menu can't be re-tapped.
     let _ = edit_telegram_message(token, chat_id, message.message_id, &updated);
@@ -4925,6 +5089,18 @@ fn discord_gateway_session(
                                         );
                                         None
                                     }
+                                    // Discord (this transport) has no inline keyboard,
+                                    // so list the choices as text; the user picks by
+                                    // sending the command with a value (e.g. /model <id>).
+                                    ConsoleCommand::Select { title, options } => {
+                                        let mut msg =
+                                            title.lines().next().unwrap_or("Options").to_string();
+                                        for opt in &options {
+                                            msg.push_str(&format!("\n• {}", opt.label));
+                                        }
+                                        let _ = discord_post_message(&token, &chan, &msg);
+                                        None
+                                    }
                                 }
                             } else {
                                 Some(content)
@@ -5743,6 +5919,42 @@ mod tests {
         assert_eq!(a, stable_chat_key("C123"));
         assert!(a >= 0);
         assert_ne!(a, stable_chat_key("C124"));
+    }
+
+    #[test]
+    fn console_transcript_round_trips_and_is_per_agent() {
+        // BUG1: TUI conversation must persist across an agent switch — record +
+        // read back the same Markdown transcript Telegram uses, keyed per agent.
+        let temp = temp_dir("console-transcript");
+        let home = MaturanaHome::new(temp.path().join(".maturana"));
+        record_console_turn(&home, "alpha", "user", "hello\nworld").unwrap();
+        record_console_turn(&home, "alpha", "assistant", "hi there").unwrap();
+        assert_eq!(
+            read_console_transcript(&home, "alpha"),
+            vec![
+                ("user".to_string(), "hello\nworld".to_string()),
+                ("assistant".to_string(), "hi there".to_string()),
+            ]
+        );
+        // A different agent has its own (empty) transcript — switching can't bleed.
+        assert!(read_console_transcript(&home, "beta").is_empty());
+    }
+
+    #[test]
+    fn dispatch_model_with_args_sets_via_text_not_picker() {
+        // BUG2: bare `/model` opens a picker (Select), but `/model gpt-5` must set
+        // directly via the text handler (never a picker).
+        let temp = temp_dir("dispatch-model-args");
+        let home = MaturanaHome::new(temp.path().join(".maturana"));
+        let out = dispatch_slash_command(
+            &home,
+            "alpha",
+            "s",
+            console_chat_key(),
+            "console",
+            "/model gpt-5",
+        );
+        assert!(matches!(out, ConsoleCommand::Reply(_)));
     }
 
     #[test]

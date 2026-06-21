@@ -36,6 +36,14 @@ struct ChatMsg {
     text: String,
 }
 
+/// A modal command picker (/model, /reasoning, /tts-provider, /session) — the
+/// console analog of Telegram's inline keyboard.
+struct Picker {
+    title: String,
+    options: Vec<crate::channels::SelectOption>,
+    sel: usize,
+}
+
 // Slash commands are sourced from `channels::console_command_catalog()` so the
 // console TUI stays at parity with the Telegram command menu.
 
@@ -62,6 +70,8 @@ struct App {
     slash_sel: usize,
     /// When Some, the agent-selector HUD is open; the value is the highlighted row.
     selector: Option<usize>,
+    /// When Some, a modal command picker (/model etc.) is open.
+    picker: Option<Picker>,
     quit: bool,
 }
 
@@ -102,6 +112,7 @@ impl App {
             show_slash: false,
             slash_sel: 0,
             selector: if open_selector { Some(current) } else { None },
+            picker: None,
             quit: false,
         };
         app.load_current();
@@ -125,6 +136,17 @@ impl App {
         self.session_id = crate::infer_agent_session_id(&self.home, &agent_id)
             .unwrap_or_else(|_| "telegram-main".to_string());
         self.agent_id = agent_id;
+        // Restore this agent's persisted conversation (empty on first run) so
+        // switching agents and back no longer wipes the dialogue.
+        self.messages.clear();
+        for (role, text) in crate::channels::read_console_transcript(&self.home, &self.agent_id) {
+            let role = match role.as_str() {
+                "user" => Role::User,
+                "assistant" => Role::Agent,
+                _ => continue,
+            };
+            self.messages.push(ChatMsg { role, text });
+        }
     }
 
     /// Switch the active agent: abandon any in-flight reply, reload identity, and
@@ -135,8 +157,9 @@ impl App {
         }
         self.current = index.min(self.agents.len() - 1);
         self.finish_wait();
+        // load_current now reloads this agent's transcript into messages; do NOT
+        // clear after it or the restored dialogue would be discarded again.
         self.load_current();
-        self.messages.clear();
         self.input.clear();
         self.show_slash = false;
         self.scrollback = 0;
@@ -219,6 +242,8 @@ impl App {
             role: Role::User,
             text: text.clone(),
         });
+        // Persist to the same transcript Telegram uses so it survives a switch.
+        let _ = crate::channels::record_console_turn(&self.home, &self.agent_id, "user", &text);
         // Round-trip on a background thread so the UI keeps animating.
         let (tx, rx) = mpsc::channel();
         let home = MaturanaHome::new(self.home.root().to_path_buf());
@@ -254,6 +279,13 @@ impl App {
                 });
             }
             ConsoleCommand::Quit => self.quit = true,
+            ConsoleCommand::Select { title, options } => {
+                self.picker = Some(Picker {
+                    title,
+                    options,
+                    sel: 0,
+                });
+            }
         }
     }
 
@@ -261,6 +293,13 @@ impl App {
         if let Some(rx) = &self.reply_rx {
             match rx.try_recv() {
                 Ok(Ok(text)) => {
+                    // Persist before the move so the reply survives an agent switch.
+                    let _ = crate::channels::record_console_turn(
+                        &self.home,
+                        &self.agent_id,
+                        "assistant",
+                        &text,
+                    );
                     self.messages.push(ChatMsg {
                         role: Role::Agent,
                         text,
@@ -346,6 +385,40 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
                 }
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 let alt = key.modifiers.contains(KeyModifiers::ALT);
+                // While a command picker (/model etc.) is open it captures navigation.
+                // Each arm takes only a short borrow so we can also touch app.quit/
+                // app.messages without a borrow conflict.
+                if app.picker.is_some() {
+                    match key.code {
+                        KeyCode::Char('c') if ctrl => app.quit = true,
+                        KeyCode::Up => {
+                            if let Some(p) = &mut app.picker {
+                                p.sel = p.sel.saturating_sub(1);
+                            }
+                        }
+                        KeyCode::Down => {
+                            if let Some(p) = &mut app.picker {
+                                p.sel = (p.sel + 1).min(p.options.len().saturating_sub(1));
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if let Some(picker) = app.picker.take() {
+                                let chosen = picker.sel;
+                                if let Some(opt) = picker.options.into_iter().nth(chosen) {
+                                    // Same save path as Telegram's button tap.
+                                    let confirm = (opt.apply)();
+                                    app.messages.push(ChatMsg {
+                                        role: Role::System,
+                                        text: confirm,
+                                    });
+                                }
+                            }
+                        }
+                        KeyCode::Esc => app.picker = None,
+                        _ => {}
+                    }
+                    continue;
+                }
                 // While the agent-selector HUD is open it captures navigation.
                 if let Some(sel) = app.selector {
                     match key.code {
@@ -454,6 +527,48 @@ fn draw(f: &mut Frame, app: &App) {
     if let Some(sel) = app.selector {
         draw_agent_selector(f, f.area(), app, sel);
     }
+    if let Some(p) = &app.picker {
+        draw_picker(f, f.area(), p);
+    }
+}
+
+/// Centered modal picker for /model, /reasoning, /tts-provider, /session — the
+/// console analog of Telegram's inline keyboard, driven by ConsoleCommand::Select.
+fn draw_picker(f: &mut Frame, full: Rect, p: &Picker) {
+    let rows = p.options.len() as u16;
+    let height = (rows + 2).min(full.height.saturating_sub(2)).max(3);
+    let width = 56.min(full.width.saturating_sub(4)).max(24);
+    let area = Rect {
+        x: full.x + full.width.saturating_sub(width) / 2,
+        y: full.y + full.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    let items: Vec<ListItem> = p
+        .options
+        .iter()
+        .enumerate()
+        .map(|(i, opt)| {
+            let style = if i == p.sel {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(Span::styled(
+                format!(" {} ", opt.label),
+                style.add_modifier(Modifier::BOLD),
+            )))
+        })
+        .collect();
+    let title = p.title.lines().next().unwrap_or("select").to_string();
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {title} · ↑↓ Enter · Esc cancel "))
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    f.render_widget(Clear, area);
+    f.render_widget(list, area);
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
