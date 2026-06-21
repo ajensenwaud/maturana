@@ -1042,6 +1042,23 @@ pub(crate) fn run_console_command(
     session_id: &str,
     raw: &str,
 ) -> ConsoleCommand {
+    dispatch_slash_command(home, agent_id, session_id, console_chat_key(), "console", raw)
+}
+
+/// Channel-agnostic slash-command dispatcher. The console TUI, Discord (and any
+/// text channel) share this so the command set never drifts: every command not
+/// handled locally below routes to `handle_channel_command` — the SAME leaf
+/// handler Telegram uses — so adding a command there lights it up everywhere.
+/// `chat_id` is the surface's stable per-chat key; `channel` is the source label
+/// (used for the feedback-trajectory partition and per-chat settings).
+pub(crate) fn dispatch_slash_command(
+    home: &MaturanaHome,
+    agent_id: &str,
+    session_id: &str,
+    chat_id: i64,
+    channel: &str,
+    raw: &str,
+) -> ConsoleCommand {
     let trimmed = raw.trim();
     let (head, args) = match trimmed.split_once(char::is_whitespace) {
         Some((h, a)) => (h, a.trim()),
@@ -1062,10 +1079,10 @@ pub(crate) fn run_console_command(
         "quit" | "exit" => ConsoleCommand::Quit,
         // Both reset the conversation view; /new and /reset behave the same here.
         "new" | "reset" => {
-            let _ = reset_channel_context(home, agent_id, console_chat_key());
+            let _ = reset_channel_context(home, agent_id, chat_id);
             ConsoleCommand::NewSession
         }
-        "status" => ConsoleCommand::Reply(status_text(home, agent_id, session_id, "console")),
+        "status" => ConsoleCommand::Reply(status_text(home, agent_id, session_id, channel)),
         "good" | "bad" => {
             let value = if name == "good" {
                 signals::THUMBS_UP
@@ -1073,7 +1090,7 @@ pub(crate) fn run_console_command(
                 signals::THUMBS_DOWN
             };
             let reply = match TrajectoryStore::open(&TrajectoryStore::store_path(home.root()))
-                .and_then(|store| store.reward_latest(agent_id, session_id, "console", value, None))
+                .and_then(|store| store.reward_latest(agent_id, session_id, channel, value, None))
             {
                 Ok(Some(_)) if value > 0.0 => "Logged a 👍 on the last reply.".to_string(),
                 Ok(Some(_)) => "Logged a 👎 on the last reply.".to_string(),
@@ -1092,23 +1109,19 @@ pub(crate) fn run_console_command(
         }
         // /emerge <task> spawns an ephemeral sub-agent on the task.
         "emerge" if !args.is_empty() => {
-            // Record the sub-task, then run it as a real turn: ConsoleCommand::Prompt
-            // sends it to the agent (previously it queued into a session nothing ran).
-            let name = slugify_channel_id(args);
-            let _ = create_subagent(home, agent_id, &name, SpawnMode::Ephemeral, args);
-            ConsoleCommand::Prompt(frame_subtask(&name, args))
+            // Record the sub-task, then run it as a real turn.
+            let sub = slugify_channel_id(args);
+            let _ = create_subagent(home, agent_id, &sub, SpawnMode::Ephemeral, args);
+            ConsoleCommand::Prompt(frame_subtask(&sub, args))
         }
-        // Everything else with a text reply goes through the shared handler.
-        "commands" | "tools" | "models" | "model" | "reasoning" | "stop" | "compact" | "session"
-        | "subagents" | "graph-query" | "graph-insert" | "tts" | "tts-provider" | "onboard"
-        | "skill" | "emerge" => {
-            match handle_channel_command(home, agent_id, session_id, console_chat_key(), &name, args)
-            {
-                Ok(reply) => ConsoleCommand::Reply(reply),
-                Err(error) => ConsoleCommand::Reply(format!("Command failed: {error:#}")),
-            }
-        }
-        _ => ConsoleCommand::Reply(format!("Unknown command /{name}. Try /help.")),
+        // Every other slash command routes to the shared channel handler — the
+        // SAME one Telegram uses — so no surface lags the command set. A new
+        // command in `handle_channel_command` works here automatically;
+        // unrecognized names get its own "Unknown command" reply.
+        _ => match handle_channel_command(home, agent_id, session_id, chat_id, &name, args) {
+            Ok(reply) => ConsoleCommand::Reply(reply),
+            Err(error) => ConsoleCommand::Reply(format!("Command failed: {error:#}")),
+        },
     }
 }
 
@@ -4869,31 +4882,78 @@ fn discord_gateway_session(
                         if let Some((channel_id, content)) =
                             discord_extract_prompt(&event, self_id.as_deref())
                         {
-                            enqueue_channel_prompt(
-                                home,
-                                &config.agent_id,
-                                &config.session_id,
-                                "discord",
-                                &channel_id,
-                                None,
-                                &content,
-                            )?;
-                            if let Some(provider) = &config.run_once_provider {
-                                let options = RunnerOptions {
-                                    provider: provider.to_string(),
-                                };
-                                run_session_once(paths, &options, 20)?;
-                            }
                             let token = bot_token.to_string();
                             let chan = channel_id.clone();
-                            deliver_channel_outbox(
-                                home,
-                                &config.agent_id,
-                                &config.session_id,
-                                "discord",
-                                &channel_id,
-                                |reply, _| discord_post_message(&token, &chan, reply),
-                            )?;
+                            // Slash commands share the TUI/Telegram dispatcher so
+                            // Discord exposes the same command set. A command is
+                            // either a text reply (posted here) or a turn
+                            // (enqueued like a normal message below).
+                            let turn_text: Option<String> = if content
+                                .trim_start()
+                                .starts_with('/')
+                            {
+                                match dispatch_slash_command(
+                                    home,
+                                    &config.agent_id,
+                                    &config.session_id,
+                                    stable_chat_key(&channel_id),
+                                    "discord",
+                                    &content,
+                                ) {
+                                    ConsoleCommand::Reply(text) => {
+                                        let _ = discord_post_message(&token, &chan, &text);
+                                        None
+                                    }
+                                    ConsoleCommand::Prompt(text) => Some(text),
+                                    ConsoleCommand::NewSession => {
+                                        let _ = discord_post_message(
+                                            &token,
+                                            &chan,
+                                            "New session started.",
+                                        );
+                                        None
+                                    }
+                                    ConsoleCommand::Clear => {
+                                        let _ = discord_post_message(&token, &chan, "Cleared.");
+                                        None
+                                    }
+                                    ConsoleCommand::Quit => {
+                                        let _ = discord_post_message(
+                                            &token,
+                                            &chan,
+                                            "`/quit` is console-only.",
+                                        );
+                                        None
+                                    }
+                                }
+                            } else {
+                                Some(content)
+                            };
+                            if let Some(text) = turn_text {
+                                enqueue_channel_prompt(
+                                    home,
+                                    &config.agent_id,
+                                    &config.session_id,
+                                    "discord",
+                                    &channel_id,
+                                    None,
+                                    &text,
+                                )?;
+                                if let Some(provider) = &config.run_once_provider {
+                                    let options = RunnerOptions {
+                                        provider: provider.to_string(),
+                                    };
+                                    run_session_once(paths, &options, 20)?;
+                                }
+                                deliver_channel_outbox(
+                                    home,
+                                    &config.agent_id,
+                                    &config.session_id,
+                                    "discord",
+                                    &channel_id,
+                                    |reply, _| discord_post_message(&token, &chan, reply),
+                                )?;
+                            }
                         }
                     }
                     _ => {}
@@ -5683,6 +5743,38 @@ mod tests {
         assert_eq!(a, stable_chat_key("C123"));
         assert!(a >= 0);
         assert_ne!(a, stable_chat_key("C124"));
+    }
+
+    #[test]
+    fn every_catalog_command_dispatches_on_all_surfaces() {
+        // Anti-drift guard for slash-command parity: every command advertised in
+        // COMMAND_GROUPS must be RECOGNIZED by the shared dispatcher on every text
+        // surface (console TUI + Discord share `dispatch_slash_command`; Telegram
+        // routes the same names to the same `handle_channel_command`). A command
+        // that fell through to "Unknown command" would mean a channel lags the set.
+        let temp = temp_dir("channel-command-parity");
+        let home = MaturanaHome::new(temp.path().join(".maturana"));
+        let names: Vec<&str> = COMMAND_GROUPS
+            .iter()
+            .flat_map(|(_, cmds)| cmds.iter().map(|(name, _)| *name))
+            .collect();
+        assert!(!names.is_empty(), "command catalog is empty");
+        for name in names {
+            // arg-guarded commands (/skill, /emerge, …) need a dummy arg to reach
+            // the handler rather than the usage fallthrough.
+            let raw = format!("{name} x");
+            for (chat_id, channel) in
+                [(console_chat_key(), "console"), (stable_chat_key("c1"), "discord")]
+            {
+                let outcome = dispatch_slash_command(&home, "a", "s", chat_id, channel, &raw);
+                if let ConsoleCommand::Reply(text) = &outcome {
+                    assert!(
+                        !text.starts_with("Unknown command"),
+                        "catalog command {name} fell through to Unknown on {channel}: {text}"
+                    );
+                }
+            }
+        }
     }
 
     fn text_update(chat_id: i64, text: &str) -> TelegramUpdate {
