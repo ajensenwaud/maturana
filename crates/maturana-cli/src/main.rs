@@ -1948,14 +1948,20 @@ fn build_orchestrator_config(
              Build an agent from Codex (`cd <repo> && codex`), then restart `maturana up`."
         );
     }
-    // claude-code agents get the host-owned OAuth refresh daemon.
+    // claude-code agents get the host-owned OAuth refresh daemon — EXCEPT
+    // firecracker guests, which keep their own token alive.
+    //
     // Host-side claude token refresh is for agents that CANNOT refresh their own
-    // OAuth token. Firecracker claude guests self-refresh against the allowlisted
-    // `platform.claude.com`, and they own the (single-use) refresh-token lineage;
-    // a host-side refresh of the same seed only races the guest and can consume
-    // the token out from under it (-> guest 401). So exclude self-refreshing
-    // firecracker profiles — the guest is the sole refresher, and reboot recovery
-    // never re-pushes auth, so the seed going stale is harmless.
+    // OAuth token. A firecracker claude guest CAN: its resident run-agent.sh loop
+    // refreshes the token in-guest when it nears expiry (worker.rs keep-alive),
+    // and the guest owns the (single-use) refresh-token lineage end to end. A
+    // host-side refresh of the same seed would only race the guest and consume the
+    // token out from under it (-> guest 401). So exclude firecracker profiles —
+    // the guest is the SOLE refresher, and reboot recovery never re-pushes auth so
+    // a stale host seed is harmless. (Earlier this exclusion was unsafe because the
+    // guest only refreshed lazily *during a turn*, so an idle agent's token died at
+    // ~8h; the in-guest keep-alive loop is what now makes the guest self-sufficient
+    // while idle.)
     let claude_refresh_agents = agent_ids
         .iter()
         .filter(|id| {

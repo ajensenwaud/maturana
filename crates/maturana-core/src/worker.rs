@@ -715,9 +715,109 @@ for (pid, body, ended) in texts:
 sys.stdout.write(final)
 PYEOF
 
+# Claude OAuth keep-alive: claude-code's access token expires ~8h and refresh is
+# single-use (rotates on every use). The guest runs `claude -p` one-shot PER TURN
+# (above), so claude-code only ever refreshes the token while a turn is RUNNING —
+# an idle agent (e.g. overnight) never fires a turn, the token expires, and the
+# user is logged out. This resident loop is the only thing always running in the
+# guest, so it owns the refresh during idle: the guest stays the SOLE refresher of
+# its lineage (the host daemon excludes firecracker claude precisely so there is
+# no second party to race on the single-use token). Mirrors maturana-core's
+# claude_refresh.rs (same endpoint/client_id/skew) so it can be tested against the
+# real endpoint. Silent unless it actually rotates or hits an error.
+cat > /tmp/maturana-claude-keepalive.py <<'PYEOF'
+import json, os, sys, time, urllib.request, urllib.error
+
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+skew_s = int(os.environ.get("MATURANA_CLAUDE_REFRESH_SKEW_SECONDS") or "900")
+
+home = os.environ.get("HOME") or "/home/ubuntu"
+path = os.path.join(home, ".claude", ".credentials.json")
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(0)  # no creds yet — nothing to keep alive
+oauth = data.get("claudeAiOauth")
+if not isinstance(oauth, dict):
+    sys.exit(0)
+refresh_token = oauth.get("refreshToken")
+expires_at = oauth.get("expiresAt")
+if not refresh_token or not isinstance(expires_at, (int, float)):
+    sys.exit(0)
+now_ms = int(time.time() * 1000)
+if expires_at - now_ms > skew_s * 1000:
+    sys.exit(0)  # not near expiry — stay silent
+
+body = json.dumps({
+    "grant_type": "refresh_token",
+    "refresh_token": refresh_token,
+    "client_id": CLIENT_ID,
+}).encode()
+req = urllib.request.Request(TOKEN_URL, data=body, method="POST")
+req.add_header("content-type", "application/json")
+req.add_header("accept", "application/json")
+req.add_header("anthropic-beta", "oauth-2025-04-20")
+# An explicit User-Agent is REQUIRED: the default "Python-urllib/x.y" signature
+# is blocked by Cloudflare (error 1010) before it reaches the OAuth handler.
+req.add_header("user-agent", "maturana-claude-keepalive/1.0")
+try:
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read().decode()
+except urllib.error.HTTPError as e:
+    detail = ""
+    try:
+        detail = e.read().decode()[:200]
+    except Exception:
+        pass
+    print("claude-keepalive: refresh failed HTTP %s: %s" % (e.code, detail), flush=True)
+    sys.exit(1)
+except Exception as e:
+    print("claude-keepalive: refresh transport error: %s" % e, flush=True)
+    sys.exit(1)
+
+try:
+    parsed = json.loads(raw)
+except Exception as e:
+    print("claude-keepalive: response not JSON: %s" % e, flush=True)
+    sys.exit(1)
+access_token = parsed.get("access_token")
+if not access_token:
+    print("claude-keepalive: response missing access_token", flush=True)
+    sys.exit(1)
+# Some responses omit a rotated refresh_token; then the old one stays valid.
+new_refresh = parsed.get("refresh_token") or refresh_token
+expires_in = parsed.get("expires_in") or 8 * 3600
+oauth["accessToken"] = access_token
+oauth["refreshToken"] = new_refresh
+oauth["expiresAt"] = now_ms + int(expires_in) * 1000
+data["claudeAiOauth"] = oauth
+# Atomic + 0600 so a crash can't leave a partial or world-readable token.
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(data, f, indent=2)
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+print("claude-keepalive: refreshed; expires in %d min"
+      % int((oauth["expiresAt"] - now_ms) / 60000), flush=True)
+PYEOF
+
+# Throttle the keep-alive: the script only POSTs when within skew of expiry, but
+# we still re-check periodically (cheap) rather than every ~1s idle iteration.
+claude_keepalive_last=0
+claude_keepalive_interval="${MATURANA_CLAUDE_REFRESH_INTERVAL_SECONDS:-60}"
+
 while true; do
   date -Is > /var/log/maturana/heartbeat
   heartbeat idle
+  if [ "${MATURANA_HARNESS}" = "claude-code" ]; then
+    keepalive_now="$(date +%s)"
+    if [ "$(( keepalive_now - claude_keepalive_last ))" -ge "$claude_keepalive_interval" ]; then
+      claude_keepalive_last="$keepalive_now"
+      python3 /tmp/maturana-claude-keepalive.py >>/var/log/maturana/agent.log 2>>/var/log/maturana/worker.err.log || true
+    fi
+  fi
   claim_body="$(python3 - <<'PY'
 import json, os
 print(json.dumps({"agent_id": os.environ["MATURANA_AGENT_ID"], "session_id": os.environ["MATURANA_SESSION_ID"], "limit": 1}))
@@ -1041,6 +1141,28 @@ mod tests {
         assert!(runner.contains("/session/forge"));
         assert!(runner.contains("/tmp/maturana-current-msg"));
         assert!(runner.contains(".local/bin"));
+    }
+
+    #[test]
+    fn runner_keeps_claude_token_alive_while_idle() {
+        let runner = render_run_agent();
+        // The keep-alive script ships and the loop calls it (throttled) ONLY for
+        // claude-code — the gap it closes is an idle guest never firing a turn.
+        assert!(runner.contains("/tmp/maturana-claude-keepalive.py"));
+        assert!(runner.contains(r#"if [ "${MATURANA_HARNESS}" = "claude-code" ]; then"#));
+        assert!(runner.contains("claude_keepalive_interval"));
+        // It mirrors claude_refresh.rs against the real OAuth endpoint, so the
+        // values must stay in lock-step with the shared module constants.
+        assert!(runner.contains(crate::claude_refresh::CLIENT_ID));
+        assert!(runner.contains(crate::claude_refresh::TOKEN_URL));
+        assert!(runner.contains("grant_type"));
+        assert!(runner.contains("refresh_token"));
+        // Default skew matches the host daemon's REFRESH_SKEW (15 min).
+        assert_eq!(crate::claude_refresh::REFRESH_SKEW.as_secs(), 900);
+        assert!(runner.contains("MATURANA_CLAUDE_REFRESH_SKEW_SECONDS") || runner.contains("\"900\""));
+        // Writes back atomically + 0600 (never a partial/world-readable token).
+        assert!(runner.contains("os.replace(tmp, path)"));
+        assert!(runner.contains("0o600"));
     }
 
     #[test]

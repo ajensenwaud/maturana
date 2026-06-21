@@ -108,6 +108,9 @@ pub fn refresh_claude_token(creds: &ClaudeCreds) -> anyhow::Result<ClaudeCreds> 
         .timeout(Duration::from_secs(30))
         .set("Accept", "application/json")
         .set("anthropic-beta", "oauth-2025-04-20")
+        // Explicit UA: the token endpoint sits behind Cloudflare, which 1010-blocks
+        // some default client signatures before the OAuth handler ever sees them.
+        .set("User-Agent", "maturana-claude-keepalive/1.0")
         .send_json(body)
     {
         Ok(response) => response.into_string()?,
