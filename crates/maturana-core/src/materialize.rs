@@ -311,3 +311,44 @@ fn render_soul(spec: &AgentSpec) -> String {
         name = spec.identity.name,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::AgentSpec;
+
+    fn spec_from_yaml(yaml: &str) -> AgentSpec {
+        serde_yaml::from_str(yaml).expect("spec parses")
+    }
+
+    #[test]
+    fn guest_agents_emits_search_forge_and_limits_when_granted() {
+        let spec = spec_from_yaml(
+            "identity:\n  id: oc\n  name: OC Agent\n  purpose: test\nruntime:\n  harness: opencode\nvm:\n  provider: firecracker\nnetwork:\n  egress_allowlist:\n    - api.search.brave.com\n    - duckduckgo.com\n    - en.wikipedia.org\ncapabilities:\n  self_forge: true\n",
+        );
+        let out = render_guest_agents(&spec);
+        // web-search recipe + DDG fallback + allowlist-only honesty
+        assert!(out.contains("### Web search"), "missing web search recipe:\n{out}");
+        assert!(out.contains("html.duckduckgo.com"), "missing DDG fallback:\n{out}");
+        assert!(out.contains("Only the hosts on your egress allowlist"), "missing allowlist-only note:\n{out}");
+        // self-forge recipe is emitted when the capability is granted
+        assert!(out.contains("### Self-forge"), "missing self-forge recipe:\n{out}");
+        assert!(out.contains("maturana-forge"), "missing forge helper:\n{out}");
+        // honest limits block lists the locked egress
+        assert!(out.contains("## Limits"), "missing limits block:\n{out}");
+        assert!(out.contains("api.search.brave.com"), "limits should list egress:\n{out}");
+    }
+
+    #[test]
+    fn guest_agents_gates_forge_and_ddg_but_always_has_limits() {
+        let spec = spec_from_yaml(
+            "identity:\n  id: oc\n  name: OC\n  purpose: test\nruntime:\n  harness: opencode\nvm:\n  provider: firecracker\nnetwork:\n  egress_allowlist:\n    - github.com\n",
+        );
+        let out = render_guest_agents(&spec);
+        // forge recipe is gated on self_forge; DDG line gated on duckduckgo in egress
+        assert!(!out.contains("### Self-forge"), "forge recipe must be gated on self_forge:\n{out}");
+        assert!(!out.contains("html.duckduckgo.com"), "DDG fallback only when duckduckgo allowlisted:\n{out}");
+        // the honest limits block is unconditional
+        assert!(out.contains("## Limits"), "limits block must always be present:\n{out}");
+    }
+}
