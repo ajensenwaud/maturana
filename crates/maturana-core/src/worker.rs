@@ -815,7 +815,11 @@ while true; do
     keepalive_now="$(date +%s)"
     if [ "$(( keepalive_now - claude_keepalive_last ))" -ge "$claude_keepalive_interval" ]; then
       claude_keepalive_last="$keepalive_now"
-      python3 /tmp/maturana-claude-keepalive.py >>/var/log/maturana/agent.log 2>>/var/log/maturana/worker.err.log || true
+      # Inherit the runner's stdout/stderr (systemd append:agent.log, opened by
+      # root) rather than self-opening the log: agent.log is root-owned, so a
+      # ">> /var/log/maturana/agent.log" as the ubuntu service user fails EACCES
+      # and `|| true` would silently skip the whole keep-alive.
+      python3 /tmp/maturana-claude-keepalive.py 2>&1 || true
     fi
   fi
   claim_body="$(python3 - <<'PY'
