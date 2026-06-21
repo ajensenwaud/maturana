@@ -959,7 +959,9 @@ fn main() -> anyhow::Result<()> {
                 timeout_seconds,
             } => {
                 let prompt = read_agent_prompt(prompt, prompt_file)?;
-                let queued = enqueue_agent_run(&home, &agent_id, &prompt)?;
+                // Bare `agent run` is a one-off (no recorded transcript), so text
+                // and prompt are the same; the TUI uses agent_chat_turn for memory.
+                let queued = enqueue_agent_run(&home, &agent_id, &prompt, &prompt)?;
                 audit_agent_event(
                     &home,
                     &agent_id,
@@ -5123,13 +5125,17 @@ struct CompletedAgentRun {
 fn enqueue_agent_run(
     home: &MaturanaHome,
     agent_id: &str,
+    text: &str,
     prompt: &str,
 ) -> anyhow::Result<QueuedAgentRun> {
     let session_id = infer_agent_session_id(home, agent_id)?;
     let paths = session_paths(&home.agent_dir(agent_id), &session_id);
     ensure_session(&paths)?;
     let content = serde_json::json!({
-        "text": prompt,
+        // `text` is the raw user message (for the transcript); `prompt` is what
+        // the harness actually runs — for interactive callers it carries the
+        // recent-transcript context so the agent has turn-to-turn memory.
+        "text": text,
         "prompt": prompt,
         "model": crate::channels::channel_model(home, agent_id),
         "reasoning": crate::channels::channel_reasoning(home, agent_id),
@@ -5181,7 +5187,16 @@ pub(crate) fn agent_chat_turn(
     prompt: &str,
     timeout_seconds: u64,
 ) -> anyhow::Result<String> {
-    let queued = enqueue_agent_run(home, agent_id, prompt)?;
+    // The interactive console (TUI) records each turn under `console_chat_key`.
+    // Inject that recent transcript into the prompt — exactly like the Telegram
+    // bridge (`run_channel_prompt`) — so the agent has turn-to-turn memory instead
+    // of "starting fresh" every message. The raw `prompt` stays as `text` (the
+    // transcript record); the enriched form is what the harness runs. Falls back
+    // to the bare prompt if context assembly fails, so a turn is never lost.
+    let key = crate::channels::console_chat_key();
+    let enriched = crate::channels::build_channel_prompt(home, agent_id, key, prompt)
+        .unwrap_or_else(|_| prompt.to_string());
+    let queued = enqueue_agent_run(home, agent_id, prompt, &enriched)?;
     let completed = wait_for_agent_run(home, agent_id, &queued, timeout_seconds)?;
     Ok(completed.text)
 }
@@ -6459,7 +6474,7 @@ mod tests {
         )
         .unwrap();
 
-        let queued = enqueue_agent_run(&home, "agent", "hello from cli").unwrap();
+        let queued = enqueue_agent_run(&home, "agent", "hello from cli", "hello from cli").unwrap();
         assert_eq!(queued.session_id, "cli-main");
         let paths = session_paths(&home.agent_dir("agent"), "cli-main");
         let pending = maturana_core::session_db::claim_pending_inbound(&paths, 1).unwrap();

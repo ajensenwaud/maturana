@@ -1013,7 +1013,7 @@ fn frame_subtask(name: &str, task: &str) -> String {
 
 /// A stable per-channel "chat key" for the console TUI, so commands that key off
 /// a chat id (transcript reset) have a consistent target.
-fn console_chat_key() -> i64 {
+pub(crate) fn console_chat_key() -> i64 {
     stable_chat_key("console:tui")
 }
 
@@ -3873,7 +3873,7 @@ fn delete_telegram_message(token: &str, chat_id: i64, message_id: i64) -> anyhow
     Ok(())
 }
 
-fn build_channel_prompt(
+pub(crate) fn build_channel_prompt(
     home: &MaturanaHome,
     agent_id: &str,
     chat_id: i64,
@@ -5894,6 +5894,34 @@ mod tests {
             .source_files
             .iter()
             .any(|file| file.label == "memory/MEMORY.md" && !file.missing));
+    }
+
+    #[test]
+    fn console_turns_feed_the_next_prompt_so_the_tui_has_memory() {
+        // Regression: the TUI (agent_chat_turn) sent the bare prompt, so the agent
+        // "started fresh" every turn. It now injects the console transcript via
+        // build_channel_prompt(console_chat_key()). Record a couple of console
+        // turns and assert the next prompt carries them — the exact path the TUI
+        // uses, keyed the same way the TUI records (console_chat_key).
+        let temp = temp_dir("tui-memory");
+        let home = MaturanaHome::new(temp.path().join(".maturana"));
+        let agent_dir = home.agent_dir("agent");
+        fs::create_dir_all(agent_dir.join("memory")).unwrap();
+        fs::write(agent_dir.join("AGENTS.md"), "# Agent\n").unwrap();
+        fs::write(agent_dir.join("SOUL.md"), "# Soul\n").unwrap();
+        fs::write(agent_dir.join("MATURANA.md"), "# Contract\n").unwrap();
+        fs::write(agent_dir.join("memory/MEMORY.md"), "# Memory\n").unwrap();
+        record_console_turn(&home, "agent", "user", "My name is Anders.").unwrap();
+        record_console_turn(&home, "agent", "assistant", "Hi Anders! Nice to meet you.").unwrap();
+
+        let prompt =
+            build_channel_prompt(&home, "agent", console_chat_key(), "what's my name?").unwrap();
+        assert!(
+            prompt.contains("My name is Anders."),
+            "prompt is missing the prior user turn → no memory: {prompt}"
+        );
+        assert!(prompt.contains("Hi Anders!"), "prompt is missing the prior assistant turn");
+        assert!(prompt.contains("what's my name?"));
     }
 
     #[test]
