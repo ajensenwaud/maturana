@@ -1232,13 +1232,154 @@ pub(crate) fn dispatch_slash_command(
     }
 }
 
+/// Per-channel send behavior for the shared [`deliver_outbox`] loop. The loop owns
+/// claiming, dropping unparseable rows, the silence-sentinel filter, transcript
+/// recording, mark-delivered, audit, and release-on-failure (a failed send is
+/// retried, never wedged). Each channel's sink supplies only HOW to send plus any
+/// extras (Telegram's live-message edit + TTS).
+trait OutboundSink {
+    /// Send the final reply; return the platform message id (if any). `inbound_id`
+    /// is the originating inbound row (Telegram looks up its live "working…"
+    /// message by it); `reply_to` is the outbound row's thread id.
+    fn send(
+        &mut self,
+        inbound_id: Option<&str>,
+        text: &str,
+        reply_to: Option<&str>,
+    ) -> anyhow::Result<Option<String>>;
+    /// The reply was the silence sentinel — clean up any live placeholder. No-op by default.
+    fn on_silence(&mut self, _inbound_id: Option<&str>) {}
+    /// After a successful send (e.g. speak it via TTS). No-op by default.
+    fn after_delivered(&mut self, _text: &str, _reply_to: Option<&str>) {}
+}
+
+/// The ONE outbound delivery loop every async channel bridge shares — Telegram and
+/// the generic Discord/Slack/AgentMail path. It claims each undelivered row for
+/// `channel`+`platform_id`, drops unparseable ones, filters the silence sentinel,
+/// sends via `sink`, records the assistant turn under `chat_key`, marks delivered,
+/// and audits — and on a send error RELEASES the claim so a later pass retries
+/// instead of wedging a claimed-but-undelivered row. `min_age` skips replies
+/// younger than it (Telegram's concurrent-backstop gate); `None` delivers now.
+fn deliver_outbox(
+    home: &MaturanaHome,
+    agent_id: &str,
+    paths: &SessionPaths,
+    channel: &str,
+    platform_id: &str,
+    chat_key: i64,
+    min_age: Option<Duration>,
+    sink: &mut dyn OutboundSink,
+) -> anyhow::Result<usize> {
+    let mut delivered = 0;
+    for message in list_undelivered(paths)? {
+        if message.channel != channel || message.platform_id != platform_id {
+            continue;
+        }
+        if let Some(min_age) = min_age {
+            if (Utc::now() - message.created_at)
+                .to_std()
+                .map(|age| age < min_age)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+        }
+        // Atomic claim so concurrent delivery paths can't double-send a reply.
+        if !claim_delivery(paths, &message.id)? {
+            continue;
+        }
+        // Drop an unparseable row rather than spinning on it forever (deterministic).
+        let response = match message_text(&message.content) {
+            Ok(text) => truncate_for_telegram(&text),
+            Err(error) => {
+                eprintln!("{channel}: dropping unparseable outbound {}: {error:#}", message.id);
+                let _ = mark_delivered(paths, &message.id, None);
+                continue;
+            }
+        };
+        let inbound_id = message.in_reply_to.as_deref();
+        let reply_to = message.thread_id.as_deref();
+        // A self-check that decided there's nothing worth saying emits the silence
+        // sentinel; never surface it. Let the sink clean up any live placeholder.
+        if response.trim() == crate::proactive::SILENCE_SENTINEL {
+            sink.on_silence(inbound_id);
+            let _ = mark_delivered(paths, &message.id, None);
+            continue;
+        }
+        match sink.send(inbound_id, &response, reply_to) {
+            Ok(platform_message_id) => {
+                let _ = mark_delivered(paths, &message.id, platform_message_id.as_deref());
+                let _ = append_channel_turn(home, agent_id, chat_key, "assistant", &response);
+                sink.after_delivered(&response, reply_to);
+                let _ = audit_channel_event(
+                    home,
+                    agent_id,
+                    &format!("channel.{channel}.outbound"),
+                    "sent channel response",
+                );
+                delivered += 1;
+            }
+            Err(error) => {
+                // Release the claim so a later pass retries, not drop the reply.
+                eprintln!("{channel} delivery failed, will retry: {error:#}");
+                unclaim_delivery(paths, &message.id)?;
+            }
+        }
+    }
+    Ok(delivered)
+}
+
+/// Telegram delivery sink: turn the live streaming "working…" message into the
+/// final reply by editing it in place (one clean message, never a duplicate), then
+/// speak it if TTS is on. The silence path deletes the live placeholder.
+struct TelegramSink<'a> {
+    token: &'a str,
+    chat_id: i64,
+    paths: &'a SessionPaths,
+    home: &'a MaturanaHome,
+    agent_id: &'a str,
+}
+
+impl OutboundSink for TelegramSink<'_> {
+    fn send(
+        &mut self,
+        inbound_id: Option<&str>,
+        text: &str,
+        reply_to: Option<&str>,
+    ) -> anyhow::Result<Option<String>> {
+        let live_id = inbound_id.and_then(|inbound| peek_telegram_status(self.paths, inbound));
+        let reply_to = reply_to.and_then(|value| value.parse::<i64>().ok());
+        let platform_message_id =
+            finalize_reply(self.token, self.chat_id, live_id, text, reply_to)?;
+        if let Some(inbound) = inbound_id {
+            clear_telegram_status(self.paths, inbound);
+        }
+        Ok(platform_message_id.map(|id| id.to_string()))
+    }
+
+    fn on_silence(&mut self, inbound_id: Option<&str>) {
+        let live_id = inbound_id.and_then(|inbound| peek_telegram_status(self.paths, inbound));
+        if let Some(id) = live_id {
+            let _ = delete_telegram_message(self.token, self.chat_id, id);
+        }
+        if let Some(inbound) = inbound_id {
+            clear_telegram_status(self.paths, inbound);
+        }
+    }
+
+    fn after_delivered(&mut self, text: &str, reply_to: Option<&str>) {
+        let reply_to = reply_to.and_then(|value| value.parse::<i64>().ok());
+        maybe_send_tts(self.home, self.token, self.agent_id, self.chat_id, text, reply_to);
+    }
+}
+
 /// Deliver pending telegram replies. `min_age` gates how old an outbound must be
 /// before this path will deliver it: the inline path (the streaming loop already
 /// returned) passes `None` to deliver immediately, while the concurrent 1s
 /// background thread passes a value LARGER than the streamer's whole deadline, so
 /// it only ever acts as a backstop for a turn whose streamer died — it never edits
 /// the live message while a streamer is still animating it (which would race the
-/// answer back to a spinner).
+/// answer back to a spinner). Thin wrapper over the shared [`deliver_outbox`].
 fn deliver_telegram_outbox(
     home: &MaturanaHome,
     token: &str,
@@ -1249,93 +1390,23 @@ fn deliver_telegram_outbox(
 ) -> anyhow::Result<usize> {
     let paths = session_paths(&home.agent_dir(agent_id), session_id);
     ensure_session(&paths)?;
-    let mut delivered = 0;
-    for message in list_undelivered(&paths)? {
-        if message.channel != "telegram" || message.platform_id != chat_id.to_string() {
-            continue;
-        }
-        // Backstop gate: skip replies younger than `min_age` so the concurrent
-        // background thread never delivers a reply whose streaming loop is still
-        // live (which owns the single live message). Stale replies — a turn whose
-        // streamer died — fall through and get delivered here.
-        if let Some(min_age) = min_age {
-            if (Utc::now() - message.created_at)
-                .to_std()
-                .map(|age| age < min_age)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-        }
-        // Atomic claim: the streaming render loop and this delivery thread both
-        // deliver, so claim first or the same reply goes out multiple times.
-        if !claim_delivery(&paths, &message.id)? {
-            continue;
-        }
-        // Drop an unparseable outbound rather than spinning on it forever (the
-        // parse error is deterministic; leaving it claimed-and-unhandled would wedge).
-        let response = match message_text(&message.content) {
-            Ok(text) => truncate_for_telegram(&text),
-            Err(error) => {
-                eprintln!("telegram: dropping unparseable outbound {}: {error:#}", message.id);
-                let _ = mark_delivered(&paths, &message.id, None);
-                continue;
-            }
-        };
-        // The streaming loop leaves a single live "working…" message for this turn
-        // (its id recorded in the marker). Whoever wins the claim turns THAT same
-        // message into the final reply by editing it in place — so the progress
-        // animation becomes the answer, one clean message, never a duplicate. Peek
-        // (don't consume) the marker so a failed attempt can retry the same message.
-        let inbound = message.in_reply_to.as_deref();
-        let live_id = inbound.and_then(|inbound| peek_telegram_status(&paths, inbound));
-        // A self-check that decided there's nothing worth saying emits the silence
-        // sentinel: remove any live message (best-effort) and finalize regardless, so
-        // a failed delete can never wedge the turn into an endless retry.
-        if response.trim() == crate::proactive::SILENCE_SENTINEL {
-            if let Some(id) = live_id {
-                let _ = delete_telegram_message(token, chat_id, id);
-            }
-            if let Some(inbound) = inbound {
-                clear_telegram_status(&paths, inbound);
-            }
-            let _ = mark_delivered(&paths, &message.id, None);
-            continue;
-        }
-        let reply_to_message_id = message
-            .thread_id
-            .as_deref()
-            .and_then(|value| value.parse::<i64>().ok());
-        match finalize_reply(token, chat_id, live_id, &response, reply_to_message_id) {
-            Ok(platform_message_id) => {
-                // Finalize the claim (the row already exists from claim_delivery, so a
-                // mark_delivered hiccup can't re-open it for a duplicate send).
-                let _ = mark_delivered(
-                    &paths,
-                    &message.id,
-                    platform_message_id.map(|id| id.to_string()).as_deref(),
-                );
-                if let Some(inbound) = inbound {
-                    clear_telegram_status(&paths, inbound);
-                }
-                let _ = append_channel_turn(home, agent_id, chat_id, "assistant", &response);
-                maybe_send_tts(home, token, agent_id, chat_id, &response, reply_to_message_id);
-                let _ = audit_channel_event(
-                    home,
-                    agent_id,
-                    "channel.telegram.outbound",
-                    "sent telegram response",
-                );
-                delivered += 1;
-            }
-            Err(error) => {
-                // Could not deliver without risking a duplicate: release the claim
-                // so a later pass retries, instead of dropping the reply forever.
-                eprintln!("telegram delivery failed, will retry: {error:#}");
-                unclaim_delivery(&paths, &message.id)?;
-            }
-        }
-    }
+    let mut sink = TelegramSink {
+        token,
+        chat_id,
+        paths: &paths,
+        home,
+        agent_id,
+    };
+    let delivered = deliver_outbox(
+        home,
+        agent_id,
+        &paths,
+        "telegram",
+        &chat_id.to_string(),
+        chat_id,
+        min_age,
+        &mut sink,
+    )?;
     if delivered > 0 {
         println!("telegram outbound responses sent: {delivered}");
     }
@@ -5485,9 +5556,31 @@ pub(crate) fn enqueue_channel_prompt(
     Ok(())
 }
 
+/// A sink that delegates to a plain send closure — for text channels (Discord,
+/// Slack, AgentMail) with no live-message edit or TTS.
+struct ClosureSink<'a, F> {
+    send: &'a mut F,
+}
+
+impl<F> OutboundSink for ClosureSink<'_, F>
+where
+    F: FnMut(&str, Option<&str>) -> anyhow::Result<Option<String>>,
+{
+    fn send(
+        &mut self,
+        _inbound_id: Option<&str>,
+        text: &str,
+        reply_to: Option<&str>,
+    ) -> anyhow::Result<Option<String>> {
+        (self.send)(text, reply_to)
+    }
+}
+
 /// Deliver undelivered outbound rows for `channel`+`platform_id` using a
-/// channel-specific `send` closure (returns the platform message id). Mirrors
-/// `deliver_telegram_outbox` generically.
+/// channel-specific `send` closure (returns the platform message id). A thin
+/// wrapper over the shared [`deliver_outbox`] loop — same claiming, silence
+/// filter, transcript recording, mark-delivered, audit, and retry-on-failure as
+/// Telegram, just a plain send instead of a live-message edit.
 pub(crate) fn deliver_channel_outbox<F>(
     home: &MaturanaHome,
     agent_id: &str,
@@ -5502,35 +5595,8 @@ where
     let paths = session_paths(&home.agent_dir(agent_id), session_id);
     ensure_session(&paths)?;
     let key = stable_chat_key(platform_id);
-    let mut delivered = 0;
-    for message in list_undelivered(&paths)? {
-        if message.channel != channel || message.platform_id != platform_id {
-            continue;
-        }
-        // Atomic claim so concurrent delivery paths can't double-send this reply.
-        if !claim_delivery(&paths, &message.id)? {
-            continue;
-        }
-        let response = truncate_for_telegram(&message_text(&message.content)?);
-        // A proactive self-check that decided there's nothing worth saying emits
-        // the silence sentinel; never surface it on a channel. Mark it delivered
-        // so it doesn't linger in the outbox or get retried.
-        if response.trim() == crate::proactive::SILENCE_SENTINEL {
-            mark_delivered(&paths, &message.id, None)?;
-            continue;
-        }
-        let platform_message_id = send(&response, message.thread_id.as_deref())?;
-        append_channel_turn(home, agent_id, key, "assistant", &response)?;
-        mark_delivered(&paths, &message.id, platform_message_id.as_deref())?;
-        audit_channel_event(
-            home,
-            agent_id,
-            &format!("channel.{channel}.outbound"),
-            "sent channel response",
-        )?;
-        delivered += 1;
-    }
-    Ok(delivered)
+    let mut sink = ClosureSink { send: &mut send };
+    deliver_outbox(home, agent_id, &paths, channel, platform_id, key, None, &mut sink)
 }
 
 fn generate_pair_code() -> String {
@@ -5982,6 +6048,66 @@ mod tests {
         let transcript = fs::read_to_string(channel_transcript_path(&home, "agent", 555)).unwrap();
         assert!(transcript.contains("remember the blue door"));
         assert!(transcript.contains("what did I say?"));
+    }
+
+    #[test]
+    fn deliver_outbox_is_the_single_delivery_loop() {
+        // Telegram and the generic Discord/Slack/AgentMail path share this loop.
+        // It must: filter by channel/platform, drop the silence sentinel to
+        // on_silence (never send it), record the assistant turn under chat_key,
+        // mark delivered, and on a send FAILURE release the claim so the row is
+        // retried (not wedged claimed-and-undelivered).
+        struct MockSink {
+            sent: Vec<String>,
+            silenced: usize,
+            fail: bool,
+        }
+        impl OutboundSink for MockSink {
+            fn send(
+                &mut self,
+                _inbound: Option<&str>,
+                text: &str,
+                _reply: Option<&str>,
+            ) -> anyhow::Result<Option<String>> {
+                if self.fail {
+                    anyhow::bail!("send boom");
+                }
+                self.sent.push(text.to_string());
+                Ok(Some("pmid".to_string()))
+            }
+            fn on_silence(&mut self, _inbound: Option<&str>) {
+                self.silenced += 1;
+            }
+        }
+        use maturana_core::session_db::write_outbound;
+        let temp = temp_dir("deliver-outbox");
+        let home = MaturanaHome::new(temp.path().join(".maturana"));
+        let paths = session_paths(&home.agent_dir("agent"), "s");
+        ensure_session(&paths).unwrap();
+        let body = |t: &str| serde_json::json!({ "text": t }).to_string();
+        write_outbound(&paths, None, "chat", "tg", "111", None, &body("hello there")).unwrap();
+        write_outbound(&paths, None, "chat", "tg", "111", None, &body(crate::proactive::SILENCE_SENTINEL)).unwrap();
+        write_outbound(&paths, None, "chat", "other", "111", None, &body("wrong channel")).unwrap();
+
+        let mut sink = MockSink { sent: vec![], silenced: 0, fail: false };
+        let delivered =
+            deliver_outbox(&home, "agent", &paths, "tg", "111", 111, None, &mut sink).unwrap();
+        assert_eq!(delivered, 1, "only the matching non-silence row delivers");
+        assert_eq!(sink.sent, vec!["hello there".to_string()]);
+        assert_eq!(sink.silenced, 1, "silence sentinel routes to on_silence, never sent");
+        let transcript = fs::read_to_string(channel_transcript_path(&home, "agent", 111)).unwrap();
+        assert!(transcript.contains("hello there"), "assistant turn recorded under chat_key");
+
+        // A failing send must RELEASE the claim so the row is retried next pass.
+        write_outbound(&paths, None, "chat", "tg", "111", None, &body("retry me")).unwrap();
+        let mut failer = MockSink { sent: vec![], silenced: 0, fail: true };
+        let n = deliver_outbox(&home, "agent", &paths, "tg", "111", 111, None, &mut failer).unwrap();
+        assert_eq!(n, 0);
+        let undelivered = list_undelivered(&paths).unwrap();
+        assert!(
+            undelivered.iter().any(|m| m.content.contains("retry me")),
+            "failed send must release the claim for retry, not wedge it"
+        );
     }
 
     #[test]
