@@ -611,7 +611,13 @@ fn draw_slash_popup(f: &mut Frame, input_area: Rect, app: &App) {
     if matches.is_empty() {
         return;
     }
-    let height = (matches.len() as u16 + 2).min(input_area.height.max(3));
+    // The menu floats ABOVE the input, so size it to the space available there
+    // (rows from the top of the screen down to the input), not the input's own
+    // 5-row height — otherwise only ~3 of the ~20 commands showed (just the
+    // first entries /help /clear /quit), making it look like the real commands
+    // were missing. +2 for the border; show the whole list when it fits.
+    let space_above = input_area.y.max(3);
+    let height = (matches.len() as u16 + 2).min(space_above);
     let area = Rect {
         x: input_area.x,
         y: input_area.y.saturating_sub(height),
@@ -620,25 +626,33 @@ fn draw_slash_popup(f: &mut Frame, input_area: Rect, app: &App) {
     };
     let items: Vec<ListItem> = matches
         .iter()
-        .enumerate()
-        .map(|(i, (name, desc))| {
-            let style = if i == app.slash_sel.min(matches.len() - 1) {
-                Style::default().fg(Color::Black).bg(Color::Cyan)
-            } else {
-                Style::default()
-            };
+        .map(|(name, desc)| {
             ListItem::new(Line::from(vec![
-                Span::styled(format!(" {name} "), style.add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!(" {name} "),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(format!(" {desc}"), Style::default().fg(Color::DarkGray)),
             ]))
         })
         .collect();
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" commands ")
-            .border_style(Style::default().fg(Color::Cyan)),
-    );
+    // ListState drives highlight + auto-scroll, so the selected command is always
+    // in view even when the list is taller than the popup (short terminals).
+    let mut state = ratatui::widgets::ListState::default();
+    state.select(Some(app.slash_sel.min(matches.len().saturating_sub(1))));
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" commands ")
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
     f.render_widget(Clear, area);
-    f.render_widget(list, area);
+    f.render_stateful_widget(list, area, &mut state);
 }
