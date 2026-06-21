@@ -605,18 +605,44 @@ fn enqueue_schedule(
     schedule: &ScheduleRecord,
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    let paths = session_paths(&home.agent_dir(agent_id), session_id);
-    ensure_session(&paths)?;
     let channel = schedule.channel.as_deref().unwrap_or("schedule");
-    let content = serde_json::json!({
-        "text": schedule.prompt,
-        "prompt": schedule.prompt,
-        "schedule_id": schedule.id,
-        "schedule_name": schedule.name,
-        "scheduled_at": now,
-    })
-    .to_string();
-    let id = insert_inbound(&paths, "schedule", channel, &schedule.id, None, &content)?;
+    // A telegram schedule is a reminder TO the user. Route it through the shared
+    // outreach front door so the reply is tagged for the REAL chat (telegram +
+    // chat_id) and actually gets delivered — tagging platform_id = schedule.id
+    // meant the telegram delivery loop (which matches platform_id == chat_id) never
+    // delivered the reply, the same dropped-reply bug fixed for proactivity. The
+    // front door also injects context so the reminder turn has memory.
+    let chat_id = (channel == "telegram")
+        .then(|| crate::channels::current_paired_telegram_chat_id(home, agent_id))
+        .flatten();
+    let id = if let Some(chat_id) = chat_id {
+        crate::channels::enqueue_outreach_turn(
+            home,
+            agent_id,
+            session_id,
+            chat_id,
+            &schedule.prompt,
+            "schedule",
+            serde_json::json!({
+                "schedule_id": schedule.id,
+                "schedule_name": schedule.name,
+                "scheduled_at": now,
+            }),
+        )?
+    } else {
+        // Legacy tagging for non-telegram channels (or telegram with no paired chat).
+        let paths = session_paths(&home.agent_dir(agent_id), session_id);
+        ensure_session(&paths)?;
+        let content = serde_json::json!({
+            "text": schedule.prompt,
+            "prompt": schedule.prompt,
+            "schedule_id": schedule.id,
+            "schedule_name": schedule.name,
+            "scheduled_at": now,
+        })
+        .to_string();
+        insert_inbound(&paths, "schedule", channel, &schedule.id, None, &content)?
+    };
     append_event(
         home.audit_dir().join(format!("{agent_id}.jsonl")),
         &AuditEvent {

@@ -6820,18 +6820,25 @@ pub(crate) fn enqueue_outreach_turn(
     chat_id: i64,
     directive: &str,
     kind: &str,
+    extra: serde_json::Value,
 ) -> anyhow::Result<String> {
     let prompt = build_channel_prompt(home, agent_id, chat_id, directive)?;
     let settings = load_channel_settings(home, agent_id);
     let paths = session_paths(&home.agent_dir(agent_id), session_id);
     ensure_session(&paths)?;
-    let content = serde_json::json!({
+    let mut content = serde_json::json!({
         "text": directive,
         "prompt": prompt,
         // Same per-turn model/reasoning overrides as a normal channel turn.
         "model": settings.model,
         "reasoning": settings.reasoning,
     });
+    // Caller metadata (e.g. a scheduler's schedule_id/name) merged into the payload.
+    if let (Some(obj), serde_json::Value::Object(extra_map)) = (content.as_object_mut(), extra) {
+        for (key, value) in extra_map {
+            obj.insert(key, value);
+        }
+    }
     insert_inbound(
         &paths,
         kind,
@@ -7564,6 +7571,7 @@ mod tests {
             8566198884,
             "[PROACTIVE CHECK] anything worth saying?",
             "proactive",
+            serde_json::json!({}),
         )
         .unwrap();
 
