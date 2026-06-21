@@ -37,6 +37,11 @@ pub enum ProactiveSubcommand {
         /// Minimum spacing between proactive messages (anti-nag).
         #[arg(long, default_value_t = 7200)]
         min_gap_seconds: u64,
+        /// Override the self-check directive with a specific nudge (e.g. a scheduled
+        /// "morning briefing"). Default: the open-ended "is anything worth saying?"
+        /// self-check that may stay silent.
+        #[arg(long)]
+        directive: Option<String>,
         #[arg(long)]
         once: bool,
     },
@@ -55,6 +60,7 @@ pub fn handle_proactive(command: ProactiveCommand, home: &MaturanaHome) -> anyho
             session_id,
             interval_seconds,
             min_gap_seconds,
+            directive,
             once,
         } => serve(
             home,
@@ -62,6 +68,7 @@ pub fn handle_proactive(command: ProactiveCommand, home: &MaturanaHome) -> anyho
             &session_id,
             interval_seconds.max(30),
             min_gap_seconds,
+            directive.as_deref(),
             once,
         ),
     }
@@ -106,11 +113,12 @@ fn serve(
     session_id: &str,
     interval_seconds: u64,
     min_gap_seconds: u64,
+    directive: Option<&str>,
     once: bool,
 ) -> anyhow::Result<()> {
     println!("proactive loop serving agent {agent_id}");
     loop {
-        if let Err(error) = maybe_fire(home, agent_id, session_id, min_gap_seconds) {
+        if let Err(error) = maybe_fire(home, agent_id, session_id, min_gap_seconds, directive) {
             eprintln!("proactive: {error:#}");
         }
         if once {
@@ -139,6 +147,7 @@ fn maybe_fire(
     agent_id: &str,
     session_id: &str,
     min_gap_seconds: u64,
+    directive: Option<&str>,
 ) -> anyhow::Result<bool> {
     if !should_fire(home, agent_id, min_gap_seconds) {
         return Ok(false);
@@ -153,12 +162,13 @@ fn maybe_fire(
     let Some(chat_id) = crate::channels::current_paired_telegram_chat_id(home, agent_id) else {
         return Ok(false);
     };
+    let prompt = directive.map(str::to_string).unwrap_or_else(proactive_prompt);
     crate::channels::enqueue_outreach_turn(
         home,
         agent_id,
         session_id,
         chat_id,
-        &proactive_prompt(),
+        &prompt,
         "proactive",
     )?;
     let mut state = load_state(home, agent_id);
