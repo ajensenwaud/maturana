@@ -410,6 +410,10 @@ struct WorkerPool<'a> {
     cache: std::collections::HashMap<String, Worker>,
     spawned: Vec<SpawnedVm>,
     vm_slots: SlotCounter,
+    /// Total time spent booting/provisioning spawned VMs. Excluded from the run's
+    /// wall-clock budget, which bounds agent WORK, not one-time infra setup (a
+    /// slow 8GB rootfs copy must not eat the budget meant for the actual steps).
+    spawn_elapsed: Duration,
 }
 
 impl<'a> WorkerPool<'a> {
@@ -428,7 +432,13 @@ impl<'a> WorkerPool<'a> {
             cache: std::collections::HashMap::new(),
             spawned: Vec::new(),
             vm_slots: SlotCounter::new(max_vms),
+            spawn_elapsed: Duration::ZERO,
         }
+    }
+
+    /// Total time spent spawning VMs so far, excluded from the wall budget.
+    fn spawn_elapsed(&self) -> Duration {
+        self.spawn_elapsed
     }
 
     fn resolve(&mut self, role_name: &str) -> anyhow::Result<Worker> {
@@ -466,7 +476,9 @@ impl<'a> WorkerPool<'a> {
                 let new_id = format!("orch-{}-{}", self.run_id, role_name);
                 let session_id = format!("{new_id}-main");
                 println!("  spawning a specialized VM for role '{role_name}' (cloning {})", self.base_spec);
+                let spawn_start = Instant::now();
                 crate::orchestrator_spawn_worker(self.home, &self.base_spec, &new_id, &session_id, &net)?;
+                self.spawn_elapsed += spawn_start.elapsed();
                 self.spawned.push(SpawnedVm {
                     agent_id: new_id.clone(),
                     tap_name: net.tap_name.clone(),
@@ -678,7 +690,7 @@ fn run_inner(
             stop_reason = "tick ceiling reached";
             break;
         }
-        if started.elapsed() >= wall {
+        if started.elapsed().saturating_sub(pool.spawn_elapsed()) >= wall {
             stop_reason = "wall-clock budget reached";
             break;
         }
