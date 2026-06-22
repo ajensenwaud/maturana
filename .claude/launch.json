@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "cockpit",
+      "runtimeExecutable": "C:\\Users\\aj\\Documents\\maturana\\target\\debug\\maturana.exe",
+      "runtimeArgs": [
+        "--home",
+        "C:\\Users\\aj\\Documents\\maturana\\.maturana",
+        "web",
+        "--bind",
+        "127.0.0.1:47899"
+      ],
+      "port": 47899
+    },
+    {
+      "name": "maturana-site",
+      "runtimeExecutable": "C:\\Users\\aj\\Documents\\maturana.sh\\node_modules\\.bin\\next.cmd",
+      "runtimeArgs": ["dev", "C:\\Users\\aj\\Documents\\maturana.sh", "-p", "3100"],
+      "port": 3100
+    }
+  ]
+}
