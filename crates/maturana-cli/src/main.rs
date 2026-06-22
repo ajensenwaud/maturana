@@ -3300,7 +3300,10 @@ pub(crate) fn orchestrator_spawn_worker(
             sessiond_url: format!("http://{}:47834", net.host_ip),
             sessiond_token_path: home.root().join("sessiond/token"),
             auth_source: Some(PathBuf::from(base_profile.auth_source)),
-            install_harness: true,
+            // The cloned rootfs already has the harness baked in (and its auth);
+            // just re-point the worker at this VM's session. The re-seed guard
+            // skips re-pushing auth the copy already carries.
+            install_harness: false,
             force_reseed_auth: false,
         },
     )?;
