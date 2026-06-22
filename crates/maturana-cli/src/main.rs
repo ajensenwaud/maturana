@@ -3274,6 +3274,28 @@ pub(crate) fn orchestrator_spawn_worker(
     fs::copy(&base_rootfs, &new_rootfs)
         .with_context(|| format!("failed to copy rootfs for {new_id}"))?;
 
+    // 2b. The guest's static IP is baked into the image's netplan (matched by the
+    //     interface MAC), so the copy still carries the base agent's IP. Regenerate
+    //     the netplan for THIS VM's MAC + allocated IP/gateway and write it into the
+    //     copy with virt-copy-in, the same tool the image build uses.
+    let netplan = format!(
+        "network:\n  version: 2\n  ethernets:\n    eth0:\n      match:\n        macaddress: \"{mac}\"\n      set-name: eth0\n      dhcp4: false\n      addresses:\n        - {guest_ip}/30\n      routes:\n        - to: default\n          via: {host_ip}\n      nameservers:\n        addresses:\n          - 1.1.1.1\n          - 8.8.8.8\n",
+        mac = net.guest_mac,
+        guest_ip = net.guest_ip,
+        host_ip = net.host_ip,
+    );
+    let netplan_file = rootfs_dir.join("50-maturana-firecracker.yaml");
+    fs::write(&netplan_file, &netplan)?;
+    println!("  spawn {new_id}: rewriting guest netplan to {}", net.guest_ip);
+    run_checked_process(
+        ProcessCommand::new("virt-copy-in")
+            .arg("-a")
+            .arg(&new_rootfs)
+            .arg(&netplan_file)
+            .arg("/etc/netplan"),
+        "rewrite spawned guest netplan",
+    )?;
+
     // 3. Derive the per-role spec (unique id + allocated net + this rootfs) and launch.
     let mut spec = maturana_core::orchestrator_spawn::derive_role_spec(&base_spec, new_id, net);
     if let Some(fc) = spec.vm.firecracker.as_mut() {
