@@ -1,7 +1,7 @@
 # maturana-a2a
 
-Use this skill to understand and operate Maturana's Agent2Agent (A2A) layer —
-the open-standard wire format every agent-to-agent call uses: the master
+Use this skill when operating, testing, or debugging Maturana's Agent2Agent (A2A)
+layer — the open-standard wire format every agent-to-agent call uses: the master
 orchestrator talking to its workers, and one agent delegating to a peer in-band.
 
 A2A here is JSON-RPC 2.0 over HTTP with an Agent Card for discovery. A host A2A
@@ -21,6 +21,24 @@ A2A Task whose first artifact carries the answer.
    blocking `message/send` never freezes it.
 4. The same core (`a2a_dispatch`) backs both the orchestrator (in-process, over a
    loopback A2A server it starts per run) and in-band peers (over the wire).
+
+## Preflight
+
+- Confirm the `a2a` process is running (`maturana status`) and bound to `:47837`.
+- Confirm the sessiond token exists at `.maturana/sessiond/token`.
+- Confirm the target agent is materialized and its worker is claiming turns.
+- Decide the call's depth: a delegation carries `maturana_depth`; the host refuses
+  past the cap, so don't start a chain you can't finish.
+
+## Decision Path
+
+- Orchestrator dispatch failing: check the `a2a` process + token, not the loop.
+- In-band delegation returns a `failed` task: read the reason — depth cap,
+  self-dispatch, or unknown agent — and fix the call, not the cap.
+- Agent Card fetch 404: the path must be `/a2a/<agent>/.well-known/agent-card.json`.
+- 401 on every call: the `x-maturana-session-token` header is missing or wrong.
+- A call hangs: the target agent's worker isn't claiming — inspect that agent's
+  plane, not the A2A server.
 
 ## How it's used
 
@@ -65,6 +83,18 @@ Before claiming the A2A layer is healthy, collect:
 - A `message/send` returns a JSON-RPC `result` that is an A2A Task
   (`kind: "task"`, `status.state: "completed"`, an artifact with the answer).
 - The depth cap and self-dispatch refusal return a `failed` Task with a reason.
+
+## Recovery
+
+- `a2a` process not running: start the plane with `maturana up` (it supervises it).
+- 401 unauthorized: pass the sessiond token from `.maturana/sessiond/token` in the
+  `x-maturana-session-token` header.
+- Task `failed` with a depth or self-dispatch reason: restructure the delegation
+  (shallower, or a different peer); do not raise the cap.
+- `message/send` times out: the target agent's worker is down or stuck — inspect
+  that agent's plane and queue, not the A2A server.
+- Agent Card 404: correct the well-known path to
+  `/a2a/<agent>/.well-known/agent-card.json`.
 
 ## Boundaries
 

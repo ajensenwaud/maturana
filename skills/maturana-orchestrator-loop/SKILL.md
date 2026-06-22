@@ -12,6 +12,16 @@ everything into a final answer. Hard limits live in the host program, not in any
 agent, so a run always stops and never costs without bound. This is the primary
 way an agent (e.g. Codex) takes on work that is bigger than itself.
 
+## Grounding
+
+1. Read `AGENTS.md` first.
+2. The loop command lives in `crates/maturana-cli/src/orchestrate.rs`; the
+   host-enforced limits in `crates/maturana-core/src/orchestrator_budget.rs`; the
+   roles in `crates/maturana-core/src/roles.rs`; on-demand VM spawning in
+   `crates/maturana-core/src/orchestrator_spawn.rs`.
+3. Every step is sent over the Agent2Agent (A2A) layer — read `maturana-a2a` if a
+   dispatch is failing rather than the goal.
+
 ## When to use it
 
 - The goal has parts that don't all depend on each other (research two topics at
@@ -60,6 +70,29 @@ agents cannot change them — only the host program enforces them:
 
 A plan whose worst case wouldn't fit in the turn budget is rejected up front, so a
 run ends by finishing, not by running out mid-way.
+
+## Preflight
+
+- Confirm the host plane is up (`maturana status`) and the `a2a` process is
+  running — every step travels over A2A.
+- Decide placement: spawn a fresh VM per role (needs a baked rootfs + spare
+  disk/IPs) or reuse standing agents via `roles.toml`. On a small install, reuse.
+- Size the budget to the goal before running, not after — a plan that can't fit
+  the turn budget is rejected up front.
+- Pick a `run_id` you can follow with `status` / `abort`, or let one be assigned.
+
+## Decision Path
+
+- Goal fits in one turn for one agent: don't use this — just answer directly.
+- Small install, no spare VM capacity: map roles to standing agents in
+  `roles.toml` (`reuse`), don't spawn.
+- A step dispatch errors rather than the step's work failing: the A2A layer, not
+  the goal — read `maturana-a2a`.
+- The run stops on a limit (`wall-clock budget reached`, `turn budget exhausted`):
+  the goal is too big for that budget — shrink the goal, don't reflexively raise
+  the cap.
+- The plan is rejected up front (`plan could exceed the budget` / a cycle): fix
+  the plan/goal, not the ceiling.
 
 ## Actions
 
