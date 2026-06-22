@@ -39,9 +39,23 @@ pub struct OrchestratorCommand {
 #[derive(Debug, Subcommand)]
 pub enum OrchestratorSubcommand {
     /// Run a goal to completion across multiple worker agents, with hard limits.
+    ///
+    /// By DEFAULT this reuses the agents you already have running — no config, no
+    /// VM spawning. It only spawns dedicated VMs when you ask for it with
+    /// `--base-spec`. Where the result is written is set with `--output`.
     Loop {
         /// The goal, in plain English.
         goal: String,
+        /// Where to write the result. A prose answer goes to this file (default
+        /// `<run>/answer.md`); a file/code/game deliverable is written as real
+        /// files into this directory (default `<run>/output/`).
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Reuse specific running agents, comma-separated and strongest-coder
+        /// first (e.g. `codex-firecracker,claude-firecracker`). Roles are assigned
+        /// across them. Omit to auto-reuse every running agent.
+        #[arg(long)]
+        agents: Option<String>,
         /// Override the run id (default: derived from the time + goal).
         #[arg(long)]
         run_id: Option<String>,
@@ -57,13 +71,15 @@ pub enum OrchestratorSubcommand {
         /// Lower how many worker VMs may be alive at once (can only tighten).
         #[arg(long)]
         max_vms: Option<u32>,
-        /// Optional roles.toml overriding the default role set.
+        /// Full per-role control via a roles.toml (advanced; overrides the
+        /// reuse/spawn defaults).
         #[arg(long)]
         roles_file: Option<PathBuf>,
-        /// Spec template new role VMs are spawned from when a role's placement
-        /// is `spawn` (the default). Reuse-placement roles ignore this.
-        #[arg(long, default_value = "worker-base")]
-        base_spec: String,
+        /// Opt into on-demand specialized VMs: spawn a fresh worker VM per role by
+        /// cloning this base agent/spec (slow, ~minutes per VM). Omit to reuse
+        /// standing agents instead.
+        #[arg(long)]
+        base_spec: Option<String>,
     },
     /// Show the live step list and budget for a run.
     Status { run_id: String },
@@ -574,6 +590,8 @@ pub fn handle_orchestrator(command: OrchestratorCommand, home: &MaturanaHome) ->
     match command.command {
         OrchestratorSubcommand::Loop {
             goal,
+            output,
+            agents,
             run_id,
             max_turns,
             max_wall_seconds,
@@ -589,7 +607,12 @@ pub fn handle_orchestrator(command: OrchestratorCommand, home: &MaturanaHome) ->
                 max_concurrent_vms: max_vms,
                 max_steps: None,
             };
-            run_loop(home, &goal, run_id, overrides, roles_file, &base_spec)
+            let placement = PlacementChoice {
+                roles_file,
+                agents,
+                base_spec,
+            };
+            run_loop(home, &goal, run_id, overrides, placement, output)
         }
         OrchestratorSubcommand::Status { run_id } => status(home, &run_id),
         OrchestratorSubcommand::Abort { run_id } => {
@@ -628,19 +651,94 @@ fn status(home: &MaturanaHome, run_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How the run picks its workers. Mutually-resolved in priority order:
+/// `roles_file` (full control) > `base_spec` (spawn dedicated VMs) > `agents`
+/// (reuse a named list) > default (reuse every running agent).
+struct PlacementChoice {
+    roles_file: Option<PathBuf>,
+    agents: Option<String>,
+    base_spec: Option<String>,
+}
+
+/// Reusable standing agents, strongest-coder first. Reads the materialized
+/// specs under `<home>/agents`, skips orchestrator-spawned workers (`orch-*`),
+/// and orders by harness so the heavy roles land on a capable coder by default
+/// (codex, then claude-code, then everything else, ties broken by id).
+fn discover_reusable_agents(home: &MaturanaHome) -> Vec<String> {
+    use maturana_core::HarnessRuntime;
+    let rank = |harness: Option<HarnessRuntime>| match harness {
+        Some(HarnessRuntime::Codex) => 0u8,
+        Some(HarnessRuntime::ClaudeCode) => 1,
+        Some(HarnessRuntime::Opencode) => 2,
+        None => 3,
+    };
+    let Ok(entries) = std::fs::read_dir(home.agents_dir()) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(u8, String)> = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let id = entry.file_name().to_string_lossy().to_string();
+        if id.starts_with("orch-") {
+            continue; // a previous run's ephemeral spawned worker
+        }
+        let spec_path = entry.path().join("MATURANA.md");
+        if !spec_path.exists() {
+            continue;
+        }
+        let harness = maturana_core::AgentSpec::from_maturana_markdown(&spec_path)
+            .ok()
+            .map(|s| s.runtime.harness);
+        found.push((rank(harness), id));
+    }
+    found.sort();
+    found.into_iter().map(|(_, id)| id).collect()
+}
+
+fn resolve_registry(home: &MaturanaHome, placement: &PlacementChoice) -> anyhow::Result<RoleRegistry> {
+    if let Some(path) = &placement.roles_file {
+        // Advanced: full per-role control. Un-overridden default roles spawn, so
+        // keep a base-spec fallback for them.
+        let base = placement.base_spec.clone().unwrap_or_else(|| "worker-base".to_string());
+        return RoleRegistry::load_or_default(path, &base);
+    }
+    if let Some(spec) = &placement.base_spec {
+        // Opt-in: spawn a dedicated VM per role by cloning this base.
+        println!("  placement: spawning dedicated VMs (cloning {spec})");
+        return Ok(RoleRegistry::defaults(spec));
+    }
+    let agents: Vec<String> = match &placement.agents {
+        Some(csv) => csv
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        None => discover_reusable_agents(home),
+    };
+    if agents.is_empty() {
+        anyhow::bail!(
+            "no running agents to reuse. Launch agents first (`maturana list` to see them), \
+             pass --agents <id,id>, or spawn dedicated VMs with --base-spec <agent-or-spec>."
+        );
+    }
+    println!("  placement: reusing agents {}", agents.join(", "));
+    Ok(RoleRegistry::reuse_across(&agents))
+}
+
 fn run_loop(
     home: &MaturanaHome,
     goal: &str,
     run_id: Option<String>,
     overrides: CapsOverride,
-    roles_file: Option<PathBuf>,
-    base_spec: &str,
+    placement: PlacementChoice,
+    output: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let caps = OrchestratorCaps::default().tighten_with(&overrides);
-    let registry = match &roles_file {
-        Some(path) => RoleRegistry::load_or_default(path, base_spec)?,
-        None => RoleRegistry::defaults(base_spec),
-    };
+    let registry = resolve_registry(home, &placement)?;
+    // Only spawn-placement roles consume this; reuse runs never touch it.
+    let base_spec = placement.base_spec.clone().unwrap_or_default();
     let run_id = run_id.unwrap_or_else(|| format!("run-{}", chrono::Utc::now().timestamp()));
     std::fs::create_dir_all(run_dir(home, &run_id))?;
     println!("orchestrator: run {run_id}");
@@ -674,10 +772,10 @@ fn run_loop(
         home,
         &registry,
         run_id.clone(),
-        base_spec.to_string(),
+        base_spec,
         caps.max_concurrent_vms,
     );
-    let result = run_inner(home, goal, &run_id, &registry, &caps, &mut pool, &a2a);
+    let result = run_inner(home, goal, &run_id, &registry, &caps, &mut pool, &a2a, output.as_deref());
     pool.teardown();
     result
 }
@@ -691,6 +789,7 @@ fn run_inner(
     caps: &OrchestratorCaps,
     pool: &mut WorkerPool,
     a2a: &A2aWire,
+    output: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     let mut budget = RunBudget::new(caps.clone());
     let started = Instant::now();
@@ -806,14 +905,156 @@ fn run_inner(
             summary.push_str(&format!("\n## {} ({})\n{}\n", step.id, step.role, result));
         }
     }
+    summary.push_str(DELIVERABLE_FORMAT);
     let synth_task = registry
         .frame_task("synthesizer", &summary)
         .unwrap_or(summary);
-    let answer = dispatch_and_wait(home, a2a, &synthesizer, run_id, &synth_task, &mut budget)?;
-    let answer = answer.replace(marker::DONE, "").trim().to_string();
-    std::fs::write(run_dir(home, run_id).join("answer.md"), &answer)?;
-    println!("\n=== orchestrator run {run_id}: final answer ===\n{answer}");
+    let reply = dispatch_and_wait(home, a2a, &synthesizer, run_id, &synth_task, &mut budget)?;
+    let reply = reply
+        .replace(marker::DONE, "")
+        .replace(marker::BLOCKED, "")
+        .trim()
+        .to_string();
+
+    // The deliverable is either a set of real files (code/a game/a webpage) or a
+    // prose answer. Write whichever the synthesizer produced to the chosen output.
+    match write_deliverable(home, run_id, output, &reply)? {
+        Deliverable::Files { dir, names } => {
+            println!(
+                "\n=== orchestrator run {run_id}: wrote {} file(s) to {} ===",
+                names.len(),
+                dir.display()
+            );
+            for name in &names {
+                println!("  - {name}");
+            }
+        }
+        Deliverable::Prose { path } => {
+            println!(
+                "\n=== orchestrator run {run_id}: final answer ({}) ===\n{reply}",
+                path.display()
+            );
+        }
+    }
     Ok(())
+}
+
+/// Appended to the synthesizer's task: tells it to emit a file manifest when the
+/// goal is a concrete artifact, or prose otherwise. The host materializes the
+/// manifest into real files (see [`write_deliverable`]).
+const DELIVERABLE_FORMAT: &str = "\n\n--- OUTPUT FORMAT ---\n\
+If the goal asks for one or more FILES (code, a game, a script, a webpage, a \
+document set), reply with ONLY a single JSON object and nothing else, in exactly \
+this shape:\n\
+{\"files\":[{\"path\":\"index.html\",\"content\":\"<full file contents>\"}]}\n\
+Use complete, working file contents and sensible relative paths (forward slashes, \
+never absolute or ..). Do NOT wrap the JSON in markdown fences. Otherwise, reply \
+with the prose answer directly. End your reply with [[ORCH_DONE]] on its own final line.";
+
+/// What the run produced and where it landed.
+enum Deliverable {
+    Files { dir: PathBuf, names: Vec<String> },
+    Prose { path: PathBuf },
+}
+
+#[derive(Deserialize)]
+struct FileManifest {
+    files: Vec<ManifestFile>,
+}
+
+#[derive(Deserialize)]
+struct ManifestFile {
+    path: String,
+    content: String,
+}
+
+/// Pull a `{"files":[...]}` manifest out of the synthesizer reply, if present.
+/// Accepts a bare JSON object or one inside a ```json fence; returns `None` for
+/// a prose answer so the caller falls back to writing the text as-is.
+fn extract_file_manifest(reply: &str) -> Option<Vec<ManifestFile>> {
+    let candidate = if let Some(start) = reply.find("```json") {
+        let rest = &reply[start + "```json".len()..];
+        rest.find("```").map(|end| rest[..end].trim().to_string())
+    } else {
+        let start = reply.find('{')?;
+        let end = reply.rfind('}')?;
+        if end > start {
+            Some(reply[start..=end].to_string())
+        } else {
+            None
+        }
+    }?;
+    let manifest: FileManifest = serde_json::from_str(&candidate).ok()?;
+    if manifest.files.is_empty() {
+        return None;
+    }
+    Some(manifest.files)
+}
+
+/// Normalize a manifest path to a safe relative path under the output dir:
+/// strip a leading slash, drop `.`/`..` and empty components. Returns `None` if
+/// nothing usable is left.
+fn safe_relative_path(raw: &str) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for part in raw.replace('\\', "/").split('/') {
+        match part {
+            "" | "." | ".." => continue,
+            p => out.push(p),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Write the synthesizer's deliverable. A file manifest becomes real files under
+/// the output directory (`--output` or `<run>/output/`); prose becomes a single
+/// file (`--output` or `<run>/answer.md`).
+fn write_deliverable(
+    home: &MaturanaHome,
+    run_id: &str,
+    output: Option<&std::path::Path>,
+    reply: &str,
+) -> anyhow::Result<Deliverable> {
+    if let Some(files) = extract_file_manifest(reply) {
+        let dir = output
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| run_dir(home, run_id).join("output"));
+        std::fs::create_dir_all(&dir)?;
+        let mut names = Vec::new();
+        for file in files {
+            let Some(rel) = safe_relative_path(&file.path) else {
+                continue;
+            };
+            let dest = dir.join(&rel);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&dest, file.content)?;
+            names.push(rel.to_string_lossy().to_string());
+        }
+        // Keep a copy of the raw synthesis next to the run for debugging.
+        let _ = std::fs::write(run_dir(home, run_id).join("answer.md"), reply);
+        return Ok(Deliverable::Files { dir, names });
+    }
+
+    let path = match output {
+        Some(p) if p.is_dir() || p.to_string_lossy().ends_with('/') => {
+            std::fs::create_dir_all(p)?;
+            p.join("answer.md")
+        }
+        Some(p) => {
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            p.to_path_buf()
+        }
+        None => run_dir(home, run_id).join("answer.md"),
+    };
+    std::fs::write(&path, reply)?;
+    Ok(Deliverable::Prose { path })
 }
 
 /// Complete one step, running the bounded reviewer loop synchronously if the step
@@ -906,6 +1147,43 @@ mod tests {
             attempts: 0,
             review_cycles: 0,
         }
+    }
+
+    #[test]
+    fn manifest_extracted_from_bare_json_and_fenced() {
+        // Bare JSON object.
+        let files = extract_file_manifest(
+            r#"{"files":[{"path":"index.html","content":"<h1>hi</h1>"},{"path":"game.js","content":"x=1"}]}"#,
+        )
+        .expect("bare json manifest");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "index.html");
+
+        // Fenced, with chatter around it.
+        let fenced = "Here you go:\n```json\n{\"files\":[{\"path\":\"a.py\",\"content\":\"print(1)\"}]}\n```\nDone.";
+        let files = extract_file_manifest(fenced).expect("fenced manifest");
+        assert_eq!(files[0].path, "a.py");
+    }
+
+    #[test]
+    fn prose_is_not_a_manifest() {
+        assert!(extract_file_manifest("The answer is 42. Paris has ~2.1M people.").is_none());
+        // A JSON object without a files array is prose, not a manifest.
+        assert!(extract_file_manifest(r#"{"answer":"42"}"#).is_none());
+        // An empty files array is not a deliverable.
+        assert!(extract_file_manifest(r#"{"files":[]}"#).is_none());
+    }
+
+    #[test]
+    fn safe_relative_path_blocks_traversal_and_absolutes() {
+        assert_eq!(safe_relative_path("a/b.txt").unwrap(), PathBuf::from("a/b.txt"));
+        // Leading slash, .. and . components are stripped — nothing escapes the dir.
+        assert_eq!(safe_relative_path("/etc/passwd").unwrap(), PathBuf::from("etc/passwd"));
+        assert_eq!(safe_relative_path("../../x").unwrap(), PathBuf::from("x"));
+        assert_eq!(safe_relative_path("src/./main.rs").unwrap(), PathBuf::from("src/main.rs"));
+        // Nothing usable left.
+        assert!(safe_relative_path("../..").is_none());
+        assert!(safe_relative_path("").is_none());
     }
 
     #[test]
