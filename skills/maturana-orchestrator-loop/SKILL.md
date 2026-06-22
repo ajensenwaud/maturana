@@ -115,13 +115,16 @@ written as **real files** into the `--output` directory, not a single markdown:
 
 ```bash
 maturana orchestrator loop "Build a tic-tac-toe game playable in the browser" --output ./tictactoe
-# -> ./tictactoe/index.html, ./tictactoe/game.js, ...
+# -> ./tictactoe/index.html, ./tictactoe/game.js, ./tictactoe/SUMMARY.md
 ```
 
-The output is configurable in both shapes: a prose answer goes to the `--output`
-file (default `<run>/answer.md`); a file/code/game deliverable is written into the
-`--output` directory (default `<run>/output/`). The synthesizer decides which from
-the goal; you just say where with `--output`.
+The files are the agents' REAL output — each worker writes its files inside its VM
+and the host copies those exact bytes out (binaries included); they are not retyped
+by another agent. A short `SUMMARY.md` (goal + each step's report + the file list)
+is written alongside. If the goal was prose and no worker wrote a file, the result
+is a single text answer instead (`--output` file, default `<run>/answer.md`). You
+just say where with `--output`; the system picks files-vs-prose from what the agents
+actually produced.
 
 Pick specific agents, or tighten the limits for a cheaper run:
 
@@ -155,10 +158,12 @@ Before claiming a run succeeded, collect:
 
 - The printed plan (`N steps`) and the per-step `-> sent` / `<- done` lines.
 - `maturana orchestrator status <run_id>` showing every step `Done`.
+- For a file deliverable: the printed `wrote N file(s) to <dir>` list, the real
+  files at `--output` (default `<run>/output/`), and a `SUMMARY.md` beside them.
+  The per-step `(+N file(s) collected)` lines show the bytes came off the workers'
+  VMs, not a rewrite. For a prose goal: `answer.md`.
 - The run directory `.maturana/orchestration/<run_id>/`: `plan.json` (the final
-  step list with results) and `answer.md` (the raw synthesis). For a file
-  deliverable, the printed `wrote N file(s) to <dir>` list and the files
-  themselves at `--output` (default `<run>/output/`).
+  step list with results) and `staging/` (what was fetched from the workers).
 - That the run ended on its own (completed) rather than hitting a limit — a stop
   for `wall-clock budget reached` or `turn budget exhausted` means it did not
   finish; simplify the goal or raise the relevant cap (within reason).
