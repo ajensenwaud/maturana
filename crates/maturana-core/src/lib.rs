@@ -1,3 +1,4 @@
+pub mod a2a;
 pub mod animation;
 pub mod audit;
 pub mod claude_refresh;
