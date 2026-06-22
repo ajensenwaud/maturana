@@ -377,11 +377,11 @@ fn is_aborted(home: &MaturanaHome, run_id: &str) -> bool {
 
 // ===== Worker resolution =====
 
-/// A resolved place to run a role's work: a concrete agent + its session.
+/// A resolved place to run a role's work: a concrete agent (A2A re-derives its
+/// session from the agent's worker env, so we don't carry it here).
 #[derive(Clone)]
 struct Worker {
     agent_id: String,
-    session_id: String,
     model: Option<String>,
 }
 
@@ -447,10 +447,7 @@ impl<'a> WorkerPool<'a> {
             .ok_or_else(|| anyhow::anyhow!("unknown role '{role_name}'"))?;
         let model = role.model.clone();
         let worker = match role.placement.clone() {
-            RolePlacement::Reuse { agent_id } => {
-                let session_id = crate::infer_agent_session_id(self.home, &agent_id)?;
-                Worker { agent_id, session_id, model }
-            }
+            RolePlacement::Reuse { agent_id } => Worker { agent_id, model },
             RolePlacement::Spawn { .. } => {
                 if !self.vm_slots.try_acquire() {
                     anyhow::bail!(
@@ -479,7 +476,7 @@ impl<'a> WorkerPool<'a> {
                     agent_id: new_id.clone(),
                     tap_name: net.tap_name.clone(),
                 });
-                Worker { agent_id: new_id, session_id, model }
+                Worker { agent_id: new_id, model }
             }
         };
         self.cache.insert(role_name.to_string(), worker.clone());
