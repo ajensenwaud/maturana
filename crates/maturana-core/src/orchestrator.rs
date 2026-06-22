@@ -171,6 +171,25 @@ pub fn plan_processes(config: &OrchestratorConfig) -> Vec<SupervisedProcess> {
         });
     }
 
+    // A2A (Agent2Agent) server: ONE for all agents. Lets an agent delegate to a
+    // peer in-band over A2A (and the orchestrator dispatches workers over the same
+    // protocol). Binds a public interface the guests reach over their TAP, so it
+    // needs the sessiond token; supervised only when that token exists.
+    if let Some(token) = &config.sessiond_token {
+        processes.push(SupervisedProcess {
+            name: "a2a".to_string(),
+            args: vec![
+                "a2a".to_string(),
+                "serve".to_string(),
+                "--bind".to_string(),
+                "0.0.0.0:47837".to_string(),
+                "--token".to_string(),
+                token.clone(),
+            ],
+            critical: false,
+        });
+    }
+
     // Host-owned Claude OAuth refresh: one daemon for all claude-code agents.
     if !config.claude_refresh_agents.is_empty() {
         let mut args = vec!["claude-refresh".to_string(), "serve".to_string()];
