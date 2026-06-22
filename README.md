@@ -1,14 +1,10 @@
 # Maturana
 
-> *A secure agent harness that runs every agent in its own hardware-isolated microVM. Lightweight, built to be read and understood, and completely yours to customize from Codex.*
+> *A secure agent harness that runs every agent in its own hardware-isolated microVM. Lightweight, fast, and completely yours to customise from Codex.
+> 
+Maturana is a secure, zero-trust, Codex-native AI agent platform. It has hardware isolation (Firecracker/Hyper-V), encrypted secrets (pipelock), egress network control, and a shared knowledge graph. Maturana is built on a small, modular core built in Rust, enccapculated in skills. You use Codex to interfact it Maturana, either through the CLI or the Windows / Mac application. Codex is the control plane.
 
-Maturana turns a single `MATURANA.md` file into a running, always-on AI agent inside its own
-Firecracker (Linux) or Hyper-V (Windows) microVM — with a bounded filesystem, an egress
-allowlist, encrypted secrets, durable shared memory, and one-command snapshot/rewind.
-
-You operate it by talking to the **Codex CLI** on your host: describe what you want in plain
-language and Codex runs the right skills to build, launch, and govern your agents. The `maturana`
-commands shown below are the machinery underneath — rarely your day-to-day interface.
+The result is a small, secure, and intutive agent platform.
 
 ---
 
