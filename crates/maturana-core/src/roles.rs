@@ -96,23 +96,13 @@ struct RegistryPatch {
 }
 
 impl RoleRegistry {
-    /// The built-in, harness-agnostic default roles. `default_base_spec` is the
-    /// spec template new role VMs are spawned from (so a fresh install works
-    /// without a `roles.toml`); operators point it at whatever base agent they
-    /// want specialized.
-    pub fn defaults(default_base_spec: &str) -> Self {
-        let spawn = |s: &str| RolePlacement::Spawn { base_spec: s.to_string() };
-        let role = |name: &str, description: &str, prompt: &str| Role {
-            name: name.to_string(),
-            description: description.to_string(),
-            system_prompt: prompt.to_string(),
-            model: None,
-            placement: spawn(default_base_spec),
-        };
-        let mut roles = BTreeMap::new();
-        roles.insert(
-            "coordinator".to_string(),
-            role(
+    /// The five built-in roles as `(name, description, system_prompt)` — the
+    /// harness-agnostic personas, with no placement decided yet. Both `defaults`
+    /// (spawn) and `reuse_across` (reuse) build from this one list so the prompts
+    /// never drift between the two.
+    fn core_role_defs() -> [(&'static str, &'static str, &'static str); 5] {
+        [
+            (
                 "coordinator",
                 "Breaks the goal into steps with dependencies and decides when it is done.",
                 "You are the COORDINATOR. Break the goal into the smallest sufficient list of \
@@ -120,28 +110,19 @@ impl RoleRegistry {
                  Keep the plan as small as will satisfy the goal. When the work is complete, \
                  reply with the final answer and end with the marker on its own line.",
             ),
-        );
-        roles.insert(
-            "researcher".to_string(),
-            role(
+            (
                 "researcher",
                 "Gathers facts and source material.",
                 "You are the RESEARCHER. Gather only the information the task asks for, cite \
                  sources, and return a tight, factual result. Do not write the final answer.",
             ),
-        );
-        roles.insert(
-            "developer".to_string(),
-            role(
+            (
                 "developer",
                 "Writes and edits code or concrete artifacts.",
                 "You are the DEVELOPER. Produce the specific artifact the task asks for \
                  (code, file, command). Be concrete and minimal; return exactly what was asked.",
             ),
-        );
-        roles.insert(
-            "reviewer".to_string(),
-            role(
+            (
                 "reviewer",
                 "Checks a result against acceptance criteria and approves or returns it.",
                 "You are the REVIEWER. Check the result against the stated acceptance criteria. \
@@ -149,10 +130,7 @@ impl RoleRegistry {
                  needs another pass, end with [[REVIEW: REVISE]] followed by specific, \
                  actionable feedback.",
             ),
-        );
-        roles.insert(
-            "synthesizer".to_string(),
-            role(
+            (
                 "synthesizer",
                 "Combines step results into the final answer for the user.",
                 "You are the SYNTHESIZER. Combine the completed step results into one clear \
@@ -160,8 +138,55 @@ impl RoleRegistry {
                  on its own line. If you cannot complete it, end with [[ORCH_BLOCKED]] and the \
                  reason.",
             ),
-        );
+        ]
+    }
+
+    /// Build a registry from the core roles, deciding each role's placement with
+    /// `placement_for(role_name)`.
+    fn from_core(placement_for: impl Fn(&str) -> RolePlacement) -> Self {
+        let mut roles = BTreeMap::new();
+        for (name, description, prompt) in Self::core_role_defs() {
+            roles.insert(
+                name.to_string(),
+                Role {
+                    name: name.to_string(),
+                    description: description.to_string(),
+                    system_prompt: prompt.to_string(),
+                    model: None,
+                    placement: placement_for(name),
+                },
+            );
+        }
         Self { roles }
+    }
+
+    /// The built-in roles, each spawning a dedicated microVM from `default_base_spec`.
+    /// Use this only when you explicitly want on-demand specialized VMs; for the
+    /// common case prefer [`reuse_across`](Self::reuse_across).
+    pub fn defaults(default_base_spec: &str) -> Self {
+        Self::from_core(|_| RolePlacement::Spawn {
+            base_spec: default_base_spec.to_string(),
+        })
+    }
+
+    /// The built-in roles, all REUSING standing agents — the zero-config default
+    /// when agents are already running (no `roles.toml`, no VM spawning). Agents
+    /// are assigned best-first: pass `agent_ids` ordered strongest-coder-first and
+    /// the heavy roles (developer, coordinator) land on `agent_ids[0]`, review +
+    /// synthesis on the next, research on the third — wrapping when there are
+    /// fewer agents than that. `agent_ids` must be non-empty.
+    pub fn reuse_across(agent_ids: &[String]) -> Self {
+        assert!(!agent_ids.is_empty(), "reuse_across needs at least one agent");
+        let pick = |i: usize| agent_ids[i.min(agent_ids.len() - 1)].clone();
+        Self::from_core(|name| {
+            let agent_id = match name {
+                "developer" | "coordinator" => pick(0),
+                "reviewer" | "synthesizer" => pick(1),
+                "researcher" => pick(2),
+                _ => pick(0),
+            };
+            RolePlacement::Reuse { agent_id }
+        })
     }
 
     /// Load roles from `path` (TOML) if it exists, otherwise the defaults. The
@@ -248,6 +273,44 @@ mod tests {
             assert_eq!(
                 role.placement,
                 RolePlacement::Spawn { base_spec: "worker-base".to_string() }
+            );
+        }
+    }
+
+    #[test]
+    fn reuse_across_assigns_heavy_roles_to_the_first_agent() {
+        let agents = vec![
+            "codex-firecracker".to_string(),
+            "claude-firecracker".to_string(),
+            "opencode-firecracker".to_string(),
+        ];
+        let reg = RoleRegistry::reuse_across(&agents);
+        // No role spawns; every role reuses a standing agent.
+        for name in ["coordinator", "researcher", "developer", "reviewer", "synthesizer"] {
+            assert!(matches!(
+                reg.get(name).unwrap().placement,
+                RolePlacement::Reuse { .. }
+            ));
+        }
+        let agent_of = |n: &str| match &reg.get(n).unwrap().placement {
+            RolePlacement::Reuse { agent_id } => agent_id.clone(),
+            _ => unreachable!(),
+        };
+        // Heavy roles on the strongest (first) agent; review/synth next; research third.
+        assert_eq!(agent_of("developer"), "codex-firecracker");
+        assert_eq!(agent_of("coordinator"), "codex-firecracker");
+        assert_eq!(agent_of("reviewer"), "claude-firecracker");
+        assert_eq!(agent_of("synthesizer"), "claude-firecracker");
+        assert_eq!(agent_of("researcher"), "opencode-firecracker");
+    }
+
+    #[test]
+    fn reuse_across_wraps_when_fewer_agents_than_roles() {
+        let reg = RoleRegistry::reuse_across(&["solo".to_string()]);
+        for name in ["coordinator", "researcher", "developer", "reviewer", "synthesizer"] {
+            assert_eq!(
+                reg.get(name).unwrap().placement,
+                RolePlacement::Reuse { agent_id: "solo".to_string() }
             );
         }
     }

@@ -46,14 +46,19 @@ A run uses named roles. The defaults, which you can override in a `roles.toml`:
   back for one more pass (only for steps marked for review).
 - **synthesizer** — combines the step results into the final answer.
 
-By default each role runs in its own dedicated worker VM the loop brings up for
-the run (set by `--base-spec`). On a small install you can instead point a role at
-an existing agent in `roles.toml`:
+**By default the loop reuses the agents you already have running** — no config,
+no VM spawning. It discovers them, puts the heavy roles (developer, coordinator)
+on the strongest coder, and runs. The three ways to choose workers, in order:
 
-```toml
-[roles.researcher.placement]
-reuse = { agent_id = "opencode-firecracker" }
-```
+- **Nothing (default):** reuse every running agent. Just works.
+- `--agents codex-firecracker,claude-firecracker`: reuse a specific list
+  (strongest-coder first; roles are assigned across them).
+- `--base-spec <agent-or-spec>`: opt into the on-demand specialized VMs — spawn a
+  fresh dedicated VM per role by cloning that base (slow, ~minutes per VM).
+- `--roles-file ./roles.toml`: full per-role control (custom prompt/model/placement).
+
+You only reach for a `roles.toml` when you want to hand-tune a role; the common
+case needs none.
 
 ## How it always stops (the limits)
 
@@ -75,8 +80,8 @@ run ends by finishing, not by running out mid-way.
 
 - Confirm the host plane is up (`maturana status`) and the `a2a` process is
   running — every step travels over A2A.
-- Decide placement: spawn a fresh VM per role (needs a baked rootfs + spare
-  disk/IPs) or reuse standing agents via `roles.toml`. On a small install, reuse.
+- Placement is reuse-by-default; confirm agents are running (`maturana list`). Only
+  pass `--base-spec` if you actually want to spawn dedicated VMs (slow).
 - Size the budget to the goal before running, not after — a plan that can't fit
   the turn budget is rejected up front.
 - Pick a `run_id` you can follow with `status` / `abort`, or let one be assigned.
@@ -84,8 +89,11 @@ run ends by finishing, not by running out mid-way.
 ## Decision Path
 
 - Goal fits in one turn for one agent: don't use this — just answer directly.
-- Small install, no spare VM capacity: map roles to standing agents in
-  `roles.toml` (`reuse`), don't spawn.
+- Want it to just work: run with no placement flags — it reuses running agents.
+  Reach for `--base-spec` (spawn) or `--roles-file` only when you specifically need
+  isolation or per-role tuning.
+- Goal produces files (a game, a webpage, a script): pass `--output <dir>` and the
+  files land there; don't expect a single `answer.md`.
 - A step dispatch errors rather than the step's work failing: the A2A layer, not
   the goal — read `maturana-a2a`.
 - The run stops on a limit (`wall-clock budget reached`, `turn budget exhausted`):
@@ -96,21 +104,36 @@ run ends by finishing, not by running out mid-way.
 
 ## Actions
 
-Run a goal:
+Run a goal — reuses your running agents, no flags needed:
 
 ```bash
 maturana orchestrator loop "Research the top 3 Rust web frameworks and write a one-page comparison"
 ```
 
-Tighten the limits for a cheaper run:
+Build something with files (a game, a webpage, a script) — the deliverable is
+written as **real files** into the `--output` directory, not a single markdown:
 
 ```bash
-maturana orchestrator loop "<goal>" --max-turns 12 --max-parallel 2 --max-vms 2
+maturana orchestrator loop "Build a tic-tac-toe game playable in the browser" --output ./tictactoe
+# -> ./tictactoe/index.html, ./tictactoe/game.js, ...
 ```
 
-Use a custom role set:
+The output is configurable in both shapes: a prose answer goes to the `--output`
+file (default `<run>/answer.md`); a file/code/game deliverable is written into the
+`--output` directory (default `<run>/output/`). The synthesizer decides which from
+the goal; you just say where with `--output`.
+
+Pick specific agents, or tighten the limits for a cheaper run:
 
 ```bash
+maturana orchestrator loop "<goal>" --agents codex-firecracker,claude-firecracker
+maturana orchestrator loop "<goal>" --max-turns 12 --max-parallel 2
+```
+
+Opt into dedicated spawned VMs, or take full per-role control:
+
+```bash
+maturana orchestrator loop "<goal>" --base-spec codex-firecracker --max-vms 2
 maturana orchestrator loop "<goal>" --roles-file ./roles.toml
 ```
 
@@ -133,7 +156,9 @@ Before claiming a run succeeded, collect:
 - The printed plan (`N steps`) and the per-step `-> sent` / `<- done` lines.
 - `maturana orchestrator status <run_id>` showing every step `Done`.
 - The run directory `.maturana/orchestration/<run_id>/`: `plan.json` (the final
-  step list with results) and `answer.md` (the final answer).
+  step list with results) and `answer.md` (the raw synthesis). For a file
+  deliverable, the printed `wrote N file(s) to <dir>` list and the files
+  themselves at `--output` (default `<run>/output/`).
 - That the run ended on its own (completed) rather than hitting a limit — a stop
   for `wall-clock budget reached` or `turn budget exhausted` means it did not
   finish; simplify the goal or raise the relevant cap (within reason).
@@ -144,8 +169,11 @@ Before claiming a run succeeded, collect:
   give a clearer goal.
 - "plan could exceed the budget": the goal is too big for the turn budget. Make
   the goal smaller or raise `--max-turns`.
-- A role error about "spawn placement … not wired": map that role to a standing
-  agent in `roles.toml` (see above) until on-demand VM spawning is available.
+- "no running agents to reuse": launch agents first (`maturana list`), or pass
+  `--agents <id,id>`, or spawn dedicated VMs with `--base-spec <agent-or-spec>`.
+- A file deliverable came out as prose in `answer.md` instead of files: the
+  synthesizer judged the goal as prose — rerun with a goal that clearly asks for
+  files, and pass `--output <dir>`.
 - A step keeps failing: read its result in `plan.json`; the failure stops the run
   with the partial results preserved.
 
