@@ -27,12 +27,8 @@ use maturana_core::orchestrator_budget::{CapsOverride, OrchestratorCaps, RunBudg
 use maturana_core::roles::{marker, RoleRegistry, RolePlacement};
 use maturana_core::state::MaturanaHome;
 
-/// How long to wait for a single worker step before giving up on it (seconds).
-/// Set above the in-guest harness timeout so a slow-but-alive turn is not failed
-/// prematurely.
-const STEP_TIMEOUT_SECONDS: u64 = 300;
-/// How long to wait for the coordinator's plan / the synthesizer's answer.
-const COORDINATOR_TIMEOUT_SECONDS: u64 = 300;
+// Worker step / coordinator / synthesizer timeouts are owned by the A2A client
+// ([`crate::a2a`]), which has its own per-call deadline.
 
 #[derive(Debug, Args)]
 pub struct OrchestratorCommand {
@@ -498,42 +494,69 @@ impl<'a> WorkerPool<'a> {
     }
 }
 
-// ===== Dispatch helpers =====
+// ===== A2A dispatch =====
 
-/// Send one task to a worker and block (polling) until its reply or a timeout.
-/// Charges exactly one turn against the budget BEFORE sending, so an in-flight
-/// turn is always already paid for. Used for the coordinator and synthesizer,
-/// and inside the synchronous review of a single step.
+/// The A2A wire the orchestrator dispatches over: a loopback A2A server's base
+/// URL + the sessiond token. The master orchestrator sends every worker step as
+/// an A2A `message/send` to this — so it speaks the same protocol as an agent
+/// delegating to a peer in-band.
+#[derive(Clone)]
+struct A2aWire {
+    base: String,
+    token: String,
+}
+
+/// Send one task to `agent` as an A2A `message/send` and return the reply text,
+/// or an error if the task came back failed/timed-out. `context_id` is the run
+/// id so all of a run's turns share an A2A context. The orchestrator is at
+/// delegation depth 0.
+fn a2a_send(
+    a2a: &A2aWire,
+    agent: &str,
+    model: Option<&str>,
+    context_id: &str,
+    text: &str,
+) -> anyhow::Result<String> {
+    let mut message = maturana_core::a2a::Message::user_text(&maturana_core::a2a::gen_id(), text);
+    message.context_id = Some(context_id.to_string());
+    let mut metadata = serde_json::json!({ "maturana_depth": 0 });
+    if let Some(m) = model {
+        metadata["maturana_model"] = serde_json::json!(m);
+    }
+    message.metadata = Some(metadata);
+    let task = crate::a2a::a2a_client_send(&a2a.base, agent, &a2a.token, message)?;
+    match task.status.state {
+        maturana_core::a2a::TaskState::Completed => task
+            .result_text()
+            .ok_or_else(|| anyhow::anyhow!("A2A task completed with no result")),
+        _ => anyhow::bail!(
+            "{}",
+            task.status
+                .message
+                .map(|m| m.text())
+                .unwrap_or_else(|| "A2A task failed".to_string())
+        ),
+    }
+}
+
+/// Charge one turn, then dispatch `task` to `worker` over A2A and wait for the
+/// reply. Used for the coordinator, synthesizer, and the synchronous review of a
+/// step. Charging before the call means an in-flight turn is always paid for.
 fn dispatch_and_wait(
     home: &MaturanaHome,
+    a2a: &A2aWire,
     worker: &Worker,
     run_id: &str,
     task: &str,
     budget: &mut RunBudget,
-    timeout_seconds: u64,
 ) -> anyhow::Result<String> {
     budget
         .spend_turn()
         .map_err(|_| anyhow::anyhow!("turn budget exhausted"))?;
-    let handle = crate::channels::enqueue_dispatch_turn(
-        home,
-        &worker.agent_id,
-        &worker.session_id,
-        run_id,
-        task,
-        worker.model.as_deref(),
-    )?;
-    let deadline = Instant::now() + Duration::from_secs(timeout_seconds.max(1));
-    while Instant::now() < deadline {
-        if is_aborted(home, run_id) {
-            anyhow::bail!("run aborted");
-        }
-        if let Some(reply) = crate::channels::try_collect_dispatch(home, &worker.agent_id, &handle)? {
-            return Ok(reply);
-        }
-        std::thread::sleep(Duration::from_secs(2));
+    if is_aborted(home, run_id) {
+        anyhow::bail!("run aborted");
     }
-    anyhow::bail!("timed out waiting for {} after {timeout_seconds}s", worker.agent_id)
+    a2a_send(a2a, &worker.agent_id, worker.model.as_deref(), run_id, task)
 }
 
 fn build_step_task(registry: &RoleRegistry, plan: &Plan, step: &Step) -> String {
@@ -630,6 +653,24 @@ fn run_loop(
         caps.max_total_turns, caps.max_wall_seconds, caps.max_parallel, caps.max_concurrent_vms
     );
 
+    // The orchestrator dispatches every worker step over the A2A protocol. Start
+    // a loopback A2A server for this run (dies with the process) and send to it,
+    // so the master orchestrator speaks the SAME protocol as an agent delegating
+    // to a peer in-band.
+    let token = std::fs::read_to_string(home.root().join("sessiond/token"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if token.is_empty() {
+        anyhow::bail!(
+            "the A2A wire needs the sessiond token at {}/sessiond/token",
+            home.root().display()
+        );
+    }
+    let a2a = A2aWire {
+        base: crate::a2a::start_local_a2a_server(home, &token)?,
+        token,
+    };
+
     // Run the loop with a worker pool, then ALWAYS tear down any spawned VMs —
     // whatever way run_inner returns (success, a budget stop, or an error).
     let mut pool = WorkerPool::new(
@@ -639,11 +680,12 @@ fn run_loop(
         base_spec.to_string(),
         caps.max_concurrent_vms,
     );
-    let result = run_inner(home, goal, &run_id, &registry, &caps, &mut pool);
+    let result = run_inner(home, goal, &run_id, &registry, &caps, &mut pool, &a2a);
     pool.teardown();
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_inner(
     home: &MaturanaHome,
     goal: &str,
@@ -651,6 +693,7 @@ fn run_inner(
     registry: &RoleRegistry,
     caps: &OrchestratorCaps,
     pool: &mut WorkerPool,
+    a2a: &A2aWire,
 ) -> anyhow::Result<()> {
     let mut budget = RunBudget::new(caps.clone());
     let started = Instant::now();
@@ -660,11 +703,11 @@ fn run_inner(
     let coordinator = pool.resolve("coordinator")?;
     let plan_reply = dispatch_and_wait(
         home,
+        a2a,
         &coordinator,
         run_id,
         &coordinator_task(goal, registry, caps),
         &mut budget,
-        COORDINATOR_TIMEOUT_SECONDS,
     )?;
     let mut plan =
         parse_plan(goal, &plan_reply, registry).map_err(|e| anyhow::anyhow!("planning failed: {e}"))?;
@@ -678,20 +721,21 @@ fn run_inner(
     save_plan(home, run_id, &plan)?;
     println!("  plan: {} steps", plan.steps.len());
 
-    // --- Execute: run ready steps across workers until done or a limit stops us ---
-    let mut in_flight: Vec<(String, Worker, crate::channels::DispatchHandle)> = Vec::new();
-    let mut slots = SlotCounter::new(caps.max_parallel);
+    // --- Execute: run each ready step over the A2A wire until done or stopped ---
     let mut stop_reason = "completed";
-
     loop {
-        // Liveness backstop first, then wall-clock, then abort — all independent
-        // of whether any progress happened.
+        // Liveness backstop first, then wall-clock, then budget, then abort — all
+        // independent of whether any progress happened.
         if budget.tick().is_err() {
             stop_reason = "tick ceiling reached";
             break;
         }
         if started.elapsed().saturating_sub(pool.spawn_elapsed()) >= wall {
             stop_reason = "wall-clock budget reached";
+            break;
+        }
+        if budget.turns_remaining() == 0 {
+            stop_reason = "turn budget exhausted";
             break;
         }
         if is_aborted(home, run_id) {
@@ -706,13 +750,12 @@ fn run_inner(
             break;
         }
 
-        // Dispatch ready steps to free workers (one in-flight step per agent, so
-        // a worker's single-flight VM is never double-booked).
         let ready_ids: Vec<String> = plan.ready_steps().iter().map(|s| s.id.clone()).collect();
+        if ready_ids.is_empty() {
+            stop_reason = "no runnable steps left";
+            break;
+        }
         for sid in ready_ids {
-            if slots.available() == 0 {
-                break;
-            }
             let step = plan.steps.iter().find(|s| s.id == sid).unwrap().clone();
             let worker = match pool.resolve(&step.role) {
                 Ok(w) => w,
@@ -724,50 +767,32 @@ fn run_inner(
                     continue;
                 }
             };
-            if in_flight.iter().any(|(_, w, _)| w.agent_id == worker.agent_id) {
-                continue; // that agent is busy with another step this tick
-            }
-            if budget.spend_turn().is_err() {
-                stop_reason = "turn budget exhausted";
-                break;
-            }
-            let framed = build_step_task(registry, &plan, &step);
-            let handle = crate::channels::enqueue_dispatch_turn(
-                home,
-                &worker.agent_id,
-                &worker.session_id,
-                run_id,
-                &framed,
-                worker.model.as_deref(),
-            )?;
-            slots.try_acquire();
             if let Some(s) = plan.step_mut(&sid) {
                 s.status = StepStatus::Running;
                 s.attempts += 1;
             }
-            println!("  -> step {sid} ({}) sent to {}", step.role, worker.agent_id);
-            in_flight.push((sid, worker, handle));
-        }
-
-        // Poll every in-flight step once (non-blocking), process replies.
-        let mut still = Vec::new();
-        for (sid, worker, handle) in std::mem::take(&mut in_flight) {
-            match crate::channels::try_collect_dispatch(home, &worker.agent_id, &handle)? {
-                Some(reply) => {
-                    slots.release();
-                    let result = finish_step(home, registry, run_id, &mut plan, &sid, &worker, reply, &mut budget, pool)?;
+            let framed = build_step_task(registry, &plan, &step);
+            println!("  -> step {sid} ({}) -> {} via A2A", step.role, worker.agent_id);
+            match dispatch_and_wait(home, a2a, &worker, run_id, &framed, &mut budget) {
+                Ok(reply) => {
+                    let result = finish_step(
+                        home, a2a, registry, run_id, &mut plan, &sid, &worker, reply, &mut budget, pool,
+                    )?;
                     if let Some(s) = plan.step_mut(&sid) {
                         s.result = Some(result);
                         s.status = StepStatus::Done;
                     }
                     println!("  <- step {sid} done");
                 }
-                None => still.push((sid, worker, handle)),
+                Err(error) => {
+                    eprintln!("orchestrator: step {sid} failed: {error:#}");
+                    if let Some(s) = plan.step_mut(&sid) {
+                        s.status = StepStatus::Failed;
+                    }
+                }
             }
+            save_plan(home, run_id, &plan)?;
         }
-        in_flight = still;
-        save_plan(home, run_id, &plan)?;
-        std::thread::sleep(Duration::from_secs(2));
     }
 
     save_plan(home, run_id, &plan)?;
@@ -787,7 +812,7 @@ fn run_inner(
     let synth_task = registry
         .frame_task("synthesizer", &summary)
         .unwrap_or(summary);
-    let answer = dispatch_and_wait(home, &synthesizer, run_id, &synth_task, &mut budget, COORDINATOR_TIMEOUT_SECONDS)?;
+    let answer = dispatch_and_wait(home, a2a, &synthesizer, run_id, &synth_task, &mut budget)?;
     let answer = answer.replace(marker::DONE, "").trim().to_string();
     std::fs::write(run_dir(home, run_id).join("answer.md"), &answer)?;
     println!("\n=== orchestrator run {run_id}: final answer ===\n{answer}");
@@ -797,8 +822,10 @@ fn run_inner(
 /// Complete one step, running the bounded reviewer loop synchronously if the step
 /// asked for review. Returns the accepted result text. Each reviewer turn and
 /// each revise turn charges the budget, so review ping-pong has a hard ceiling.
+#[allow(clippy::too_many_arguments)]
 fn finish_step(
     home: &MaturanaHome,
+    a2a: &A2aWire,
     registry: &RoleRegistry,
     run_id: &str,
     plan: &mut Plan,
@@ -829,7 +856,7 @@ fn finish_step(
                 ),
             )
             .unwrap_or_default();
-        let verdict = match dispatch_and_wait(home, &reviewer, run_id, &review_task, budget, STEP_TIMEOUT_SECONDS) {
+        let verdict = match dispatch_and_wait(home, a2a, &reviewer, run_id, &review_task, budget) {
             Ok(v) => v,
             Err(_) => break,
         };
@@ -849,7 +876,7 @@ fn finish_step(
                         ),
                     )
                     .unwrap_or_default();
-                current = dispatch_and_wait(home, worker, run_id, &revise_task, budget, STEP_TIMEOUT_SECONDS)?;
+                current = dispatch_and_wait(home, a2a, worker, run_id, &revise_task, budget)?;
             }
             ReviewVerdict::Unclear => {
                 cycles += 1;

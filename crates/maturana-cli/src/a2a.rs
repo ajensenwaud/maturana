@@ -189,13 +189,19 @@ pub(crate) fn a2a_dispatch(
     }
 
     let session_id = crate::infer_agent_session_id(home, target_agent)?;
+    // A per-role model override travels in metadata so it survives the A2A hop.
+    let model = message
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("maturana_model"))
+        .and_then(|m| m.as_str());
     let handle = crate::channels::enqueue_dispatch_turn(
         home,
         target_agent,
         &session_id,
         &context_id,
         &message.text(),
-        None,
+        model,
     )?;
     let deadline = Instant::now() + Duration::from_secs(A2A_REPLY_TIMEOUT_SECONDS);
     while Instant::now() < deadline {
