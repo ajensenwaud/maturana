@@ -6,6 +6,7 @@ pub mod materialize;
 pub mod mcp;
 pub mod orchestrator;
 pub mod orchestrator_budget;
+pub mod orchestrator_spawn;
 pub mod pipelock;
 pub mod pipelock_proxy;
 pub mod providers;
