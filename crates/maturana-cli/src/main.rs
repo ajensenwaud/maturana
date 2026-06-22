@@ -1,3 +1,4 @@
+mod a2a;
 mod channels;
 mod graph;
 mod orchestrate;
@@ -93,6 +94,9 @@ enum Command {
     Proactive(proactive::ProactiveCommand),
     /// Run a goal across multiple worker agents in a bounded loop.
     Orchestrator(orchestrate::OrchestratorCommand),
+    /// Serve Agent2Agent (A2A) endpoints for agent-to-agent calls.
+    #[command(hide = true)]
+    A2a(a2a::A2aCommand),
     /// Push a skill or tool to a live agent over SSH.
     Deploy(DeployCommand),
     /// Scaffold a new skill or tool locally under skills/ or tools/.
@@ -1401,6 +1405,7 @@ fn main() -> anyhow::Result<()> {
         Command::Schedule(command) => handle_schedule(command, &home)?,
         Command::Proactive(command) => proactive::handle_proactive(command, &home)?,
         Command::Orchestrator(command) => orchestrate::handle_orchestrator(command, &home)?,
+        Command::A2a(command) => a2a::handle_a2a(command, &home)?,
         Command::Deploy(command) => handle_deploy(command, &home)?,
         Command::Develop(command) => handle_develop(command)?,
         Command::Skill(command) => handle_skill(command)?,

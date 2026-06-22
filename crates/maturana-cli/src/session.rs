@@ -499,14 +499,14 @@ fn forge_impl(
     )
 }
 
-struct HttpRequest {
-    method: String,
-    path: String,
-    headers: HashMap<String, String>,
-    body: Vec<u8>,
+pub(crate) struct HttpRequest {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) headers: HashMap<String, String>,
+    pub(crate) body: Vec<u8>,
 }
 
-fn read_http_request(stream: &mut TcpStream) -> anyhow::Result<HttpRequest> {
+pub(crate) fn read_http_request(stream: &mut TcpStream) -> anyhow::Result<HttpRequest> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut data = Vec::new();
     let mut buffer = [0u8; 4096];
@@ -603,7 +603,7 @@ fn valid_identifier(value: &str) -> bool {
 
 /// Length-independent byte comparison to keep the session-token check from
 /// leaking the token through response timing on the public listener.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -614,7 +614,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn write_json_response(
+pub(crate) fn write_json_response(
     stream: &mut TcpStream,
     status: u16,
     value: &serde_json::Value,
