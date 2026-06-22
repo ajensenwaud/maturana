@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 
-use maturana_core::orchestrator_budget::{BudgetExhausted, CapsOverride, OrchestratorCaps, RunBudget, SlotCounter};
+use maturana_core::orchestrator_budget::{CapsOverride, OrchestratorCaps, RunBudget, SlotCounter};
 use maturana_core::roles::{marker, RoleRegistry, RolePlacement};
 use maturana_core::state::MaturanaHome;
 
