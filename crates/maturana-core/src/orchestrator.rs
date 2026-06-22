@@ -349,15 +349,17 @@ mod tests {
         config.agents.push(agent.clone());
 
         let processes = plan_processes(&config);
-        // sessiond + telegram + schedule + proactive
-        assert_eq!(processes.len(), 4);
+        // sessiond + a2a + telegram + schedule + proactive
+        assert_eq!(processes.len(), 5);
         assert_eq!(processes[0].name, "sessiond");
         assert!(processes[0].critical);
         assert!(processes[0].args.contains(&"--token".to_string()));
+        // A2A server (one for all agents) follows sessiond when a token exists.
+        assert_eq!(processes[1].name, "a2a");
 
-        let channel = &processes[1];
-        let schedule = &processes[2];
-        let proactive = &processes[3];
+        let channel = &processes[2];
+        let schedule = &processes[3];
+        let proactive = &processes[4];
         assert_eq!(proactive.name, "proactive:personal");
         let channel_session = session_id_arg(&channel.args);
         let schedule_session = session_id_arg(&schedule.args);
