@@ -101,6 +101,7 @@ Agent lifecycle
 Host runtime & operations
 - `maturana-cli-actions` — operate Maturana from Codex on the host (start here)
 - `maturana-orchestrate` — bring an agent's host runtime plane online / diagnose it
+- `maturana-orchestrator-loop` — run a goal across multiple worker agents in a bounded loop (spawns/reuses VMs)
 - `maturana-hostd` — check/install/diagnose the privileged host daemon (Windows)
 - `maturana-schedule` — add/list/test/debug/run agent schedules
 - `maturana-personal-agent` — turn a VM-backed agent into a personal assistant
