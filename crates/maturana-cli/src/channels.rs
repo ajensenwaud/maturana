@@ -40,7 +40,13 @@ const STREAM_BACKSTOP_AGE: Duration = Duration::from_secs(360);
 /// How long the inline streaming loop animates + waits for a turn's reply before
 /// handing the (undelivered) reply off to the background backstop.
 const STREAM_TURN_TIMEOUT: Duration = Duration::from_secs(300);
-const IDENTITY_CONTEXT_CHARS: usize = 4000;
+// AGENTS.md is the agent's own contract + operational recipes (capabilities,
+// peer delegation, honesty limits). A fully-loaded spec renders ~5KB; a 4KB cap
+// truncated it mid-recipe (the A2A delegation tail + the "## Limits" block were
+// lost), so the agent never saw how to read a peer's reply or its own caps. Keep
+// the whole file — it is authored and bounded, not unbounded context like wiki
+// or transcript. 8000 fits a maxed AGENTS.md with headroom.
+const IDENTITY_CONTEXT_CHARS: usize = 8000;
 const SOUL_CONTEXT_CHARS: usize = 4000;
 const CONTRACT_CONTEXT_CHARS: usize = 5000;
 const MEMORY_CONTEXT_CHARS: usize = 5000;
