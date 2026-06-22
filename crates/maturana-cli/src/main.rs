@@ -1,5 +1,7 @@
+mod a2a;
 mod channels;
 mod graph;
+mod orchestrate;
 mod proactive;
 mod service;
 mod personal;
@@ -90,6 +92,11 @@ enum Command {
     /// Proactivity loop runner (machine-managed by `maturana up`).
     #[command(hide = true)]
     Proactive(proactive::ProactiveCommand),
+    /// Run a goal across multiple worker agents in a bounded loop.
+    Orchestrator(orchestrate::OrchestratorCommand),
+    /// Serve Agent2Agent (A2A) endpoints for agent-to-agent calls.
+    #[command(hide = true)]
+    A2a(a2a::A2aCommand),
     /// Push a skill or tool to a live agent over SSH.
     Deploy(DeployCommand),
     /// Scaffold a new skill or tool locally under skills/ or tools/.
@@ -1397,6 +1404,8 @@ fn main() -> anyhow::Result<()> {
         Command::Heartbeat(command) => handle_heartbeat(command, &home)?,
         Command::Schedule(command) => handle_schedule(command, &home)?,
         Command::Proactive(command) => proactive::handle_proactive(command, &home)?,
+        Command::Orchestrator(command) => orchestrate::handle_orchestrator(command, &home)?,
+        Command::A2a(command) => a2a::handle_a2a(command, &home)?,
         Command::Deploy(command) => handle_deploy(command, &home)?,
         Command::Develop(command) => handle_develop(command)?,
         Command::Skill(command) => handle_skill(command)?,
@@ -3218,6 +3227,133 @@ fn setup_firecracker_tap(profile: &FirecrackerHarnessProfile) -> anyhow::Result<
             .arg(profile.cidr),
         "setup Firecracker TAP",
     )
+}
+
+/// Spawn a dedicated worker VM for an orchestration role by cloning a base
+/// Firecracker agent: create a fresh TAP on an allocated address, copy the base's
+/// baked rootfs (the drive is mounted read-write, so each VM needs its own),
+/// materialize + launch the VM, and install the guest worker reusing the base
+/// agent's harness auth. Blocks until the worker is reachable and provisioned.
+/// Tear it down with [`orchestrator_teardown_worker`].
+pub(crate) fn orchestrator_spawn_worker(
+    home: &MaturanaHome,
+    base_agent_id: &str,
+    new_id: &str,
+    session_id: &str,
+    net: &maturana_core::orchestrator_spawn::FirecrackerNet,
+) -> anyhow::Result<()> {
+    let base_profile = firecracker_profile_for(base_agent_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "--base-spec '{base_agent_id}' is not a known Firecracker agent to clone; \
+             pass an existing materialized firecracker agent id (e.g. codex-firecracker)"
+        )
+    })?;
+    let base_spec =
+        AgentSpec::from_maturana_markdown(home.agent_dir(base_agent_id).join("MATURANA.md"))?;
+    let base_rootfs = {
+        let fc = base_spec
+            .vm
+            .firecracker
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("base agent {base_agent_id} is not Firecracker"))?;
+        absolute_or_cwd(PathBuf::from(&fc.rootfs_image))?
+    };
+
+    // 1. Create the host TAP for the new VM (scoped sudo via the setup script).
+    run_checked_process(
+        ProcessCommand::new("bash")
+            .arg("./scripts/firecracker-setup-tap.sh")
+            .arg(&net.tap_name)
+            .arg(format!("{}/30", net.host_ip))
+            .arg(&net.cidr),
+        "setup orchestration worker TAP",
+    )?;
+
+    // 2. Give the VM its own rootfs (copy a baked one — no CoW required of users).
+    //    Keep it under the spawned agent's own dir: the shared images/ dir is
+    //    root-owned (from libguestfs asset prep), but agent dirs are user-owned.
+    let rootfs_dir = home.agent_dir(new_id);
+    fs::create_dir_all(&rootfs_dir)?;
+    let new_rootfs = rootfs_dir.join("ubuntu-rootfs.ext4");
+    println!("  spawn {new_id}: copying rootfs (this is a few GB)…");
+    fs::copy(&base_rootfs, &new_rootfs)
+        .with_context(|| format!("failed to copy rootfs for {new_id}"))?;
+
+    // 2b. The guest's static IP is baked into the image's netplan (matched by the
+    //     interface MAC), so the copy still carries the base agent's IP. Regenerate
+    //     the netplan for THIS VM's MAC + allocated IP/gateway and write it into the
+    //     copy with virt-copy-in, the same tool the image build uses.
+    let netplan = format!(
+        "network:\n  version: 2\n  ethernets:\n    eth0:\n      match:\n        macaddress: \"{mac}\"\n      set-name: eth0\n      dhcp4: false\n      addresses:\n        - {guest_ip}/30\n      routes:\n        - to: default\n          via: {host_ip}\n      nameservers:\n        addresses:\n          - 1.1.1.1\n          - 8.8.8.8\n",
+        mac = net.guest_mac,
+        guest_ip = net.guest_ip,
+        host_ip = net.host_ip,
+    );
+    let netplan_file = rootfs_dir.join("50-maturana-firecracker.yaml");
+    fs::write(&netplan_file, &netplan)?;
+    println!("  spawn {new_id}: rewriting guest netplan to {}", net.guest_ip);
+    run_checked_process(
+        ProcessCommand::new("virt-copy-in")
+            .arg("-a")
+            .arg(&new_rootfs)
+            .arg(&netplan_file)
+            .arg("/etc/netplan"),
+        "rewrite spawned guest netplan",
+    )?;
+
+    // 3. Derive the per-role spec (unique id + allocated net + this rootfs) and launch.
+    let mut spec = maturana_core::orchestrator_spawn::derive_role_spec(&base_spec, new_id, net);
+    if let Some(fc) = spec.vm.firecracker.as_mut() {
+        fc.rootfs_image = new_rootfs.display().to_string();
+    }
+    let markdown = spec.to_maturana_markdown()?;
+    maturana_core::materialize_agent(&spec, &markdown, home, maturana_core::LaunchMode::Apply)?;
+
+    // 4. Wait for SSH, then install the guest worker (reusing the base's auth).
+    let ssh_key = absolute_or_cwd(PathBuf::from(
+        ".maturana/images/firecracker/maturana-firecracker.id_rsa",
+    ))?;
+    let host_key = GuestHostKey::resolve(home, new_id, &net.guest_ip)?;
+    println!("  spawn {new_id}: waiting for guest SSH at {}…", net.guest_ip);
+    wait_for_guest_ssh(&net.guest_ip, "ubuntu", &ssh_key, &host_key, Duration::from_secs(180))?;
+    install_guest_worker(
+        home,
+        GuestWorkerInstall {
+            agent_id: new_id.to_string(),
+            session_id: session_id.to_string(),
+            harness: base_spec.runtime.harness.clone(),
+            guest_ip: net.guest_ip.clone(),
+            ssh_user: "ubuntu".to_string(),
+            ssh_key,
+            harness_auth_guest_path: base_profile.auth_guest_path.to_string(),
+            sessiond_url: format!("http://{}:47834", net.host_ip),
+            sessiond_token_path: home.root().join("sessiond/token"),
+            auth_source: Some(PathBuf::from(base_profile.auth_source)),
+            // The cloned rootfs already has the harness baked in (and its auth);
+            // just re-point the worker at this VM's session. The re-seed guard
+            // skips re-pushing auth the copy already carries.
+            install_harness: false,
+            force_reseed_auth: false,
+        },
+    )?;
+    println!("  spawn {new_id}: worker provisioned on {}", net.guest_ip);
+    Ok(())
+}
+
+/// Tear down a spawned worker VM: stop it, remove its TAP, and delete its rootfs
+/// copy. Best-effort — each step is independent so a partial spawn still cleans up.
+pub(crate) fn orchestrator_teardown_worker(
+    home: &MaturanaHome,
+    agent_id: &str,
+    tap_name: &str,
+) -> anyhow::Result<()> {
+    let _ = maturana_core::stop_agent(home, agent_id);
+    let _ = ProcessCommand::new("sudo")
+        .args(["-n", "ip", "link", "del", tap_name])
+        .status();
+    // Reclaim the spawned VM's whole agent dir (its rootfs copy lives there).
+    let _ = fs::remove_dir_all(home.agent_dir(agent_id));
+    Ok(())
 }
 
 fn prepare_firecracker_assets(

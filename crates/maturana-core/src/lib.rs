@@ -1,3 +1,4 @@
+pub mod a2a;
 pub mod animation;
 pub mod audit;
 pub mod claude_refresh;
@@ -5,9 +6,12 @@ pub mod improvement;
 pub mod materialize;
 pub mod mcp;
 pub mod orchestrator;
+pub mod orchestrator_budget;
+pub mod orchestrator_spawn;
 pub mod pipelock;
 pub mod pipelock_proxy;
 pub mod providers;
+pub mod roles;
 pub mod search;
 pub mod secrets;
 pub mod session_db;

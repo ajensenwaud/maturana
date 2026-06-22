@@ -239,6 +239,35 @@ fn render_guest_agents(spec: &AgentSpec) -> String {
         out.push('\n');
     }
 
+    // How to delegate a sub-task to a PEER agent over A2A (Agent2Agent). The host
+    // runs an A2A server reachable over the TAP at the sessiond host, port 47837.
+    out.push_str(
+        r#"
+## Delegating to another agent (A2A)
+
+When a sub-task is better handled by a different agent (a coding task while you
+reason; research while you write; a second opinion), delegate it to a peer over
+the Agent2Agent (A2A) protocol and use the result, instead of doing everything
+yourself. The host runs an A2A server reachable from here at your sessiond host on
+port 47837. Send a JSON-RPC `message/send`:
+
+```bash
+A2A="$(printf '%s' "$MATURANA_SESSIOND_URL" | sed 's/:47834/:47837/')"
+curl -s -X POST "$A2A/a2a/<PEER_AGENT_ID>" \
+  -H "x-maturana-session-token: $MATURANA_SESSIOND_TOKEN" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"role":"user","parts":[{"kind":"text","text":"<THE TASK FOR THE PEER>"}],"messageId":"d1","kind":"message","metadata":{"maturana_caller":"'"$MATURANA_AGENT_ID"'","maturana_depth":1}}}}'
+```
+
+The reply is an A2A Task: read `result.artifacts[0].parts[0].text` for the peer's
+answer (`result.status.state` is `completed`, or `failed` with a reason in
+`result.status.message`). A peer's id is another agent in your fleet (e.g.
+`claude-firecracker`, `codex-firecracker`, `opencode-firecracker`); GET
+`$A2A/a2a/<peer>/.well-known/agent-card.json` to see what it offers. Keep
+delegations shallow and few — the host caps nesting depth and refuses an agent
+delegating to itself.
+"#,
+    );
+
     // Be explicit about the locked boundary so the agent fails fast + honestly on
     // impossible asks (e.g. "check my iCloud email") instead of looping on blocked
     // hosts or writing code that can't run here.

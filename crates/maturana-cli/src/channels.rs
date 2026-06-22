@@ -40,7 +40,13 @@ const STREAM_BACKSTOP_AGE: Duration = Duration::from_secs(360);
 /// How long the inline streaming loop animates + waits for a turn's reply before
 /// handing the (undelivered) reply off to the background backstop.
 const STREAM_TURN_TIMEOUT: Duration = Duration::from_secs(300);
-const IDENTITY_CONTEXT_CHARS: usize = 4000;
+// AGENTS.md is the agent's own contract + operational recipes (capabilities,
+// peer delegation, honesty limits). A fully-loaded spec renders ~5KB; a 4KB cap
+// truncated it mid-recipe (the A2A delegation tail + the "## Limits" block were
+// lost), so the agent never saw how to read a peer's reply or its own caps. Keep
+// the whole file — it is authored and bounded, not unbounded context like wiki
+// or transcript. 8000 fits a maxed AGENTS.md with headroom.
+const IDENTITY_CONTEXT_CHARS: usize = 8000;
 const SOUL_CONTEXT_CHARS: usize = 4000;
 const CONTRACT_CONTEXT_CHARS: usize = 5000;
 const MEMORY_CONTEXT_CHARS: usize = 5000;
@@ -5658,6 +5664,88 @@ pub(crate) fn enqueue_channel_prompt(
     Ok(())
 }
 
+/// A handle to one dispatched orchestration step: which session it was queued in
+/// and the inbound message id to match its reply by.
+pub(crate) struct DispatchHandle {
+    pub session_id: String,
+    pub message_id: String,
+}
+
+/// Enqueue ONE orchestration step to a worker agent and return a handle to poll
+/// for its reply. Unlike a chat turn ([`enqueue_turn`]) this:
+///   * records NOTHING in the agent's visible transcript (a step is not a user
+///     message), so orchestration work never pollutes the agent's chat memory;
+///   * sends the already-framed task text verbatim (the role's instruction
+///     prefix + the task + any upstream results the loop chose) with NO
+///     host-injected transcript — so concurrent runs and live chats can never
+///     bleed context into a step;
+///   * tags the turn `channel="orchestrate"`, `platform_id=<run_id>` — a channel
+///     no live delivery loop serves — so the worker's reply is collected by the
+///     orchestrator loop on the host and can NEVER leak into a user's chat.
+/// The orchestrator loop charges the turn budget before calling this, so every
+/// turn is paid for before it is sent.
+pub(crate) fn enqueue_dispatch_turn(
+    home: &MaturanaHome,
+    agent_id: &str,
+    session_id: &str,
+    run_id: &str,
+    framed_task: &str,
+    model: Option<&str>,
+) -> anyhow::Result<DispatchHandle> {
+    let paths = session_paths(&home.agent_dir(agent_id), session_id);
+    ensure_session(&paths)?;
+    let content = serde_json::json!({
+        "text": framed_task,
+        "prompt": framed_task,
+        "model": model,
+        "reasoning": serde_json::Value::Null,
+    });
+    let message_id = insert_inbound(
+        &paths,
+        "dispatch",
+        "orchestrate",
+        run_id,
+        None,
+        &content.to_string(),
+    )?;
+    Ok(DispatchHandle {
+        session_id: session_id.to_string(),
+        message_id,
+    })
+}
+
+/// One NON-blocking poll for a dispatched step's reply. The orchestrator loop
+/// calls this for every in-flight step each tick, so one slow step never blocks
+/// the others. Returns `Ok(Some(text))` once the worker has replied (the reply
+/// row is atomically claimed via `claim_delivery` so no other path can take it,
+/// then consumed so it never reaches a chat), `Ok(None)` if not ready yet, or an
+/// error only on a real storage failure.
+pub(crate) fn try_collect_dispatch(
+    home: &MaturanaHome,
+    agent_id: &str,
+    handle: &DispatchHandle,
+) -> anyhow::Result<Option<String>> {
+    let paths = session_paths(&home.agent_dir(agent_id), &handle.session_id);
+    let Some(message) = list_undelivered(&paths)?
+        .into_iter()
+        .find(|m| m.in_reply_to.as_deref() == Some(&handle.message_id))
+    else {
+        return Ok(None);
+    };
+    // Atomically claim so a stray delivery path can never double-take the row.
+    if !claim_delivery(&paths, &message.id)? {
+        return Ok(None);
+    }
+    let text = match message_text(&message.content) {
+        Ok(text) => text,
+        // An unparseable reply is consumed (not spun on forever) and surfaced as
+        // an error string the loop treats as a failed step.
+        Err(error) => format!("[unparseable worker reply: {error}]"),
+    };
+    mark_delivered(&paths, &message.id, Some("orchestrate"))?;
+    Ok(Some(text))
+}
+
 /// A sink that delegates to a plain send closure — for text channels (Discord,
 /// Slack, AgentMail) with no live-message edit or TTS.
 struct ClosureSink<'a, F> {
@@ -6509,6 +6597,47 @@ mod tests {
         assert_eq!(a, stable_chat_key("C123"));
         assert!(a >= 0);
         assert_ne!(a, stable_chat_key("C124"));
+    }
+
+    #[test]
+    fn dispatch_turn_round_trips_and_is_never_chat_deliverable() {
+        use maturana_core::session_db::write_outbound;
+        let temp = temp_dir("dispatch");
+        let home = MaturanaHome::new(temp.path().join(".maturana"));
+
+        // Enqueue one orchestration step to a worker; nothing to collect yet.
+        let handle =
+            enqueue_dispatch_turn(&home, "worker", "s", "run-7", "do the thing", None).unwrap();
+        assert!(try_collect_dispatch(&home, "worker", &handle).unwrap().is_none());
+
+        // The step inbound is tagged on the non-deliverable orchestrate channel,
+        // not a user channel — no live delivery loop serves it.
+        let paths = session_paths(&home.agent_dir("worker"), "s");
+        let pending = maturana_core::session_db::claim_pending_inbound(&paths, 10).unwrap();
+        let step = pending.iter().find(|m| m.id == handle.message_id).unwrap();
+        assert_eq!(step.channel, "orchestrate");
+        assert_eq!(step.platform_id, "run-7");
+        assert_eq!(step.kind, "dispatch");
+
+        // The worker replies; the loop collects it exactly once, then it's consumed.
+        write_outbound(
+            &paths,
+            Some(&handle.message_id),
+            "dispatch",
+            "orchestrate",
+            "run-7",
+            None,
+            &serde_json::json!({ "text": "did the thing" }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            try_collect_dispatch(&home, "worker", &handle).unwrap().as_deref(),
+            Some("did the thing")
+        );
+        assert!(
+            try_collect_dispatch(&home, "worker", &handle).unwrap().is_none(),
+            "a collected reply is consumed and never seen again"
+        );
     }
 
     #[test]
