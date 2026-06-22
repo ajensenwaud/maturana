@@ -3265,7 +3265,9 @@ pub(crate) fn orchestrator_spawn_worker(
     )?;
 
     // 2. Give the VM its own rootfs (copy a baked one — no CoW required of users).
-    let rootfs_dir = home.root().join("images/firecracker").join(new_id);
+    //    Keep it under the spawned agent's own dir: the shared images/ dir is
+    //    root-owned (from libguestfs asset prep), but agent dirs are user-owned.
+    let rootfs_dir = home.agent_dir(new_id);
     fs::create_dir_all(&rootfs_dir)?;
     let new_rootfs = rootfs_dir.join("ubuntu-rootfs.ext4");
     println!("  spawn {new_id}: copying rootfs (this is a few GB)…");
@@ -3322,7 +3324,8 @@ pub(crate) fn orchestrator_teardown_worker(
     let _ = ProcessCommand::new("sudo")
         .args(["-n", "ip", "link", "del", tap_name])
         .status();
-    let _ = fs::remove_dir_all(home.root().join("images/firecracker").join(agent_id));
+    // Reclaim the spawned VM's whole agent dir (its rootfs copy lives there).
+    let _ = fs::remove_dir_all(home.agent_dir(agent_id));
     Ok(())
 }
 
