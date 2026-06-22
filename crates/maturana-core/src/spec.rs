@@ -424,6 +424,15 @@ impl AgentSpec {
         Ok(spec)
     }
 
+    /// Serialize this spec back to `MATURANA.md` form — YAML frontmatter plus a
+    /// heading — the inverse of [`AgentSpec::from_maturana_markdown`]. Used when
+    /// the orchestrator derives a spawned worker's spec and must write a
+    /// `MATURANA.md` that the launcher and guest-worker install can re-read.
+    pub fn to_maturana_markdown(&self) -> anyhow::Result<String> {
+        let yaml = serde_yaml::to_string(self)?;
+        Ok(format!("---\n{yaml}---\n\n# {}\n", self.identity.name))
+    }
+
     /// Realize the egress defaults that opt-in capabilities promise (see
     /// [`Capabilities`]): e.g. `image_gen: true` reaches the OpenAI images API,
     /// so `api.openai.com` must be allowed through the egress proxy. Added only

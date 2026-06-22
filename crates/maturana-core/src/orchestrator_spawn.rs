@@ -30,6 +30,9 @@ pub struct FirecrackerNet {
     pub host_ip: String,
     pub guest_ip: String,
     pub guest_mac: String,
+    /// The /30 subnet base the host/guest pair sits in (e.g. host .13 → ".12/30"),
+    /// passed to the TAP-setup script exactly like the standing agents' `cidr`.
+    pub cidr: String,
 }
 
 /// Pick a non-colliding network triple in `subnet`. Each VM uses a host/guest
@@ -50,6 +53,9 @@ pub fn allocate_net(subnet: &str, used_host_octets: &HashSet<u8>) -> Option<Fire
                 // Locally-administered MAC; last octet tracks the guest IP so it
                 // is unique per VM and easy to correlate.
                 guest_mac: format!("06:00:AC:1E:0A:{guest:02X}"),
+                // The host/guest pair sits in a /30 whose base is host-1
+                // (.1/.2 → .0/30, .5/.6 → .4/30, .13/.14 → .12/30).
+                cidr: format!("{subnet}.{}/30", host - 1),
             }
         })
 }
@@ -124,6 +130,7 @@ mod tests {
         assert_eq!(net.host_ip, "172.30.10.13");
         assert_eq!(net.guest_ip, "172.30.10.14");
         assert_eq!(net.tap_name, "tap-mat-orch-13");
+        assert_eq!(net.cidr, "172.30.10.12/30");
         assert!(net.guest_mac.starts_with("06:00:AC:1E:0A:"));
     }
 

@@ -382,34 +382,107 @@ fn is_aborted(home: &MaturanaHome, run_id: &str) -> bool {
 // ===== Worker resolution =====
 
 /// A resolved place to run a role's work: a concrete agent + its session.
+#[derive(Clone)]
 struct Worker {
     agent_id: String,
     session_id: String,
     model: Option<String>,
 }
 
-/// Resolve a role to a concrete worker. `reuse` placement uses a standing agent
-/// directly. `spawn` placement is the default and brings up a dedicated VM — but
-/// that path is wired in a later step; until then it returns a clear error so a
-/// user can map the role to a standing agent via roles.toml in the meantime.
-fn resolve_worker(home: &MaturanaHome, registry: &RoleRegistry, role_name: &str) -> anyhow::Result<Worker> {
-    let role = registry
-        .get(role_name)
-        .ok_or_else(|| anyhow::anyhow!("unknown role '{role_name}'"))?;
-    match &role.placement {
-        RolePlacement::Reuse { agent_id } => {
-            let session_id = crate::infer_agent_session_id(home, agent_id)?;
-            Ok(Worker {
-                agent_id: agent_id.clone(),
-                session_id,
-                model: role.model.clone(),
-            })
+/// A spawned worker VM to tear down at the end of a run.
+struct SpawnedVm {
+    agent_id: String,
+    tap_name: String,
+}
+
+/// Resolves each role to a concrete worker — once per run, then cached — and
+/// remembers spawned VMs so they are torn down when the run ends. A `reuse` role
+/// maps straight to a standing agent; a `spawn` role brings up a dedicated VM on
+/// demand (cloned from `base_spec`, bounded by the concurrent-VM cap), which is
+/// what lets a run use more workers than happen to be running. A role's VM is
+/// reused across all of that role's steps, so steps for one role serialize on its
+/// single worker while different roles run in parallel.
+struct WorkerPool<'a> {
+    home: &'a MaturanaHome,
+    registry: &'a RoleRegistry,
+    run_id: String,
+    base_spec: String,
+    cache: std::collections::HashMap<String, Worker>,
+    spawned: Vec<SpawnedVm>,
+    vm_slots: SlotCounter,
+}
+
+impl<'a> WorkerPool<'a> {
+    fn new(
+        home: &'a MaturanaHome,
+        registry: &'a RoleRegistry,
+        run_id: String,
+        base_spec: String,
+        max_vms: u32,
+    ) -> Self {
+        Self {
+            home,
+            registry,
+            run_id,
+            base_spec,
+            cache: std::collections::HashMap::new(),
+            spawned: Vec::new(),
+            vm_slots: SlotCounter::new(max_vms),
         }
-        RolePlacement::Spawn { base_spec } => anyhow::bail!(
-            "role '{role_name}' uses spawn placement (base spec '{base_spec}'); on-demand VM \
-             spawning is not wired yet — for now map this role to a standing agent in roles.toml: \
-             [roles.{role_name}.placement]\\nreuse = {{ agent_id = \"<agent>\" }}"
-        ),
+    }
+
+    fn resolve(&mut self, role_name: &str) -> anyhow::Result<Worker> {
+        if let Some(worker) = self.cache.get(role_name) {
+            return Ok(worker.clone());
+        }
+        let role = self
+            .registry
+            .get(role_name)
+            .ok_or_else(|| anyhow::anyhow!("unknown role '{role_name}'"))?;
+        let model = role.model.clone();
+        let worker = match role.placement.clone() {
+            RolePlacement::Reuse { agent_id } => {
+                let session_id = crate::infer_agent_session_id(self.home, &agent_id)?;
+                Worker { agent_id, session_id, model }
+            }
+            RolePlacement::Spawn { .. } => {
+                if !self.vm_slots.try_acquire() {
+                    anyhow::bail!(
+                        "the concurrent worker-VM cap is reached; raise --max-vms or use fewer roles"
+                    );
+                }
+                // `used_host_octets` re-scans materialized specs each time, and a
+                // just-spawned VM has already written its spec, so sequential
+                // spawns never collide.
+                let used = maturana_core::orchestrator_spawn::used_host_octets(
+                    self.home,
+                    maturana_core::orchestrator_spawn::DEFAULT_SUBNET,
+                );
+                let net = maturana_core::orchestrator_spawn::allocate_net(
+                    maturana_core::orchestrator_spawn::DEFAULT_SUBNET,
+                    &used,
+                )
+                .ok_or_else(|| anyhow::anyhow!("no free network address for a spawned worker VM"))?;
+                let new_id = format!("orch-{}-{}", self.run_id, role_name);
+                let session_id = format!("{new_id}-main");
+                println!("  spawning a specialized VM for role '{role_name}' (cloning {})", self.base_spec);
+                crate::orchestrator_spawn_worker(self.home, &self.base_spec, &new_id, &session_id, &net)?;
+                self.spawned.push(SpawnedVm {
+                    agent_id: new_id.clone(),
+                    tap_name: net.tap_name.clone(),
+                });
+                Worker { agent_id: new_id, session_id, model }
+            }
+        };
+        self.cache.insert(role_name.to_string(), worker.clone());
+        Ok(worker)
+    }
+
+    fn teardown(&mut self) {
+        for vm in std::mem::take(&mut self.spawned) {
+            println!("  tearing down spawned worker {}", vm.agent_id);
+            let _ = crate::orchestrator_teardown_worker(self.home, &vm.agent_id, &vm.tap_name);
+        }
     }
 }
 
@@ -538,10 +611,6 @@ fn run_loop(
     };
     let run_id = run_id.unwrap_or_else(|| format!("run-{}", chrono::Utc::now().timestamp()));
     std::fs::create_dir_all(run_dir(home, &run_id))?;
-    let mut budget = RunBudget::new(caps.clone());
-    let started = Instant::now();
-    let wall = Duration::from_secs(caps.max_wall_seconds);
-
     println!("orchestrator: run {run_id}");
     println!("  goal: {goal}");
     println!(
@@ -549,18 +618,44 @@ fn run_loop(
         caps.max_total_turns, caps.max_wall_seconds, caps.max_parallel, caps.max_concurrent_vms
     );
 
+    // Run the loop with a worker pool, then ALWAYS tear down any spawned VMs —
+    // whatever way run_inner returns (success, a budget stop, or an error).
+    let mut pool = WorkerPool::new(
+        home,
+        &registry,
+        run_id.clone(),
+        base_spec.to_string(),
+        caps.max_concurrent_vms,
+    );
+    let result = run_inner(home, goal, &run_id, &registry, &caps, &mut pool);
+    pool.teardown();
+    result
+}
+
+fn run_inner(
+    home: &MaturanaHome,
+    goal: &str,
+    run_id: &str,
+    registry: &RoleRegistry,
+    caps: &OrchestratorCaps,
+    pool: &mut WorkerPool,
+) -> anyhow::Result<()> {
+    let mut budget = RunBudget::new(caps.clone());
+    let started = Instant::now();
+    let wall = Duration::from_secs(caps.max_wall_seconds);
+
     // --- Plan: ask the coordinator to break the goal into steps ---
-    let coordinator = resolve_worker(home, &registry, "coordinator")?;
+    let coordinator = pool.resolve("coordinator")?;
     let plan_reply = dispatch_and_wait(
         home,
         &coordinator,
-        &run_id,
-        &coordinator_task(goal, &registry, &caps),
+        run_id,
+        &coordinator_task(goal, registry, caps),
         &mut budget,
         COORDINATOR_TIMEOUT_SECONDS,
     )?;
     let mut plan =
-        parse_plan(goal, &plan_reply, &registry).map_err(|e| anyhow::anyhow!("planning failed: {e}"))?;
+        parse_plan(goal, &plan_reply, registry).map_err(|e| anyhow::anyhow!("planning failed: {e}"))?;
     if !budget.admits_plan(plan.steps.len() as u32) {
         anyhow::bail!(
             "the {}-step plan could exceed the {} remaining turn budget; simplify the goal or raise --max-turns",
@@ -568,7 +663,7 @@ fn run_loop(
             budget.turns_remaining()
         );
     }
-    save_plan(home, &run_id, &plan)?;
+    save_plan(home, run_id, &plan)?;
     println!("  plan: {} steps", plan.steps.len());
 
     // --- Execute: run ready steps across workers until done or a limit stops us ---
@@ -587,7 +682,7 @@ fn run_loop(
             stop_reason = "wall-clock budget reached";
             break;
         }
-        if is_aborted(home, &run_id) {
+        if is_aborted(home, run_id) {
             stop_reason = "aborted";
             break;
         }
@@ -607,7 +702,7 @@ fn run_loop(
                 break;
             }
             let step = plan.steps.iter().find(|s| s.id == sid).unwrap().clone();
-            let worker = match resolve_worker(home, &registry, &step.role) {
+            let worker = match pool.resolve(&step.role) {
                 Ok(w) => w,
                 Err(error) => {
                     eprintln!("orchestrator: step {sid} role '{}' unresolved: {error:#}", step.role);
@@ -624,12 +719,12 @@ fn run_loop(
                 stop_reason = "turn budget exhausted";
                 break;
             }
-            let framed = build_step_task(&registry, &plan, &step);
+            let framed = build_step_task(registry, &plan, &step);
             let handle = crate::channels::enqueue_dispatch_turn(
                 home,
                 &worker.agent_id,
                 &worker.session_id,
-                &run_id,
+                run_id,
                 &framed,
                 worker.model.as_deref(),
             )?;
@@ -648,7 +743,7 @@ fn run_loop(
             match crate::channels::try_collect_dispatch(home, &worker.agent_id, &handle)? {
                 Some(reply) => {
                     slots.release();
-                    let result = finish_step(home, &registry, &run_id, &mut plan, &sid, &worker, reply, &mut budget)?;
+                    let result = finish_step(home, registry, run_id, &mut plan, &sid, &worker, reply, &mut budget, pool)?;
                     if let Some(s) = plan.step_mut(&sid) {
                         s.result = Some(result);
                         s.status = StepStatus::Done;
@@ -659,18 +754,18 @@ fn run_loop(
             }
         }
         in_flight = still;
-        save_plan(home, &run_id, &plan)?;
+        save_plan(home, run_id, &plan)?;
         std::thread::sleep(Duration::from_secs(2));
     }
 
-    save_plan(home, &run_id, &plan)?;
+    save_plan(home, run_id, &plan)?;
 
     if !plan.is_complete() {
         anyhow::bail!("orchestrator run {run_id} stopped before completion: {stop_reason}");
     }
 
     // --- Synthesize: combine the step results into the final answer ---
-    let synthesizer = resolve_worker(home, &registry, "synthesizer")?;
+    let synthesizer = pool.resolve("synthesizer")?;
     let mut summary = format!("Goal:\n{goal}\n\nCompleted step results:\n");
     for step in &plan.steps {
         if let Some(result) = &step.result {
@@ -680,9 +775,9 @@ fn run_loop(
     let synth_task = registry
         .frame_task("synthesizer", &summary)
         .unwrap_or(summary);
-    let answer = dispatch_and_wait(home, &synthesizer, &run_id, &synth_task, &mut budget, COORDINATOR_TIMEOUT_SECONDS)?;
+    let answer = dispatch_and_wait(home, &synthesizer, run_id, &synth_task, &mut budget, COORDINATOR_TIMEOUT_SECONDS)?;
     let answer = answer.replace(marker::DONE, "").trim().to_string();
-    std::fs::write(run_dir(home, &run_id).join("answer.md"), &answer)?;
+    std::fs::write(run_dir(home, run_id).join("answer.md"), &answer)?;
     println!("\n=== orchestrator run {run_id}: final answer ===\n{answer}");
     Ok(())
 }
@@ -699,6 +794,7 @@ fn finish_step(
     worker: &Worker,
     worker_reply: String,
     budget: &mut RunBudget,
+    pool: &mut WorkerPool,
 ) -> anyhow::Result<String> {
     let step = plan.steps.iter().find(|s| s.id == sid).unwrap().clone();
     if !step.review {
@@ -708,7 +804,7 @@ fn finish_step(
     let mut current = worker_reply;
     let mut cycles = 0u32;
     while cycles < max_cycles {
-        let reviewer = match resolve_worker(home, registry, "reviewer") {
+        let reviewer = match pool.resolve("reviewer") {
             Ok(w) => w,
             Err(_) => break, // no reviewer available; accept what we have
         };
