@@ -65,7 +65,7 @@ case needs none.
 Every limit can be tightened but never raised past a compiled ceiling, and the
 agents cannot change them — only the host program enforces them:
 
-- `--max-turns` (default 24): most model turns the whole run may spend. The real
+- `--max-turns` (default 40): most model turns the whole run may spend. The real
   cost ceiling.
 - `--max-wall-seconds` (default 1800): longest the run may take.
 - `--max-parallel` (default 4): most steps running at once.

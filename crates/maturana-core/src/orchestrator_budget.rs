@@ -71,7 +71,11 @@ pub struct OrchestratorCaps {
 impl Default for OrchestratorCaps {
     fn default() -> Self {
         Self {
-            max_total_turns: 24,
+            // Sized to admit a full `max_steps`-step plan's worst case
+            // (`worst_case_turns(6)` = 38, plus the coordinator turn), so the
+            // turn budget never contradicts the step cap. Typical runs spend far
+            // less; this is the ceiling, not the expected spend.
+            max_total_turns: 40,
             max_steps: 6,
             max_wall_seconds: 1800,
             max_ticks: 1200,
@@ -319,7 +323,7 @@ mod tests {
 
     #[test]
     fn overrides_can_only_tighten() {
-        let caps = OrchestratorCaps::default(); // 24 turns, 4 VMs
+        let caps = OrchestratorCaps::default(); // 40 turns, 4 VMs
         // A request to RAISE turns to 1000 is ignored (min wins); a request to
         // LOWER VMs to 1 is applied.
         let tightened = caps.tighten_with(&CapsOverride {
@@ -327,7 +331,7 @@ mod tests {
             max_concurrent_vms: Some(1),
             ..CapsOverride::default()
         });
-        assert_eq!(tightened.max_total_turns, 24, "override cannot raise the cap");
+        assert_eq!(tightened.max_total_turns, 40, "override cannot raise the cap");
         assert_eq!(tightened.max_concurrent_vms, 1, "override can lower the cap");
     }
 
@@ -364,17 +368,26 @@ mod tests {
 
     #[test]
     fn admission_rejects_a_plan_that_cannot_finish_in_budget() {
-        // Default caps: 24 turns, 6 steps, 2 review cycles, 1 replan.
+        // Default caps: 40 turns, 6 steps, 2 review cycles, 1 replan.
         // worst_case = steps * (1+2) * (1+1) + 2 = steps*6 + 2.
         let budget = RunBudget::new(OrchestratorCaps::default());
-        // 3 steps -> 20 turns worst case, fits in 24.
-        assert!(budget.admits_plan(3));
-        // 4 steps -> 26 turns worst case, does NOT fit -> rejected before running.
-        assert!(!budget.admits_plan(4));
+        // The default budget admits a FULL max_steps plan: 6 steps -> 38 worst
+        // case, fits in 40. (The turn budget no longer contradicts the step cap.)
+        assert!(budget.admits_plan(3)); // 20
+        assert!(budget.admits_plan(6)); // 38
         // Over the step cap is rejected regardless of turn math.
         assert!(!budget.admits_plan(7));
         // Empty plans are rejected too.
         assert!(!budget.admits_plan(0));
+
+        // A TIGHTENED budget still rejects a plan that cannot finish: with only
+        // 20 turns, a 4-step plan (26 worst case) is refused before any step runs.
+        let tight = RunBudget::new(OrchestratorCaps {
+            max_total_turns: 20,
+            ..OrchestratorCaps::default()
+        });
+        assert!(tight.admits_plan(3)); // 20 <= 20
+        assert!(!tight.admits_plan(4)); // 26 > 20, within step cap -> budget-rejected
     }
 
     #[test]
