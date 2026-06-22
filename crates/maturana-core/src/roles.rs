@@ -77,6 +77,24 @@ pub struct RoleRegistry {
     pub roles: BTreeMap<String, Role>,
 }
 
+/// A partial role override read from `roles.toml` — every field optional so an
+/// operator can change just one thing (commonly the placement) without restating
+/// the whole role. Merged over the defaults by [`RoleRegistry::load_or_default`].
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RolePatch {
+    name: Option<String>,
+    description: Option<String>,
+    system_prompt: Option<String>,
+    model: Option<String>,
+    placement: Option<RolePlacement>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RegistryPatch {
+    #[serde(default)]
+    roles: BTreeMap<String, RolePatch>,
+}
+
 impl RoleRegistry {
     /// The built-in, harness-agnostic default roles. `default_base_spec` is the
     /// spec template new role VMs are spawned from (so a fresh install works
@@ -146,16 +164,54 @@ impl RoleRegistry {
         Self { roles }
     }
 
-    /// Load roles from `path` (TOML) if it exists, otherwise the defaults. A
-    /// partial file is merged over the defaults so an operator can override one
-    /// role without restating them all.
+    /// Load roles from `path` (TOML) if it exists, otherwise the defaults. The
+    /// file is merged over the defaults FIELD BY FIELD: an operator can override
+    /// just where a role runs (its placement) or just its model while keeping the
+    /// default instruction prompt, e.g.
+    ///
+    /// ```toml
+    /// [roles.researcher.placement]
+    /// reuse = { agent_id = "opencode-firecracker" }
+    /// ```
+    ///
+    /// A role name not in the defaults defines a brand-new role and must at least
+    /// supply a placement.
     pub fn load_or_default(path: &Path, default_base_spec: &str) -> anyhow::Result<Self> {
         let mut registry = Self::defaults(default_base_spec);
         if path.exists() {
             let raw = std::fs::read_to_string(path)?;
-            let overrides: RoleRegistry = toml::from_str(&raw)?;
-            for (name, role) in overrides.roles {
-                registry.roles.insert(name, role);
+            let patch: RegistryPatch = toml::from_str(&raw)?;
+            for (name, fields) in patch.roles {
+                let merged = match registry.roles.get(&name).cloned() {
+                    Some(mut base) => {
+                        if let Some(v) = fields.name {
+                            base.name = v;
+                        }
+                        if let Some(v) = fields.description {
+                            base.description = v;
+                        }
+                        if let Some(v) = fields.system_prompt {
+                            base.system_prompt = v;
+                        }
+                        if fields.model.is_some() {
+                            base.model = fields.model;
+                        }
+                        if let Some(v) = fields.placement {
+                            base.placement = v;
+                        }
+                        base
+                    }
+                    None => Role {
+                        name: fields.name.unwrap_or_else(|| name.clone()),
+                        description: fields.description.unwrap_or_default(),
+                        system_prompt: fields.system_prompt.unwrap_or_default(),
+                        model: fields.model,
+                        placement: fields.placement.ok_or_else(|| {
+                            anyhow::anyhow!("new role '{name}' in roles.toml needs a placement")
+                        })?,
+                    },
+                };
+                registry.roles.insert(name, merged);
             }
         }
         Ok(registry)
@@ -216,12 +272,9 @@ mod tests {
 
     #[test]
     fn toml_overrides_merge_over_defaults() {
-        // Override just the developer to reuse a standing agent; others stay.
+        // Override ONLY where the developer runs — a field-level patch; the
+        // default instruction prompt must be kept.
         let toml_src = r#"
-[roles.developer]
-name = "developer"
-description = "custom"
-system_prompt = "Be terse."
 [roles.developer.placement]
 reuse = { agent_id = "codex-firecracker" }
 "#;
@@ -231,11 +284,13 @@ reuse = { agent_id = "codex-firecracker" }
         std::fs::write(&path, toml_src).unwrap();
 
         let reg = RoleRegistry::load_or_default(&path, "worker-base").unwrap();
-        // The override applied...
+        // The placement override applied...
         assert_eq!(
             reg.get("developer").unwrap().placement,
             RolePlacement::Reuse { agent_id: "codex-firecracker".to_string() }
         );
+        // ...while the default DEVELOPER prompt was kept (field-level merge)...
+        assert!(reg.get("developer").unwrap().system_prompt.contains("DEVELOPER"));
         // ...and the un-overridden roles kept their spawn defaults.
         assert_eq!(
             reg.get("researcher").unwrap().placement,
