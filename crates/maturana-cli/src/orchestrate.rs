@@ -795,6 +795,13 @@ fn run_inner(
     let started = Instant::now();
     let wall = Duration::from_secs(caps.max_wall_seconds);
 
+    // Where workers write real files, and where we stage what we fetch back. The
+    // deliverable is the actual bytes a worker produced in its VM — copied out
+    // over scp — not a final agent's retyping of them from a text summary.
+    let out_remote = remote_out_dir(run_id);
+    let staging_dir = run_dir(home, run_id).join("staging");
+    let mut collected_total = 0usize;
+
     // --- Plan: ask the coordinator to break the goal into steps ---
     let coordinator = pool.resolve("coordinator")?;
     let plan_reply = dispatch_and_wait(
@@ -867,7 +874,15 @@ fn run_inner(
                 s.status = StepStatus::Running;
                 s.attempts += 1;
             }
-            let framed = build_step_task(registry, &plan, &step);
+            let framed = format!(
+                "{}\n\n--- PRODUCING FILES ---\n\
+                 If this step creates any files (code, a webpage, a script, data, an \
+                 image), WRITE them as real files into the directory {out_remote}/ \
+                 (create it). Keep your text reply a brief summary of what you produced — \
+                 do NOT paste full file contents into your reply; the files are collected \
+                 from that directory automatically.",
+                build_step_task(registry, &plan, &step)
+            );
             println!("  -> step {sid} ({}) -> {} via A2A", step.role, worker.agent_id);
             match dispatch_and_wait(home, a2a, &worker, run_id, &framed, &mut budget) {
                 Ok(reply) => {
@@ -878,7 +893,14 @@ fn run_inner(
                         s.result = Some(result);
                         s.status = StepStatus::Done;
                     }
-                    println!("  <- step {sid} done");
+                    // Pull the real files this worker wrote out of its VM (best-effort).
+                    let got = collect_step_artifacts(home, &worker.agent_id, &out_remote, &staging_dir);
+                    if got > 0 {
+                        collected_total += got;
+                        println!("  <- step {sid} done (+{got} file(s) collected)");
+                    } else {
+                        println!("  <- step {sid} done");
+                    }
                 }
                 Err(error) => {
                     eprintln!("orchestrator: step {sid} failed: {error:#}");
@@ -897,7 +919,34 @@ fn run_inner(
         anyhow::bail!("orchestrator run {run_id} stopped before completion: {stop_reason}");
     }
 
-    // --- Synthesize: combine the step results into the final answer ---
+    // --- Deliver ---
+    // If the workers actually produced files, THOSE are the deliverable: the real
+    // bytes, copied straight out of the agents' VMs. We do NOT ask another agent
+    // to retype them from a summary (that loses binaries, truncates big files, and
+    // pays a turn to recreate something we already have). The synthesizer only runs
+    // as a fallback when the goal was prose and nobody wrote a file.
+    let collected_root = staging_dir.join(out_basename(&out_remote));
+    if collected_total > 0 && count_files(&collected_root) > 0 {
+        let dir = output_dir_for(home, run_id, output);
+        std::fs::create_dir_all(&dir)?;
+        let mut names = copy_tree(&collected_root, &dir)?;
+        names.sort();
+        // A short, honest summary from what each step reported — not a rewrite of
+        // the files. Sits alongside the real artifacts.
+        std::fs::write(dir.join("SUMMARY.md"), build_run_summary(goal, &plan, &names))?;
+        println!(
+            "\n=== orchestrator run {run_id}: wrote {} file(s) to {} ===",
+            names.len(),
+            dir.display()
+        );
+        for name in &names {
+            println!("  - {name}");
+        }
+        return Ok(());
+    }
+
+    // No files were produced — synthesize a prose (or, as a last resort, manifest)
+    // answer from the step results.
     let synthesizer = pool.resolve("synthesizer")?;
     let mut summary = format!("Goal:\n{goal}\n\nCompleted step results:\n");
     for step in &plan.steps {
@@ -916,8 +965,6 @@ fn run_inner(
         .trim()
         .to_string();
 
-    // The deliverable is either a set of real files (code/a game/a webpage) or a
-    // prose answer. Write whichever the synthesizer produced to the chosen output.
     match write_deliverable(home, run_id, output, &reply)? {
         Deliverable::Files { dir, names } => {
             println!(
@@ -1057,6 +1104,168 @@ fn write_deliverable(
     Ok(Deliverable::Prose { path })
 }
 
+// ===== Real-artifact collection =====
+//
+// The deliverable for a build task is the actual files an agent wrote, not a
+// second agent's retyping of them. Each worker is told to write its files into a
+// per-run directory in its VM; after the step we scp that directory out and the
+// collected files ARE the result. Everything here is best-effort: if a worker is
+// unreachable or wrote nothing, we fall back to the prose/synthesizer path.
+
+/// The directory inside a worker's VM where it writes the files it produces.
+/// Per-run, so a reused agent never serves a previous run's leftovers.
+fn remote_out_dir(run_id: &str) -> String {
+    format!("/workspace/maturana-out-{run_id}")
+}
+
+/// The trailing component of a remote out dir — what `scp -r` creates locally.
+fn out_basename(remote: &str) -> String {
+    remote.rsplit('/').find(|s| !s.is_empty()).unwrap_or("out").to_string()
+}
+
+/// The private key for SSHing into a worker's guest, by provider. Firecracker
+/// guests use the baked image key; anything else the default agent key.
+fn guest_ssh_key(home: &MaturanaHome, agent_id: &str) -> PathBuf {
+    let provider = maturana_core::AgentSpec::from_maturana_markdown(
+        home.agent_dir(agent_id).join("MATURANA.md"),
+    )
+    .ok()
+    .map(|spec| spec.vm.provider);
+    match provider {
+        Some(maturana_core::HostProvider::Firecracker) => home
+            .root()
+            .join("images/firecracker/maturana-firecracker.id_rsa"),
+        _ => home.root().join("keys/maturana-agent-ed25519"),
+    }
+}
+
+/// Copy the files a worker wrote into `remote_dir` out of its VM and into
+/// `staging_dir`. Returns how many NEW files landed. Best-effort — any failure
+/// (agent unreachable, empty dir, missing key) returns 0 without aborting.
+fn collect_step_artifacts(
+    home: &MaturanaHome,
+    agent_id: &str,
+    remote_dir: &str,
+    staging_dir: &std::path::Path,
+) -> usize {
+    let ip = match crate::resolve_guest_ip(home, agent_id, None) {
+        Ok(ip) => ip,
+        Err(_) => return 0,
+    };
+    let key = guest_ssh_key(home, agent_id);
+    if !key.exists() {
+        return 0;
+    }
+    let host_key = match crate::GuestHostKey::resolve(home, agent_id, &ip) {
+        Ok(host_key) => host_key,
+        Err(_) => return 0,
+    };
+    // Skip the copy entirely if the worker produced nothing.
+    let probe = format!("ls -A {remote_dir} 2>/dev/null | head -1");
+    match crate::run_ssh_with_stdin(&ip, "ubuntu", &key, &host_key, &probe, None) {
+        Ok(listing) if !listing.trim().is_empty() => {}
+        _ => return 0,
+    }
+    if std::fs::create_dir_all(staging_dir).is_err() {
+        return 0;
+    }
+    let roots = crate::agent_transfer_roots(home, agent_id, false)
+        .unwrap_or_else(|_| vec!["/workspace".to_string()]);
+    let landing = staging_dir.join(out_basename(remote_dir));
+    let before = count_files(&landing);
+    match crate::fetch_live_path(
+        &ip,
+        "ubuntu",
+        &key,
+        &host_key,
+        remote_dir,
+        &staging_dir.to_path_buf(),
+        &roots,
+        true,
+    ) {
+        Ok(()) => count_files(&landing).saturating_sub(before),
+        Err(error) => {
+            eprintln!("  (could not collect files from {agent_id}: {error})");
+            0
+        }
+    }
+}
+
+/// Count regular files under `dir`, recursively (0 if it doesn't exist).
+fn count_files(dir: &std::path::Path) -> usize {
+    let mut count = 0;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                count += count_files(&path);
+            } else if path.is_file() {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Recursively copy every file under `src` into `dst`, preserving layout.
+/// Returns the relative paths written (forward-slashed).
+fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Result<Vec<String>> {
+    let mut names = Vec::new();
+    copy_tree_inner(src, src, dst, &mut names)?;
+    Ok(names)
+}
+
+fn copy_tree_inner(
+    root: &std::path::Path,
+    cur: &std::path::Path,
+    dst: &std::path::Path,
+    names: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(cur)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            copy_tree_inner(root, &path, dst, names)?;
+        } else if path.is_file() {
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            let target = dst.join(rel);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&path, &target)?;
+            names.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    Ok(())
+}
+
+/// Where collected files (and the SUMMARY) are written: `--output` if given,
+/// else `<run>/output`.
+fn output_dir_for(home: &MaturanaHome, run_id: &str, output: Option<&std::path::Path>) -> PathBuf {
+    match output {
+        Some(path) => path.to_path_buf(),
+        None => run_dir(home, run_id).join("output"),
+    }
+}
+
+/// A short human summary placed beside the real files: the goal, the list of
+/// files produced, and each step's own brief report. Not a rewrite of the files.
+fn build_run_summary(goal: &str, plan: &Plan, files: &[String]) -> String {
+    let mut out = format!("# {goal}\n\n## Files produced\n");
+    if files.is_empty() {
+        out.push_str("- (none)\n");
+    }
+    for file in files {
+        out.push_str(&format!("- {file}\n"));
+    }
+    out.push_str("\n## How it was built\n");
+    for step in &plan.steps {
+        if let Some(result) = &step.result {
+            out.push_str(&format!("\n### {} ({})\n{}\n", step.id, step.role, result.trim()));
+        }
+    }
+    out
+}
+
 /// Complete one step, running the bounded reviewer loop synchronously if the step
 /// asked for review. Returns the accepted result text. Each reviewer turn and
 /// each revise turn charges the budget, so review ping-pong has a hard ceiling.
@@ -1184,6 +1393,44 @@ mod tests {
         // Nothing usable left.
         assert!(safe_relative_path("../..").is_none());
         assert!(safe_relative_path("").is_none());
+    }
+
+    #[test]
+    fn out_basename_is_the_last_segment() {
+        assert_eq!(out_basename("/workspace/maturana-out-run-123"), "maturana-out-run-123");
+        assert_eq!(out_basename("/workspace/maturana-out-run-123/"), "maturana-out-run-123");
+    }
+
+    #[test]
+    fn copy_tree_preserves_layout_and_counts_files() {
+        let base = std::env::temp_dir().join(format!("orch-copytree-{}", std::process::id()));
+        let src = base.join("src");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(src.join("css")).unwrap();
+        std::fs::write(src.join("index.html"), "<h1>hi</h1>").unwrap();
+        std::fs::write(src.join("css/style.css"), "body{}").unwrap();
+        assert_eq!(count_files(&src), 2);
+        assert_eq!(count_files(&base.join("nope")), 0);
+
+        let mut names = copy_tree(&src, &dst).unwrap();
+        names.sort();
+        assert_eq!(names, vec!["css/style.css".to_string(), "index.html".to_string()]);
+        // The real bytes are copied, not regenerated.
+        assert_eq!(std::fs::read_to_string(dst.join("index.html")).unwrap(), "<h1>hi</h1>");
+        assert_eq!(std::fs::read_to_string(dst.join("css/style.css")).unwrap(), "body{}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn run_summary_lists_files_and_step_reports() {
+        let mut dev = step("s1", &[], StepStatus::Done);
+        dev.role = "developer".to_string();
+        dev.result = Some("Wrote index.html with the board and win logic.".to_string());
+        let plan = Plan { goal: "build a game".to_string(), steps: vec![dev] };
+        let md = build_run_summary("build a game", &plan, &["index.html".to_string()]);
+        assert!(md.contains("## Files produced"));
+        assert!(md.contains("- index.html"));
+        assert!(md.contains("Wrote index.html")); // the step's own words, not a rewrite
     }
 
     #[test]
