@@ -105,7 +105,7 @@ Before claiming a board run succeeded, collect:
 
 - Do not treat the board as a new execution backend — a card always runs in its
   assignee's VM over A2A; there is no local/Docker/SSH shortcut (that is the
-  zero-trust line, see `docs/hermes-parity.md`).
+  zero-trust line, see `docs/multi-agent-orchestration.md`).
 - Do not raise a cap to get past a budget stop — the ceilings are host-enforced and
   an agent cannot widen them.
 - Do not hand a card work that rewrites another agent's identity files; a card is a

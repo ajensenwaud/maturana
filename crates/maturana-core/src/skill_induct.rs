@@ -1,5 +1,5 @@
-//! Auto-skill induction — Maturana's zero-trust answer to Hermes' "the agent
-//! writes its own skills from your repeated workflows".
+//! Auto-skill induction — the agent's repeated workflows become proposed skills,
+//! the zero-trust way.
 //!
 //! It surfaces RECURRING task patterns from the trajectory store and PROPOSES a
 //! skill draft for each. It never installs anything. An agent observing its own

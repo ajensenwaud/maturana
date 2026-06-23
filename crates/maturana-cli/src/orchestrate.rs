@@ -1739,7 +1739,7 @@ mod tests {
     }
 }
 
-// ===== Multi-agent board (Hermes-style Kanban) =====
+// ===== Multi-agent task board (Kanban) =====
 //
 // A persistent board of cards that a dispatcher runs to completion: it claims
 // every ready card (deps satisfied) and runs it on its assignee over A2A — in
@@ -1747,7 +1747,7 @@ mod tests {
 // VM isolation, same real-artifact collection as the orchestrator loop; the
 // board just makes the work durable and user-editable instead of a one-shot
 // plan, and never becomes a new (weaker) execution substrate. See
-// docs/hermes-parity.md.
+// docs/multi-agent-orchestration.md.
 
 #[derive(Debug, Args)]
 pub struct BoardCommand {

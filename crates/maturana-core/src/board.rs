@@ -1,6 +1,6 @@
 //! Persistent multi-agent Kanban board — the durable coordination layer a
 //! dispatcher loop works through, claiming ready cards and running each on its
-//! assignee. This is Maturana's zero-trust realization of Hermes' Kanban: the
+//! assignee. It is Maturana's zero-trust task board: the
 //! data model lives here (pure + serializable); the dispatcher that actually
 //! runs a card over A2A lives in the CLI, because running a card means giving an
 //! agent VM work — and every agent runs in its own VM, the same as everywhere
