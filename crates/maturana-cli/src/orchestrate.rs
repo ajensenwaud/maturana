@@ -90,6 +90,33 @@ pub enum OrchestratorSubcommand {
     Status { run_id: String },
     /// Stop a run (takes effect between steps; in-flight steps finish their lease).
     Abort { run_id: String },
+    /// List every run and its state (complete / incomplete / aborted / failed) —
+    /// runs are durable on disk, so this survives a host restart.
+    List,
+    /// Resume an interrupted run from its saved plan: completed steps are kept,
+    /// unfinished (running/failed) steps are re-queued and driven to completion.
+    /// Caps/placement flags may be re-specified, as for `loop`.
+    Resume {
+        run_id: String,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        no_verify: bool,
+        #[arg(long)]
+        agents: Option<String>,
+        #[arg(long)]
+        base_spec: Option<String>,
+        #[arg(long)]
+        roles_file: Option<PathBuf>,
+        #[arg(long)]
+        max_turns: Option<u32>,
+        #[arg(long)]
+        max_wall_seconds: Option<u64>,
+        #[arg(long)]
+        max_parallel: Option<u32>,
+        #[arg(long)]
+        max_vms: Option<u32>,
+    },
 }
 
 /// One step's lifecycle state.
@@ -627,7 +654,171 @@ pub fn handle_orchestrator(command: OrchestratorCommand, home: &MaturanaHome) ->
             println!("orchestrator: abort requested for {run_id} (in-flight steps finish their lease)");
             Ok(())
         }
+        OrchestratorSubcommand::List => list_runs(home),
+        OrchestratorSubcommand::Resume {
+            run_id,
+            output,
+            no_verify,
+            agents,
+            base_spec,
+            roles_file,
+            max_turns,
+            max_wall_seconds,
+            max_parallel,
+            max_vms,
+        } => {
+            let overrides = CapsOverride {
+                max_total_turns: max_turns,
+                max_wall_seconds,
+                max_parallel,
+                max_concurrent_vms: max_vms,
+                max_steps: None,
+            };
+            let placement = PlacementChoice {
+                roles_file,
+                agents,
+                base_spec,
+            };
+            resume_run(home, &run_id, overrides, placement, output, !no_verify)
+        }
     }
+}
+
+/// Re-queue a resumed run's interrupted (`Running`) and `Failed` steps back to
+/// `Waiting` so they run again; `Done` steps are kept. Returns how many reset.
+fn requeue_unfinished(plan: &mut Plan) -> usize {
+    let mut count = 0;
+    for step in &mut plan.steps {
+        if matches!(step.status, StepStatus::Running | StepStatus::Failed) {
+            step.status = StepStatus::Waiting;
+            count += 1;
+        }
+    }
+    count
+}
+
+/// The on-disk state of every run, oldest id first. Runs are durable — this
+/// survives a host/plane restart, which is the point of `resume`.
+fn run_state_label(home: &MaturanaHome, run_id: &str, plan: &Plan) -> &'static str {
+    if plan.is_complete() {
+        "complete"
+    } else if is_aborted(home, run_id) {
+        "aborted"
+    } else if plan.has_failure() {
+        "failed"
+    } else {
+        "incomplete"
+    }
+}
+
+fn list_runs(home: &MaturanaHome) -> anyhow::Result<()> {
+    let dir = home.root().join("orchestration");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        println!("no orchestrator runs yet");
+        return Ok(());
+    };
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let run_id = entry.file_name().to_string_lossy().to_string();
+        let Ok(raw) = std::fs::read_to_string(entry.path().join("plan.json")) else {
+            continue;
+        };
+        let Ok(plan) = serde_json::from_str::<Plan>(&raw) else {
+            continue;
+        };
+        let done = plan.steps.iter().filter(|s| s.status == StepStatus::Done).count();
+        let goal = plan.goal.chars().take(56).collect::<String>();
+        rows.push((
+            run_id.clone(),
+            format!(
+                "{:<11} {}/{} steps  {}",
+                run_state_label(home, &run_id, &plan),
+                done,
+                plan.steps.len(),
+                goal
+            ),
+        ));
+    }
+    if rows.is_empty() {
+        println!("no orchestrator runs yet");
+        return Ok(());
+    }
+    rows.sort();
+    println!("{} run(s):", rows.len());
+    for (run_id, summary) in rows {
+        println!("  {run_id:<24} {summary}");
+    }
+    println!("\nresume an incomplete run with: maturana orchestrator resume <run_id>");
+    Ok(())
+}
+
+/// Resume an interrupted run from its durable plan: keep `Done` steps, re-queue
+/// `Running`/`Failed` ones, clear any abort, and drive it to completion using the
+/// same execute+deliver path as a fresh run (just skipping the planning turn).
+#[allow(clippy::too_many_arguments)]
+fn resume_run(
+    home: &MaturanaHome,
+    run_id: &str,
+    overrides: CapsOverride,
+    placement: PlacementChoice,
+    output: Option<PathBuf>,
+    verify: bool,
+) -> anyhow::Result<()> {
+    let plan_path = run_dir(home, run_id).join("plan.json");
+    if !plan_path.exists() {
+        anyhow::bail!("no run '{run_id}' to resume (nothing at {})", plan_path.display());
+    }
+    let mut plan: Plan = serde_json::from_str(&std::fs::read_to_string(&plan_path)?)?;
+    if plan.is_complete() {
+        println!("orchestrator: run {run_id} is already complete — nothing to resume");
+        return Ok(());
+    }
+    // Interrupted or failed steps re-run; completed steps are kept.
+    let requeued = requeue_unfinished(&mut plan);
+    // A resume is, by definition, not aborted.
+    let _ = std::fs::remove_file(abort_marker(home, run_id));
+    save_plan(home, run_id, &plan)?;
+
+    let caps = OrchestratorCaps::default().tighten_with(&overrides);
+    let registry = resolve_registry(home, &placement)?;
+    let base_spec = placement.base_spec.clone().unwrap_or_default();
+    let done = plan.steps.iter().filter(|s| s.status == StepStatus::Done).count();
+    println!("orchestrator: resuming {run_id}");
+    println!("  goal: {}", plan.goal);
+    println!("  {done} of {} step(s) already done; {requeued} re-queued", plan.steps.len());
+
+    let token = std::fs::read_to_string(home.root().join("sessiond/token"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if token.is_empty() {
+        anyhow::bail!(
+            "the A2A wire needs the sessiond token at {}/sessiond/token",
+            home.root().display()
+        );
+    }
+    let a2a = A2aWire {
+        base: crate::a2a::start_local_a2a_server(home, &token)?,
+        token,
+    };
+    let mut pool = WorkerPool::new(home, &registry, run_id.to_string(), base_spec, caps.max_concurrent_vms);
+    let goal = plan.goal.clone();
+    let result = run_inner(
+        home,
+        &goal,
+        run_id,
+        &registry,
+        &caps,
+        &mut pool,
+        &a2a,
+        output.as_deref(),
+        verify,
+        Some(plan),
+    );
+    pool.teardown();
+    result
 }
 
 fn status(home: &MaturanaHome, run_id: &str) -> anyhow::Result<()> {
@@ -784,7 +975,7 @@ fn run_loop(
         caps.max_concurrent_vms,
     );
     let result = run_inner(
-        home, goal, &run_id, &registry, &caps, &mut pool, &a2a, output.as_deref(), verify,
+        home, goal, &run_id, &registry, &caps, &mut pool, &a2a, output.as_deref(), verify, None,
     );
     pool.teardown();
     result
@@ -801,6 +992,7 @@ fn run_inner(
     a2a: &A2aWire,
     output: Option<&std::path::Path>,
     verify: bool,
+    resume_plan: Option<Plan>,
 ) -> anyhow::Result<()> {
     let mut budget = RunBudget::new(caps.clone());
     let started = Instant::now();
@@ -817,27 +1009,40 @@ fn run_inner(
     let mut builder: Option<String> = None;
     let mut builder_files = 0usize;
 
-    // --- Plan: ask the coordinator to break the goal into steps ---
-    let coordinator = pool.resolve("coordinator")?;
-    let plan_reply = dispatch_and_wait(
-        home,
-        a2a,
-        &coordinator,
-        run_id,
-        &coordinator_task(goal, registry, caps),
-        &mut budget,
-    )?;
-    let mut plan =
-        parse_plan(goal, &plan_reply, registry).map_err(|e| anyhow::anyhow!("planning failed: {e}"))?;
-    if !budget.admits_plan(plan.steps.len() as u32) {
-        anyhow::bail!(
-            "the {}-step plan could exceed the {} remaining turn budget; simplify the goal or raise --max-turns",
-            plan.steps.len(),
-            budget.turns_remaining()
-        );
-    }
-    save_plan(home, run_id, &plan)?;
-    println!("  plan: {} steps", plan.steps.len());
+    // --- Plan: from disk (resume) or by asking the coordinator (fresh run) ---
+    let mut plan = match resume_plan {
+        Some(plan) => {
+            // Durable resume: the plan already exists; skip the planning turn and
+            // re-enter the execute loop. The unfinished steps were re-queued by
+            // the caller.
+            let remaining = plan.steps.iter().filter(|s| s.status != StepStatus::Done).count();
+            println!("  resuming plan: {} step(s) left of {}", remaining, plan.steps.len());
+            plan
+        }
+        None => {
+            let coordinator = pool.resolve("coordinator")?;
+            let plan_reply = dispatch_and_wait(
+                home,
+                a2a,
+                &coordinator,
+                run_id,
+                &coordinator_task(goal, registry, caps),
+                &mut budget,
+            )?;
+            let plan = parse_plan(goal, &plan_reply, registry)
+                .map_err(|e| anyhow::anyhow!("planning failed: {e}"))?;
+            if !budget.admits_plan(plan.steps.len() as u32) {
+                anyhow::bail!(
+                    "the {}-step plan could exceed the {} remaining turn budget; simplify the goal or raise --max-turns",
+                    plan.steps.len(),
+                    budget.turns_remaining()
+                );
+            }
+            save_plan(home, run_id, &plan)?;
+            println!("  plan: {} steps", plan.steps.len());
+            plan
+        }
+    };
 
     // --- Execute: run each ready step over the A2A wire until done or stopped ---
     let mut stop_reason = "completed";
@@ -1546,6 +1751,36 @@ mod tests {
             attempts: 0,
             review_cycles: 0,
         }
+    }
+
+    #[test]
+    fn requeue_unfinished_resets_running_and_failed_keeps_done() {
+        let mut plan = Plan {
+            goal: "g".to_string(),
+            steps: vec![
+                step("s1", &[], StepStatus::Done),
+                step("s2", &[], StepStatus::Running),
+                step("s3", &[], StepStatus::Failed),
+                step("s4", &[], StepStatus::Waiting),
+            ],
+        };
+        let reset = requeue_unfinished(&mut plan);
+        assert_eq!(reset, 2, "running + failed are re-queued");
+        assert_eq!(plan.steps[0].status, StepStatus::Done); // completed work is kept
+        assert_eq!(plan.steps[1].status, StepStatus::Waiting);
+        assert_eq!(plan.steps[2].status, StepStatus::Waiting);
+        assert_eq!(plan.steps[3].status, StepStatus::Waiting);
+        assert!(!plan.is_complete());
+    }
+
+    #[test]
+    fn requeue_on_a_complete_plan_is_a_noop() {
+        let mut plan = Plan {
+            goal: "g".to_string(),
+            steps: vec![step("s1", &[], StepStatus::Done)],
+        };
+        assert!(plan.is_complete());
+        assert_eq!(requeue_unfinished(&mut plan), 0);
     }
 
     #[test]
