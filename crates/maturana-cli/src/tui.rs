@@ -692,7 +692,7 @@ const LOGO: [&str; 6] = [
     "██║ ╚═╝ ██║██║  ██║   ██║   ╚██████╔╝██║  ██║██║  ██║██║ ╚████║██║  ██║",
     "╚═╝     ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝",
 ];
-const LOGO_SUB: &str = "secure multi-agent orchestration · firecracker microVMs";
+const LOGO_SUB: &str = "Secure, lean, codex-native";
 
 /// The cool palette (teal → sky → violet) sampled at column `col` of `width`.
 fn logo_rgb(col: usize, width: usize) -> Color {

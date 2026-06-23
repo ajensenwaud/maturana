@@ -20,7 +20,7 @@ WORDMARK = [
     "╚═╝     ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝",
 ]
 
-SUBTITLE = "secure multi-agent orchestration · firecracker microVMs"
+SUBTITLE = "Secure, lean, codex-native"
 
 # Each palette is a list of RGB stops the gradient interpolates between.
 PALETTES = {
