@@ -94,6 +94,8 @@ enum Command {
     Proactive(proactive::ProactiveCommand),
     /// Run a goal across multiple worker agents in a bounded loop.
     Orchestrator(orchestrate::OrchestratorCommand),
+    /// Route inbound messages (by channel/sender/content) to the right agent.
+    Route(RouteCommand),
     /// Serve Agent2Agent (A2A) endpoints for agent-to-agent calls.
     #[command(hide = true)]
     A2a(a2a::A2aCommand),
@@ -361,6 +363,48 @@ struct UpCommand {
 struct SpecCommand {
     #[command(subcommand)]
     command: SpecSubcommand,
+}
+
+#[derive(Debug, Args)]
+struct RouteCommand {
+    #[command(subcommand)]
+    command: RouteSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum RouteSubcommand {
+    /// Add a rule: an inbound matching the given conditions routes to `--agent`.
+    /// Conditions are optional and ANDed; unset = wildcard. Most specific wins.
+    Add {
+        #[arg(long)]
+        agent: String,
+        /// Match only this channel (telegram/discord/slack/agentmail/webhook/…).
+        #[arg(long)]
+        channel: Option<String>,
+        /// Match only this sender / peer / chat id.
+        #[arg(long)]
+        from: Option<String>,
+        /// Match only messages containing this text (case-insensitive).
+        #[arg(long)]
+        contains: Option<String>,
+    },
+    /// Set the default agent for inbound that matches no rule.
+    Default { agent: String },
+    /// Show the routing table.
+    List,
+    /// Remove rule number N (as shown by `list`, 1-based).
+    Remove { index: usize },
+    /// Test where an inbound would route (prints the resolved agent).
+    Test {
+        #[arg(long)]
+        channel: String,
+        #[arg(long, default_value = "")]
+        from: String,
+        #[arg(long, default_value = "")]
+        text: String,
+    },
+    /// Remove every rule and the default.
+    Clear,
 }
 
 #[derive(Debug, Args)]
@@ -1405,6 +1449,7 @@ fn main() -> anyhow::Result<()> {
         Command::Schedule(command) => handle_schedule(command, &home)?,
         Command::Proactive(command) => proactive::handle_proactive(command, &home)?,
         Command::Orchestrator(command) => orchestrate::handle_orchestrator(command, &home)?,
+        Command::Route(command) => handle_route(command, &home)?,
         Command::A2a(command) => a2a::handle_a2a(command, &home)?,
         Command::Deploy(command) => handle_deploy(command, &home)?,
         Command::Develop(command) => handle_develop(command)?,
@@ -1490,6 +1535,81 @@ fn trim_trailing_newlines(mut value: String) -> String {
         value.pop();
     }
     value
+}
+
+/// Manage the multi-agent routing table: which agent an inbound message goes to,
+/// by channel/sender/content. A dispatch table only — agents stay VM-isolated.
+fn handle_route(command: RouteCommand, home: &MaturanaHome) -> anyhow::Result<()> {
+    use maturana_core::routing::{Route, RoutingTable};
+    match command.command {
+        RouteSubcommand::Add {
+            agent,
+            channel,
+            from,
+            contains,
+        } => {
+            let mut table = RoutingTable::load(home)?;
+            let route = Route {
+                channel,
+                sender: from,
+                contains,
+                agent: agent.clone(),
+            };
+            println!("added route: {} -> {agent}", route.describe());
+            table.routes.push(route);
+            table.save(home)?;
+            Ok(())
+        }
+        RouteSubcommand::Default { agent } => {
+            let mut table = RoutingTable::load(home)?;
+            table.default = Some(agent.clone());
+            table.save(home)?;
+            println!("default route -> {agent}");
+            Ok(())
+        }
+        RouteSubcommand::List => {
+            let table = RoutingTable::load(home)?;
+            if table.routes.is_empty() && table.default.is_none() {
+                println!("no routes yet (add with `maturana route add --agent <id> [--channel …] [--from …] [--contains …]`)");
+                return Ok(());
+            }
+            for (i, route) in table.routes.iter().enumerate() {
+                println!("  {}. {} -> {}", i + 1, route.describe(), route.agent);
+            }
+            match &table.default {
+                Some(agent) => println!("  default -> {agent}"),
+                None => println!("  default -> (none; an unmatched message is dropped)"),
+            }
+            Ok(())
+        }
+        RouteSubcommand::Remove { index } => {
+            let mut table = RoutingTable::load(home)?;
+            if index == 0 || index > table.routes.len() {
+                anyhow::bail!("no rule #{index} (see `maturana route list`)");
+            }
+            let removed = table.routes.remove(index - 1);
+            table.save(home)?;
+            println!("removed rule: {} -> {}", removed.describe(), removed.agent);
+            Ok(())
+        }
+        RouteSubcommand::Test {
+            channel,
+            from,
+            text,
+        } => {
+            let table = RoutingTable::load(home)?;
+            match table.resolve(&channel, &from, &text) {
+                Some(agent) => println!("{channel}/{from}: \"{text}\" -> {agent}"),
+                None => println!("{channel}/{from}: \"{text}\" -> (no route)"),
+            }
+            Ok(())
+        }
+        RouteSubcommand::Clear => {
+            RoutingTable::default().save(home)?;
+            println!("cleared the routing table");
+            Ok(())
+        }
+    }
 }
 
 fn handle_skill(command: SkillCommand) -> anyhow::Result<()> {

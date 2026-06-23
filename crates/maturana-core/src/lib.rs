@@ -12,6 +12,7 @@ pub mod pipelock;
 pub mod pipelock_proxy;
 pub mod providers;
 pub mod roles;
+pub mod routing;
 pub mod search;
 pub mod secrets;
 pub mod session_db;
