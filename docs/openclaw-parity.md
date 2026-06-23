@@ -26,9 +26,9 @@ Note: rich Telegram delivery (HTML/markdown/progress drafts) Maturana already mi
 | **Isolation** | Docker / SSH / OpenShell sandboxes | Firecracker / Hyper-V **VMs** (hardware) | Maturana **stronger** |
 | **Secrets / egress** | tokens in config + allowlists | pipelock (encrypted, never in guest) + MITM egress proxy + audit | Maturana **stronger** |
 | **Orchestration** | **TaskFlow** — durable flow state; sub-agent spawns, scheduled tasks, multi-step workflows survive a restart, inspectable / recoverable / cancellable | orchestrator loop with **durable runs**: `orchestrator list` / `resume` / `abort` — a run survives a host restart and resumes from its saved plan (kept done steps, re-run unfinished) | **Closed** (this branch) |
-| **Multi-agent routing** | route inbound channels / accounts / peers → isolated agents (per-agent workspaces + sessions) | each agent has its own channel/bot; no sender→agent router | **GAP** |
+| **Multi-agent routing** | route inbound channels / accounts / peers → isolated agents (per-agent workspaces + sessions) | `maturana route` — a host-side routing table (channel/sender/content → agent, most-specific wins, default fallback); resolver live-proven. Live channel hand-off (cross-agent reply delivery) = follow-on | **Closed (engine)** (this branch) |
 | **Plugin / skill model** | SKILL.md dirs **+ ClawHub marketplace**: browse/install ~15k skills; plugins add channels, providers, tools, voice | SKILL.md dirs (in-repo) installed as Codex skills; MCP servers | **GAP — registry + remote install** |
-| **Memory** | MEMORY.md + provenance-rich + **hybrid keyword+vector** (Qdrant, opt-in) | MaturanaGraph (keyword GraphRAG) + LLM-wiki + per-agent memory | **PARTIAL — no provenance surfaced, no vector** |
+| **Memory** | MEMORY.md + provenance-rich + **hybrid keyword+vector** (Qdrant, opt-in) | MaturanaGraph (keyword GraphRAG) + LLM-wiki + per-agent memory; remembered facts now **provenance-stamped** `(via <channel>)` + date in MEMORY.md and the graph note | **Provenance closed**; pluggable vector store = follow-on (needs embedding egress + store client) |
 | **Scheduled jobs / heartbeat** | cron skill + HEARTBEAT.md background scheduler | `maturana-schedule` + heartbeat + proactive loop | **Have** |
 | **Voice** | STT/TTS + wake-word + talk-mode (device apps) | STT/TTS skill (server-side) | **Partial** (device wake-word = out of scope) |
 | **Browser / computer use** | Playwright browser, Canvas (visual A2UI workspace), mobile nodes (camera) | headless Chrome in-VM | **Partial** (Canvas/nodes niche) |
@@ -57,16 +57,28 @@ Maturana's bet is the opposite.
    install skills from a registry — but every install runs through
    `maturana-security-review` and stays sandboxed (the charter's whole point:
    extensibility *without* importing a supply-chain attack surface).
-3. **Multi-agent routing.** A front router mapping an inbound sender / channel / peer
-   to the right isolated agent — the personal-assistant-fleet ergonomic.
+3. **Multi-agent routing. — CLOSED (engine) on this branch.** `maturana route`
+   add/list/remove/default/test/clear: a host-side table maps inbound (channel /
+   sender / content) → agent, most-specific rule wins, default fallback. Resolver
+   live-proven (telegram+sender→one agent, content "code"→another, else default). A
+   route only picks which agent's front door an inbound uses — agents stay isolated.
+   Wiring it into a live shared channel (cross-agent reply delivery) is the follow-on.
 4. **Real named channels.** Concrete first-class connectors, Matrix first (open,
    self-hostable, outbound-only, zero-trust-clean), then enterprise (Teams / Google
    Chat / Mattermost). The honest "more channels" answer — not a generic webhook.
-5. **Memory provenance + opt-in hybrid (vector) search.** Tag memories with their
-   source and surface it on recall; add embeddings/vector retrieval behind a governed
-   egress when wanted.
-6. **Provider routing / model failover.** Multi-provider routing with failover + auth
-   rotation.
+   *(Not built this round — agreed to skip in favour of 1/3/5.)*
+5. **Memory provenance — CLOSED; + opt-in hybrid (vector) search — follow-on.**
+   Provenance: a remembered fact is stamped `(via <channel>)` + date in MEMORY.md and
+   the graph note, so recall carries where it came from. MaturanaGraph stays the
+   DEFAULT memory; a pluggable external vector store (Qdrant/LanceDB) is a real
+   subsystem — it needs an embedding egress + a store client + hybrid retrieval — so
+   it's scoped as a focused follow-on, deliberately not stubbed.
+6. **Provider routing / model failover — N/A by architecture.** The model call happens
+   in the harness inside the VM (Codex→OpenAI, Claude→Anthropic, opencode→OpenRouter),
+   not in Maturana. Provider breadth/failover already lives in opencode+OpenRouter;
+   host-level routing exists at agent/role granularity (orchestrator routes role→agent
+   →provider). A host LLM proxy for in-call failover would route model traffic through
+   the host, weakening isolation for little gain — declined.
 
 ## E. Declined (zero-trust / scope)
 
