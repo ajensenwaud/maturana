@@ -526,7 +526,10 @@ fn draw(f: &mut Frame, app: &App) {
         draw_slash_popup(f, chunks[2], app);
     }
     if let Some(sel) = app.selector {
-        draw_agent_selector(f, f.area(), app, sel);
+        // Show the gradient logo above the selector when there's room; the
+        // selector then centers in the space below it.
+        let body = draw_banner(f, f.area());
+        draw_agent_selector(f, body, app, sel);
     }
     if let Some(p) = &app.picker {
         draw_picker(f, f.area(), p);
@@ -677,6 +680,87 @@ fn draw_footer(f: &mut Frame, area: Rect, _app: &App) {
         Style::default().fg(Color::DarkGray),
     )]);
     f.render_widget(Paragraph::new(hint), area);
+}
+
+/// The Maturana wordmark (figlet "ANSI Shadow"), shown as the TUI's startup
+/// banner. Kept in sync with `scripts/maturana-logo.py` and `assets/maturana-logo.svg`.
+const LOGO: [&str; 6] = [
+    "███╗   ███╗ █████╗ ████████╗██╗   ██╗██████╗  █████╗ ███╗   ██╗ █████╗ ",
+    "████╗ ████║██╔══██╗╚══██╔══╝██║   ██║██╔══██╗██╔══██╗████╗  ██║██╔══██╗",
+    "██╔████╔██║███████║   ██║   ██║   ██║██████╔╝███████║██╔██╗ ██║███████║",
+    "██║╚██╔╝██║██╔══██║   ██║   ██║   ██║██╔══██╗██╔══██║██║╚██╗██║██╔══██║",
+    "██║ ╚═╝ ██║██║  ██║   ██║   ╚██████╔╝██║  ██║██║  ██║██║ ╚████║██║  ██║",
+    "╚═╝     ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝",
+];
+const LOGO_SUB: &str = "secure multi-agent orchestration · firecracker microVMs";
+
+/// The cool palette (teal → sky → violet) sampled at column `col` of `width`.
+fn logo_rgb(col: usize, width: usize) -> Color {
+    const STOPS: [(f32, f32, f32); 3] = [
+        (45.0, 212.0, 191.0),
+        (56.0, 189.0, 248.0),
+        (167.0, 139.0, 250.0),
+    ];
+    let t = if width <= 1 {
+        0.0
+    } else {
+        col as f32 / (width - 1) as f32
+    };
+    let (a, b, local) = if t < 0.5 {
+        (STOPS[0], STOPS[1], t / 0.5)
+    } else {
+        (STOPS[1], STOPS[2], (t - 0.5) / 0.5)
+    };
+    let mix = |x: f32, y: f32| (x + (y - x) * local).round() as u8;
+    Color::Rgb(mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2))
+}
+
+/// Render the gradient wordmark centered near the top of `full` when the
+/// terminal is large enough, and return the rect BELOW it for the selector. On a
+/// small terminal it draws nothing and returns `full` unchanged.
+fn draw_banner(f: &mut Frame, full: Rect) -> Rect {
+    let width = LOGO.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let logo_w = width as u16;
+    // Need room for the whole mark plus a usable selector beneath it.
+    if full.width < logo_w + 2 || full.height < 16 {
+        return full;
+    }
+    let mut lines: Vec<Line> = Vec::with_capacity(LOGO.len() + 2);
+    for row in LOGO.iter() {
+        let spans: Vec<Span> = row
+            .chars()
+            .enumerate()
+            .map(|(col, ch)| {
+                if ch == ' ' {
+                    Span::raw(" ")
+                } else {
+                    Span::styled(ch.to_string(), Style::default().fg(logo_rgb(col, width)))
+                }
+            })
+            .collect();
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        LOGO_SUB,
+        Style::default().fg(Color::DarkGray),
+    )));
+    let banner_h = lines.len() as u16;
+    let area = Rect {
+        x: full.x + (full.width - logo_w) / 2,
+        y: full.y + 1,
+        width: logo_w,
+        height: banner_h,
+    };
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(lines), area);
+    let used = 1 + banner_h + 1;
+    Rect {
+        x: full.x,
+        y: full.y + used,
+        width: full.width,
+        height: full.height.saturating_sub(used),
+    }
 }
 
 /// Centered agent-selector HUD: lists every agent, marks the active one (●),
