@@ -715,16 +715,40 @@ fn logo_rgb(col: usize, width: usize) -> Color {
     Color::Rgb(mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2))
 }
 
+/// Geometry for the banner: given the full area, the wordmark width and banner
+/// height, return `(banner_area, body_below)` when there's room for both the mark
+/// and a usable selector beneath it, or `None` to skip the banner. Pure so the
+/// centering and the leftover-rect math can be tested without a terminal.
+fn banner_layout(full: Rect, logo_w: u16, banner_h: u16) -> Option<(Rect, Rect)> {
+    if full.width < logo_w + 2 || full.height < banner_h + 8 {
+        return None;
+    }
+    let area = Rect {
+        x: full.x + (full.width - logo_w) / 2,
+        y: full.y + 1,
+        width: logo_w,
+        height: banner_h,
+    };
+    let used = 1 + banner_h + 1;
+    let body = Rect {
+        x: full.x,
+        y: full.y + used,
+        width: full.width,
+        height: full.height.saturating_sub(used),
+    };
+    Some((area, body))
+}
+
 /// Render the gradient wordmark centered near the top of `full` when the
 /// terminal is large enough, and return the rect BELOW it for the selector. On a
 /// small terminal it draws nothing and returns `full` unchanged.
 fn draw_banner(f: &mut Frame, full: Rect) -> Rect {
     let width = LOGO.iter().map(|l| l.chars().count()).max().unwrap_or(0);
     let logo_w = width as u16;
-    // Need room for the whole mark plus a usable selector beneath it.
-    if full.width < logo_w + 2 || full.height < 16 {
+    let banner_h = (LOGO.len() + 2) as u16;
+    let Some((area, body)) = banner_layout(full, logo_w, banner_h) else {
         return full;
-    }
+    };
     let mut lines: Vec<Line> = Vec::with_capacity(LOGO.len() + 2);
     for row in LOGO.iter() {
         let spans: Vec<Span> = row
@@ -745,22 +769,9 @@ fn draw_banner(f: &mut Frame, full: Rect) -> Rect {
         LOGO_SUB,
         Style::default().fg(Color::DarkGray),
     )));
-    let banner_h = lines.len() as u16;
-    let area = Rect {
-        x: full.x + (full.width - logo_w) / 2,
-        y: full.y + 1,
-        width: logo_w,
-        height: banner_h,
-    };
     f.render_widget(Clear, area);
     f.render_widget(Paragraph::new(lines), area);
-    let used = 1 + banner_h + 1;
-    Rect {
-        x: full.x,
-        y: full.y + used,
-        width: full.width,
-        height: full.height.saturating_sub(used),
-    }
+    body
 }
 
 /// Centered agent-selector HUD: lists every agent, marks the active one (●),
@@ -855,4 +866,42 @@ fn draw_slash_popup(f: &mut Frame, input_area: Rect, app: &App) {
         );
     f.render_widget(Clear, area);
     f.render_stateful_widget(list, area, &mut state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn banner_shows_and_centers_when_there_is_room() {
+        // 90x30: full wordmark (71 wide) fits with a usable body below.
+        let (banner, body) = banner_layout(Rect::new(0, 0, 90, 30), 71, 8).expect("room for banner");
+        // Centered horizontally: equal-ish margins.
+        assert_eq!(banner.x, (90 - 71) / 2);
+        assert_eq!(banner.width, 71);
+        assert_eq!(banner.height, 8);
+        // The body starts below the banner and shrinks by the space it used.
+        assert_eq!(body.y, 1 + 8 + 1);
+        assert_eq!(body.height, 30 - (1 + 8 + 1));
+        assert_eq!(body.width, 90);
+    }
+
+    #[test]
+    fn banner_skipped_when_too_narrow_or_short() {
+        // Too narrow for the 71-wide mark.
+        assert!(banner_layout(Rect::new(0, 0, 60, 30), 71, 8).is_none());
+        // Wide enough but not tall enough to also fit the selector.
+        assert!(banner_layout(Rect::new(0, 0, 90, 12), 71, 8).is_none());
+    }
+
+    #[test]
+    fn logo_gradient_runs_teal_to_violet() {
+        // Left end is teal (the first stop), right end is violet (the last).
+        assert_eq!(logo_rgb(0, 71), Color::Rgb(45, 212, 191));
+        assert_eq!(logo_rgb(70, 71), Color::Rgb(167, 139, 250));
+        // A midpoint is the middle sky-blue stop, not either end.
+        let mid = logo_rgb(35, 71);
+        assert_ne!(mid, Color::Rgb(45, 212, 191));
+        assert_ne!(mid, Color::Rgb(167, 139, 250));
+    }
 }
