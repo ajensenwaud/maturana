@@ -94,6 +94,8 @@ enum Command {
     Proactive(proactive::ProactiveCommand),
     /// Run a goal across multiple worker agents in a bounded loop.
     Orchestrator(orchestrate::OrchestratorCommand),
+    /// Persistent multi-agent Kanban board: add cards, then run them across agents.
+    Board(orchestrate::BoardCommand),
     /// Serve Agent2Agent (A2A) endpoints for agent-to-agent calls.
     #[command(hide = true)]
     A2a(a2a::A2aCommand),
@@ -1405,6 +1407,7 @@ fn main() -> anyhow::Result<()> {
         Command::Schedule(command) => handle_schedule(command, &home)?,
         Command::Proactive(command) => proactive::handle_proactive(command, &home)?,
         Command::Orchestrator(command) => orchestrate::handle_orchestrator(command, &home)?,
+        Command::Board(command) => orchestrate::handle_board(command, &home)?,
         Command::A2a(command) => a2a::handle_a2a(command, &home)?,
         Command::Deploy(command) => handle_deploy(command, &home)?,
         Command::Develop(command) => handle_develop(command)?,

@@ -1738,3 +1738,474 @@ mod tests {
         assert!(matches!(parse_review("no marker here"), ReviewVerdict::Unclear));
     }
 }
+
+// ===== Multi-agent board (Hermes-style Kanban) =====
+//
+// A persistent board of cards that a dispatcher runs to completion: it claims
+// every ready card (deps satisfied) and runs it on its assignee over A2A — in
+// parallel, up to the host-enforced max_parallel. Same budgets, same per-agent
+// VM isolation, same real-artifact collection as the orchestrator loop; the
+// board just makes the work durable and user-editable instead of a one-shot
+// plan, and never becomes a new (weaker) execution substrate. See
+// docs/hermes-parity.md.
+
+#[derive(Debug, Args)]
+pub struct BoardCommand {
+    #[command(subcommand)]
+    pub command: BoardSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BoardSubcommand {
+    /// Add a card to the board.
+    Add {
+        /// What to do (the card's title).
+        title: String,
+        /// Longer detail / acceptance criteria.
+        #[arg(long)]
+        detail: Option<String>,
+        /// Who runs it: a role (developer/researcher/reviewer/…) or an agent id.
+        #[arg(long)]
+        assignee: Option<String>,
+        /// Card ids this one depends on, comma-separated (e.g. c1,c2).
+        #[arg(long, value_delimiter = ',')]
+        needs: Vec<String>,
+        #[arg(long, default_value = "default")]
+        board: String,
+    },
+    /// Show the board's cards by column.
+    List {
+        #[arg(long, default_value = "default")]
+        board: String,
+    },
+    /// Move a card to a status: todo | doing | done | blocked.
+    Move {
+        card: String,
+        status: String,
+        #[arg(long, default_value = "default")]
+        board: String,
+    },
+    /// Run the board: dispatch every ready card across its assignee until drained.
+    Run {
+        #[arg(long, default_value = "default")]
+        board: String,
+        /// Where to copy any files the cards produced.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Reuse a specific set of agents (comma-separated); default = all running.
+        #[arg(long)]
+        agents: Option<String>,
+        /// Spawn dedicated VMs per role by cloning this base (opt-in; slow).
+        #[arg(long)]
+        base_spec: Option<String>,
+        /// Full per-role control via a roles.toml.
+        #[arg(long)]
+        roles_file: Option<PathBuf>,
+        #[arg(long)]
+        max_turns: Option<u32>,
+        #[arg(long)]
+        max_parallel: Option<u32>,
+        #[arg(long)]
+        max_wall_seconds: Option<u64>,
+        #[arg(long)]
+        max_vms: Option<u32>,
+    },
+    /// Show card counts.
+    Status {
+        #[arg(long, default_value = "default")]
+        board: String,
+    },
+    /// Remove every card from the board.
+    Clear {
+        #[arg(long, default_value = "default")]
+        board: String,
+    },
+}
+
+pub fn handle_board(command: BoardCommand, home: &MaturanaHome) -> anyhow::Result<()> {
+    use maturana_core::board::{Board, CardStatus};
+    match command.command {
+        BoardSubcommand::Add {
+            title,
+            detail,
+            assignee,
+            needs,
+            board,
+        } => {
+            let mut b = Board::load(home, &board)?;
+            let deps: Vec<String> = needs
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            for dep in &deps {
+                if b.card(dep).is_none() {
+                    anyhow::bail!("card depends on unknown card '{dep}' (add it first)");
+                }
+            }
+            let id = b.add(&title, detail.as_deref().unwrap_or(""), assignee, deps);
+            b.validate().map_err(|e| anyhow::anyhow!(e))?;
+            b.save(home)?;
+            println!("added {id}: {title}");
+            Ok(())
+        }
+        BoardSubcommand::List { board } => {
+            print_board(&Board::load(home, &board)?);
+            Ok(())
+        }
+        BoardSubcommand::Move { card, status, board } => {
+            let st = CardStatus::parse(&status)
+                .ok_or_else(|| anyhow::anyhow!("unknown status '{status}' (todo|doing|done|blocked)"))?;
+            let mut b = Board::load(home, &board)?;
+            b.card_mut(&card)
+                .ok_or_else(|| anyhow::anyhow!("no card '{card}' on board {board}"))?
+                .status = st;
+            b.save(home)?;
+            println!("{card} -> {}", st.label());
+            Ok(())
+        }
+        BoardSubcommand::Status { board } => {
+            let b = Board::load(home, &board)?;
+            let (todo, doing, done, blocked) = b.counts();
+            println!(
+                "board {} — {todo} todo · {doing} doing · {done} done · {blocked} blocked",
+                b.name
+            );
+            Ok(())
+        }
+        BoardSubcommand::Clear { board } => {
+            let mut b = Board::load(home, &board)?;
+            let n = b.cards.len();
+            b.cards.clear();
+            b.save(home)?;
+            println!("cleared {n} card(s) from board {}", b.name);
+            Ok(())
+        }
+        BoardSubcommand::Run {
+            board,
+            output,
+            agents,
+            base_spec,
+            roles_file,
+            max_turns,
+            max_parallel,
+            max_wall_seconds,
+            max_vms,
+        } => {
+            let overrides = CapsOverride {
+                max_total_turns: max_turns,
+                max_wall_seconds,
+                max_parallel,
+                max_concurrent_vms: max_vms,
+                max_steps: None,
+            };
+            let placement = PlacementChoice {
+                roles_file,
+                agents,
+                base_spec,
+            };
+            run_board(home, &board, overrides, placement, output.as_deref())
+        }
+    }
+}
+
+fn print_board(b: &maturana_core::board::Board) {
+    use maturana_core::board::CardStatus;
+    println!("board {} ({} cards)", b.name, b.cards.len());
+    for status in [
+        CardStatus::Todo,
+        CardStatus::Doing,
+        CardStatus::Blocked,
+        CardStatus::Done,
+    ] {
+        let cards: Vec<_> = b.cards.iter().filter(|c| c.status == status).collect();
+        if cards.is_empty() {
+            continue;
+        }
+        println!("\n[{}]", status.label());
+        for c in cards {
+            let who = c.assignee.as_deref().unwrap_or("(default)");
+            let deps = if c.deps.is_empty() {
+                String::new()
+            } else {
+                format!("  after {}", c.deps.join(","))
+            };
+            println!("  {:<5} {:<44} @{}{}", c.id, c.title, who, deps);
+        }
+    }
+}
+
+fn run_board(
+    home: &MaturanaHome,
+    board_name: &str,
+    overrides: CapsOverride,
+    placement: PlacementChoice,
+    output: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    use maturana_core::board::Board;
+    let mut board = Board::load(home, board_name)?;
+    if board.cards.is_empty() {
+        anyhow::bail!("board '{board_name}' is empty — add cards first (`maturana board add …`)");
+    }
+    board.validate().map_err(|e| anyhow::anyhow!(e))?;
+
+    let caps = OrchestratorCaps::default().tighten_with(&overrides);
+    let registry = resolve_registry(home, &placement)?;
+    let run_id = format!("board-{}-{}", board_name, chrono::Utc::now().timestamp());
+
+    let token = std::fs::read_to_string(home.root().join("sessiond/token"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if token.is_empty() {
+        anyhow::bail!(
+            "the A2A wire needs the sessiond token at {}/sessiond/token",
+            home.root().display()
+        );
+    }
+    let a2a = A2aWire {
+        base: crate::a2a::start_local_a2a_server(home, &token)?,
+        token,
+    };
+
+    let base_spec = placement.base_spec.clone().unwrap_or_default();
+    let mut pool = WorkerPool::new(home, &registry, run_id.clone(), base_spec, caps.max_concurrent_vms);
+    let staging_dir = run_dir(home, &run_id).join("staging");
+    std::fs::create_dir_all(run_dir(home, &run_id))?;
+
+    println!("board {board_name}: running ({} cards)", board.cards.len());
+    println!(
+        "  caps: {} turns / {}s wall / {} parallel",
+        caps.max_total_turns, caps.max_wall_seconds, caps.max_parallel
+    );
+
+    let result = run_board_inner(home, &mut board, &registry, &caps, &mut pool, &a2a, &run_id, &staging_dir);
+    pool.teardown();
+    let _ = board.save(home);
+    result?;
+
+    if staging_dir.exists() && count_files(&staging_dir) > 0 {
+        let dir = output_dir_for(home, &run_id, output);
+        std::fs::create_dir_all(&dir)?;
+        let names = copy_tree(&staging_dir, &dir)?;
+        println!("\nboard {board_name}: wrote {} file(s) to {}", names.len(), dir.display());
+    }
+    println!();
+    print_board(&board);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_board_inner(
+    home: &MaturanaHome,
+    board: &mut maturana_core::board::Board,
+    registry: &RoleRegistry,
+    caps: &OrchestratorCaps,
+    pool: &mut WorkerPool,
+    a2a: &A2aWire,
+    run_id: &str,
+    staging_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    use maturana_core::board::CardStatus;
+    let mut budget = RunBudget::new(caps.clone());
+    let started = Instant::now();
+    let wall = Duration::from_secs(caps.max_wall_seconds);
+
+    loop {
+        if budget.tick().is_err() {
+            println!("  [tick ceiling reached]");
+            break;
+        }
+        if started.elapsed() >= wall {
+            println!("  [wall-clock budget reached]");
+            break;
+        }
+        if budget.turns_remaining() == 0 {
+            println!("  [turn budget exhausted]");
+            break;
+        }
+        if board.is_complete() {
+            break;
+        }
+
+        let ready: Vec<maturana_core::board::Card> =
+            board.ready().into_iter().cloned().collect();
+        if ready.is_empty() {
+            if board.cards.iter().any(|c| c.status == CardStatus::Todo) {
+                println!("  [stuck: remaining cards are blocked by a failed dependency]");
+            }
+            break;
+        }
+
+        // Build a batch up to max_parallel, spending a turn per card up front so
+        // the budget stays single-threaded; the A2A I/O then fans out.
+        let mut batch: Vec<(String, Worker, String)> = Vec::new();
+        let mut agent_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for card in ready.iter().take(caps.max_parallel.max(1) as usize) {
+            if budget.spend_turn().is_err() {
+                break;
+            }
+            let worker = resolve_assignee(pool, registry, card.assignee.as_deref())?;
+            let task = build_card_task(registry, board, card, &card_out_dir(run_id, &card.id));
+            agent_of.insert(card.id.clone(), worker.agent_id.clone());
+            if let Some(c) = board.card_mut(&card.id) {
+                c.status = CardStatus::Doing;
+                c.attempts += 1;
+            }
+            println!("  -> card {} ({}) -> {}", card.id, card.title, worker.agent_id);
+            batch.push((card.id.clone(), worker, task));
+        }
+        if batch.is_empty() {
+            println!("  [turn budget exhausted]");
+            break;
+        }
+        board.save(home)?;
+
+        for (id, res) in parallel_dispatch(a2a, run_id, batch) {
+            match res {
+                Ok(reply) => {
+                    let mut note = reply
+                        .replace(maturana_core::roles::marker::DONE, "")
+                        .trim()
+                        .to_string();
+                    if let Some(agent) = agent_of.get(&id) {
+                        let got =
+                            collect_step_artifacts(home, agent, &card_out_dir(run_id, &id), staging_dir);
+                        if got > 0 {
+                            note.push_str(&format!("\n[+{got} file(s) collected]"));
+                        }
+                    }
+                    if let Some(c) = board.card_mut(&id) {
+                        c.result = Some(note);
+                        c.status = CardStatus::Done;
+                    }
+                    println!("  <- card {id} done");
+                }
+                Err(error) => {
+                    if let Some(c) = board.card_mut(&id) {
+                        c.status = CardStatus::Blocked;
+                        c.result = Some(format!("failed: {error:#}"));
+                    }
+                    eprintln!("  <- card {id} blocked: {error:#}");
+                }
+            }
+        }
+        board.save(home)?;
+    }
+    Ok(())
+}
+
+fn card_out_dir(run_id: &str, card_id: &str) -> String {
+    format!("{}-{}", remote_out_dir(run_id), card_id)
+}
+
+/// Resolve a card's assignee to a worker: a known role goes through the pool
+/// (reuse or spawn its placement); anything else is treated as a concrete agent
+/// id and reused directly; an unassigned card defaults to the `developer` role.
+fn resolve_assignee(
+    pool: &mut WorkerPool,
+    registry: &RoleRegistry,
+    assignee: Option<&str>,
+) -> anyhow::Result<Worker> {
+    match assignee {
+        Some(a) if registry.get(a).is_some() => pool.resolve(a),
+        Some(a) => Ok(Worker {
+            agent_id: a.to_string(),
+            model: None,
+        }),
+        None => pool.resolve("developer"),
+    }
+}
+
+fn build_card_task(
+    registry: &RoleRegistry,
+    board: &maturana_core::board::Board,
+    card: &maturana_core::board::Card,
+    out_remote: &str,
+) -> String {
+    let mut body = format!("Task: {}\n", card.title);
+    if !card.detail.is_empty() {
+        body.push_str(&format!("\n{}\n", card.detail));
+    }
+    let ctx = board.dependency_context(card);
+    if !ctx.trim().is_empty() {
+        body.push_str(&format!("\n--- INPUTS FROM EARLIER CARDS ---{ctx}\n"));
+    }
+    body.push_str(&format!(
+        "\n--- PRODUCING FILES ---\nIf this task creates any files (code, a page, a script, data), \
+         WRITE them into the directory {out_remote}/ (create it). Keep your reply a brief summary; \
+         do NOT paste full file contents.\n"
+    ));
+    match card.assignee.as_deref() {
+        Some(a) if registry.get(a).is_some() => registry.frame_task(a, &body).unwrap_or(body),
+        Some(_) => body,
+        None => registry.frame_task("developer", &body).unwrap_or(body),
+    }
+}
+
+/// Dispatch a batch of cards over A2A concurrently (one thread each); returns
+/// (card_id, reply-or-error) per card. The A2A server is thread-per-connection,
+/// so simultaneous message/send calls are safe.
+fn parallel_dispatch(
+    a2a: &A2aWire,
+    run_id: &str,
+    batch: Vec<(String, Worker, String)>,
+) -> Vec<(String, anyhow::Result<String>)> {
+    if batch.len() == 1 {
+        let (id, worker, task) = &batch[0];
+        let res = a2a_send(a2a, &worker.agent_id, worker.model.as_deref(), run_id, task);
+        return vec![(id.clone(), res)];
+    }
+    let mut handles: Vec<(String, std::thread::JoinHandle<anyhow::Result<String>>)> = Vec::new();
+    for (id, worker, task) in batch {
+        let a2a = a2a.clone();
+        let run_id = run_id.to_string();
+        let agent = worker.agent_id.clone();
+        let model = worker.model.clone();
+        let handle = std::thread::spawn(move || a2a_send(&a2a, &agent, model.as_deref(), &run_id, &task));
+        handles.push((id, handle));
+    }
+    handles
+        .into_iter()
+        .map(|(id, h)| {
+            (
+                id,
+                h.join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("worker thread panicked"))),
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod board_tests {
+    use super::*;
+    use maturana_core::board::Board;
+    use maturana_core::roles::RoleRegistry;
+
+    #[test]
+    fn card_out_dir_is_per_card() {
+        assert_eq!(card_out_dir("board-x-1", "c3"), "/workspace/maturana-out-board-x-1-c3");
+    }
+
+    #[test]
+    fn build_card_task_frames_a_role_and_adds_the_file_instruction() {
+        let reg = RoleRegistry::reuse_across(&["codex-firecracker".to_string()]);
+        let mut b = Board::new("t");
+        b.add("Build the page", "two players", Some("developer".into()), vec![]);
+        let card = b.card("c1").unwrap().clone();
+        let task = build_card_task(&reg, &b, &card, "/workspace/out-c1");
+        assert!(task.contains("Build the page"));
+        assert!(task.contains("/workspace/out-c1"));
+        assert!(task.contains("DEVELOPER")); // role persona applied
+    }
+
+    #[test]
+    fn build_card_task_for_a_concrete_agent_has_no_role_prefix() {
+        let reg = RoleRegistry::reuse_across(&["codex-firecracker".to_string()]);
+        let mut b = Board::new("t");
+        b.add("Do it", "", Some("claude-firecracker".into()), vec![]);
+        let card = b.card("c1").unwrap().clone();
+        let task = build_card_task(&reg, &b, &card, "/workspace/out");
+        assert!(task.starts_with("Task: Do it"));
+    }
+}
