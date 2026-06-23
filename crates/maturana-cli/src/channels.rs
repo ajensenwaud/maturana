@@ -1045,6 +1045,20 @@ pub(crate) fn record_console_turn(
     append_channel_turn(home, agent_id, console_chat_key(), role, text)
 }
 
+/// Wipe the console TUI's persisted transcript so a `/clear` (or a new session)
+/// stays cleared across quit/reopen — otherwise `read_console_transcript` would
+/// restore the old dialogue the next time the TUI opens. Clearing the file also
+/// drops it from the next turn's context, which is what `/clear` should mean.
+/// Missing file is success (already clear).
+pub(crate) fn clear_console_transcript(home: &MaturanaHome, agent_id: &str) -> std::io::Result<()> {
+    let path = channel_transcript_path(home, agent_id, console_chat_key());
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Read the console transcript back as ordered (role, body) pairs to repopulate
 /// the TUI view on agent switch. Parses the `## <rfc3339> <role>` section format
 /// `append_channel_turn` writes; non-`## ` lines (reset banners, notices) are
@@ -6657,6 +6671,20 @@ mod tests {
         );
         // A different agent has its own (empty) transcript — switching can't bleed.
         assert!(read_console_transcript(&home, "beta").is_empty());
+    }
+
+    #[test]
+    fn clear_console_transcript_persists_across_reopen() {
+        // /clear must wipe the stored transcript so it does NOT come back the next
+        // time the TUI opens (read_console_transcript returns empty after a clear).
+        let temp = temp_dir("console-clear");
+        let home = MaturanaHome::new(temp.path().join(".maturana"));
+        record_console_turn(&home, "alpha", "user", "old conversation").unwrap();
+        assert!(!read_console_transcript(&home, "alpha").is_empty());
+        clear_console_transcript(&home, "alpha").unwrap();
+        assert!(read_console_transcript(&home, "alpha").is_empty());
+        // Clearing an already-empty transcript is fine (no file → ok).
+        clear_console_transcript(&home, "alpha").unwrap();
     }
 
     #[test]

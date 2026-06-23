@@ -116,14 +116,9 @@ impl App {
             quit: false,
         };
         app.load_current();
-        app.messages.push(ChatMsg {
-            role: Role::System,
-            text: format!(
-                "Connected to agent '{}' ({} harness). Type a message and press Enter. \
-                 /help for commands · Ctrl+P agents · Ctrl+←/→ switch · Esc or Ctrl+C quit.",
-                app.agent_id, app.harness
-            ),
-        });
+        // No greeting message: a fresh or cleared conversation shows the logo and
+        // nothing else (the footer carries the key hints). Restored history, if
+        // any, renders as usual.
         app
     }
 
@@ -271,13 +266,17 @@ impl App {
                 text,
             }),
             ConsoleCommand::Prompt(text) => self.send_turn(text),
-            ConsoleCommand::Clear => self.messages.clear(),
+            ConsoleCommand::Clear => {
+                self.messages.clear();
+                // Persist the clear: wipe the stored transcript so it doesn't come
+                // back on the next open. Empty view → the logo shows.
+                let _ = crate::channels::clear_console_transcript(&self.home, &self.agent_id);
+                self.scrollback = 0;
+            }
             ConsoleCommand::NewSession => {
                 self.messages.clear();
-                self.messages.push(ChatMsg {
-                    role: Role::System,
-                    text: "New session started.".to_string(),
-                });
+                let _ = crate::channels::clear_console_transcript(&self.home, &self.agent_id);
+                self.scrollback = 0;
             }
             ConsoleCommand::Quit => self.quit = true,
             ConsoleCommand::Select { title, options } => {
@@ -605,6 +604,11 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_transcript(f: &mut Frame, area: Rect, app: &App) {
+    // Clean slate (fresh open or after /clear): just the logo, nothing else.
+    if app.messages.is_empty() {
+        draw_empty_logo(f, area);
+        return;
+    }
     let mut lines: Vec<Line> = Vec::new();
     for msg in &app.messages {
         let (label, color) = match msg.role {
@@ -653,6 +657,64 @@ fn draw_transcript(f: &mut Frame, area: Rect, app: &App) {
     let max_off = total.saturating_sub(inner_h);
     let offset = max_off.saturating_sub(app.scrollback.min(max_off));
     f.render_widget(para.scroll((offset, 0)), area);
+}
+
+/// The empty-conversation state: the gradient wordmark centered in the pane,
+/// inside the same " conversation " border. Falls back to a compact mark when the
+/// pane is too narrow for the block art.
+fn draw_empty_logo(f: &mut Frame, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" conversation ")
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let width = LOGO.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let logo_w = width as u16;
+    let mut lines: Vec<Line> = Vec::new();
+    if inner.width >= logo_w && inner.height >= 9 {
+        for row in LOGO.iter() {
+            let spans: Vec<Span> = row
+                .chars()
+                .enumerate()
+                .map(|(col, ch)| {
+                    if ch == ' ' {
+                        Span::raw(" ")
+                    } else {
+                        Span::styled(ch.to_string(), Style::default().fg(logo_rgb(col, width)))
+                    }
+                })
+                .collect();
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("{:^w$}", LOGO_SUB, w = width),
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "maturana",
+            Style::default()
+                .fg(Color::Rgb(56, 189, 248))
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            LOGO_SUB,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let block_h = (lines.len() as u16).min(inner.height);
+    let render_w = logo_w.min(inner.width);
+    let logo_area = Rect {
+        x: inner.x + inner.width.saturating_sub(render_w) / 2,
+        y: inner.y + inner.height.saturating_sub(block_h) / 2,
+        width: render_w,
+        height: block_h,
+    };
+    f.render_widget(Paragraph::new(lines), logo_area);
 }
 
 fn draw_input(f: &mut Frame, area: Rect, app: &App) {
