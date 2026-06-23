@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/maturana-logo.svg" alt="Maturana" width="720">
+</p>
+
 # Maturana
 
 > *A secure agent harness that runs every agent in its own hardware-isolated microVM. Lightweight, fast, and completely yours to customise from Codex.
