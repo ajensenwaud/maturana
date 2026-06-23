@@ -4658,13 +4658,16 @@ fn extract_memory_fact(text: &str) -> Option<String> {
 fn maybe_remember_user_message(
     home: &MaturanaHome,
     agent_id: &str,
+    channel: &str,
     text: &str,
 ) -> anyhow::Result<()> {
     let Some(fact) = extract_memory_fact(text) else {
         return Ok(());
     };
 
-    // 1. Durable MEMORY.md (loaded into the channel context every turn).
+    // 1. Durable MEMORY.md (loaded into the channel context every turn). Each
+    //    fact is stamped with its PROVENANCE — the channel it came in on and the
+    //    date — so a recalled memory carries where it's from, not just what.
     let path = home.agent_dir(agent_id).join("memory/MEMORY.md");
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -4672,7 +4675,7 @@ fn maybe_remember_user_message(
     if !path.exists() {
         fs::write(&path, "# Memory\n")?;
     }
-    let entry = format!("\n- {}: {}\n", Utc::now().date_naive(), fact);
+    let entry = format!("\n- {} (via {}): {}\n", Utc::now().date_naive(), channel, fact);
     let mut file = fs::OpenOptions::new()
         .append(true)
         .open(&path)
@@ -4686,7 +4689,8 @@ fn maybe_remember_user_message(
         let dir = home.agent_dir(agent_id).join("inbox");
         if fs::create_dir_all(&dir).is_ok() {
             let note = dir.join(format!("memory-{}.md", Utc::now().timestamp_millis()));
-            if fs::write(&note, &fact).is_ok() {
+            let provenanced = format!("[via {channel}, {}] {fact}", Utc::now().date_naive());
+            if fs::write(&note, &provenanced).is_ok() {
                 let _ = crate::graph::ingest_file_into_service(
                     crate::graph::DEFAULT_LOCAL_URL,
                     &token,
@@ -5631,7 +5635,7 @@ pub(crate) fn enqueue_turn(
     extra: serde_json::Value,
 ) -> anyhow::Result<String> {
     append_channel_turn(home, agent_id, chat_key, "user", text)?;
-    maybe_remember_user_message(home, agent_id, text)?;
+    maybe_remember_user_message(home, agent_id, channel, text)?;
     let prompt = build_channel_prompt(home, agent_id, chat_key, text)?;
     let settings = load_channel_settings(home, agent_id);
     let paths = session_paths(&home.agent_dir(agent_id), session_id);
@@ -6559,13 +6563,15 @@ mod tests {
     fn remember_message_appends_to_memory() {
         let temp = temp_dir("channel-memory");
         let home = MaturanaHome::new(temp.path().join(".maturana"));
-        maybe_remember_user_message(&home, "agent", "remember that I prefer short replies")
+        maybe_remember_user_message(&home, "agent", "telegram", "remember that I prefer short replies")
             .unwrap();
 
         let memory = fs::read_to_string(home.agent_dir("agent").join("memory/MEMORY.md")).unwrap();
         // The explicit "remember that" cue is stripped to the bare fact.
         assert!(memory.contains("I prefer short replies"));
         assert!(!memory.contains("remember that"));
+        // Provenance: the recalled memory carries which channel it came in on.
+        assert!(memory.contains("(via telegram)"), "memory should record provenance: {memory}");
     }
 
     #[test]
