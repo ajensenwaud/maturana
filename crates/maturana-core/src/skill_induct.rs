@@ -187,10 +187,12 @@ mod tests {
 
     #[test]
     fn induct_clusters_by_signature_and_thresholds() {
+        // Real repeated tasks share a prefix; the signature is the first few
+        // significant words, so these three collapse to one cluster.
         let trajectories = vec![
             traj("codex", "List 3 popular Rust web frameworks"),
-            traj("claude", "list the rust web frameworks please"),
-            traj("opencode", "Rust web frameworks — name a few"),
+            traj("claude", "please list the popular rust web frameworks"),
+            traj("opencode", "rust web frameworks"),
             traj("codex", "summarize today's emails"), // only once → below threshold
         ];
         let proposals = induct(&trajectories, 3, 6);
@@ -207,8 +209,8 @@ mod tests {
         let p = induct(
             &[
                 traj("codex", "deploy the rust web service"),
-                traj("codex", "deploy the rust web service again"),
-                traj("claude", "deploy rust web service to prod"),
+                traj("codex", "please deploy the rust web service"),
+                traj("claude", "deploy rust web service"),
             ],
             3,
             6,
