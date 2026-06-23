@@ -16,6 +16,7 @@ pub mod roles;
 pub mod search;
 pub mod secrets;
 pub mod session_db;
+pub mod skill_induct;
 pub mod ssh_pin;
 pub mod snapshots;
 pub mod spec;

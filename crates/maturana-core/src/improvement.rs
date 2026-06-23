@@ -228,6 +228,16 @@ impl TrajectoryStore {
 
     /// All trajectories whose aggregate reward is at least `min_reward`,
     /// highest first — the supervised fine-tuning set.
+    /// Every recorded trajectory, oldest first — the raw material for skill
+    /// induction (which clusters by recurring task input, independent of reward).
+    pub fn all(&self) -> anyhow::Result<Vec<Trajectory>> {
+        Ok(self
+            .scored_trajectories()?
+            .into_iter()
+            .map(|example| example.trajectory)
+            .collect())
+    }
+
     pub fn curate(&self, min_reward: f64) -> anyhow::Result<Vec<CuratedExample>> {
         let mut examples = self.scored_trajectories()?;
         examples.retain(|example| example.reward.total >= min_reward);

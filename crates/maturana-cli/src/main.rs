@@ -391,6 +391,18 @@ enum SkillSubcommand {
         #[arg(long, alias = "prompts-dir")]
         dest: Option<PathBuf>,
     },
+    /// Propose skills from RECURRING task patterns in the trajectory store. Writes
+    /// review-gated DRAFTS to `<home>/skill-proposals/` — it never installs
+    /// anything. An agent cannot grant itself automation; a human reviews a
+    /// proposal with `maturana-security-review` before it becomes a real skill.
+    Induct {
+        /// Only consider one agent's trajectories.
+        #[arg(long)]
+        agent: Option<String>,
+        /// How many times a pattern must recur to be proposed.
+        #[arg(long, default_value_t = 3)]
+        min: usize,
+    },
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1411,7 +1423,7 @@ fn main() -> anyhow::Result<()> {
         Command::A2a(command) => a2a::handle_a2a(command, &home)?,
         Command::Deploy(command) => handle_deploy(command, &home)?,
         Command::Develop(command) => handle_develop(command)?,
-        Command::Skill(command) => handle_skill(command)?,
+        Command::Skill(command) => handle_skill(command, &home)?,
         Command::Channel(command) => handle_channel(command, &home)?,
         Command::Session(command) => handle_session(command, &home)?,
         Command::Graph(command) => graph::handle_graph(command, &home)?,
@@ -1495,7 +1507,7 @@ fn trim_trailing_newlines(mut value: String) -> String {
     value
 }
 
-fn handle_skill(command: SkillCommand) -> anyhow::Result<()> {
+fn handle_skill(command: SkillCommand, home: &MaturanaHome) -> anyhow::Result<()> {
     match command.command {
         SkillSubcommand::Validate { root, json } => {
             let report = validate_skill_pack(&root)?;
@@ -1526,7 +1538,52 @@ fn handle_skill(command: SkillCommand) -> anyhow::Result<()> {
             println!("installed {count} Codex skill(s); use /skills or $<name> in Codex");
             Ok(())
         }
+        SkillSubcommand::Induct { agent, min } => handle_skill_induct(home, agent.as_deref(), min),
     }
+}
+
+/// Surface recurring task patterns from the trajectory store and write a
+/// review-gated skill DRAFT for each. Never installs — an agent cannot grant
+/// itself automation; a human routes a proposal through `maturana-security-review`
+/// before it becomes a real skill.
+fn handle_skill_induct(home: &MaturanaHome, agent: Option<&str>, min: usize) -> anyhow::Result<()> {
+    use maturana_core::improvement::TrajectoryStore;
+    use maturana_core::skill_induct;
+
+    let store = TrajectoryStore::open(&TrajectoryStore::store_path(home.root()))?;
+    let mut trajectories = store.all()?;
+    if let Some(a) = agent {
+        trajectories.retain(|t| t.agent_id == a);
+    }
+    let proposals = skill_induct::induct(&trajectories, min, 6);
+    if proposals.is_empty() {
+        println!(
+            "no recurring task patterns (need ≥{min} occurrences across {} trajectories)",
+            trajectories.len()
+        );
+        return Ok(());
+    }
+    let dir = home.root().join("skill-proposals");
+    fs::create_dir_all(&dir)?;
+    for proposal in &proposals {
+        let pdir = dir.join(&proposal.slug);
+        fs::create_dir_all(&pdir)?;
+        fs::write(pdir.join("SKILL.md"), skill_induct::render_proposal(proposal))?;
+        println!(
+            "  proposal: {} — recurred {}x ({}) -> {}",
+            proposal.title,
+            proposal.occurrences,
+            proposal.agents.join(","),
+            pdir.join("SKILL.md").display()
+        );
+    }
+    println!(
+        "\nwrote {} proposal(s) to {}. These are DRAFTS, not installed — review with \
+         maturana-security-review before turning any into a real skill.",
+        proposals.len(),
+        dir.display()
+    );
+    Ok(())
 }
 
 /// Install Maturana's skills as native **Codex skills** so Codex discovers them

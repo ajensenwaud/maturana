@@ -29,7 +29,7 @@ not copied (security).
 | Persistent memory | MaturanaGraph (GraphRAG) + LLM-wiki + durable per-agent memory | **Have** |
 | Closed learning loop (trajectories → improvement) | trajectory capture + reward → curated examples / preference pairs → offline SFT/DPO → eval gate → snapshot-safe rollout | **Have** |
 | Build/run new capabilities on the fly | self-forge (sandboxed WASM, fuel/memory/timeout bounded) | **Have** (stronger sandbox) |
-| **Auto-skill induction** — detect a repeated workflow, write a reusable skill file | skills are authored (skill-create) or model-level; no "observe repetition → propose skill" | **Partial** — candidate next step; see Boundaries |
+| **Auto-skill induction** — detect a repeated workflow, write a reusable skill file | `maturana skill induct` clusters recurring task inputs in the trajectory store and writes a skill DRAFT per pattern — gated, never auto-installed (see Boundaries) | **Add** — security-gated proposals |
 
 ## Channels, providers, MCP
 
@@ -61,6 +61,12 @@ backs it with a VM.)
 2. **Parallel worker execution** — the dispatcher runs ready cards concurrently up
    to `max_parallel`, bounded by the same caps (the A2A server is already
    thread-per-connection).
+3. **Auto-skill induction** — `maturana skill induct` reads the trajectory store,
+   clusters recurring task inputs, and writes a skill DRAFT per recurring pattern
+   to `<home>/skill-proposals/`. It is Hermes' "the agent writes its own skills
+   from your repeated workflows" — but a proposal is never installed: a human
+   routes it through `maturana-security-review` first, so an agent observing its
+   own repetition cannot silently grant itself automation.
 
 ## Boundaries (kept intentionally)
 
