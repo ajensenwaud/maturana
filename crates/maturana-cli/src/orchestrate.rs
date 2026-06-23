@@ -51,6 +51,11 @@ pub enum OrchestratorSubcommand {
         /// files into this directory (default `<run>/output/`).
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Skip the verification pass. By default, when the run produces files, an
+        /// agent actually runs/exercises them and the goal isn't "done" until they
+        /// work (bounded by the review-cycle cap). Pass this to deliver unchecked.
+        #[arg(long)]
+        no_verify: bool,
         /// Reuse specific running agents, comma-separated and strongest-coder
         /// first (e.g. `codex-firecracker,claude-firecracker`). Roles are assigned
         /// across them. Omit to auto-reuse every running agent.
@@ -591,6 +596,7 @@ pub fn handle_orchestrator(command: OrchestratorCommand, home: &MaturanaHome) ->
         OrchestratorSubcommand::Loop {
             goal,
             output,
+            no_verify,
             agents,
             run_id,
             max_turns,
@@ -612,7 +618,7 @@ pub fn handle_orchestrator(command: OrchestratorCommand, home: &MaturanaHome) ->
                 agents,
                 base_spec,
             };
-            run_loop(home, &goal, run_id, overrides, placement, output)
+            run_loop(home, &goal, run_id, overrides, placement, output, !no_verify)
         }
         OrchestratorSubcommand::Status { run_id } => status(home, &run_id),
         OrchestratorSubcommand::Abort { run_id } => {
@@ -727,6 +733,7 @@ fn resolve_registry(home: &MaturanaHome, placement: &PlacementChoice) -> anyhow:
     Ok(RoleRegistry::reuse_across(&agents))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_loop(
     home: &MaturanaHome,
     goal: &str,
@@ -734,6 +741,7 @@ fn run_loop(
     overrides: CapsOverride,
     placement: PlacementChoice,
     output: Option<PathBuf>,
+    verify: bool,
 ) -> anyhow::Result<()> {
     let caps = OrchestratorCaps::default().tighten_with(&overrides);
     let registry = resolve_registry(home, &placement)?;
@@ -775,7 +783,9 @@ fn run_loop(
         base_spec,
         caps.max_concurrent_vms,
     );
-    let result = run_inner(home, goal, &run_id, &registry, &caps, &mut pool, &a2a, output.as_deref());
+    let result = run_inner(
+        home, goal, &run_id, &registry, &caps, &mut pool, &a2a, output.as_deref(), verify,
+    );
     pool.teardown();
     result
 }
@@ -790,6 +800,7 @@ fn run_inner(
     pool: &mut WorkerPool,
     a2a: &A2aWire,
     output: Option<&std::path::Path>,
+    verify: bool,
 ) -> anyhow::Result<()> {
     let mut budget = RunBudget::new(caps.clone());
     let started = Instant::now();
@@ -801,6 +812,10 @@ fn run_inner(
     let out_remote = remote_out_dir(run_id);
     let staging_dir = run_dir(home, run_id).join("staging");
     let mut collected_total = 0usize;
+    // The worker whose VM holds the most produced files — where verification runs
+    // it, since the files are already there.
+    let mut builder: Option<String> = None;
+    let mut builder_files = 0usize;
 
     // --- Plan: ask the coordinator to break the goal into steps ---
     let coordinator = pool.resolve("coordinator")?;
@@ -897,6 +912,10 @@ fn run_inner(
                     let got = collect_step_artifacts(home, &worker.agent_id, &out_remote, &staging_dir);
                     if got > 0 {
                         collected_total += got;
+                        if got >= builder_files {
+                            builder_files = got;
+                            builder = Some(worker.agent_id.clone());
+                        }
                         println!("  <- step {sid} done (+{got} file(s) collected)");
                     } else {
                         println!("  <- step {sid} done");
@@ -927,21 +946,44 @@ fn run_inner(
     // as a fallback when the goal was prose and nobody wrote a file.
     let collected_root = staging_dir.join(out_basename(&out_remote));
     if collected_total > 0 && count_files(&collected_root) > 0 {
+        // Before calling the goal done, actually RUN the deliverable: an agent
+        // exercises the files in its VM (the builder's, where they already are),
+        // fixes them if broken, and we re-verify — bounded by the review cap.
+        let verdict = if verify {
+            run_verification(
+                home,
+                a2a,
+                run_id,
+                goal,
+                &out_remote,
+                &staging_dir,
+                builder.as_deref(),
+                caps,
+                &mut budget,
+            )
+        } else {
+            VerifyOutcome::Skipped
+        };
+
         let dir = output_dir_for(home, run_id, output);
         std::fs::create_dir_all(&dir)?;
+        // Copy AFTER verification so the delivered bytes include any fixes.
         let mut names = copy_tree(&collected_root, &dir)?;
         names.sort();
-        // A short, honest summary from what each step reported — not a rewrite of
-        // the files. Sits alongside the real artifacts.
-        std::fs::write(dir.join("SUMMARY.md"), build_run_summary(goal, &plan, &names))?;
+        std::fs::write(
+            dir.join("SUMMARY.md"),
+            build_run_summary(goal, &plan, &names, &verdict),
+        )?;
         println!(
-            "\n=== orchestrator run {run_id}: wrote {} file(s) to {} ===",
+            "\n=== orchestrator run {run_id}: wrote {} file(s) to {} [{}] ===",
             names.len(),
-            dir.display()
+            dir.display(),
+            verdict.label()
         );
         for name in &names {
             println!("  - {name}");
         }
+        println!("{}", verdict.detail());
         return Ok(());
     }
 
@@ -1248,9 +1290,11 @@ fn output_dir_for(home: &MaturanaHome, run_id: &str, output: Option<&std::path::
 }
 
 /// A short human summary placed beside the real files: the goal, the list of
-/// files produced, and each step's own brief report. Not a rewrite of the files.
-fn build_run_summary(goal: &str, plan: &Plan, files: &[String]) -> String {
-    let mut out = format!("# {goal}\n\n## Files produced\n");
+/// files produced, the verification verdict, and each step's own brief report.
+/// Not a rewrite of the files.
+fn build_run_summary(goal: &str, plan: &Plan, files: &[String], verdict: &VerifyOutcome) -> String {
+    let mut out = format!("# {goal}\n\n## Verification\n{}\n", verdict.detail().trim());
+    out.push_str("\n## Files produced\n");
     if files.is_empty() {
         out.push_str("- (none)\n");
     }
@@ -1264,6 +1308,152 @@ fn build_run_summary(goal: &str, plan: &Plan, files: &[String]) -> String {
         }
     }
     out
+}
+
+// ===== Verification: actually run the deliverable before calling it done =====
+
+/// The outcome of running the produced files.
+enum VerifyOutcome {
+    /// An agent ran the deliverable and it works.
+    Passed,
+    /// It still failed after the bounded repair attempts (with the last reason).
+    Failed(String),
+    /// Verification could not be completed (no builder, budget out, no verdict).
+    Inconclusive(String),
+    /// `--no-verify`, or there was nothing runnable to check.
+    Skipped,
+}
+
+impl VerifyOutcome {
+    fn label(&self) -> &'static str {
+        match self {
+            VerifyOutcome::Passed => "verified: runs",
+            VerifyOutcome::Failed(_) => "NOT verified",
+            VerifyOutcome::Inconclusive(_) => "unverified",
+            VerifyOutcome::Skipped => "verification skipped",
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self {
+            VerifyOutcome::Passed => {
+                "verification: an agent ran the deliverable and confirmed it works.".to_string()
+            }
+            VerifyOutcome::Failed(why) => {
+                format!("verification: FAILED after repair attempts — {}", why.trim())
+            }
+            VerifyOutcome::Inconclusive(why) => {
+                format!("verification: inconclusive — {}", why.trim())
+            }
+            VerifyOutcome::Skipped => "verification: skipped.".to_string(),
+        }
+    }
+}
+
+/// Run the produced files in the builder's VM, fixing and re-checking up to the
+/// review-cycle cap, and report the verdict. The files live in `out_remote` in
+/// that agent's VM already, so it tests them in place; after each attempt we
+/// re-collect so any fixes reach the delivered bytes.
+#[allow(clippy::too_many_arguments)]
+fn run_verification(
+    home: &MaturanaHome,
+    a2a: &A2aWire,
+    run_id: &str,
+    goal: &str,
+    out_remote: &str,
+    staging_dir: &std::path::Path,
+    builder: Option<&str>,
+    caps: &OrchestratorCaps,
+    budget: &mut RunBudget,
+) -> VerifyOutcome {
+    let Some(agent_id) = builder else {
+        return VerifyOutcome::Inconclusive("no agent produced runnable files".to_string());
+    };
+    let worker = Worker {
+        agent_id: agent_id.to_string(),
+        model: None,
+    };
+    let mut last_fail = String::from("still failing");
+    // One initial check plus up to `max_review_cycles` re-checks after fixes.
+    for _ in 0..=caps.max_review_cycles {
+        if budget.turns_remaining() == 0 {
+            return VerifyOutcome::Inconclusive(
+                "turn budget ran out before verification finished".to_string(),
+            );
+        }
+        println!("  -> verifying deliverable on {agent_id}…");
+        let reply = match dispatch_and_wait(home, a2a, &worker, run_id, &verify_task(goal, out_remote), budget) {
+            Ok(reply) => reply,
+            Err(error) => {
+                return VerifyOutcome::Inconclusive(format!("verifier dispatch failed: {error}"))
+            }
+        };
+        // The verifier may have edited files in place — re-collect so we deliver
+        // the fixed versions.
+        collect_step_artifacts(home, agent_id, out_remote, staging_dir);
+        match parse_verify(&reply) {
+            Some(true) => {
+                println!("  <- verification passed");
+                return VerifyOutcome::Passed;
+            }
+            Some(false) => {
+                last_fail = verify_detail(&reply);
+                println!("  <- verification failed; repairing: {last_fail}");
+            }
+            None => {
+                return VerifyOutcome::Inconclusive(
+                    "verifier did not report PASS or FAIL".to_string(),
+                )
+            }
+        }
+    }
+    VerifyOutcome::Failed(last_fail)
+}
+
+/// The verifier's task: exercise whatever was built, and fix it in place if it
+/// doesn't work. Deliberately type-agnostic — the agent decides how to run it.
+fn verify_task(goal: &str, out_remote: &str) -> String {
+    format!(
+        "You are the VERIFIER. The files produced for this goal are in {out_remote} in your \
+         workspace.\n\nGoal: {goal}\n\n\
+         ACTUALLY EXERCISE the deliverable the way a user would: run the program, execute the \
+         script, open the page in a headless browser, call the endpoint — whatever fits what was \
+         built. Decide whether it genuinely works and meets the goal.\n\
+         - If it works, reply with {pass} on its own line plus ONE line on what you checked.\n\
+         - If it does NOT work, FIX the files in place inside {out_remote}, then reply with {fail} \
+         on its own line followed by what was broken and what you changed.\n\
+         Keep your reply brief; do not paste full file contents.",
+        pass = marker::VERIFY_PASS,
+        fail = marker::VERIFY_FAIL,
+    )
+}
+
+/// `Some(true)` on PASS, `Some(false)` on FAIL, `None` if neither marker is present.
+fn parse_verify(reply: &str) -> Option<bool> {
+    if reply.contains(marker::VERIFY_PASS) {
+        Some(true)
+    } else if reply.contains(marker::VERIFY_FAIL) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// The text after the FAIL marker (what was wrong / changed), trimmed and capped.
+fn verify_detail(reply: &str) -> String {
+    let tail = reply
+        .split(marker::VERIFY_FAIL)
+        .nth(1)
+        .unwrap_or("")
+        .trim();
+    let one_line = tail.replace('\n', " ");
+    if one_line.is_empty() {
+        "no detail given".to_string()
+    } else if one_line.chars().count() > 200 {
+        format!("{}…", one_line.chars().take(200).collect::<String>())
+    } else {
+        one_line
+    }
 }
 
 /// Complete one step, running the bounded reviewer loop synchronously if the step
@@ -1427,10 +1617,44 @@ mod tests {
         dev.role = "developer".to_string();
         dev.result = Some("Wrote index.html with the board and win logic.".to_string());
         let plan = Plan { goal: "build a game".to_string(), steps: vec![dev] };
-        let md = build_run_summary("build a game", &plan, &["index.html".to_string()]);
+        let md = build_run_summary(
+            "build a game",
+            &plan,
+            &["index.html".to_string()],
+            &VerifyOutcome::Passed,
+        );
         assert!(md.contains("## Files produced"));
         assert!(md.contains("- index.html"));
         assert!(md.contains("Wrote index.html")); // the step's own words, not a rewrite
+        assert!(md.contains("## Verification"));
+        assert!(md.contains("confirmed it works"));
+    }
+
+    #[test]
+    fn parse_verify_reads_the_markers() {
+        assert_eq!(parse_verify("all good\n[[VERIFY: PASS]]\nchecked the board"), Some(true));
+        assert_eq!(parse_verify("[[VERIFY: FAIL]] the reset button throws"), Some(false));
+        assert_eq!(parse_verify("I think it's probably fine"), None);
+    }
+
+    #[test]
+    fn verify_detail_extracts_the_failure_reason() {
+        let reply = "[[VERIFY: FAIL]] script.js referenced a missing id; added it.";
+        assert_eq!(verify_detail(reply), "script.js referenced a missing id; added it.");
+        // No body after the marker still yields something printable.
+        assert_eq!(verify_detail("[[VERIFY: FAIL]]"), "no detail given");
+    }
+
+    #[test]
+    fn verify_task_names_the_dir_goal_and_markers() {
+        let task = verify_task("build a game", "/workspace/maturana-out-run-1");
+        assert!(task.contains("/workspace/maturana-out-run-1"));
+        assert!(task.contains("build a game"));
+        assert!(task.contains(marker::VERIFY_PASS));
+        assert!(task.contains(marker::VERIFY_FAIL));
+        // It must tell the agent to actually run it and fix in place.
+        assert!(task.contains("EXERCISE"));
+        assert!(task.contains("FIX the files in place"));
     }
 
     #[test]

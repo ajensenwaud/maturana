@@ -35,6 +35,13 @@ pub mod marker {
     /// pass; the original worker is re-sent the step with the feedback appended,
     /// bounded by `max_review_cycles`.
     pub const REVIEW_REVISE: &str = "[[REVIEW: REVISE]]";
+    /// The verifier prints this after actually running the produced files and
+    /// finding they work — the deliverable is accepted as runnable.
+    pub const VERIFY_PASS: &str = "[[VERIFY: PASS]]";
+    /// The verifier prints this (followed by what's broken) after running the
+    /// produced files and finding they do NOT work; it fixes them in place and
+    /// the loop re-verifies, bounded by `max_review_cycles`.
+    pub const VERIFY_FAIL: &str = "[[VERIFY: FAIL]]";
 }
 
 /// Where a role's work runs.
