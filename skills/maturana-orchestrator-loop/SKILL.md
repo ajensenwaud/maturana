@@ -8,9 +8,12 @@ same time, and then be combined into one answer.
 It runs `maturana orchestrator loop "<goal>"`: a host program that asks one agent
 to break the goal into a small list of steps, runs those steps across several
 worker agents, feeds each result into the steps that depend on it, and combines
-everything into a final answer. Hard limits live in the host program, not in any
-agent, so a run always stops and never costs without bound. This is the primary
-way an agent (e.g. Codex) takes on work that is bigger than itself.
+everything into a final answer. When the goal produces files, the result is the
+agents' REAL files (copied out of their VMs), and before the goal is called done
+an agent actually RUNS them — fixing and re-checking within the cap. Hard limits
+live in the host program, not in any agent, so a run always stops and never costs
+without bound. This is the primary way an agent (e.g. Codex) takes on work that is
+bigger than itself.
 
 ## Grounding
 
@@ -120,7 +123,11 @@ maturana orchestrator loop "Build a tic-tac-toe game playable in the browser" --
 
 The files are the agents' REAL output — each worker writes its files inside its VM
 and the host copies those exact bytes out (binaries included); they are not retyped
-by another agent. A short `SUMMARY.md` (goal + each step's report + the file list)
+by another agent. Before delivering, an agent RUNS the files (opens the page, runs
+the script, calls the endpoint) and fixes them in place if broken, re-checking up to
+the review-cycle cap; the verdict (`verified: runs` / `NOT verified` / `unverified`)
+prints and is recorded in `SUMMARY.md`. Pass `--no-verify` to skip that and deliver
+unchecked. A short `SUMMARY.md` (verdict + goal + each step's report + the file list)
 is written alongside. If the goal was prose and no worker wrote a file, the result
 is a single text answer instead (`--output` file, default `<run>/answer.md`). You
 just say where with `--output`; the system picks files-vs-prose from what the agents
@@ -158,10 +165,11 @@ Before claiming a run succeeded, collect:
 
 - The printed plan (`N steps`) and the per-step `-> sent` / `<- done` lines.
 - `maturana orchestrator status <run_id>` showing every step `Done`.
-- For a file deliverable: the printed `wrote N file(s) to <dir>` list, the real
-  files at `--output` (default `<run>/output/`), and a `SUMMARY.md` beside them.
-  The per-step `(+N file(s) collected)` lines show the bytes came off the workers'
-  VMs, not a rewrite. For a prose goal: `answer.md`.
+- For a file deliverable: the printed `wrote N file(s) to <dir> [<verdict>]` line,
+  the real files at `--output` (default `<run>/output/`), and a `SUMMARY.md` beside
+  them. The per-step `(+N file(s) collected)` lines show the bytes came off the
+  workers' VMs, not a rewrite; the `-> verifying…` / `verification passed` lines and
+  the `[verified: runs]` tag show it was actually run. For a prose goal: `answer.md`.
 - The run directory `.maturana/orchestration/<run_id>/`: `plan.json` (the final
   step list with results) and `staging/` (what was fetched from the workers).
 - That the run ended on its own (completed) rather than hitting a limit — a stop
@@ -179,6 +187,9 @@ Before claiming a run succeeded, collect:
 - A file deliverable came out as prose in `answer.md` instead of files: the
   synthesizer judged the goal as prose — rerun with a goal that clearly asks for
   files, and pass `--output <dir>`.
+- Verdict is `NOT verified` / `unverified`: an agent ran the files and they still
+  failed (or it couldn't finish within the cap) — read `SUMMARY.md` for what's
+  broken, then re-run (optionally `--max-turns` higher to allow more repair passes).
 - A step keeps failing: read its result in `plan.json`; the failure stops the run
   with the partial results preserved.
 
