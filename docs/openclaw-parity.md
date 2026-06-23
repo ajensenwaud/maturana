@@ -25,7 +25,7 @@ Note: rich Telegram delivery (HTML/markdown/progress drafts) Maturana already mi
 |---|---|---|---|
 | **Isolation** | Docker / SSH / OpenShell sandboxes | Firecracker / Hyper-V **VMs** (hardware) | Maturana **stronger** |
 | **Secrets / egress** | tokens in config + allowlists | pipelock (encrypted, never in guest) + MITM egress proxy + audit | Maturana **stronger** |
-| **Orchestration** | **TaskFlow** — durable flow state; sub-agent spawns, scheduled tasks, multi-step workflows survive a restart, inspectable / recoverable / cancellable | orchestrator loop (ephemeral; dies with the process) | **GAP — durability/recovery** |
+| **Orchestration** | **TaskFlow** — durable flow state; sub-agent spawns, scheduled tasks, multi-step workflows survive a restart, inspectable / recoverable / cancellable | orchestrator loop with **durable runs**: `orchestrator list` / `resume` / `abort` — a run survives a host restart and resumes from its saved plan (kept done steps, re-run unfinished) | **Closed** (this branch) |
 | **Multi-agent routing** | route inbound channels / accounts / peers → isolated agents (per-agent workspaces + sessions) | each agent has its own channel/bot; no sender→agent router | **GAP** |
 | **Plugin / skill model** | SKILL.md dirs **+ ClawHub marketplace**: browse/install ~15k skills; plugins add channels, providers, tools, voice | SKILL.md dirs (in-repo) installed as Codex skills; MCP servers | **GAP — registry + remote install** |
 | **Memory** | MEMORY.md + provenance-rich + **hybrid keyword+vector** (Qdrant, opt-in) | MaturanaGraph (keyword GraphRAG) + LLM-wiki + per-agent memory | **PARTIAL — no provenance surfaced, no vector** |
@@ -47,10 +47,12 @@ Maturana's bet is the opposite.
 
 ## D. The real gaps, ranked (candidates to close)
 
-1. **Durable / recoverable orchestration (TaskFlow-equivalent).** Background runs,
-   schedules, and multi-step flows that survive a restart and are inspectable /
-   resumable / cancellable. Highest value, security-neutral. The persistent board
-   (Hermes branch) is the foundation; this adds durable state + resume + a flow view.
+1. **Durable / recoverable orchestration (TaskFlow-equivalent). — CLOSED on this
+   branch.** `orchestrator list` shows every run + state (complete / incomplete /
+   aborted / failed); `orchestrator resume <run_id>` reloads the saved plan, keeps
+   completed steps, re-queues unfinished ones, and drives it to completion (skipping
+   the planning turn); `abort` cancels. Live-proven: a run was killed mid-flight at
+   1/4 steps and `resume` finished it to 4/4. Security-neutral.
 2. **Skill / plugin registry + gated remote install (ClawHub-equivalent).** Browse +
    install skills from a registry — but every install runs through
    `maturana-security-review` and stays sandboxed (the charter's whole point:

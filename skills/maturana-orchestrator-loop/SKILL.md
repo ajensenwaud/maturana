@@ -159,6 +159,14 @@ Stop a run (takes effect between steps; a step already running finishes its turn
 maturana orchestrator abort <run_id>
 ```
 
+Runs are DURABLE on disk — list them and resume an interrupted one (e.g. after a
+host restart or a crash); completed steps are kept, unfinished steps re-run:
+
+```bash
+maturana orchestrator list                 # every run + state (complete/incomplete/aborted/failed)
+maturana orchestrator resume <run_id>      # pick up where it left off
+```
+
 ## Evidence
 
 Before claiming a run succeeded, collect:
