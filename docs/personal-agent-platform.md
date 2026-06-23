@@ -1,11 +1,12 @@
-# OpenClaw — functional comparison
+# Maturana — personal-agent platform capabilities
 
-OpenClaw (latest **2026.6.9**) is a self-hosted personal-agent platform: ~120k stars,
-50+ integrations, a plugin marketplace (**ClawHub**, ~15k community skills), 23+
-messaging channels, durable workflow orchestration (**TaskFlow**), and mobile/desktop
-companion apps. This is an honest comparison of what it does vs Maturana — channels
-**and** everything else — so we can agree what's worth closing. Maturana's invariant:
-hardware-VM isolation, no secrets in the guest, governed **outbound-only** egress.
+Maturana is a secure, VM-isolated personal-agent platform. To see where it stands in
+the field, this benchmarks it against a broad self-hosted agent platform (OpenClaw,
+2026.6.9 — ~120k stars, a plugin marketplace, 23+ channels, durable orchestration,
+companion apps) as a reference point. It is a map of our own capabilities and what's
+worth building next — not a spec to copy; the design choices are ours, and several of
+theirs we deliberately reject. Maturana's invariant holds throughout: hardware-VM
+isolation, no secrets in the guest, governed **outbound-only** egress.
 
 ## A. Channels
 
@@ -45,7 +46,7 @@ proxy + audit, snapshot/rollback, and (on the Hermes branch) a budget-capped
 multi-agent loop + Kanban + verify-it-runs. OpenClaw trades isolation for breadth;
 Maturana's bet is the opposite.
 
-## D. The real gaps, ranked (candidates to close)
+## D. Capabilities to build, ranked
 
 1. **Durable / recoverable orchestration (TaskFlow-equivalent). — CLOSED on this
    branch.** `orchestrator list` shows every run + state (complete / incomplete /

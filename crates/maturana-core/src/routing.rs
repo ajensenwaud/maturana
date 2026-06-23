@@ -1,10 +1,9 @@
-//! Multi-agent routing: decide which agent should handle an inbound message,
-//! by channel, sender, and/or content. OpenClaw routes inbound channels /
-//! accounts / peers to isolated agents; this is Maturana's host-side, zero-trust
-//! version. A route only decides WHICH agent's front door (`enqueue_turn`) an
-//! inbound goes to — the agents stay isolated in their own VMs, secrets stay
-//! host-side, nothing about isolation changes. It is a dispatch table, not a new
-//! trust boundary.
+//! Multi-agent routing: decide which agent should handle an inbound message, by
+//! channel, sender, and/or content — so one front-end can fan out to several
+//! isolated agents (a personal-assistant fleet behind one inbox). A route only
+//! decides WHICH agent's front door (`enqueue_turn`) an inbound goes to — the
+//! agents stay isolated in their own VMs, secrets stay host-side, nothing about
+//! isolation changes. It is a dispatch table, not a new trust boundary.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
