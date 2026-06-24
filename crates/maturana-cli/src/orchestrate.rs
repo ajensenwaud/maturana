@@ -85,6 +85,11 @@ pub enum OrchestratorSubcommand {
         /// standing agents instead.
         #[arg(long)]
         base_spec: Option<String>,
+        /// Internal: post progress + the final result back to the chat that
+        /// started the run. Set by the `/loop` channel command; omit for a plain
+        /// CLI run (which just prints).
+        #[command(flatten)]
+        chat: ChatTargetArgs,
     },
     /// Show the live step list and budget for a run.
     Status { run_id: String },
@@ -605,6 +610,7 @@ pub fn handle_orchestrator(command: OrchestratorCommand, home: &MaturanaHome) ->
             max_vms,
             roles_file,
             base_spec,
+            chat,
         } => {
             let overrides = CapsOverride {
                 max_total_turns: max_turns,
@@ -618,7 +624,7 @@ pub fn handle_orchestrator(command: OrchestratorCommand, home: &MaturanaHome) ->
                 agents,
                 base_spec,
             };
-            run_loop(home, &goal, run_id, overrides, placement, output, !no_verify)
+            run_loop(home, &goal, run_id, overrides, placement, output, !no_verify, chat.resolve())
         }
         OrchestratorSubcommand::Status { run_id } => status(home, &run_id),
         OrchestratorSubcommand::Abort { run_id } => {
@@ -734,6 +740,78 @@ fn resolve_registry(home: &MaturanaHome, placement: &PlacementChoice) -> anyhow:
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The chat a `/loop` run reports back to. Every field travels as a `--chat-*`
+/// flag from the channel command; the orchestrator posts its progress + final
+/// result to this chat's outbox (channel-agnostic — the channel's own delivery
+/// thread sends it). A plain CLI run leaves these unset and only prints.
+#[derive(Debug, Clone, Default, Args)]
+pub struct ChatTargetArgs {
+    #[arg(long = "chat-channel")]
+    pub chat_channel: Option<String>,
+    #[arg(long = "chat-platform-id")]
+    pub chat_platform_id: Option<String>,
+    #[arg(long = "chat-thread-id")]
+    pub chat_thread_id: Option<String>,
+    #[arg(long = "chat-agent")]
+    pub chat_agent: Option<String>,
+    #[arg(long = "chat-session")]
+    pub chat_session: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ChatTarget {
+    channel: String,
+    platform_id: String,
+    thread_id: Option<String>,
+    agent_id: String,
+    session_id: String,
+}
+
+impl ChatTargetArgs {
+    /// A target only when the channel actually addressed one (all required fields
+    /// present together); otherwise this is a plain CLI run that just prints.
+    fn resolve(self) -> Option<ChatTarget> {
+        Some(ChatTarget {
+            channel: self.chat_channel?,
+            platform_id: self.chat_platform_id?,
+            agent_id: self.chat_agent?,
+            session_id: self.chat_session?,
+            thread_id: self.chat_thread_id,
+        })
+    }
+}
+
+/// Post one literal status line to the originating chat's outbox; the channel's
+/// running delivery thread sends it. Best-effort — a failed post never stops the
+/// run, and a plain CLI run (chat = None) is a no-op.
+fn post_chat(home: &MaturanaHome, chat: Option<&ChatTarget>, text: &str) {
+    let Some(c) = chat else { return };
+    let paths = maturana_core::session_db::session_paths(&home.agent_dir(&c.agent_id), &c.session_id);
+    let body = serde_json::json!({ "text": text }).to_string();
+    let _ = maturana_core::session_db::write_outbound(
+        &paths,
+        None,
+        "chat",
+        &c.channel,
+        &c.platform_id,
+        c.thread_id.as_deref(),
+        &body,
+    );
+}
+
+/// A compact, chat-friendly rendering of the plan (one line per step).
+fn plan_chat_summary(plan: &Plan) -> String {
+    plan.steps
+        .iter()
+        .enumerate()
+        .map(|(i, step)| {
+            let task: String = step.task.chars().take(80).collect();
+            format!("{}. [{}] {}", i + 1, step.role, task.trim())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn run_loop(
     home: &MaturanaHome,
     goal: &str,
@@ -742,6 +820,7 @@ fn run_loop(
     placement: PlacementChoice,
     output: Option<PathBuf>,
     verify: bool,
+    chat: Option<ChatTarget>,
 ) -> anyhow::Result<()> {
     let caps = OrchestratorCaps::default().tighten_with(&overrides);
     let registry = resolve_registry(home, &placement)?;
@@ -751,6 +830,11 @@ fn run_loop(
     std::fs::create_dir_all(run_dir(home, &run_id))?;
     println!("orchestrator: run {run_id}");
     println!("  goal: {goal}");
+    post_chat(
+        home,
+        chat.as_ref(),
+        &format!("🔄 On it — {goal}\nRun `{run_id}`. Breaking the goal into steps…"),
+    );
     println!(
         "  caps: {} turns / {}s wall / {} parallel / {} VMs",
         caps.max_total_turns, caps.max_wall_seconds, caps.max_parallel, caps.max_concurrent_vms
@@ -785,8 +869,12 @@ fn run_loop(
     );
     let result = run_inner(
         home, goal, &run_id, &registry, &caps, &mut pool, &a2a, output.as_deref(), verify,
+        chat.as_ref(),
     );
     pool.teardown();
+    if let Err(error) = &result {
+        post_chat(home, chat.as_ref(), &format!("⚠️ Loop `{run_id}` stopped: {error:#}"));
+    }
     result
 }
 
@@ -801,6 +889,7 @@ fn run_inner(
     a2a: &A2aWire,
     output: Option<&std::path::Path>,
     verify: bool,
+    chat: Option<&ChatTarget>,
 ) -> anyhow::Result<()> {
     let mut budget = RunBudget::new(caps.clone());
     let started = Instant::now();
@@ -838,6 +927,15 @@ fn run_inner(
     }
     save_plan(home, run_id, &plan)?;
     println!("  plan: {} steps", plan.steps.len());
+    post_chat(
+        home,
+        chat,
+        &format!(
+            "📋 Plan — {} steps:\n{}\n\nRunning now…",
+            plan.steps.len(),
+            plan_chat_summary(&plan)
+        ),
+    );
 
     // --- Execute: run each ready step over the A2A wire until done or stopped ---
     let mut stop_reason = "completed";
@@ -920,6 +1018,12 @@ fn run_inner(
                     } else {
                         println!("  <- step {sid} done");
                     }
+                    let done = plan.steps.iter().filter(|s| s.status == StepStatus::Done).count();
+                    post_chat(
+                        home,
+                        chat,
+                        &format!("✓ {done}/{} — {} ({sid})", plan.steps.len(), step.role),
+                    );
                 }
                 Err(error) => {
                     eprintln!("orchestrator: step {sid} failed: {error:#}");
@@ -984,6 +1088,17 @@ fn run_inner(
             println!("  - {name}");
         }
         println!("{}", verdict.detail());
+        post_chat(
+            home,
+            chat,
+            &format!(
+                "✅ Done — Loop `{run_id}` [{}]\nWrote {} file(s): {}\nOutput: {}",
+                verdict.label(),
+                names.len(),
+                names.join(", "),
+                dir.display(),
+            ),
+        );
         return Ok(());
     }
 
@@ -1017,12 +1132,24 @@ fn run_inner(
             for name in &names {
                 println!("  - {name}");
             }
+            post_chat(
+                home,
+                chat,
+                &format!(
+                    "✅ Done — Loop `{run_id}`\nWrote {} file(s): {}\nOutput: {}",
+                    names.len(),
+                    names.join(", "),
+                    dir.display(),
+                ),
+            );
         }
         Deliverable::Prose { path } => {
             println!(
                 "\n=== orchestrator run {run_id}: final answer ({}) ===\n{reply}",
                 path.display()
             );
+            let answer: String = reply.chars().take(3500).collect();
+            post_chat(home, chat, &format!("✅ Done — Loop `{run_id}`\n\n{answer}"));
         }
     }
     Ok(())

@@ -856,7 +856,7 @@ fn handle_telegram_update(
                 return Ok(());
             }
             let reply =
-                handle_channel_command(home, &config.agent_id, &config.session_id, chat_id, &name, &args)
+                handle_channel_command(home, &config.agent_id, &config.session_id, chat_id, "telegram", &chat_id.to_string(), &name, &args)
                     .unwrap_or_else(|error| format!("Command failed: {error:#}"));
             send_telegram(token, &chat_id.to_string(), &reply, reply_to_message_id)?;
             Ok(())
@@ -1167,7 +1167,15 @@ pub(crate) fn run_console_command(
     session_id: &str,
     raw: &str,
 ) -> ConsoleCommand {
-    dispatch_slash_command(home, agent_id, session_id, console_chat_key(), "console", raw)
+    dispatch_slash_command(
+        home,
+        agent_id,
+        session_id,
+        console_chat_key(),
+        "console",
+        &console_chat_key().to_string(),
+        raw,
+    )
 }
 
 /// Channel-agnostic slash-command dispatcher. The console TUI, Discord (and any
@@ -1182,6 +1190,7 @@ pub(crate) fn dispatch_slash_command(
     session_id: &str,
     chat_id: i64,
     channel: &str,
+    platform_id: &str,
     raw: &str,
 ) -> ConsoleCommand {
     let trimmed = raw.trim();
@@ -1269,7 +1278,7 @@ pub(crate) fn dispatch_slash_command(
                         .collect();
                     ConsoleCommand::Select { title, options }
                 }
-                None => match handle_channel_command(home, agent_id, session_id, chat_id, &name, args)
+                None => match handle_channel_command(home, agent_id, session_id, chat_id, channel, platform_id, &name, args)
                 {
                     Ok(reply) => ConsoleCommand::Reply(reply),
                     Err(error) => ConsoleCommand::Reply(format!("Command failed: {error:#}")),
@@ -1280,7 +1289,7 @@ pub(crate) fn dispatch_slash_command(
         // SAME one Telegram uses — so no surface lags the command set. A new
         // command in `handle_channel_command` works here automatically;
         // unrecognized names get its own "Unknown command" reply.
-        _ => match handle_channel_command(home, agent_id, session_id, chat_id, &name, args) {
+        _ => match handle_channel_command(home, agent_id, session_id, chat_id, channel, platform_id, &name, args) {
             Ok(reply) => ConsoleCommand::Reply(reply),
             Err(error) => ConsoleCommand::Reply(format!("Command failed: {error:#}")),
         },
@@ -2084,7 +2093,7 @@ fn classify_telegram_update(
         "/onboard" => InboundAction::Onboard { chat_id },
         "/commands" | "/tools" | "/models" | "/model" | "/reasoning" | "/reset" | "/stop" | "/compact"
         | "/session" | "/subagents" | "/graph-query" | "/graph-insert" | "/tts"
-        | "/tts-provider" | "/emerge" | "/skill" => InboundAction::Command {
+        | "/tts-provider" | "/emerge" | "/skill" | "/loop" => InboundAction::Command {
             chat_id,
             name: cmd.trim_start_matches('/').to_string(),
             args,
@@ -2279,6 +2288,7 @@ const COMMAND_GROUPS: &[(&str, &[(&str, &str)])] = &[
     (
         "Management",
         &[
+            ("/loop", "run a multi-agent loop on a goal (/loop <goal>); posts progress here"),
             ("/subagents", "inspect subagent runs for this session"),
             ("/skill", "run a skill by name (/skill <name> [args])"),
             ("/emerge", "run a sub-agent on a task (/emerge <task>)"),
@@ -2861,11 +2871,201 @@ fn channel_presence(home: &MaturanaHome, agent_id: &str) -> String {
 
 /// Handle a slash command that returns a text reply (and may persist settings or
 /// reset context). Side-effecting spawns/prompts are routed earlier in classify.
+/// Spawn `maturana orchestrator loop` as a detached host process that reports its
+/// progress + final result back to THIS chat (via the chat-target flags). The
+/// command handler returns immediately; a reaper thread waits on the child so it
+/// never becomes a zombie. The loop is a normal process, so it keeps running after
+/// the handler returns (only a full plane restart would stop it mid-run).
+fn spawn_loop_process(
+    home: &MaturanaHome,
+    run_id: &str,
+    goal: &str,
+    channel: &str,
+    platform_id: &str,
+    agent_id: &str,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("locate the maturana binary")?;
+    let run_dir = home.root().join("orchestration").join(run_id);
+    fs::create_dir_all(&run_dir)?;
+    let log = fs::File::create(run_dir.join("loop.log"))?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--home")
+        .arg(home.root())
+        .arg("orchestrator")
+        .arg("loop")
+        .arg(goal)
+        .arg("--run-id")
+        .arg(run_id)
+        .arg("--chat-channel")
+        .arg(channel)
+        .arg("--chat-platform-id")
+        .arg(platform_id)
+        .arg("--chat-agent")
+        .arg(agent_id)
+        .arg("--chat-session")
+        .arg(session_id)
+        .stdin(std::process::Stdio::null())
+        .stderr(log.try_clone()?)
+        .stdout(log);
+    let mut child = cmd.spawn().context("spawn orchestrator loop")?;
+    // Reap the child off-thread so it doesn't zombie; never blocks the channel.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// `/loop` — start a multi-agent orchestration loop on a goal (it posts progress
+/// + the result back here), or manage one (`status` / `abort`). Available on every
+/// text channel through the shared command handler.
+fn handle_loop_command(
+    home: &MaturanaHome,
+    agent_id: &str,
+    session_id: &str,
+    chat_id: i64,
+    channel: &str,
+    platform_id: &str,
+    args: &str,
+) -> String {
+    let args = args.trim();
+    let (sub, rest) = match args.split_once(char::is_whitespace) {
+        Some((a, b)) => (a.to_ascii_lowercase(), b.trim()),
+        None => (args.to_ascii_lowercase(), ""),
+    };
+    match sub.as_str() {
+        "" => loop_usage_text(),
+        "abort" => {
+            if rest.is_empty() {
+                return "Usage: /loop abort <run_id>".to_string();
+            }
+            let dir = home.root().join("orchestration").join(rest);
+            if !dir.exists() {
+                return format!("No loop `{rest}` found.");
+            }
+            match fs::write(dir.join("abort"), "aborted") {
+                Ok(()) => format!(
+                    "🛑 Abort requested for `{rest}` — the in-flight step finishes its lease, then it stops."
+                ),
+                Err(error) => format!("Couldn't abort `{rest}`: {error}"),
+            }
+        }
+        "status" => {
+            if rest.is_empty() {
+                loop_list_text(home)
+            } else {
+                loop_status_text(home, rest)
+            }
+        }
+        // Anything else is the goal.
+        _ => {
+            let goal = args;
+            let run_id = format!("loop-{}-{}", chat_id.unsigned_abs(), Utc::now().timestamp());
+            match spawn_loop_process(home, &run_id, goal, channel, platform_id, agent_id, session_id) {
+                Ok(()) => {
+                    let _ = audit_channel_event(
+                        home,
+                        agent_id,
+                        "channel.loop.start",
+                        &format!("{run_id}: {goal}"),
+                    );
+                    format!(
+                        "🔄 Loop `{run_id}` started on:\n{goal}\n\nSeveral agents will plan it, do the parts, check the result, and combine them — I'll post the plan and each step here, then the result.\nManage: /loop status {run_id} · /loop abort {run_id}"
+                    )
+                }
+                Err(error) => format!("Couldn't start the loop: {error:#}"),
+            }
+        }
+    }
+}
+
+fn loop_usage_text() -> String {
+    "🔄 /loop runs a multi-agent loop on a goal: several agents plan it, do the parts, \
+     check the result, and combine them — progress posts here.\n\n\
+     • /loop <goal> — start (e.g. /loop build a tic-tac-toe game playable in the browser)\n\
+     • /loop status [run_id] — list loops, or show one run's steps\n\
+     • /loop abort <run_id> — stop a run"
+        .to_string()
+}
+
+/// A one-line state for a loop run, read from its durable plan.json.
+fn loop_state_label(run_dir: &Path) -> String {
+    let raw = match fs::read_to_string(run_dir.join("plan.json")) {
+        Ok(raw) => raw,
+        Err(_) => return "planning…".to_string(),
+    };
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return "planning…".to_string(),
+    };
+    let Some(steps) = value.get("steps").and_then(|s| s.as_array()) else {
+        return "planning…".to_string();
+    };
+    let status_is = |step: &serde_json::Value, want: &str| {
+        step.get("status")
+            .and_then(|s| s.as_str())
+            .map(|s| s.eq_ignore_ascii_case(want))
+            .unwrap_or(false)
+    };
+    let total = steps.len();
+    let done = steps.iter().filter(|s| status_is(s, "done")).count();
+    let failed = steps.iter().any(|s| status_is(s, "failed"));
+    let state = if run_dir.join("abort").exists() {
+        "aborted"
+    } else if failed {
+        "failed"
+    } else if total > 0 && done == total {
+        "complete"
+    } else {
+        "running"
+    };
+    format!("{state} — {done}/{total} steps")
+}
+
+fn loop_status_text(home: &MaturanaHome, run_id: &str) -> String {
+    let run_dir = home.root().join("orchestration").join(run_id);
+    if !run_dir.exists() {
+        return format!("No loop `{run_id}` found.");
+    }
+    let goal = fs::read_to_string(run_dir.join("plan.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("goal").and_then(|g| g.as_str()).map(str::to_string))
+        .unwrap_or_default();
+    if goal.is_empty() {
+        format!("Loop `{run_id}`: {}", loop_state_label(&run_dir))
+    } else {
+        format!("Loop `{run_id}`: {}\nGoal: {goal}", loop_state_label(&run_dir))
+    }
+}
+
+fn loop_list_text(home: &MaturanaHome) -> String {
+    let dir = home.root().join("orchestration");
+    let mut runs: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("loop-") {
+                continue;
+            }
+            runs.push(format!("• `{name}` — {}", loop_state_label(&entry.path())));
+        }
+    }
+    if runs.is_empty() {
+        "No loops yet. Start one with /loop <goal>.".to_string()
+    } else {
+        runs.sort();
+        format!("Loops:\n{}", runs.join("\n"))
+    }
+}
+
 fn handle_channel_command(
     home: &MaturanaHome,
     agent_id: &str,
     session_id: &str,
     chat_id: i64,
+    channel: &str,
+    platform_id: &str,
     name: &str,
     args: &str,
 ) -> anyhow::Result<String> {
@@ -3043,6 +3243,15 @@ fn handle_channel_command(
                 format!("Usage: /skill <name> [args]\nSkills:\n{}", names.join(", "))
             }
         }
+        "loop" => handle_loop_command(
+            home,
+            &config.agent_id,
+            &config.session_id,
+            chat_id,
+            channel,
+            platform_id,
+            args,
+        ),
         _ => format!("Unknown command `/{name}`. Try /help."),
     };
     Ok(reply)
@@ -5504,6 +5713,7 @@ fn discord_gateway_session(
                                         &config.session_id,
                                         stable_chat_key(&channel_id),
                                         "discord",
+                                        &channel_id,
                                         &content,
                                     ) {
                                         ConsoleCommand::Reply(text) => {
@@ -6858,6 +7068,7 @@ mod tests {
             "s",
             console_chat_key(),
             "console",
+            &console_chat_key().to_string(),
             "/model gpt-5",
         );
         assert!(matches!(out, ConsoleCommand::Reply(_)));
@@ -6879,12 +7090,18 @@ mod tests {
         assert!(!names.is_empty(), "command catalog is empty");
         for name in names {
             // arg-guarded commands (/skill, /emerge, …) need a dummy arg to reach
-            // the handler rather than the usage fallthrough.
-            let raw = format!("{name} x");
+            // the handler rather than the usage fallthrough. /loop's bare-goal form
+            // would actually spawn a run, so exercise its non-spawning `status` path.
+            let raw = if name == "/loop" {
+                format!("{name} status")
+            } else {
+                format!("{name} x")
+            };
             for (chat_id, channel) in
                 [(console_chat_key(), "console"), (stable_chat_key("c1"), "discord")]
             {
-                let outcome = dispatch_slash_command(&home, "a", "s", chat_id, channel, &raw);
+                let outcome =
+                    dispatch_slash_command(&home, "a", "s", chat_id, channel, &chat_id.to_string(), &raw);
                 if let ConsoleCommand::Reply(text) = &outcome {
                     assert!(
                         !text.starts_with("Unknown command"),
