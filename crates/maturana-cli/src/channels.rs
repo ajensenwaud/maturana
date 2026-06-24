@@ -51,10 +51,7 @@ const SOUL_CONTEXT_CHARS: usize = 4000;
 const CONTRACT_CONTEXT_CHARS: usize = 5000;
 const MEMORY_CONTEXT_CHARS: usize = 5000;
 const AGENT_CONTEXT_CHARS: usize = 3000;
-const WIKI_INDEX_CONTEXT_CHARS: usize = 5000;
-const WIKI_CHUNK_CONTEXT_CHARS: usize = 6000;
 const TRANSCRIPT_CONTEXT_CHARS: usize = 8000;
-const CONTEXT_WIKI_CHUNK_LIMIT: usize = 3;
 
 #[derive(Debug, Args)]
 pub struct ChannelCommand {
@@ -199,7 +196,6 @@ struct ChannelContextManifest {
     agent_id: String,
     chat_id: i64,
     source_files: Vec<LoadedContextFile>,
-    wiki_chunks: Vec<LoadedWikiChunkSummary>,
     wiki_query_terms: Vec<String>,
     wiki_term_sources: Vec<WikiTermSource>,
     #[serde(default)]
@@ -233,8 +229,6 @@ struct ChannelContextBundle {
     contract: ContextFile,
     memory: ContextFile,
     agent_context: ContextFile,
-    wiki_index: ContextFile,
-    wiki_chunks: Vec<LoadedWikiChunk>,
     wiki_query_terms: Vec<String>,
     wiki_term_sources: Vec<WikiTermSource>,
     /// GraphRAG context from the agent's knowledge graph, when enabled.
@@ -255,22 +249,6 @@ struct GraphChannelContext {
     rendered: String,
 }
 
-#[derive(Debug, Clone)]
-struct LoadedWikiChunk {
-    score: usize,
-    matched_terms: Vec<String>,
-    path: PathBuf,
-    text: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LoadedWikiChunkSummary {
-    score: usize,
-    matched_terms: Vec<String>,
-    path: String,
-    chars: usize,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct WikiTermSource {
     term: String,
@@ -280,8 +258,6 @@ struct WikiTermSource {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ContextPolicySummary {
     strategy: String,
-    wiki_chunk_limit: usize,
-    wiki_char_budget: usize,
     transcript_char_budget: usize,
     excludes_reset_marker: bool,
 }
@@ -4380,12 +4356,8 @@ fn load_channel_context(
         .iter()
         .map(|term| term.term.clone())
         .collect::<Vec<_>>();
-    let wiki_chunks = load_relevant_wiki_chunks_for_terms(
-        home,
-        &wiki_query_terms,
-        CONTEXT_WIKI_CHUNK_LIMIT,
-        WIKI_CHUNK_CONTEXT_CHARS,
-    )?;
+    // The wiki was removed as a per-turn knowledge source — the graph is the
+    // single store. These query terms now drive only the GraphRAG lookup below.
     let graph_context = load_graph_channel_context(home, agent_id, &wiki_query_terms);
     // High-reward past turns shape this prompt (self-improvement, in-context).
     let learned_examples = maturana_core::improvement::TrajectoryStore::open(
@@ -4416,12 +4388,6 @@ fn load_channel_context(
             &agent_dir.join("context/README.md"),
             AGENT_CONTEXT_CHARS,
         )?,
-        wiki_index: read_context_file(
-            "wiki/INDEX.md",
-            &home.root().join("wiki/INDEX.md"),
-            WIKI_INDEX_CONTEXT_CHARS,
-        )?,
-        wiki_chunks,
         wiki_query_terms,
         wiki_term_sources: wiki_query.term_sources,
         graph_context,
@@ -4492,7 +4458,6 @@ built and what it returned.
 }
 
 fn render_channel_prompt(context: &ChannelContextBundle, user_message: &str) -> String {
-    let wiki_chunks = render_wiki_chunks(&context.wiki_chunks);
     let forge_section = if context.self_forge {
         forge_prompt_section()
     } else {
@@ -4553,12 +4518,6 @@ Return only the message that should be sent back to Telegram.
 
 ## Agent Context
 {agent_context}
-
-## Shared Wiki Index
-{wiki_index}
-
-## Relevant Wiki Chunks
-{wiki_chunks}
 {graph_section}{learned_section}{forge_section}
 ## Recent Telegram Transcript
 {transcript}
@@ -4571,7 +4530,6 @@ Return only the message that should be sent back to Telegram.
         contract = context.contract.contents,
         memory = context.memory.contents,
         agent_context = context.agent_context.contents,
-        wiki_index = context.wiki_index.contents,
         transcript = context.transcript,
     )
 }
@@ -4592,29 +4550,13 @@ fn write_channel_context_manifest(
         context.contract.summary.clone(),
         context.memory.summary.clone(),
         context.agent_context.summary.clone(),
-        context.wiki_index.summary.clone(),
     ];
-    let wiki_chunks = context
-        .wiki_chunks
-        .iter()
-        .map(|chunk| LoadedWikiChunkSummary {
-            score: chunk.score,
-            matched_terms: chunk.matched_terms.clone(),
-            path: chunk.path.display().to_string(),
-            chars: chunk.text.chars().count(),
-        })
-        .collect();
     let graph_context_chars = context
         .graph_context
         .as_ref()
         .map(|graph| graph.rendered.chars().count())
         .unwrap_or(0);
     let loaded_context_chars = source_files.iter().map(|file| file.chars).sum::<usize>()
-        + context
-            .wiki_chunks
-            .iter()
-            .map(|chunk| chunk.text.chars().count())
-            .sum::<usize>()
         + graph_context_chars
         + context.transcript.chars().count();
     let manifest = ChannelContextManifest {
@@ -4622,7 +4564,6 @@ fn write_channel_context_manifest(
         agent_id: agent_id.to_string(),
         chat_id,
         source_files,
-        wiki_chunks,
         wiki_query_terms: context.wiki_query_terms.clone(),
         wiki_term_sources: context.wiki_term_sources.clone(),
         graph_name: context
@@ -4631,10 +4572,8 @@ fn write_channel_context_manifest(
             .map(|graph| graph.graph.clone()),
         graph_context_chars,
         context_policy: ContextPolicySummary {
-            strategy: "durable-files-plus-current-message-and-recent-transcript-wiki-terms"
+            strategy: "durable-files-plus-current-message-and-recent-transcript-graph-terms"
                 .to_string(),
-            wiki_chunk_limit: CONTEXT_WIKI_CHUNK_LIMIT,
-            wiki_char_budget: WIKI_CHUNK_CONTEXT_CHARS,
             transcript_char_budget: TRANSCRIPT_CONTEXT_CHARS,
             excludes_reset_marker: true,
         },
@@ -4644,58 +4583,6 @@ fn write_channel_context_manifest(
     };
     fs::write(path, serde_json::to_string_pretty(&manifest)?)?;
     Ok(())
-}
-
-fn load_relevant_wiki_chunks_for_terms(
-    home: &MaturanaHome,
-    terms: &[String],
-    limit: usize,
-    char_budget: usize,
-) -> anyhow::Result<Vec<LoadedWikiChunk>> {
-    if terms.is_empty() {
-        return Ok(Vec::new());
-    }
-    let chunk_dir = home.root().join("wiki/chunks");
-    if !chunk_dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut hits = Vec::new();
-    for entry in fs::read_dir(chunk_dir)? {
-        let path = entry?.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
-            continue;
-        }
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let lower = raw.to_ascii_lowercase();
-        let matched_terms = terms
-            .iter()
-            .filter(|term| lower.contains(term.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        let score = matched_terms.len();
-        if score > 0 {
-            hits.push((score, matched_terms, path, raw));
-        }
-    }
-    hits.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.2.cmp(&right.2)));
-    let mut chunks = Vec::new();
-    let mut used_chars = 0usize;
-    for (score, matched_terms, path, raw) in hits.into_iter().take(limit.max(1)) {
-        let remaining = char_budget.saturating_sub(used_chars);
-        if remaining == 0 {
-            break;
-        }
-        let text = truncate_chars(&raw, remaining.min(2000));
-        used_chars += text.chars().count();
-        chunks.push(LoadedWikiChunk {
-            score,
-            matched_terms,
-            path,
-            text,
-        });
-    }
-    Ok(chunks)
 }
 
 #[derive(Debug)]
@@ -4779,23 +4666,6 @@ fn transcript_for_wiki_query(transcript: &str) -> String {
         .filter(|line| !line.contains("Memory and wiki context will be reloaded"))
         .collect::<Vec<_>>();
     lines.join("\n")
-}
-
-fn render_wiki_chunks(chunks: &[LoadedWikiChunk]) -> String {
-    if chunks.is_empty() {
-        return "(no relevant wiki chunks found)".to_string();
-    }
-    let mut output = String::new();
-    for chunk in chunks {
-        output.push_str(&format!(
-            "\n### {} score={} matched_terms={}\n\n{}\n",
-            chunk.path.display(),
-            chunk.score,
-            chunk.matched_terms.join(","),
-            chunk.text.trim()
-        ));
-    }
-    output
 }
 
 fn read_context_file(label: &str, path: &Path, limit: usize) -> anyhow::Result<ContextFile> {
@@ -6481,19 +6351,12 @@ mod tests {
         fs::write(agent_dir.join("MATURANA.md"), "# Contract\n").unwrap();
         fs::write(agent_dir.join("memory/MEMORY.md"), "likes tea\n").unwrap();
         fs::write(agent_dir.join("context/README.md"), "local context\n").unwrap();
-        fs::create_dir_all(home.root().join("wiki/chunks")).unwrap();
-        fs::write(
-            home.root().join("wiki/chunks/tea-001.md"),
-            "Tea ceremonies are relevant shared context.\n",
-        )
-        .unwrap();
         append_channel_turn(&home, "agent", 42, "user", "my name is Anders").unwrap();
 
         let prompt =
             build_channel_prompt(&home, "agent", 42, "what is my name and tea preference?")
                 .unwrap();
         assert!(prompt.contains("likes tea"));
-        assert!(prompt.contains("Tea ceremonies"));
         assert!(prompt.contains("my name is Anders"));
         assert!(prompt.contains("what is my name and tea preference?"));
         let manifest_path = channel_context_manifest_path(&home, "agent", 42);
@@ -6501,17 +6364,14 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(manifest_path).unwrap()).unwrap();
         assert_eq!(manifest.agent_id, "agent");
         assert_eq!(manifest.chat_id, 42);
-        assert_eq!(manifest.wiki_chunks.len(), 1);
         assert!(manifest.loaded_context_chars > 0);
         assert!(manifest.wiki_query_terms.contains(&"name".to_string()));
         assert_eq!(
             manifest.context_policy.strategy,
-            "durable-files-plus-current-message-and-recent-transcript-wiki-terms"
+            "durable-files-plus-current-message-and-recent-transcript-graph-terms"
         );
         assert!(manifest.context_policy.excludes_reset_marker);
-        assert!(manifest.wiki_chunks[0]
-            .matched_terms
-            .contains(&"tea".to_string()));
+        // Query-term extraction (now feeding only the graph) still picks up message terms.
         assert!(manifest.wiki_term_sources.iter().any(
             |term| term.term == "tea" && term.sources.contains(&"current_message".to_string())
         ));
@@ -6734,7 +6594,7 @@ mod tests {
     }
 
     #[test]
-    fn channel_context_selects_wiki_from_recent_transcript_for_followups() {
+    fn channel_context_selects_query_terms_from_recent_transcript_for_followups() {
         let temp = temp_dir("channel-followup-context");
         let home = MaturanaHome::new(temp.path().join(".maturana"));
         let agent_dir = home.agent_dir("agent");
@@ -6745,12 +6605,6 @@ mod tests {
         fs::write(agent_dir.join("MATURANA.md"), "# Contract\n").unwrap();
         fs::write(agent_dir.join("memory/MEMORY.md"), "# Memory\n").unwrap();
         fs::write(agent_dir.join("context/README.md"), "# Context\n").unwrap();
-        fs::create_dir_all(home.root().join("wiki/chunks")).unwrap();
-        fs::write(
-            home.root().join("wiki/chunks/calendars-001.md"),
-            "Calendar planning context should be loaded for schedule follow-ups.\n",
-        )
-        .unwrap();
         append_channel_turn(
             &home,
             "agent",
@@ -6760,17 +6614,13 @@ mod tests {
         )
         .unwrap();
 
-        let prompt = build_channel_prompt(&home, "agent", 42, "what about that?").unwrap();
-        assert!(prompt.contains("Calendar planning context"));
+        let _prompt = build_channel_prompt(&home, "agent", 42, "what about that?").unwrap();
         let manifest: ChannelContextManifest = serde_json::from_str(
             &fs::read_to_string(channel_context_manifest_path(&home, "agent", 42)).unwrap(),
         )
         .unwrap();
-        assert_eq!(manifest.wiki_chunks.len(), 1);
-        assert!(manifest.wiki_chunks[0].path.contains("calendars-001.md"));
-        assert!(manifest.wiki_chunks[0]
-            .matched_terms
-            .contains(&"calendar".to_string()));
+        // A term from the RECENT TRANSCRIPT (not the bare follow-up) is selected for
+        // the graph query, so follow-ups like "what about that?" still retrieve context.
         assert!(manifest.wiki_query_terms.contains(&"calendar".to_string()));
         assert!(manifest
             .wiki_term_sources
@@ -6833,22 +6683,6 @@ mod tests {
         fs::write(agent_dir.join("MATURANA.md"), "# Contract\n").unwrap();
         fs::write(agent_dir.join("memory/MEMORY.md"), "# Memory\n").unwrap();
         fs::write(agent_dir.join("context/README.md"), "# Context\n").unwrap();
-        fs::create_dir_all(home.root().join("wiki/chunks")).unwrap();
-        fs::write(
-            home.root().join("wiki/chunks/archived-001.md"),
-            "Archived topic oldcontext should not leak into a fresh session.\n",
-        )
-        .unwrap();
-        fs::write(
-            home.root().join("wiki/chunks/reset-marker-001.md"),
-            "Memory wiki context reloaded turn marker should never drive retrieval.\n",
-        )
-        .unwrap();
-        fs::write(
-            home.root().join("wiki/chunks/fresh-001.md"),
-            "Freshnote is the only relevant shared context for the new question.\n",
-        )
-        .unwrap();
         append_channel_turn(
             &home,
             "agent",
@@ -6859,26 +6693,20 @@ mod tests {
         .unwrap();
 
         reset_channel_context(&home, "agent", 42).unwrap();
-        let prompt = build_channel_prompt(&home, "agent", 42, "freshnote please").unwrap();
+        let _prompt = build_channel_prompt(&home, "agent", 42, "freshnote please").unwrap();
 
-        assert!(prompt.contains("Freshnote"));
-        assert!(!prompt.contains("oldcontext"));
-        assert!(!prompt.contains("reloaded turn marker"));
         let manifest: ChannelContextManifest = serde_json::from_str(
             &fs::read_to_string(channel_context_manifest_path(&home, "agent", 42)).unwrap(),
         )
         .unwrap();
+        // After a reset, graph query terms come from the fresh message only — the
+        // archived transcript ("oldcontext") and the reset-marker text ("reloaded")
+        // must not drive retrieval.
         assert!(manifest.wiki_query_terms.contains(&"freshnote".to_string()));
         assert!(!manifest
             .wiki_query_terms
             .contains(&"oldcontext".to_string()));
         assert!(!manifest.wiki_query_terms.contains(&"reloaded".to_string()));
-        assert_eq!(manifest.wiki_chunks.len(), 1);
-        assert!(manifest.wiki_chunks[0].path.contains("fresh-001.md"));
-        assert_eq!(
-            manifest.wiki_chunks[0].matched_terms,
-            vec!["freshnote".to_string()]
-        );
         assert!(manifest
             .wiki_term_sources
             .iter()
