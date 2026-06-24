@@ -335,7 +335,29 @@ struct TelegramMessage {
     document: Option<TelegramDocument>,
     #[serde(default)]
     photo: Option<Vec<TelegramPhotoSize>>,
+    #[serde(default)]
+    voice: Option<TelegramVoice>,
+    #[serde(default)]
+    audio: Option<TelegramAudio>,
     chat: TelegramChat,
+}
+
+/// A Telegram voice note (an OGG/Opus recording from the mic button). Carries no
+/// `text`; we download and transcribe it (STT) host-side. Extra fields
+/// (duration, mime_type, file_size) are ignored.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct TelegramVoice {
+    file_id: String,
+}
+
+/// A Telegram audio file (a music/audio attachment, as opposed to a voice note).
+/// Also transcribed; the original file name, when present, is a better STT format
+/// hint than the generic voice default.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct TelegramAudio {
+    file_id: String,
+    #[serde(default)]
+    file_name: Option<String>,
 }
 
 /// A Telegram document attachment (file upload). The bot API caps `getFile`
@@ -416,6 +438,12 @@ enum InboundAction {
         chat_id: i64,
         file_id: String,
         caption: Option<String>,
+    },
+    /// A voice note or audio file to transcribe (STT), then treat as a prompt.
+    Voice {
+        chat_id: i64,
+        file_id: String,
+        filename: String,
     },
     Tool {
         chat_id: i64,
@@ -944,6 +972,19 @@ fn handle_telegram_update(
             chat_id,
             &file_id,
             caption.as_deref(),
+            reply_to_message_id,
+        ),
+        InboundAction::Voice {
+            chat_id,
+            file_id,
+            filename,
+        } => handle_telegram_voice(
+            home,
+            token,
+            config,
+            chat_id,
+            &file_id,
+            &filename,
             reply_to_message_id,
         ),
         InboundAction::Prompt { chat_id, text } => {
@@ -1715,6 +1756,81 @@ fn handle_telegram_photo(
     Ok(())
 }
 
+/// A voice note or audio file: download it, transcribe it host-side (STT), echo
+/// the transcript so the user can confirm it was heard correctly, then run the
+/// transcript through the SAME channel-prompt pipeline a typed message uses (so
+/// memory, graph, reply, and read-aloud all apply). The audio and the API key
+/// stay host-side; neither reaches the guest.
+fn handle_telegram_voice(
+    home: &MaturanaHome,
+    token: &str,
+    config: &TelegramServe,
+    chat_id: i64,
+    file_id: &str,
+    filename: &str,
+    reply_to_message_id: Option<i64>,
+) -> anyhow::Result<()> {
+    send_telegram_chat_action(token, &chat_id.to_string(), "typing")?;
+    let audio = match download_telegram_file_bytes(token, file_id, MAX_TELEGRAM_DOCUMENT_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            send_telegram(
+                token,
+                &chat_id.to_string(),
+                &format!("I couldn't download that voice message: {error:#}"),
+                reply_to_message_id,
+            )?;
+            return Ok(());
+        }
+    };
+    let settings = load_channel_settings(home, &config.agent_id);
+    let provider = stt_provider(home, settings.tts_provider.as_deref());
+    let transcript = match transcribe_speech(home, &provider, &audio, filename) {
+        Ok(text) if !text.trim().is_empty() => text.trim().to_string(),
+        Ok(_) => {
+            send_telegram(
+                token,
+                &chat_id.to_string(),
+                "I heard a voice message but couldn't make out any words. Try again, or send text.",
+                reply_to_message_id,
+            )?;
+            return Ok(());
+        }
+        Err(error) => {
+            audit_channel_event(
+                home,
+                &config.agent_id,
+                "channel.telegram.voice_error",
+                &format!("STT failed via {provider}: {error:#}"),
+            )?;
+            send_telegram(
+                token,
+                &chat_id.to_string(),
+                &format!(
+                    "I couldn't transcribe that voice message (provider: {provider}): {error:#}\n\nSet a transcription key in pipelock (e.g. `pipelock:elevenlabs/api-key`)."
+                ),
+                reply_to_message_id,
+            )?;
+            return Ok(());
+        }
+    };
+    audit_channel_event(
+        home,
+        &config.agent_id,
+        "channel.telegram.voice",
+        &format!("transcribed {} chars via {provider}", transcript.chars().count()),
+    )?;
+    // Echo the transcript so the user can see what was understood before the reply.
+    send_telegram(
+        token,
+        &chat_id.to_string(),
+        &format!("🎙️ \"{}\"", truncate_inline(&transcript, 400)),
+        reply_to_message_id,
+    )?;
+    // Run it exactly like a typed prompt: same memory/graph/reply/TTS pipeline.
+    run_channel_prompt(home, token, config, chat_id, &transcript, reply_to_message_id)
+}
+
 /// OCR an image to text by shelling out to the `tesseract` CLI — no API key, runs
 /// offline host-side. Returns the extracted text; errors clearly if tesseract is
 /// not installed.
@@ -1784,6 +1900,42 @@ fn download_telegram_document(
     Ok(bytes.len() as u64)
 }
 
+/// Download a Telegram file (by `file_id`) into memory rather than to disk —
+/// used for voice/audio, which we hand straight to the STT provider. Caps the
+/// read at `max_bytes` so a hostile `getFile` can't exhaust memory.
+fn download_telegram_file_bytes(
+    token: &str,
+    file_id: &str,
+    max_bytes: u64,
+) -> anyhow::Result<Vec<u8>> {
+    let response: TelegramGetFileResponse = ureq::get(&format!(
+        "https://api.telegram.org/bot{token}/getFile?file_id={file_id}"
+    ))
+    .call()
+    .context("Telegram getFile failed")?
+    .into_json()
+    .context("failed to parse Telegram getFile response")?;
+    if !response.ok {
+        anyhow::bail!("Telegram getFile returned ok=false");
+    }
+    let file_path = response
+        .result
+        .and_then(|result| result.file_path)
+        .context("Telegram getFile returned no file_path")?;
+    let reader = ureq::get(&format!(
+        "https://api.telegram.org/file/bot{token}/{file_path}"
+    ))
+    .call()
+    .context("Telegram file download failed")?
+    .into_reader();
+    let mut bytes = Vec::new();
+    std::io::Read::take(reader, max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        anyhow::bail!("file exceeds {max_bytes} bytes");
+    }
+    Ok(bytes)
+}
+
 /// Keep only filesystem-safe filename characters; Telegram file names are
 /// attacker-controlled input that ends up in a path under the agent inbox.
 fn sanitize_document_name(name: Option<&str>) -> String {
@@ -1850,6 +2002,31 @@ fn classify_telegram_update(
             chat_id,
             file_id: largest.file_id.clone(),
             caption: message.caption.clone(),
+        };
+    }
+    // Voice notes and audio files carry no `text`; transcribe them (STT) before
+    // the text path. The pairing gate still applies — only the paired chat can
+    // feed the agent.
+    if let Some((file_id, filename)) = message
+        .voice
+        .as_ref()
+        .map(|v| (v.file_id.clone(), "voice.ogg".to_string()))
+        .or_else(|| {
+            message.audio.as_ref().map(|a| {
+                (
+                    a.file_id.clone(),
+                    a.file_name.clone().unwrap_or_else(|| "audio.ogg".to_string()),
+                )
+            })
+        })
+    {
+        if paired_chat_id != Some(chat_id) {
+            return InboundAction::Deny { chat_id };
+        }
+        return InboundAction::Voice {
+            chat_id,
+            file_id,
+            filename,
         };
     }
     let text = message.text.as_deref().unwrap_or("").trim();
@@ -3219,6 +3396,136 @@ fn synthesize_speech(home: &MaturanaHome, provider: &str, text: &str) -> anyhow:
         anyhow::bail!("{provider} tts returned no audio");
     }
     Ok(bytes)
+}
+
+/// Choose an STT provider: honor the chat's `/tts-provider` choice if its key is
+/// configured (so a user who set elevenlabs gets elevenlabs both ways), otherwise
+/// fall back to the first provider whose key is present (elevenlabs → openai →
+/// deepgram). When nothing is configured, default to elevenlabs so the failure
+/// message points the user at the most likely key to set.
+fn stt_provider(home: &MaturanaHome, tts_provider: Option<&str>) -> String {
+    let configured = |provider: &str| -> bool {
+        let source = match provider {
+            "elevenlabs" => "pipelock:elevenlabs/api-key",
+            "openai" => "pipelock:openai/api-key",
+            "deepgram" => "pipelock:deepgram/api-key",
+            _ => return false,
+        };
+        resolve_secret_source_with_home(source, home.root()).is_ok()
+    };
+    if let Some(preferred) = tts_provider {
+        let preferred = preferred.to_ascii_lowercase();
+        if configured(&preferred) {
+            return preferred;
+        }
+    }
+    for provider in ["elevenlabs", "openai", "deepgram"] {
+        if configured(provider) {
+            return provider.to_string();
+        }
+    }
+    "elevenlabs".to_string()
+}
+
+/// Transcribe audio host-side (STT) via the chosen provider. Keys come from
+/// pipelock and never reach the guest. Supported: elevenlabs (scribe_v1, default),
+/// openai (whisper-1), deepgram (nova-2) — the same provider set as `/tts-provider`.
+fn transcribe_speech(
+    home: &MaturanaHome,
+    provider: &str,
+    audio: &[u8],
+    filename: &str,
+) -> anyhow::Result<String> {
+    let resolve = |source: &str| -> anyhow::Result<String> {
+        Ok(resolve_secret_source_with_home(source, home.root())?
+            .expose_for_runtime()
+            .to_string())
+    };
+    match provider.to_ascii_lowercase().as_str() {
+        "openai" => {
+            let key = resolve("pipelock:openai/api-key")?;
+            let (content_type, payload) = multipart_audio("model", "whisper-1", filename, audio);
+            let response = ureq::post("https://api.openai.com/v1/audio/transcriptions")
+                .set("authorization", &format!("Bearer {key}"))
+                .set("content-type", &content_type)
+                .timeout(Duration::from_secs(120))
+                .send_bytes(&payload)
+                .map_err(|e| anyhow::anyhow!("openai stt request failed: {e}"))?;
+            let json: serde_json::Value = response.into_json()?;
+            Ok(json
+                .get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string())
+        }
+        "deepgram" => {
+            let key = resolve("pipelock:deepgram/api-key")?;
+            let response =
+                ureq::post("https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true")
+                    .set("authorization", &format!("Token {key}"))
+                    .set("content-type", "audio/ogg")
+                    .timeout(Duration::from_secs(120))
+                    .send_bytes(audio)
+                    .map_err(|e| anyhow::anyhow!("deepgram stt request failed: {e}"))?;
+            let json: serde_json::Value = response.into_json()?;
+            Ok(json
+                .pointer("/results/channels/0/alternatives/0/transcript")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string())
+        }
+        _ => {
+            // ElevenLabs scribe (default).
+            let key = resolve("pipelock:elevenlabs/api-key")?;
+            let (content_type, payload) = multipart_audio("model_id", "scribe_v1", filename, audio);
+            let response = ureq::post("https://api.elevenlabs.io/v1/speech-to-text")
+                .set("xi-api-key", &key)
+                .set("content-type", &content_type)
+                .timeout(Duration::from_secs(120))
+                .send_bytes(&payload)
+                .map_err(|e| anyhow::anyhow!("elevenlabs stt request failed: {e}"))?;
+            let json: serde_json::Value = response.into_json()?;
+            Ok(json
+                .get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string())
+        }
+    }
+}
+
+/// Build a minimal multipart/form-data body for an STT endpoint: a model field
+/// plus the audio file. `model_field` is `model` (OpenAI) or `model_id`
+/// (ElevenLabs). Returns (content_type, body).
+fn multipart_audio(
+    model_field: &str,
+    model_value: &str,
+    filename: &str,
+    audio: &[u8],
+) -> (String, Vec<u8>) {
+    let boundary = "maturanasttboundary7e3f";
+    let mut body = Vec::new();
+    let part = |headers: &str, data: &[u8], body: &mut Vec<u8>| {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(headers.as_bytes());
+        body.extend_from_slice(b"\r\n\r\n");
+        body.extend_from_slice(data);
+        body.extend_from_slice(b"\r\n");
+    };
+    part(
+        &format!("content-disposition: form-data; name=\"{model_field}\""),
+        model_value.as_bytes(),
+        &mut body,
+    );
+    part(
+        &format!(
+            "content-disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\ncontent-type: application/octet-stream"
+        ),
+        audio,
+        &mut body,
+    );
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={boundary}"), body)
 }
 
 /// Upload mp3 audio to the chat via Telegram `sendAudio` (multipart/form-data).
@@ -6745,6 +7052,8 @@ mod tests {
                 caption: None,
                 document: None,
                 photo: None,
+                voice: None,
+                audio: None,
                 chat: TelegramChat { id: chat_id },
             }),
             channel_post: None,
@@ -6765,6 +7074,8 @@ mod tests {
                     file_size: Some(1024),
                 }),
                 photo: None,
+                voice: None,
+                audio: None,
                 chat: TelegramChat { id: chat_id },
             }),
             channel_post: None,
@@ -6788,11 +7099,65 @@ mod tests {
                         file_id: "photo-large".to_string(),
                     },
                 ]),
+                voice: None,
+                audio: None,
                 chat: TelegramChat { id: chat_id },
             }),
             channel_post: None,
             callback_query: None,
         }
+    }
+
+    fn voice_update(chat_id: i64) -> TelegramUpdate {
+        TelegramUpdate {
+            update_id: 1,
+            message: Some(TelegramMessage {
+                message_id: 1,
+                text: None,
+                caption: None,
+                document: None,
+                photo: None,
+                voice: Some(TelegramVoice {
+                    file_id: "voice-123".to_string(),
+                }),
+                audio: None,
+                chat: TelegramChat { id: chat_id },
+            }),
+            channel_post: None,
+            callback_query: None,
+        }
+    }
+
+    #[test]
+    fn routes_voice_notes_to_transcription_from_paired_chat_only() {
+        // A voice note carries no text/document/photo. Before the fix it fell
+        // through to the empty-text path and was Ignored (the "doesn't even
+        // register it" bug); it must now classify as Voice so it gets transcribed.
+        assert_eq!(
+            classify_telegram_update(&voice_update(7), Some(7), None),
+            InboundAction::Voice {
+                chat_id: 7,
+                file_id: "voice-123".to_string(),
+                filename: "voice.ogg".to_string(),
+            }
+        );
+        // The pairing gate applies to voice exactly like documents/photos.
+        assert_eq!(
+            classify_telegram_update(&voice_update(9), Some(7), None),
+            InboundAction::Deny { chat_id: 9 }
+        );
+    }
+
+    #[test]
+    fn stt_multipart_carries_model_and_audio() {
+        let (content_type, body) = multipart_audio("model_id", "scribe_v1", "voice.ogg", b"OGGDATA");
+        assert!(content_type.contains("multipart/form-data; boundary="));
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("name=\"model_id\""));
+        assert!(text.contains("scribe_v1"));
+        assert!(text.contains("filename=\"voice.ogg\""));
+        assert!(text.contains("OGGDATA"));
+        assert!(text.trim_end().ends_with("--"));
     }
 
     #[test]
