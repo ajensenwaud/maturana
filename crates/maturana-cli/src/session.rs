@@ -724,6 +724,23 @@ pub fn message_text(content: &str) -> anyhow::Result<String> {
         .to_string())
 }
 
+/// Host-side file paths to attach to an outbound message (`{"files":[...]}`). The
+/// channel's delivery sink uploads them where the channel supports it (Telegram
+/// sendDocument) and otherwise names them in the text. Empty when there's no
+/// `files` array, so the ordinary text path is unaffected.
+pub fn message_files(content: &str) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|value| {
+            value.get("files").and_then(|f| f.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

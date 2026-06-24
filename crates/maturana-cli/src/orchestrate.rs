@@ -827,6 +827,36 @@ fn post_chat(home: &MaturanaHome, chat: Option<&ChatTarget>, text: &str) {
     );
 }
 
+/// Like [`post_chat`], but attaches host-side files; the channel's delivery sink
+/// uploads them where supported (Telegram sendDocument) and otherwise names them.
+/// Non-existent paths are dropped; if none remain it degrades to a text post.
+fn post_chat_files(home: &MaturanaHome, chat: Option<&ChatTarget>, text: &str, files: &[String]) {
+    let Some(c) = chat else { return };
+    let existing: Vec<String> = files
+        .iter()
+        .filter(|f| std::path::Path::new(f).is_file())
+        .cloned()
+        .collect();
+    if existing.is_empty() {
+        post_chat(home, Some(c), text);
+        return;
+    }
+    let paths = maturana_core::session_db::session_paths(&home.agent_dir(&c.agent_id), &c.session_id);
+    if let Some(parent) = paths.outbound_db.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body = serde_json::json!({ "text": text, "files": existing }).to_string();
+    let _ = maturana_core::session_db::write_outbound(
+        &paths,
+        None,
+        "chat",
+        &c.channel,
+        &c.platform_id,
+        c.thread_id.as_deref(),
+        &body,
+    );
+}
+
 /// A compact, chat-friendly rendering of the plan (one line per step).
 fn plan_chat_summary(plan: &Plan) -> String {
     plan.steps
@@ -1143,16 +1173,20 @@ fn run_inner(
             println!("  - {name}");
         }
         println!("{}", verdict.detail());
-        post_chat(
+        let file_paths: Vec<String> = names
+            .iter()
+            .take(10)
+            .map(|n| dir.join(n).display().to_string())
+            .collect();
+        post_chat_files(
             home,
             chat,
             &format!(
-                "✅ Done — Loop `{run_id}` [{}]\nWrote {} file(s): {}\nOutput: {}",
+                "✅ Done — Loop `{run_id}` [{}] — {} file(s)",
                 verdict.label(),
-                names.len(),
-                names.join(", "),
-                dir.display(),
+                names.len()
             ),
+            &file_paths,
         );
         return Ok(());
     }
@@ -1187,15 +1221,16 @@ fn run_inner(
             for name in &names {
                 println!("  - {name}");
             }
-            post_chat(
+            let file_paths: Vec<String> = names
+                .iter()
+                .take(10)
+                .map(|n| dir.join(n).display().to_string())
+                .collect();
+            post_chat_files(
                 home,
                 chat,
-                &format!(
-                    "✅ Done — Loop `{run_id}`\nWrote {} file(s): {}\nOutput: {}",
-                    names.len(),
-                    names.join(", "),
-                    dir.display(),
-                ),
+                &format!("✅ Done — Loop `{run_id}` — {} file(s)", names.len()),
+                &file_paths,
             );
         }
         Deliverable::Prose { path } => {

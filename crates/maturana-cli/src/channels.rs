@@ -28,7 +28,7 @@ use std::{
     time::Duration,
 };
 
-use crate::session::{message_text, run_session_once, RunnerOptions};
+use crate::session::{message_files, message_text, run_session_once, RunnerOptions};
 
 const TELEGRAM_PAIR_CODE: &str = "telegram/pair-code";
 const TELEGRAM_CHAT_ID: &str = "telegram/chat-id";
@@ -1311,6 +1311,33 @@ trait OutboundSink {
         text: &str,
         reply_to: Option<&str>,
     ) -> anyhow::Result<Option<String>>;
+    /// Deliver a reply that carries one or more host-side files. The default, for
+    /// channels with no native upload, sends the text plus the file NAMES so the
+    /// user at least sees what was produced; channels that can upload (Telegram)
+    /// override this to send the bytes. `files` are absolute host paths.
+    fn send_files(
+        &mut self,
+        inbound_id: Option<&str>,
+        text: &str,
+        files: &[String],
+        reply_to: Option<&str>,
+    ) -> anyhow::Result<Option<String>> {
+        let names: Vec<String> = files
+            .iter()
+            .map(|f| {
+                Path::new(f)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| f.clone())
+            })
+            .collect();
+        let combined = if text.trim().is_empty() {
+            format!("📎 Files produced: {}", names.join(", "))
+        } else {
+            format!("{text}\n📎 Files produced: {}", names.join(", "))
+        };
+        self.send(inbound_id, &combined, reply_to)
+    }
     /// The reply was the silence sentinel — clean up any live placeholder. No-op by default.
     fn on_silence(&mut self, _inbound_id: Option<&str>) {}
     /// After a successful send (e.g. speak it via TTS). No-op by default.
@@ -1382,7 +1409,15 @@ fn deliver_outbox(
             let _ = mark_delivered(paths, &message.id, None);
             continue;
         }
-        match sink.send(inbound_id, &response, reply_to) {
+        // An outbound may carry host-side files (e.g. a `/loop` deliverable); the
+        // sink uploads them where the channel supports it, else names them.
+        let files = message_files(&message.content);
+        let send_result = if files.is_empty() {
+            sink.send(inbound_id, &response, reply_to)
+        } else {
+            sink.send_files(inbound_id, &response, &files, reply_to)
+        };
+        match send_result {
             Ok(platform_message_id) => {
                 let _ = mark_delivered(paths, &message.id, platform_message_id.as_deref());
                 let _ = append_channel_turn(home, agent_id, chat_key, "assistant", &response);
@@ -1431,6 +1466,53 @@ impl OutboundSink for TelegramSink<'_> {
             clear_telegram_status(self.paths, inbound);
         }
         Ok(platform_message_id.map(|id| id.to_string()))
+    }
+
+    fn send_files(
+        &mut self,
+        inbound_id: Option<&str>,
+        text: &str,
+        files: &[String],
+        reply_to: Option<&str>,
+    ) -> anyhow::Result<Option<String>> {
+        let reply_to_i = reply_to.and_then(|value| value.parse::<i64>().ok());
+        // If a live "working…" message exists, turn it into the text now and send
+        // the files as their own messages; otherwise the text rides as the first
+        // document's caption.
+        let live_id = inbound_id.and_then(|inbound| peek_telegram_status(self.paths, inbound));
+        let text_already_sent = if let Some(id) = live_id {
+            let _ = finalize_reply(self.token, self.chat_id, Some(id), text, reply_to_i)?;
+            true
+        } else {
+            false
+        };
+        if let Some(inbound) = inbound_id {
+            clear_telegram_status(self.paths, inbound);
+        }
+        let mut last_id: Option<String> = None;
+        let mut uploaded = 0usize;
+        for (i, path) in files.iter().enumerate() {
+            let caption = if i == 0 && !text_already_sent { Some(text) } else { None };
+            match send_telegram_document(self.token, self.chat_id, Path::new(path), caption, reply_to_i) {
+                Ok(id) => {
+                    last_id = id.map(|i| i.to_string());
+                    uploaded += 1;
+                }
+                Err(error) => eprintln!("telegram: sendDocument failed for {path}: {error:#}"),
+            }
+        }
+        // Nothing uploaded and the text never went out → send it as text so the
+        // user is never left silent (e.g. all files were missing or oversized).
+        if uploaded == 0 && !text_already_sent {
+            let names: Vec<String> = files
+                .iter()
+                .filter_map(|f| Path::new(f).file_name().map(|n| n.to_string_lossy().to_string()))
+                .collect();
+            let msg = format!("{text}\n(couldn't attach: {})", names.join(", "));
+            return Ok(finalize_reply(self.token, self.chat_id, None, &msg, reply_to_i)?
+                .map(|id| id.to_string()));
+        }
+        Ok(last_id)
     }
 
     fn on_silence(&mut self, inbound_id: Option<&str>) {
@@ -2884,6 +2966,7 @@ fn spawn_loop_process(
     platform_id: &str,
     agent_id: &str,
     session_id: &str,
+    no_verify: bool,
 ) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("locate the maturana binary")?;
     let run_dir = home.root().join("orchestration").join(run_id);
@@ -2908,6 +2991,9 @@ fn spawn_loop_process(
         .stdin(std::process::Stdio::null())
         .stderr(log.try_clone()?)
         .stdout(log);
+    if no_verify {
+        cmd.arg("--no-verify");
+    }
     let mut child = cmd.spawn().context("spawn orchestrator loop")?;
     // Reap the child off-thread so it doesn't zombie; never blocks the channel.
     std::thread::spawn(move || {
@@ -2957,25 +3043,58 @@ fn handle_loop_command(
                 loop_status_text(home, rest)
             }
         }
+        // `/loop fast <goal>` skips the run-it-and-verify pass for ~half the time.
+        "fast" => start_loop(home, agent_id, session_id, chat_id, channel, platform_id, rest, true),
         // Anything else is the goal.
-        _ => {
-            let goal = args;
-            let run_id = format!("loop-{}-{}", chat_id.unsigned_abs(), Utc::now().timestamp());
-            match spawn_loop_process(home, &run_id, goal, channel, platform_id, agent_id, session_id) {
-                Ok(()) => {
-                    let _ = audit_channel_event(
-                        home,
-                        agent_id,
-                        "channel.loop.start",
-                        &format!("{run_id}: {goal}"),
-                    );
-                    format!(
-                        "🔄 Loop `{run_id}` started on:\n{goal}\n\nSeveral agents will plan it, do the parts, check the result, and combine them — I'll post the plan and each step here, then the result.\nManage: /loop status {run_id} · /loop abort {run_id}"
-                    )
-                }
-                Err(error) => format!("Couldn't start the loop: {error:#}"),
-            }
+        _ => start_loop(home, agent_id, session_id, chat_id, channel, platform_id, args, false),
+    }
+}
+
+/// Spawn a `/loop` run and return the user-facing acknowledgement. `no_verify`
+/// skips the deliverable's run-it-and-check pass (the `fast` form).
+#[allow(clippy::too_many_arguments)]
+fn start_loop(
+    home: &MaturanaHome,
+    agent_id: &str,
+    session_id: &str,
+    chat_id: i64,
+    channel: &str,
+    platform_id: &str,
+    goal: &str,
+    no_verify: bool,
+) -> String {
+    let goal = goal.trim();
+    if goal.is_empty() {
+        return loop_usage_text();
+    }
+    let run_id = format!("loop-{}-{}", chat_id.unsigned_abs(), Utc::now().timestamp());
+    match spawn_loop_process(
+        home,
+        &run_id,
+        goal,
+        channel,
+        platform_id,
+        agent_id,
+        session_id,
+        no_verify,
+    ) {
+        Ok(()) => {
+            let _ = audit_channel_event(
+                home,
+                agent_id,
+                "channel.loop.start",
+                &format!("{run_id}{}: {goal}", if no_verify { " (fast)" } else { "" }),
+            );
+            let mode = if no_verify {
+                " (fast — skips the run-it-and-verify pass)"
+            } else {
+                ""
+            };
+            format!(
+                "🔄 Loop `{run_id}` started{mode} on:\n{goal}\n\nSeveral agents will plan it, do the parts, check the result, and combine them — I'll post the plan and each step here, then the result (files attached when produced).\nManage: /loop status {run_id} · /loop abort {run_id}"
+            )
         }
+        Err(error) => format!("Couldn't start the loop: {error:#}"),
     }
 }
 
@@ -2983,6 +3102,7 @@ fn loop_usage_text() -> String {
     "🔄 /loop runs a multi-agent loop on a goal: several agents plan it, do the parts, \
      check the result, and combine them — progress posts here.\n\n\
      • /loop <goal> — start (e.g. /loop build a tic-tac-toe game playable in the browser)\n\
+     • /loop fast <goal> — start without the run-it-and-verify pass (~half the time)\n\
      • /loop status [run_id] — list loops, or show one run's steps\n\
      • /loop abort <run_id> — stop a run"
         .to_string()
@@ -3770,6 +3890,74 @@ fn send_telegram_audio(
         .map_err(|e| anyhow::anyhow!("telegram sendAudio failed: {e}"))?;
     let _ = response.into_string();
     Ok(())
+}
+
+/// Upload a host-side file to the chat via Telegram `sendDocument`
+/// (multipart/form-data), with an optional caption on the first one. Returns the
+/// sent message id. The Telegram bot API caps `sendDocument` at 50 MB.
+fn send_telegram_document(
+    token: &str,
+    chat_id: i64,
+    path: &Path,
+    caption: Option<&str>,
+    reply_to: Option<i64>,
+) -> anyhow::Result<Option<i64>> {
+    const MAX_DOCUMENT_BYTES: u64 = 50 * 1024 * 1024;
+    let meta =
+        fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if meta.len() > MAX_DOCUMENT_BYTES {
+        anyhow::bail!(
+            "{} is {} bytes (over Telegram's 50 MB sendDocument limit)",
+            path.display(),
+            meta.len()
+        );
+    }
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let filename = path
+        .file_name()
+        .map(|n| n.to_string_lossy().replace(['"', '\r', '\n'], "_"))
+        .unwrap_or_else(|| "file".to_string());
+    let boundary = "maturanadocboundary7e3f";
+    let mut body: Vec<u8> = Vec::new();
+    let field = |name: &str, value: &str, body: &mut Vec<u8>| {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("content-disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    };
+    field("chat_id", &chat_id.to_string(), &mut body);
+    if let Some(caption) = caption {
+        // Telegram caps a document caption at ~1024 chars.
+        let caption: String = caption.chars().take(1000).collect();
+        field("caption", &caption, &mut body);
+    }
+    if let Some(id) = reply_to {
+        field("reply_to_message_id", &id.to_string(), &mut body);
+    }
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!(
+            "content-disposition: form-data; name=\"document\"; filename=\"{filename}\"\r\ncontent-type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(&bytes);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    let response = ureq::post(&format!("https://api.telegram.org/bot{token}/sendDocument"))
+        .set(
+            "content-type",
+            &format!("multipart/form-data; boundary={boundary}"),
+        )
+        .timeout(Duration::from_secs(120))
+        .send_bytes(&body)
+        .map_err(|e| anyhow::anyhow!("telegram sendDocument failed: {e}"))?;
+    let parsed: TelegramSendResponse = response
+        .into_json()
+        .unwrap_or(TelegramSendResponse { ok: false, result: None });
+    Ok(parsed.result.map(|r| r.message_id))
 }
 
 fn send_telegram(
