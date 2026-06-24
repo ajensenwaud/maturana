@@ -787,6 +787,12 @@ impl ChatTargetArgs {
 fn post_chat(home: &MaturanaHome, chat: Option<&ChatTarget>, text: &str) {
     let Some(c) = chat else { return };
     let paths = maturana_core::session_db::session_paths(&home.agent_dir(&c.agent_id), &c.session_id);
+    // write_outbound opens the db with create, but won't make its parent dir — a
+    // real chat's session dir already exists, but ensure it so a status post is
+    // never silently dropped.
+    if let Some(parent) = paths.outbound_db.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let body = serde_json::json!({ "text": text }).to_string();
     let _ = maturana_core::session_db::write_outbound(
         &paths,
