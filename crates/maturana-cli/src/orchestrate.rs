@@ -361,6 +361,28 @@ fn coordinator_task(goal: &str, registry: &RoleRegistry, caps: &OrchestratorCaps
     )
 }
 
+/// A stricter re-prompt sent after a coordinator reply we couldn't parse — some
+/// models answer in prose or wrap the JSON, so this leaves no room for either.
+fn coordinator_retry_task(goal: &str, registry: &RoleRegistry, caps: &OrchestratorCaps) -> String {
+    format!(
+        "{}\n\nIMPORTANT: your previous reply could not be parsed. Reply with ONLY \
+         the JSON object and nothing else — no prose, no markdown fences, no code \
+         block. Your reply must start with {{ and end with }}.",
+        coordinator_task(goal, registry, caps)
+    )
+}
+
+/// A short, single-line preview of a model reply for surfacing in an error so the
+/// user/operator can see what the coordinator actually said.
+fn reply_preview(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        "(empty reply — the coordinator agent likely timed out or returned nothing)".to_string()
+    } else {
+        trimmed.chars().take(240).collect::<String>().replace('\n', " ")
+    }
+}
+
 /// Read a reviewer reply's verdict.
 enum ReviewVerdict {
     Approve,
@@ -914,7 +936,7 @@ fn run_inner(
 
     // --- Plan: ask the coordinator to break the goal into steps ---
     let coordinator = pool.resolve("coordinator")?;
-    let plan_reply = dispatch_and_wait(
+    let mut plan_reply = dispatch_and_wait(
         home,
         a2a,
         &coordinator,
@@ -922,8 +944,35 @@ fn run_inner(
         &coordinator_task(goal, registry, caps),
         &mut budget,
     )?;
-    let mut plan =
-        parse_plan(goal, &plan_reply, registry).map_err(|e| anyhow::anyhow!("planning failed: {e}"))?;
+    let mut plan = match parse_plan(goal, &plan_reply, registry) {
+        Ok(plan) => plan,
+        Err(first_err) => {
+            // Models occasionally answer in prose, wrap the JSON, or return an empty
+            // preamble. Retry ONCE with a stricter JSON-only re-prompt before giving
+            // up — and if it still fails, surface what the coordinator actually said.
+            eprintln!(
+                "orchestrator: first plan unusable ({first_err}); retrying the coordinator with a stricter prompt"
+            );
+            post_chat(home, chat, "📋 The first plan wasn't usable — re-asking the coordinator…");
+            if budget.turns_remaining() > 0 && !is_aborted(home, run_id) {
+                plan_reply = dispatch_and_wait(
+                    home,
+                    a2a,
+                    &coordinator,
+                    run_id,
+                    &coordinator_retry_task(goal, registry, caps),
+                    &mut budget,
+                )?;
+            }
+            parse_plan(goal, &plan_reply, registry).map_err(|e| {
+                anyhow::anyhow!(
+                    "planning failed: {e}. The coordinator ({}) replied: {}",
+                    coordinator.agent_id,
+                    reply_preview(&plan_reply)
+                )
+            })?
+        }
+    };
     if !budget.admits_plan(plan.steps.len() as u32) {
         anyhow::bail!(
             "the {}-step plan could exceed the {} remaining turn budget; simplify the goal or raise --max-turns",
