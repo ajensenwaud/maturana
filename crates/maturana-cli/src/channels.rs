@@ -2630,6 +2630,8 @@ fn recent_openrouter_models(models: &[OpenRouterModel], n: usize) -> Vec<String>
     let mut picked: Vec<&OpenRouterModel> = models
         .iter()
         .filter(|m| m.text_output)
+        // opencode always sends tools; a model without tool support APIErrors.
+        .filter(|m| m.supports_tools)
         .filter(|m| {
             let id = m.id.to_ascii_lowercase();
             !DENY_SUBSTR.iter().any(|deny| id.contains(deny))
@@ -2690,6 +2692,9 @@ struct OpenRouterModel {
     created: i64,
     /// Whether the model emits text (a chat model) vs. image/embedding-only.
     text_output: bool,
+    /// Whether the model accepts a `tools` array. opencode always sends one, so a
+    /// model without tool support APIErrors every turn — exclude it from the picker.
+    supports_tools: bool,
 }
 
 fn fetch_openrouter_catalog() -> anyhow::Result<Vec<OpenRouterModel>> {
@@ -2715,7 +2720,16 @@ fn fetch_openrouter_catalog() -> anyhow::Result<Vec<OpenRouterModel>> {
                         .and_then(|o| o.as_array())
                         .map(|arr| arr.iter().any(|v| v.as_str() == Some("text")))
                         .unwrap_or(true);
-                    Some(OpenRouterModel { id, created, text_output })
+                    // Require tool support when the field is present; absent => don't
+                    // penalize on missing metadata.
+                    let supports_tools = match m
+                        .get("supported_parameters")
+                        .and_then(|p| p.as_array())
+                    {
+                        Some(arr) => arr.iter().any(|v| v.as_str() == Some("tools")),
+                        None => true,
+                    };
+                    Some(OpenRouterModel { id, created, text_output, supports_tools })
                 })
                 .collect::<Vec<_>>()
         })
@@ -6130,24 +6144,29 @@ mod tests {
 
     #[test]
     fn recent_models_are_newest_first_and_filter_non_chat() {
-        let m = |id: &str, created: i64, text_output: bool| OpenRouterModel {
-            id: id.to_string(),
-            created,
-            text_output,
+        let m = |id: &str, created: i64, text_output: bool, supports_tools: bool| {
+            OpenRouterModel {
+                id: id.to_string(),
+                created,
+                text_output,
+                supports_tools,
+            }
         };
-        // Mixed catalog: chat models of varying age, plus an image model and a
-        // safety classifier that must not appear in a chat picker.
+        // Mixed catalog: chat models of varying age, an image model, a safety
+        // classifier, and a newest-but-toolless model (like openrouter/fusion) —
+        // none of the last three may appear in a chat picker opencode can use.
         let catalog = vec![
-            m("deepseek/deepseek-chat-v3.1", 100, true),
-            m("google/gemini-3.5-flash", 300, true),
-            m("anthropic/claude-opus-4.8", 250, true),
-            m("z-ai/glm-5.2", 280, true),
-            m("google/gemini-3-pro-image", 999, false), // newest, but image-only
-            m("nvidia/nemotron-3.5-content-safety", 998, true), // classifier
+            m("deepseek/deepseek-chat-v3.1", 100, true, true),
+            m("google/gemini-3.5-flash", 300, true, true),
+            m("anthropic/claude-opus-4.8", 250, true, true),
+            m("z-ai/glm-5.2", 280, true, true),
+            m("google/gemini-3-pro-image", 999, false, true), // newest, image-only
+            m("nvidia/nemotron-3.5-content-safety", 998, true, true), // classifier
+            m("openrouter/fusion", 997, true, false), // newest, but no tool support
         ];
         let picked = recent_openrouter_models(&catalog, 3);
-        // Newest chat models first; the image and safety models are excluded even
-        // though they have the largest `created` timestamps.
+        // Newest tool-capable chat models first; the image, safety, and toolless
+        // models are excluded even though they have the largest `created` stamps.
         assert_eq!(
             picked,
             vec![
@@ -6156,7 +6175,9 @@ mod tests {
                 "anthropic/claude-opus-4.8".to_string(),
             ]
         );
-        assert!(!picked.iter().any(|id| id.contains("image") || id.contains("content-safety")));
+        assert!(!picked.iter().any(|id| {
+            id.contains("image") || id.contains("content-safety") || id.contains("fusion")
+        }));
     }
 
     #[test]
