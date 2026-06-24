@@ -420,7 +420,7 @@ impl AgentSpec {
         let raw = fs::read_to_string(path)?;
         let frontmatter = extract_yaml_frontmatter(&raw)?;
         let mut spec: Self = serde_yaml::from_str(frontmatter)?;
-        spec.apply_capability_defaults();
+        spec.apply_egress_defaults();
         Ok(spec)
     }
 
@@ -439,8 +439,17 @@ impl AgentSpec {
     /// if the spec didn't already list it; the operator still supplies the key
     /// via a proxy `inject_headers` entry (the key never enters the guest), as
     /// the maturana-image-gen skill documents.
-    fn apply_capability_defaults(&mut self) {
-        for host in self.capabilities.egress_defaults() {
+    fn apply_egress_defaults(&mut self) {
+        let mut defaults: Vec<&'static str> = self.capabilities.egress_defaults();
+        // The opencode harness fetches its model registry (context window, tool
+        // support, pricing) from models.dev on every turn. When the proxy denies
+        // it, opencode's HTTP client retries/backs off — seconds of dead latency
+        // per turn — and never caches the result, so it repeats forever. Allow the
+        // host so the lookup succeeds fast and is cached.
+        if matches!(self.runtime.harness, HarnessRuntime::Opencode) {
+            defaults.push("models.dev");
+        }
+        for host in defaults {
             if !self
                 .network
                 .egress_allowlist
@@ -611,5 +620,30 @@ channels:
             .egress_allowlist
             .iter()
             .any(|h| h == "api.openai.com"));
+    }
+
+    #[test]
+    fn opencode_harness_adds_models_dev_egress_default() {
+        // opencode fetches its model registry from models.dev every turn; the
+        // proxy must allow it or each turn pays a denied-fetch retry stall.
+        let dir = std::env::temp_dir().join("maturana-spec-opencode-modelsdev");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("MATURANA.md");
+        std::fs::write(
+            &path,
+            "---\nidentity: { id: i, name: N, purpose: P }\nruntime: { harness: opencode }\nvm: { provider: firecracker, guest_os: linux }\n---\n# body\n",
+        )
+        .unwrap();
+        let spec = AgentSpec::from_maturana_markdown(&path).unwrap();
+        assert!(spec.network.egress_allowlist.iter().any(|h| h == "models.dev"));
+
+        // Other harnesses don't get it (they don't use models.dev).
+        std::fs::write(
+            &path,
+            "---\nidentity: { id: i, name: N, purpose: P }\nruntime: { harness: codex }\nvm: { provider: firecracker, guest_os: linux }\n---\n# body\n",
+        )
+        .unwrap();
+        let codex = AgentSpec::from_maturana_markdown(&path).unwrap();
+        assert!(!codex.network.egress_allowlist.iter().any(|h| h == "models.dev"));
     }
 }
