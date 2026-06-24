@@ -2608,58 +2608,36 @@ fn codex_models_for_auth(dir: Option<&Path>) -> Vec<String> {
 /// /models text. Bounded so the inline keyboard stays usable.
 fn model_button_choices(home: &MaturanaHome, agent_id: &str) -> Vec<String> {
     match harness_label(home, agent_id).as_str() {
-        "opencode" => fetch_openrouter_models()
-            .map(|ids| popular_openrouter_subset(&ids, 8))
+        "opencode" => fetch_openrouter_catalog()
+            .map(|models| recent_openrouter_models(&models, 20))
             .unwrap_or_default(),
         "claude-code" => CLAUDE_MODELS.iter().map(|s| s.to_string()).collect(),
         _ => codex_models(home, agent_id),
     }
 }
 
-/// Pick a small mainstream-provider subset of the LIVE OpenRouter catalog for the
-/// tappable buttons. Matched against `ids` so we only ever surface models that
-/// actually exist in the catalog (never an invented id); the full catalog stays
-/// reachable via `/model <id>` and `/models`. Flagship coding models first, then
-/// any id from a mainstream provider to fill up to `n`.
-fn popular_openrouter_subset(ids: &[String], n: usize) -> Vec<String> {
-    const PREFERRED: &[&str] = &[
-        "anthropic/claude-sonnet",
-        "anthropic/claude-opus",
-        "openai/gpt-5",
-        "google/gemini-2.5-pro",
-        "deepseek/deepseek-chat",
-        "x-ai/grok",
-        "openai/gpt-4o",
-        "google/gemini-2.0-flash",
-        "meta-llama/llama-3.3",
-        "qwen/qwen",
-        "mistralai/mistral",
+/// The `n` most recently-added chat models from the LIVE OpenRouter catalog,
+/// newest first. Filters out non-text models (image, embedding) and classifier/
+/// guard models so the picker only shows things you'd actually chat with — but
+/// any catalog id still works via `/model <id>`. Replaces the old hardcoded
+/// "mainstream" allowlist, which went stale as new model families shipped.
+fn recent_openrouter_models(models: &[OpenRouterModel], n: usize) -> Vec<String> {
+    // Backstop name filters: image is also caught by `text_output`, but classifier/
+    // safety/embedding models report text output yet aren't chat models.
+    const DENY_SUBSTR: &[&str] = &[
+        "embed", "moderation", "content-safety", "guard", "image", "rerank",
     ];
-    const PROVIDERS: &[&str] = &[
-        "anthropic/", "openai/", "google/", "deepseek/", "x-ai/", "meta-llama/",
-        "mistralai/", "qwen/",
-    ];
-    let mut out: Vec<String> = Vec::new();
-    for pat in PREFERRED {
-        if out.len() >= n {
-            break;
-        }
-        if let Some(id) = ids.iter().find(|id| id.contains(pat) && !out.contains(id)) {
-            out.push(id.clone());
-        }
-    }
-    if out.len() < n {
-        for id in ids {
-            if out.len() >= n {
-                break;
-            }
-            if PROVIDERS.iter().any(|p| id.starts_with(p)) && !out.contains(id) {
-                out.push(id.clone());
-            }
-        }
-    }
-    out.truncate(n);
-    out
+    let mut picked: Vec<&OpenRouterModel> = models
+        .iter()
+        .filter(|m| m.text_output)
+        .filter(|m| {
+            let id = m.id.to_ascii_lowercase();
+            !DENY_SUBSTR.iter().any(|deny| id.contains(deny))
+        })
+        .collect();
+    // Newest first; ties broken by id for a stable order.
+    picked.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.id.cmp(&b.id)));
+    picked.into_iter().take(n).map(|m| m.id.clone()).collect()
 }
 
 /// Live OpenRouter catalog for OpenCode/OpenRouter; a short curated set otherwise.
@@ -2668,10 +2646,14 @@ fn models_text(home: &MaturanaHome, agent_id: &str) -> String {
     let current = settings.model.clone().unwrap_or_else(|| "(harness default)".to_string());
     let harness = harness_label(home, agent_id);
     let body = if harness == "opencode" {
-        match fetch_openrouter_models() {
-            Ok(ids) if !ids.is_empty() => {
-                let shown: Vec<String> = ids.into_iter().take(60).collect();
-                format!("OpenRouter models (first {}):\n{}", shown.len(), shown.join("\n"))
+        match fetch_openrouter_catalog() {
+            Ok(models) if !models.is_empty() => {
+                let shown = recent_openrouter_models(&models, 30);
+                format!(
+                    "OpenRouter — {} most recent chat models (newest first):\n{}",
+                    shown.len(),
+                    shown.join("\n")
+                )
             }
             Ok(_) => "OpenRouter returned no models.".to_string(),
             Err(error) => format!("Could not fetch OpenRouter catalog: {error:#}"),
@@ -2699,23 +2681,46 @@ fn models_text(home: &MaturanaHome, agent_id: &str) -> String {
     format!("Current: {current}\nSet with /model <id>\n\n{body}")
 }
 
-fn fetch_openrouter_models() -> anyhow::Result<Vec<String>> {
+/// One entry from the live OpenRouter catalog, with the fields the picker needs
+/// to rank by recency and keep only models you'd actually chat with.
+#[derive(Debug, Clone, PartialEq)]
+struct OpenRouterModel {
+    id: String,
+    /// Unix epoch seconds the model was added to OpenRouter (newest = largest).
+    created: i64,
+    /// Whether the model emits text (a chat model) vs. image/embedding-only.
+    text_output: bool,
+}
+
+fn fetch_openrouter_catalog() -> anyhow::Result<Vec<OpenRouterModel>> {
     let resp: serde_json::Value = ureq::get("https://openrouter.ai/api/v1/models")
         .timeout(std::time::Duration::from_secs(15))
         .call()
         .context("OpenRouter request failed")?
         .into_json()
         .context("failed to parse OpenRouter response")?;
-    let ids = resp
+    let models = resp
         .get("data")
         .and_then(|d| d.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from))
+                .filter_map(|m| {
+                    let id = m.get("id").and_then(|i| i.as_str())?.to_string();
+                    let created = m.get("created").and_then(|c| c.as_i64()).unwrap_or(0);
+                    // A chat model lists "text" among its output modalities. Image
+                    // and embedding models do not. Absent field => assume text.
+                    let text_output = m
+                        .get("architecture")
+                        .and_then(|a| a.get("output_modalities"))
+                        .and_then(|o| o.as_array())
+                        .map(|arr| arr.iter().any(|v| v.as_str() == Some("text")))
+                        .unwrap_or(true);
+                    Some(OpenRouterModel { id, created, text_output })
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    Ok(ids)
+    Ok(models)
 }
 
 fn graph_query_text(home: &MaturanaHome, agent_id: &str, terms: &str) -> String {
@@ -3096,9 +3101,9 @@ fn command_selector_buttons(
                 return None;
             }
             Some((
-                format!("Current model: {current}\nTap a popular model, or send /model <id> for any model:"),
+                format!("Current model: {current}\nTap a recent model, or send /model <id> for any model:"),
                 buttons,
-                1,
+                2,
             ))
         }
         "reasoning" => {
@@ -6124,36 +6129,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn openrouter_subset_prefers_mainstream_and_only_real_ids() {
-        // A catalog whose head is niche/newest (like the live API returns).
-        let catalog: Vec<String> = [
-            "z-ai/glm-5.2",
-            "openrouter/fusion",
-            "nvidia/nemotron-3-ultra",
-            "anthropic/claude-fable-5",
-            "anthropic/claude-sonnet-4.5",
-            "openai/gpt-5",
-            "google/gemini-2.5-pro",
-            "deepseek/deepseek-chat",
-            "moonshotai/kimi-k2.7-code",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        let picked = popular_openrouter_subset(&catalog, 5);
-        // Flagship coding models surface first, in priority order...
-        assert_eq!(picked[0], "anthropic/claude-sonnet-4.5");
-        assert_eq!(picked[1], "openai/gpt-5");
-        assert_eq!(picked[2], "google/gemini-2.5-pro");
-        assert_eq!(picked[3], "deepseek/deepseek-chat");
-        // ...never the niche head of the catalog.
-        assert!(!picked.contains(&"z-ai/glm-5.2".to_string()));
-        assert!(!picked.contains(&"openrouter/fusion".to_string()));
-        // Only ids that actually exist in the catalog are ever returned.
-        for id in &picked {
-            assert!(catalog.contains(id), "invented id: {id}");
-        }
-        assert!(picked.len() <= 5);
+    fn recent_models_are_newest_first_and_filter_non_chat() {
+        let m = |id: &str, created: i64, text_output: bool| OpenRouterModel {
+            id: id.to_string(),
+            created,
+            text_output,
+        };
+        // Mixed catalog: chat models of varying age, plus an image model and a
+        // safety classifier that must not appear in a chat picker.
+        let catalog = vec![
+            m("deepseek/deepseek-chat-v3.1", 100, true),
+            m("google/gemini-3.5-flash", 300, true),
+            m("anthropic/claude-opus-4.8", 250, true),
+            m("z-ai/glm-5.2", 280, true),
+            m("google/gemini-3-pro-image", 999, false), // newest, but image-only
+            m("nvidia/nemotron-3.5-content-safety", 998, true), // classifier
+        ];
+        let picked = recent_openrouter_models(&catalog, 3);
+        // Newest chat models first; the image and safety models are excluded even
+        // though they have the largest `created` timestamps.
+        assert_eq!(
+            picked,
+            vec![
+                "google/gemini-3.5-flash".to_string(),
+                "z-ai/glm-5.2".to_string(),
+                "anthropic/claude-opus-4.8".to_string(),
+            ]
+        );
+        assert!(!picked.iter().any(|id| id.contains("image") || id.contains("content-safety")));
     }
 
     #[test]
