@@ -449,6 +449,14 @@ impl AgentSpec {
         if matches!(self.runtime.harness, HarnessRuntime::Opencode) {
             defaults.push("models.dev");
         }
+        // Codex on a ChatGPT-account login refreshes its OAuth token via
+        // auth.openai.com (chatgpt.com serves the API). A denied auth.openai.com
+        // breaks the refresh, so once the token expires every turn fails with
+        // "I hit an error while processing that message".
+        if matches!(self.runtime.harness, HarnessRuntime::Codex) {
+            defaults.push("auth.openai.com");
+            defaults.push("chatgpt.com");
+        }
         for host in defaults {
             if !self
                 .network
