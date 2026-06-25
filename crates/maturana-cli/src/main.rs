@@ -25,7 +25,7 @@ use maturana_core::{
         list_recent_inbound, list_undelivered, mark_delivered, queue_stats, session_paths,
     },
     snapshots::{list_snapshots, restore_snapshot, take_snapshot, SnapshotRecord},
-    spec::{AgentSpec, HarnessRuntime},
+    spec::{AgentSpec, HarnessRuntime, HostProvider},
     state::MaturanaHome,
     stop_agent, validate_spec,
     worker::{
@@ -2021,10 +2021,22 @@ fn build_orchestrator_config(
     let claude_refresh_agents = agent_ids
         .iter()
         .filter(|id| {
-            AgentSpec::from_maturana_markdown(&home.agent_dir(id).join("MATURANA.md"))
-                .map(|spec| spec.runtime.harness == HarnessRuntime::ClaudeCode)
-                .unwrap_or(false)
-                && firecracker_profile_for(id.as_str()).is_none()
+            let spec =
+                AgentSpec::from_maturana_markdown(&home.agent_dir(id).join("MATURANA.md")).ok();
+            let is_claude = spec
+                .as_ref()
+                .map(|s| s.runtime.harness == HarnessRuntime::ClaudeCode)
+                .unwrap_or(false);
+            // Exclude every Firecracker guest (not just the bundled examples): its
+            // resident keep-alive loop is the SOLE refresher of its OAuth lineage,
+            // so a host-side refresh would race it and consume the single-use token
+            // out from under the guest (→ 401). Gate on the provider, not on
+            // whether the agent happens to be one of the three built-ins.
+            let is_firecracker = spec
+                .as_ref()
+                .map(|s| s.vm.provider == HostProvider::Firecracker)
+                .unwrap_or(false);
+            is_claude && !is_firecracker
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -2070,10 +2082,17 @@ fn build_orchestrator_config(
                 None => infer_agent_session_id(home, &agent_id)?,
             };
             // Each fleet agent has its own Telegram bot; a single shared token
-            // would point every channel at the same bot. Prefer the agent's
-            // profile token, falling back to the command default for others.
-            let telegram_token_source = firecracker_profile_for(&agent_id)
-                .map(|profile| profile.telegram_token_source.to_string())
+            // would point every channel at the same bot. Prefer the agent's OWN
+            // spec token (works for any agent), then a bundled example's token,
+            // then the command default — so a hand-authored agent uses its own
+            // bot just like the built-ins do.
+            let telegram_token_source = spec
+                .as_ref()
+                .and_then(|s| s.channels.telegram.as_ref())
+                .map(|t| t.token_source.clone())
+                .or_else(|| {
+                    firecracker_profile_for(&agent_id).map(|p| p.telegram_token_source)
+                })
                 .unwrap_or_else(|| command.telegram_token_source.clone());
             // Supervise the agent's egress proxy whenever its spec turns the
             // proxy on. Otherwise a proxy.enabled agent has no running proxy and
@@ -2870,78 +2889,205 @@ struct FirecrackerHarnessRepair {
 
 #[derive(Debug, Clone)]
 struct FirecrackerHarnessProfile {
-    agent_id: &'static str,
-    image_name: &'static str,
-    harness_arg: &'static str,
-    host_ip: &'static str,
-    guest_ip: &'static str,
-    cidr: &'static str,
-    tap_name: &'static str,
-    guest_mac: &'static str,
-    session_id: &'static str,
+    agent_id: String,
+    image_name: String,
+    harness_arg: String,
+    host_ip: String,
+    guest_ip: String,
+    cidr: String,
+    tap_name: String,
+    guest_mac: String,
+    session_id: String,
     /// Pipelock source for this agent's own Telegram bot token, so `maturana up`
     /// supervises each fleet channel with the right bot (not one shared token).
-    telegram_token_source: &'static str,
-    auth_source: &'static str,
-    auth_guest_path: &'static str,
-    spec_path: &'static str,
+    telegram_token_source: String,
+    auth_source: String,
+    auth_guest_path: String,
+    spec_path: String,
 }
 
-/// Look up a Firecracker fleet profile by agent id, so `maturana up` can wire
-/// each agent's channel to the same session id its guest worker claims from.
-fn firecracker_profile_for(agent_id: &str) -> Option<&'static FirecrackerHarnessProfile> {
-    FIRECRACKER_HARNESS_PROFILES
-        .iter()
+/// The three example harnesses bundled in the repo. `setup firecracker-harnesses`
+/// bootstraps a fresh install from these so a first boot has a working fleet
+/// without hand-authoring a spec. They are NOT a cap on how many agents may
+/// exist: ANY materialized agent is launched from its OWN spec — see
+/// [`firecracker_profile_from_spec`]. An agent is an agent.
+fn builtin_firecracker_profiles() -> Vec<FirecrackerHarnessProfile> {
+    vec![
+        FirecrackerHarnessProfile {
+            agent_id: "codex-firecracker".to_string(),
+            image_name: "codex".to_string(),
+            harness_arg: "codex".to_string(),
+            host_ip: "172.30.10.1".to_string(),
+            guest_ip: "172.30.10.2".to_string(),
+            cidr: "172.30.10.0/30".to_string(),
+            tap_name: "tap-mat-codex".to_string(),
+            guest_mac: "AA:FC:00:00:10:01".to_string(),
+            session_id: "codex-main".to_string(),
+            telegram_token_source: "pipelock:telegram/bot-token".to_string(),
+            auth_source: ".maturana/host-auth/codex".to_string(),
+            auth_guest_path: "/home/ubuntu/.codex".to_string(),
+            spec_path: "examples/MATURANA.codex-firecracker.md".to_string(),
+        },
+        FirecrackerHarnessProfile {
+            agent_id: "opencode-firecracker".to_string(),
+            image_name: "opencode".to_string(),
+            harness_arg: "opencode".to_string(),
+            host_ip: "172.30.10.5".to_string(),
+            guest_ip: "172.30.10.6".to_string(),
+            cidr: "172.30.10.4/30".to_string(),
+            tap_name: "tap-mat-open".to_string(),
+            guest_mac: "AA:FC:00:00:10:02".to_string(),
+            session_id: "opencode-main".to_string(),
+            telegram_token_source: "pipelock:telegram/opencode-bot-token".to_string(),
+            auth_source: ".maturana/host-auth/opencode".to_string(),
+            auth_guest_path: "/home/ubuntu".to_string(),
+            spec_path: "examples/MATURANA.opencode-firecracker.md".to_string(),
+        },
+        FirecrackerHarnessProfile {
+            agent_id: "claude-firecracker".to_string(),
+            image_name: "claude".to_string(),
+            harness_arg: "claude-code".to_string(),
+            host_ip: "172.30.10.9".to_string(),
+            guest_ip: "172.30.10.10".to_string(),
+            cidr: "172.30.10.8/30".to_string(),
+            tap_name: "tap-mat-claude".to_string(),
+            guest_mac: "AA:FC:00:00:10:03".to_string(),
+            session_id: "claude-main".to_string(),
+            telegram_token_source: "pipelock:telegram/claude-bot-token".to_string(),
+            auth_source: ".maturana/host-auth/claude-code".to_string(),
+            auth_guest_path: "/home/ubuntu/.claude".to_string(),
+            spec_path: "examples/MATURANA.claude-firecracker.md".to_string(),
+        },
+    ]
+}
+
+/// A bundled example profile, looked up by agent id. Returns `None` for any
+/// agent that isn't one of the three examples — that agent is launched from its
+/// own spec instead (see [`resolve_firecracker_profile`]), never rejected.
+fn firecracker_profile_for(agent_id: &str) -> Option<FirecrackerHarnessProfile> {
+    builtin_firecracker_profiles()
+        .into_iter()
         .find(|profile| profile.agent_id == agent_id)
 }
 
-const FIRECRACKER_HARNESS_PROFILES: &[FirecrackerHarnessProfile] = &[
-    FirecrackerHarnessProfile {
-        agent_id: "codex-firecracker",
-        image_name: "codex",
-        harness_arg: "codex",
-        host_ip: "172.30.10.1",
-        guest_ip: "172.30.10.2",
-        cidr: "172.30.10.0/30",
-        tap_name: "tap-mat-codex",
-        guest_mac: "AA:FC:00:00:10:01",
-        session_id: "codex-main",
-        telegram_token_source: "pipelock:telegram/bot-token",
-        auth_source: ".maturana/host-auth/codex",
-        auth_guest_path: "/home/ubuntu/.codex",
-        spec_path: "examples/MATURANA.codex-firecracker.md",
-    },
-    FirecrackerHarnessProfile {
-        agent_id: "opencode-firecracker",
-        image_name: "opencode",
-        harness_arg: "opencode",
-        host_ip: "172.30.10.5",
-        guest_ip: "172.30.10.6",
-        cidr: "172.30.10.4/30",
-        tap_name: "tap-mat-open",
-        guest_mac: "AA:FC:00:00:10:02",
-        session_id: "opencode-main",
-        telegram_token_source: "pipelock:telegram/opencode-bot-token",
-        auth_source: ".maturana/host-auth/opencode",
-        auth_guest_path: "/home/ubuntu",
-        spec_path: "examples/MATURANA.opencode-firecracker.md",
-    },
-    FirecrackerHarnessProfile {
-        agent_id: "claude-firecracker",
-        image_name: "claude",
-        harness_arg: "claude-code",
-        host_ip: "172.30.10.9",
-        guest_ip: "172.30.10.10",
-        cidr: "172.30.10.8/30",
-        tap_name: "tap-mat-claude",
-        guest_mac: "AA:FC:00:00:10:03",
-        session_id: "claude-main",
-        telegram_token_source: "pipelock:telegram/claude-bot-token",
-        auth_source: ".maturana/host-auth/claude-code",
-        auth_guest_path: "/home/ubuntu/.claude",
-        spec_path: "examples/MATURANA.claude-firecracker.md",
-    },
-];
+/// Map a harness runtime to the `--harness` arg the guest-worker install + tap
+/// scripts expect (round-trips through [`parse_harness_runtime`]).
+fn harness_runtime_arg(harness: &HarnessRuntime) -> &'static str {
+    match harness {
+        HarnessRuntime::Codex => "codex",
+        HarnessRuntime::ClaudeCode => "claude-code",
+        HarnessRuntime::Opencode => "opencode",
+    }
+}
+
+/// Per-harness default host-auth source, used only when a spec omits an explicit
+/// `harness_auth` entry for its runtime.
+fn default_host_auth_source(harness: &HarnessRuntime) -> String {
+    match harness {
+        HarnessRuntime::Codex => ".maturana/host-auth/codex",
+        HarnessRuntime::ClaudeCode => ".maturana/host-auth/claude-code",
+        HarnessRuntime::Opencode => ".maturana/host-auth/opencode",
+    }
+    .to_string()
+}
+
+/// Per-harness default guest auth path (where the harness reads its creds inside
+/// the guest), used only when a spec omits an explicit `harness_auth` entry.
+fn default_auth_guest_path(harness: &HarnessRuntime) -> String {
+    match harness {
+        HarnessRuntime::Codex => "/home/ubuntu/.codex",
+        HarnessRuntime::ClaudeCode => "/home/ubuntu/.claude",
+        HarnessRuntime::Opencode => "/home/ubuntu",
+    }
+    .to_string()
+}
+
+/// The image directory name that holds this agent's rootfs under
+/// `.maturana/images/firecracker/<image_name>/…`, derived from the spec's
+/// rootfs path; falls back to the agent id.
+fn firecracker_image_name(agent_id: &str, rootfs_image: &str) -> String {
+    PathBuf::from(rootfs_image)
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| agent_id.to_string())
+}
+
+/// The /30 block a host_ip belongs to (each agent owns one /30 — see the
+/// network-collision guard). e.g. 172.30.10.13 -> 172.30.10.12/30.
+fn cidr_for_host_ip(host_ip: &str) -> anyhow::Result<String> {
+    let addr: std::net::Ipv4Addr = host_ip
+        .parse()
+        .with_context(|| format!("invalid firecracker host_ip '{host_ip}'"))?;
+    let network = u32::from(addr) & 0xFFFF_FFFC;
+    Ok(format!("{}/30", std::net::Ipv4Addr::from(network)))
+}
+
+/// Build a launch profile for ANY materialized agent by reading its own spec —
+/// the same source of truth `agent launch` and the collision guard use. This is
+/// what makes a freshly authored agent a first-class fleet member in
+/// setup/repair/boot-recovery, not just the three bundled examples.
+fn firecracker_profile_from_spec(
+    home: &MaturanaHome,
+    agent_id: &str,
+) -> anyhow::Result<FirecrackerHarnessProfile> {
+    let spec_path = home.agent_dir(agent_id).join("MATURANA.md");
+    let spec = AgentSpec::from_maturana_markdown(&spec_path).with_context(|| {
+        format!(
+            "no materialized spec for Firecracker agent '{agent_id}' at {} — \
+             author it and run `maturana agent launch` first",
+            spec_path.display()
+        )
+    })?;
+    let fc = spec.vm.firecracker.clone().ok_or_else(|| {
+        anyhow::anyhow!("agent '{agent_id}' is not a Firecracker agent (vm.firecracker unset)")
+    })?;
+    // host-auth source + guest path come from the agent's OWN harness_auth entry
+    // for its runtime; fall back to the per-harness convention if unspecified.
+    let auth = spec
+        .harness_auth
+        .iter()
+        .find(|a| a.runtime == spec.runtime.harness);
+    Ok(FirecrackerHarnessProfile {
+        image_name: firecracker_image_name(agent_id, &fc.rootfs_image),
+        harness_arg: harness_runtime_arg(&spec.runtime.harness).to_string(),
+        cidr: cidr_for_host_ip(&fc.host_ip)?,
+        host_ip: fc.host_ip,
+        guest_ip: fc.guest_ip,
+        tap_name: fc.tap_name,
+        guest_mac: fc.guest_mac,
+        // Matches the guest-worker install convention (`{agent_id}-main`) so the
+        // host enqueues to the SAME session the in-guest worker claims from.
+        session_id: format!("{agent_id}-main"),
+        telegram_token_source: spec
+            .channels
+            .telegram
+            .as_ref()
+            .map(|t| t.token_source.clone())
+            .unwrap_or_default(),
+        auth_source: auth
+            .map(|a| a.source_path.clone())
+            .unwrap_or_else(|| default_host_auth_source(&spec.runtime.harness)),
+        auth_guest_path: auth
+            .map(|a| a.guest_path.clone())
+            .unwrap_or_else(|| default_auth_guest_path(&spec.runtime.harness)),
+        spec_path: spec_path.to_string_lossy().into_owned(),
+        agent_id: agent_id.to_string(),
+    })
+}
+
+/// A bundled example if it's one, else derived from the agent's materialized
+/// spec on disk. Every agent resolves to a launch profile the same way.
+fn resolve_firecracker_profile(
+    home: &MaturanaHome,
+    agent_id: &str,
+) -> anyhow::Result<FirecrackerHarnessProfile> {
+    match firecracker_profile_for(agent_id) {
+        Some(profile) => Ok(profile),
+        None => firecracker_profile_from_spec(home, agent_id),
+    }
+}
 
 fn repair_firecracker_harnesses(
     home: &MaturanaHome,
@@ -2951,7 +3097,7 @@ fn repair_firecracker_harnesses(
         anyhow::bail!("firecracker harness repair requires a Linux host");
     }
 
-    let selected = selected_firecracker_profiles(&repair.agent_ids)?;
+    let selected = selected_firecracker_profiles(home, &repair.agent_ids)?;
     let sessiond_token_path = absolute_or_cwd(repair.sessiond_token_path.clone())?;
     let ssh_key = absolute_or_cwd(repair.ssh_key.clone())?;
     let sessiond_token = ensure_sessiond_token(&sessiond_token_path)?;
@@ -2974,7 +3120,7 @@ fn repair_firecracker_harnesses(
     // before rendering guest artifacts is what makes `read_graph_token` inject
     // the graph env into those agents' guests.
     let graph_opt_in = selected.iter().any(|profile| {
-        AgentSpec::from_maturana_markdown(&PathBuf::from(profile.spec_path))
+        AgentSpec::from_maturana_markdown(PathBuf::from(&profile.spec_path))
             .map(|spec| spec.knowledge_graph.enabled)
             .unwrap_or(false)
     });
@@ -3013,35 +3159,35 @@ fn repair_firecracker_harnesses(
 
         let result = (|| -> anyhow::Result<()> {
             if !repair.skip_launch {
-                let _ = stop_agent(home, profile.agent_id);
+                let _ = stop_agent(home, &profile.agent_id);
             }
             // The TAP device + NAT rule are ephemeral (gone after a host reboot)
             // and cheap to recreate, so they're decoupled from the slow
             // libguestfs asset build: recreated unless --skip-net, even with
             // --skip-assets. The setup script is idempotent (`ip link show`).
             if !repair.skip_net {
-                setup_firecracker_tap(profile)?;
+                setup_firecracker_tap(&profile)?;
             }
             if !repair.skip_assets {
                 prepare_firecracker_assets(
                     home,
-                    profile,
+                    &profile,
                     &ssh_key,
                     &sessiond_token,
                     bind_port(&repair.sessiond_bind)?,
                 )?;
             }
 
-            let spec_path = PathBuf::from(profile.spec_path);
+            let spec_path = PathBuf::from(&profile.spec_path);
             validate_and_materialize_firecracker_spec(home, &spec_path, !repair.skip_launch)?;
 
             if !repair.skip_worker_refresh {
                 // Record the rootfs's baked host public key so SSH verifies the
                 // guest (falls back to accept-new if the image predates pinning).
-                pin_firecracker_host_key(home, profile)?;
-                let host_key = GuestHostKey::resolve(home, profile.agent_id, profile.guest_ip)?;
+                pin_firecracker_host_key(home, &profile)?;
+                let host_key = GuestHostKey::resolve(home, &profile.agent_id, &profile.guest_ip)?;
                 wait_for_guest_ssh(
-                    profile.guest_ip,
+                    &profile.guest_ip,
                     "ubuntu",
                     &ssh_key,
                     &host_key,
@@ -3052,7 +3198,7 @@ fn repair_firecracker_harnesses(
                     GuestWorkerInstall {
                         agent_id: profile.agent_id.to_string(),
                         session_id: profile.session_id.to_string(),
-                        harness: parse_harness_runtime(profile.harness_arg)?,
+                        harness: parse_harness_runtime(&profile.harness_arg)?,
                         guest_ip: profile.guest_ip.to_string(),
                         ssh_user: "ubuntu".to_string(),
                         ssh_key: ssh_key.clone(),
@@ -3063,7 +3209,7 @@ fn repair_firecracker_harnesses(
                             bind_port(&repair.sessiond_bind)?
                         ),
                         sessiond_token_path: sessiond_token_path.clone(),
-                        auth_source: Some(PathBuf::from(profile.auth_source)),
+                        auth_source: Some(PathBuf::from(&profile.auth_source)),
                         install_harness: repair.install_harness,
                         force_reseed_auth: repair.force_reseed_auth,
                     },
@@ -3090,18 +3236,33 @@ fn repair_firecracker_harnesses(
 }
 
 fn selected_firecracker_profiles(
+    home: &MaturanaHome,
     agent_ids: &[String],
-) -> anyhow::Result<Vec<&'static FirecrackerHarnessProfile>> {
+) -> anyhow::Result<Vec<FirecrackerHarnessProfile>> {
     if agent_ids.is_empty() {
-        return Ok(FIRECRACKER_HARNESS_PROFILES.iter().collect());
+        // No ids = the whole fleet (boot recovery / bootstrap): the bundled
+        // examples PLUS every other materialized Firecracker agent on disk, so a
+        // hand-authored agent is relaunched on reboot exactly like a built-in.
+        let mut profiles = builtin_firecracker_profiles();
+        let mut seen: std::collections::HashSet<String> =
+            profiles.iter().map(|p| p.agent_id.clone()).collect();
+        for agent_id in discover_agent_ids(home).unwrap_or_default() {
+            if !seen.insert(agent_id.clone()) {
+                continue;
+            }
+            // Skip non-Firecracker / unmaterialized agents silently — they have
+            // no microVM for this path to relaunch.
+            if let Ok(profile) = firecracker_profile_from_spec(home, &agent_id) {
+                profiles.push(profile);
+            }
+        }
+        return Ok(profiles);
     }
+    // Named agents: a bundled example, else built from the agent's own spec.
+    // Either way an agent is never rejected just for not being one of the three.
     let mut selected = Vec::new();
     for agent_id in agent_ids {
-        let profile = FIRECRACKER_HARNESS_PROFILES
-            .iter()
-            .find(|profile| profile.agent_id == agent_id)
-            .ok_or_else(|| anyhow::anyhow!("unknown Firecracker harness agent: {agent_id}"))?;
-        selected.push(profile);
+        selected.push(resolve_firecracker_profile(home, agent_id)?);
     }
     Ok(selected)
 }
@@ -3235,9 +3396,9 @@ fn setup_firecracker_tap(profile: &FirecrackerHarnessProfile) -> anyhow::Result<
     run_checked_process(
         ProcessCommand::new("bash")
             .arg("./scripts/firecracker-setup-tap.sh")
-            .arg(profile.tap_name)
+            .arg(&profile.tap_name)
             .arg(format!("{}/30", profile.host_ip))
-            .arg(profile.cidr),
+            .arg(&profile.cidr),
         "setup Firecracker TAP",
     )
 }
@@ -3255,10 +3416,10 @@ pub(crate) fn orchestrator_spawn_worker(
     session_id: &str,
     net: &maturana_core::orchestrator_spawn::FirecrackerNet,
 ) -> anyhow::Result<()> {
-    let base_profile = firecracker_profile_for(base_agent_id).ok_or_else(|| {
-        anyhow::anyhow!(
-            "--base-spec '{base_agent_id}' is not a known Firecracker agent to clone; \
-             pass an existing materialized firecracker agent id (e.g. codex-firecracker)"
+    let base_profile = resolve_firecracker_profile(home, base_agent_id).with_context(|| {
+        format!(
+            "--base-spec '{base_agent_id}' is not a launchable Firecracker agent to clone; \
+             pass a bundled example (e.g. codex-firecracker) or any materialized agent id"
         )
     })?;
     let base_spec =
@@ -3341,7 +3502,7 @@ pub(crate) fn orchestrator_spawn_worker(
             harness_auth_guest_path: base_profile.auth_guest_path.to_string(),
             sessiond_url: format!("http://{}:47834", net.host_ip),
             sessiond_token_path: home.root().join("sessiond/token"),
-            auth_source: Some(PathBuf::from(base_profile.auth_source)),
+            auth_source: Some(PathBuf::from(&base_profile.auth_source)),
             // The cloned rootfs already has the harness baked in (and its auth);
             // just re-point the worker at this VM's session. The re-seed guard
             // skips re-pushing auth the copy already carries.
@@ -3381,7 +3542,7 @@ fn prepare_firecracker_assets(
         profile.image_name
     ));
     let asset_manifest_path = image_dir.join("asset-manifest.json");
-    let spec = AgentSpec::from_maturana_markdown(&PathBuf::from(profile.spec_path))
+    let spec = AgentSpec::from_maturana_markdown(PathBuf::from(&profile.spec_path))
         .with_context(|| format!("failed to parse {}", profile.spec_path))?;
     let artifacts = render_firecracker_guest_artifacts(
         home,
@@ -3454,7 +3615,7 @@ fn prepare_firecracker_assets(
         .arg("./scripts/firecracker-prepare-assets.sh")
         .arg(&image_dir)
         .arg(ssh_key)
-        .arg(profile.auth_source);
+        .arg(&profile.auth_source);
     run_checked_process(&mut command, "prepare Firecracker assets")?;
     validate_firecracker_asset_manifest(profile, &asset_manifest_path, &image_dir, ssh_key)
 }
@@ -3478,7 +3639,7 @@ fn pin_firecracker_host_key(
     let manifest: FirecrackerAssetManifest =
         serde_json::from_str(&raw).context("failed to parse Firecracker asset manifest")?;
     if let Some(public_line) = manifest.ssh_host_ed25519_pub.as_deref() {
-        let state_dir = home.agent_dir(profile.agent_id).join("state");
+        let state_dir = home.agent_dir(&profile.agent_id).join("state");
         fs::create_dir_all(&state_dir)?;
         fs::write(
             state_dir.join(maturana_core::ssh_pin::HOST_PUBLIC_KEY_FILE),
@@ -3541,7 +3702,7 @@ fn validate_firecracker_asset_manifest(
     }
     if manifest.guest_ip != profile.guest_ip
         || manifest.host_ip != profile.host_ip
-        || !manifest.guest_mac.eq_ignore_ascii_case(profile.guest_mac)
+        || !manifest.guest_mac.eq_ignore_ascii_case(&profile.guest_mac)
         || manifest.tap_name != profile.tap_name
     {
         anyhow::bail!(
@@ -3659,7 +3820,7 @@ fn render_firecracker_guest_artifacts(
     let artifacts_dir = home
         .root()
         .join("agents")
-        .join(profile.agent_id)
+        .join(&profile.agent_id)
         .join("state")
         .join("firecracker-image");
     fs::create_dir_all(&artifacts_dir)?;
@@ -3669,14 +3830,14 @@ fn render_firecracker_guest_artifacts(
         session_id: profile.session_id.to_string(),
         sessiond_url: sessiond_url.to_string(),
         sessiond_token: sessiond_token.to_string(),
-        harness: parse_harness_runtime(profile.harness_arg)?,
+        harness: parse_harness_runtime(&profile.harness_arg)?,
         harness_auth_guest_path: profile.auth_guest_path.to_string(),
         headless_chrome: spec.browser.headless_chrome,
         graph_token: maturana_core::worker::read_graph_token(home.root()),
         graph_name: spec
             .knowledge_graph
             .enabled
-            .then(|| spec.knowledge_graph.graph_name(profile.agent_id)),
+            .then(|| spec.knowledge_graph.graph_name(&profile.agent_id)),
     };
 
     let sessiond_env = artifacts_dir.join("sessiond.env");
@@ -3709,7 +3870,7 @@ fn render_firecracker_guest_artifacts(
     )?;
     fs::write(
         &netplan,
-        render_firecracker_netplan(profile.guest_mac, profile.guest_ip, profile.host_ip),
+        render_firecracker_netplan(&profile.guest_mac, &profile.guest_ip, &profile.host_ip),
     )?;
     fs::write(&cloud_cfg, render_firecracker_cloud_cfg())?;
     let proxy_env = if let Some(content) = render_firecracker_proxy_env(
@@ -3719,7 +3880,7 @@ fn render_firecracker_guest_artifacts(
             .map(|proxy| proxy.enabled)
             .unwrap_or(false),
         spec.network.proxy.as_ref().map(|proxy| proxy.bind.as_str()),
-        profile.host_ip,
+        &profile.host_ip,
     )? {
         fs::write(&proxy_env_path, content)?;
         Some(absolute_or_cwd(proxy_env_path)?)
@@ -5393,12 +5554,21 @@ pub(crate) fn infer_agent_session_id(home: &MaturanaHome, agent_id: &str) -> any
         }
     }
 
-    match agent_id {
-        "codex-demo" | "codex-firecracker" => Ok("codex-main".to_string()),
-        "opencode-demo" | "opencode-firecracker" => Ok("opencode-main".to_string()),
-        "claude-demo" | "claude-firecracker" => Ok("claude-main".to_string()),
-        _ => Ok("telegram-main".to_string()),
-    }
+    // Otherwise mirror the guest-worker install convention EXACTLY so the host
+    // enqueues to the same session the in-guest worker claims from: a bundled
+    // example's canonical id (codex-main, …), else `<agent_id>-main`. The old
+    // `telegram-main` fallback silently parked every non-bundled agent's turns
+    // in a session no worker watched — a queued message that never got answered.
+    // The legacy `-demo` agents keep their original ids.
+    let session_id = match agent_id {
+        "codex-demo" => "codex-main".to_string(),
+        "opencode-demo" => "opencode-main".to_string(),
+        "claude-demo" => "claude-main".to_string(),
+        _ => firecracker_profile_for(agent_id)
+            .map(|profile| profile.session_id)
+            .unwrap_or_else(|| format!("{agent_id}-main")),
+    };
+    Ok(session_id)
 }
 
 fn session_env_value(raw: &str, key: &str) -> Option<String> {
@@ -6910,8 +7080,13 @@ mod tests {
     }
 
     #[test]
-    fn firecracker_profile_selection_defaults_to_three_harnesses() {
-        let profiles = selected_firecracker_profiles(&[]).unwrap();
+    fn firecracker_profile_selection_defaults_to_builtins_plus_disk() {
+        let temp =
+            std::env::temp_dir().join(format!("maturana-fc-select-empty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let home = MaturanaHome::new(&temp);
+        // No agents on disk → exactly the three bundled examples.
+        let profiles = selected_firecracker_profiles(&home, &[]).unwrap();
         assert_eq!(profiles.len(), 3);
         assert_eq!(profiles[0].agent_id, "codex-firecracker");
         assert_eq!(profiles[1].harness_arg, "opencode");
@@ -6919,11 +7094,78 @@ mod tests {
     }
 
     #[test]
-    fn firecracker_profile_selection_rejects_unknown_agent() {
-        let error = selected_firecracker_profiles(&["missing".to_string()])
+    fn firecracker_profile_selection_errors_on_unmaterialized_agent() {
+        let temp =
+            std::env::temp_dir().join(format!("maturana-fc-select-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let home = MaturanaHome::new(&temp);
+        // A named agent that isn't a built-in and has no spec on disk is a real
+        // error — but it points at how to launch it, not "unknown harness".
+        let error = selected_firecracker_profiles(&home, &["missing".to_string()])
             .unwrap_err()
             .to_string();
-        assert!(error.contains("unknown Firecracker harness agent"));
+        assert!(error.contains("no materialized spec for Firecracker agent 'missing'"));
+    }
+
+    #[test]
+    fn firecracker_profile_from_spec_makes_any_agent_first_class() {
+        let temp =
+            std::env::temp_dir().join(format!("maturana-fc-from-spec-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let home = MaturanaHome::new(&temp);
+        let dir = home.agent_dir("humberto-maturana");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("MATURANA.md"),
+            "---\n\
+             identity: { id: humberto-maturana, name: Humberto, purpose: support }\n\
+             runtime: { harness: codex }\n\
+             harness_auth:\n\
+            \x20 - runtime: codex\n\
+            \x20   source_path: .maturana/host-auth/humberto\n\
+            \x20   guest_path: /home/ubuntu/.codex\n\
+             channels: { telegram: { token_source: pipelock:telegram/humberto-bot-token } }\n\
+             vm:\n\
+            \x20 provider: firecracker\n\
+            \x20 guest_os: linux\n\
+            \x20 firecracker:\n\
+            \x20   kernel_image: .maturana/images/firecracker/humberto/vmlinux.bin\n\
+            \x20   rootfs_image: .maturana/images/firecracker/humberto/ubuntu-rootfs.ext4\n\
+            \x20   tap_name: tap-mat-hum\n\
+            \x20   host_ip: 172.30.10.13\n\
+            \x20   guest_ip: 172.30.10.14\n\
+            \x20   guest_mac: \"AA:FC:00:00:10:04\"\n\
+             ---\n\
+             # Humberto\n",
+        )
+        .unwrap();
+
+        // A brand-new agent derives a complete launch profile from its OWN spec —
+        // no built-in entry, no special-casing.
+        let profile = firecracker_profile_from_spec(&home, "humberto-maturana").unwrap();
+        assert_eq!(profile.session_id, "humberto-maturana-main");
+        assert_eq!(profile.image_name, "humberto");
+        assert_eq!(profile.cidr, "172.30.10.12/30");
+        assert_eq!(profile.harness_arg, "codex");
+        assert_eq!(profile.tap_name, "tap-mat-hum");
+        assert_eq!(
+            profile.telegram_token_source,
+            "pipelock:telegram/humberto-bot-token"
+        );
+        assert_eq!(profile.auth_source, ".maturana/host-auth/humberto");
+        assert_eq!(profile.auth_guest_path, "/home/ubuntu/.codex");
+
+        // It is relaunched on reboot like any built-in: the empty-id fleet
+        // selection includes it alongside the three bundled examples.
+        let fleet = selected_firecracker_profiles(&home, &[]).unwrap();
+        assert!(fleet.iter().any(|p| p.agent_id == "humberto-maturana"));
+
+        // And `agent run` enqueues to the SAME session its guest worker claims
+        // from, instead of the old `telegram-main` dead-end.
+        assert_eq!(
+            infer_agent_session_id(&home, "humberto-maturana").unwrap(),
+            "humberto-maturana-main"
+        );
     }
 
     #[test]
@@ -6942,7 +7184,8 @@ mod tests {
             b"public",
         )
         .unwrap();
-        let profile = &FIRECRACKER_HARNESS_PROFILES[0];
+        let profiles = builtin_firecracker_profiles();
+        let profile = &profiles[0];
         let manifest = image_dir.join("asset-manifest.json");
         write_test_firecracker_manifest(profile, &manifest, &kernel, &rootfs, &ssh_key);
 
@@ -6965,7 +7208,8 @@ mod tests {
             b"public",
         )
         .unwrap();
-        let profile = &FIRECRACKER_HARNESS_PROFILES[0];
+        let profiles = builtin_firecracker_profiles();
+        let profile = &profiles[0];
         let manifest = image_dir.join("asset-manifest.json");
         write_test_firecracker_manifest(profile, &manifest, &kernel, &rootfs, &ssh_key);
         let mut value: serde_json::Value =
@@ -6995,7 +7239,8 @@ mod tests {
             b"public",
         )
         .unwrap();
-        let profile = &FIRECRACKER_HARNESS_PROFILES[0];
+        let profiles = builtin_firecracker_profiles();
+        let profile = &profiles[0];
         let manifest = image_dir.join("asset-manifest.json");
         write_test_firecracker_manifest(profile, &manifest, &kernel, &rootfs, &ssh_key);
 
@@ -7212,8 +7457,9 @@ Use this skill when testing.
         ));
         let _ = fs::remove_dir_all(&temp);
         let home = MaturanaHome::new(&temp);
-        let profile = &FIRECRACKER_HARNESS_PROFILES[1];
-        let spec = AgentSpec::from_maturana_markdown(&repo_example(profile.spec_path)).unwrap();
+        let profiles = builtin_firecracker_profiles();
+        let profile = &profiles[1];
+        let spec = AgentSpec::from_maturana_markdown(repo_example(&profile.spec_path)).unwrap();
 
         let artifacts = render_firecracker_guest_artifacts(
             &home,
