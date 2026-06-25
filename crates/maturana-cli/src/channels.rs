@@ -5772,8 +5772,30 @@ fn discord_gateway_session(
     let mut last_seq: Option<i64> = None;
     let mut identified = false;
     let mut self_id: Option<String> = None;
+    // The guest worker answers asynchronously, so a reply lands in the outbox
+    // seconds AFTER this loop enqueued the prompt. Without a periodic flush the
+    // reply sits undelivered until the NEXT inbound message arrives — the
+    // "Discord is painfully laggy" symptom (Telegram avoids it with a 1s delivery
+    // thread; Discord had none). Track the active channel and flush every ~1s.
+    let mut last_channel: Option<String> = None;
+    let mut last_flush = std::time::Instant::now();
 
     loop {
+        // Deliver replies the guest finished since the last tick, so a turn's
+        // answer reaches Discord within ~1s instead of waiting for another message.
+        if last_flush.elapsed() >= Duration::from_millis(1000) {
+            if let Some(chan) = last_channel.clone() {
+                let _ = deliver_channel_outbox(
+                    home,
+                    &config.agent_id,
+                    &config.session_id,
+                    "discord",
+                    &chan,
+                    |reply, _| discord_post_message(bot_token, &chan, reply),
+                );
+            }
+            last_flush = std::time::Instant::now();
+        }
         if last_heartbeat.elapsed() >= heartbeat_interval {
             let hb = serde_json::json!({ "op": 1, "d": last_seq }).to_string();
             socket
@@ -5853,6 +5875,8 @@ fn discord_gateway_session(
                         if let Some((channel_id, content)) =
                             discord_extract_prompt(&event, self_id.as_deref())
                         {
+                            // Remember where to flush async replies (the 1s loop above).
+                            last_channel = Some(channel_id.clone());
                             let token = bot_token.to_string();
                             let chan = channel_id.clone();
                             // Slash commands share the TUI/Telegram dispatcher so
