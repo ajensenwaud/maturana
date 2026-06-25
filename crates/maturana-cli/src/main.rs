@@ -2081,19 +2081,22 @@ fn build_orchestrator_config(
                 Some(session_id) => session_id.clone(),
                 None => infer_agent_session_id(home, &agent_id)?,
             };
-            // Each fleet agent has its own Telegram bot; a single shared token
-            // would point every channel at the same bot. Prefer the agent's OWN
-            // spec token (works for any agent), then a bundled example's token,
-            // then the command default — so a hand-authored agent uses its own
-            // bot just like the built-ins do.
-            let telegram_token_source = spec
+            // Supervise a Telegram poller for an agent ONLY if it has its OWN
+            // bot: its spec's `channels.telegram`, or a bundled example's profile
+            // token. An agent with neither (e.g. a Discord-only agent like
+            // humberto-maturana) must NOT start a telegram poller — it would
+            // squat another agent's bot token and 409-crash-loop against that
+            // agent's own poller, disrupting BOTH. Each agent owns its own bot.
+            let own_telegram_token = spec
                 .as_ref()
                 .and_then(|s| s.channels.telegram.as_ref())
                 .map(|t| t.token_source.clone())
-                .or_else(|| {
-                    firecracker_profile_for(&agent_id).map(|p| p.telegram_token_source)
-                })
-                .unwrap_or_else(|| command.telegram_token_source.clone());
+                .or_else(|| firecracker_profile_for(&agent_id).map(|p| p.telegram_token_source));
+            let telegram = !command.no_telegram && own_telegram_token.is_some();
+            // Unused when `telegram` is false; keep the command default so the
+            // single-agent `--telegram-token-source` path still has a value.
+            let telegram_token_source =
+                own_telegram_token.unwrap_or_else(|| command.telegram_token_source.clone());
             // Supervise the agent's egress proxy whenever its spec turns the
             // proxy on. Otherwise a proxy.enabled agent has no running proxy and
             // its outbound (harness backend, tools) is refused at a dead port.
@@ -2105,7 +2108,7 @@ fn build_orchestrator_config(
             Ok(AgentRuntime {
                 agent_id,
                 session_id,
-                telegram: !command.no_telegram,
+                telegram,
                 telegram_token_source,
                 schedules: !command.no_schedules,
                 proactive: !command.no_proactive,
@@ -6903,6 +6906,48 @@ mod tests {
         // NOT collapsed onto a single global session id.
         assert_eq!(codex.session_id, "codex-rendered");
         assert_eq!(claude.session_id, "claude-main");
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn build_orchestrator_config_skips_telegram_for_a_bot_less_agent() {
+        // A Discord-only agent (no channels.telegram, not a bundled example) must
+        // NOT get a Telegram poller: it would squat the command-default bot token
+        // and 409-crash-loop against whichever agent owns that bot. A built-in in
+        // the same fleet still gets Telegram (via its profile token).
+        let temp = std::env::temp_dir()
+            .join(format!("maturana-up-telegram-gate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let home = MaturanaHome::new(&temp);
+        let dir = home.agent_dir("humberto-maturana");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("MATURANA.md"),
+            "---\n\
+             identity: { id: humberto-maturana, name: Humberto, purpose: support }\n\
+             runtime: { harness: codex }\n\
+             vm: { provider: firecracker, guest_os: linux, firecracker: { kernel_image: k, rootfs_image: r } }\n\
+             channels: { discord: { bot_token_source: pipelock:discord/humberto-bot } }\n\
+             ---\n# Humberto\n",
+        )
+        .unwrap();
+
+        let command = up_command_for_test(vec!["humberto-maturana", "codex-firecracker"], None);
+        let config = build_orchestrator_config(&home, &command).unwrap();
+        let humberto = config
+            .agents
+            .iter()
+            .find(|a| a.agent_id == "humberto-maturana")
+            .unwrap();
+        let codex = config
+            .agents
+            .iter()
+            .find(|a| a.agent_id == "codex-firecracker")
+            .unwrap();
+        assert!(!humberto.telegram, "bot-less agent must not poll Telegram");
+        assert!(humberto.discord.is_some(), "its declared Discord stays on");
+        assert!(codex.telegram, "a built-in keeps its own Telegram bot");
 
         let _ = fs::remove_dir_all(&temp);
     }
