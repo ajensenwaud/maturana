@@ -32,9 +32,26 @@ pub fn materialize_agent(
     home: &MaturanaHome,
     mode: LaunchMode,
 ) -> anyhow::Result<MaterializedAgent> {
-    let validation = validate_spec(spec);
+    let mut validation = validate_spec(spec);
     if !validation.valid {
         anyhow::bail!("spec validation failed: {}", validation.errors.join("; "));
+    }
+
+    // Cross-agent uniqueness: a Firecracker agent must own a unique tap / IP / MAC
+    // / rootfs. A copied or cloned spec that reuses another agent's slot would
+    // otherwise fail with a cryptic `ResourceBusy` at the TAP (or, for a shared
+    // read-write rootfs, corrupt it). Block the launch with a clear message; on a
+    // dry run, surface it as a warning so file regeneration still works.
+    let collisions = check_network_collisions(home, spec);
+    if !collisions.is_empty() {
+        if mode == LaunchMode::Apply {
+            anyhow::bail!(
+                "cannot launch `{}`: {}",
+                spec.identity.id,
+                collisions.join("; ")
+            );
+        }
+        validation.warnings.extend(collisions);
     }
 
     let agent_dir = home.agent_dir(&spec.identity.id);
@@ -86,6 +103,57 @@ pub fn materialize_agent(
         validation,
         provider_commands: commands,
     })
+}
+
+/// Cross-agent uniqueness check for a Firecracker agent: every agent must own its
+/// own tap device, host/guest IP, MAC, and read-write rootfs image. Returns one
+/// message per OTHER agent whose `MATURANA.md` reuses any of those — so a spec
+/// copied from another agent (the classic mistake) is rejected with a clear
+/// reason instead of a cryptic `ResourceBusy` at the TAP. Non-Firecracker specs
+/// never collide here (empty result). Unreadable sibling specs are skipped.
+pub fn check_network_collisions(home: &MaturanaHome, spec: &AgentSpec) -> Vec<String> {
+    let Some(fc) = spec.vm.firecracker.as_ref() else {
+        return Vec::new();
+    };
+    let mut errors = Vec::new();
+    let Ok(entries) = fs::read_dir(home.agents_dir()) else {
+        return errors;
+    };
+    for entry in entries.flatten() {
+        let other_id = entry.file_name().to_string_lossy().to_string();
+        if other_id == spec.identity.id {
+            continue;
+        }
+        let Ok(other) = AgentSpec::from_maturana_markdown(entry.path().join("MATURANA.md")) else {
+            continue;
+        };
+        let Some(ofc) = other.vm.firecracker.as_ref() else {
+            continue;
+        };
+        let mut conflicts = Vec::new();
+        if ofc.tap_name.eq_ignore_ascii_case(&fc.tap_name) {
+            conflicts.push(format!("tap `{}`", fc.tap_name));
+        }
+        if ofc.host_ip == fc.host_ip {
+            conflicts.push(format!("host_ip {}", fc.host_ip));
+        }
+        if ofc.guest_ip == fc.guest_ip {
+            conflicts.push(format!("guest_ip {}", fc.guest_ip));
+        }
+        if ofc.guest_mac.eq_ignore_ascii_case(&fc.guest_mac) {
+            conflicts.push(format!("guest_mac {}", fc.guest_mac));
+        }
+        if ofc.rootfs_image == fc.rootfs_image {
+            conflicts.push(format!("rootfs_image `{}`", fc.rootfs_image));
+        }
+        if !conflicts.is_empty() {
+            errors.push(format!(
+                "shares with agent `{other_id}`: {} — give this agent its own tap_name, host_ip, guest_ip, guest_mac, and rootfs_image",
+                conflicts.join(", ")
+            ));
+        }
+    }
+    errors
 }
 
 pub fn stop_agent(home: &MaturanaHome, agent_id: &str) -> anyhow::Result<()> {
@@ -379,5 +447,43 @@ mod tests {
         assert!(!out.contains("html.duckduckgo.com"), "DDG fallback only when duckduckgo allowlisted:\n{out}");
         // the honest limits block is unconditional
         assert!(out.contains("## Limits"), "limits block must always be present:\n{out}");
+    }
+
+    #[test]
+    fn detects_firecracker_network_collisions() {
+        let tmp = std::env::temp_dir().join(format!("mat-collide-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let home = MaturanaHome::new(tmp.clone());
+        // An existing agent owning a slot.
+        let dir = home.agent_dir("codex");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("MATURANA.md"),
+            "---\nidentity: { id: codex, name: codex, purpose: p }\nruntime: { harness: codex }\nvm:\n  provider: firecracker\n  guest_os: linux\n  firecracker:\n    kernel_image: img/vmlinux.bin\n    rootfs_image: img/codex.ext4\n    tap_name: tap-mat-codex\n    host_ip: 172.30.10.1\n    guest_ip: 172.30.10.2\n    guest_mac: \"AA:FC:00:00:10:01\"\n---\n# body\n",
+        )
+        .unwrap();
+
+        // A clone reusing codex's slot must collide and name codex + the tap.
+        let clone = spec_from_yaml(
+            "identity: { id: clone, name: clone, purpose: p }\nruntime: { harness: codex }\nvm:\n  provider: firecracker\n  guest_os: linux\n  firecracker:\n    kernel_image: img/vmlinux.bin\n    rootfs_image: img/codex.ext4\n    tap_name: tap-mat-codex\n    host_ip: 172.30.10.1\n    guest_ip: 172.30.10.2\n    guest_mac: \"AA:FC:00:00:10:01\"\n",
+        );
+        let errs = check_network_collisions(&home, &clone);
+        assert!(!errs.is_empty(), "clone of codex must collide");
+        assert!(errs[0].contains("codex"), "names the conflict: {errs:?}");
+        assert!(errs[0].contains("tap"), "mentions the tap: {errs:?}");
+
+        // A unique slot does not collide; nor does the agent with itself.
+        let unique = spec_from_yaml(
+            "identity: { id: hum, name: hum, purpose: p }\nruntime: { harness: codex }\nvm:\n  provider: firecracker\n  guest_os: linux\n  firecracker:\n    kernel_image: img/vmlinux.bin\n    rootfs_image: img/hum.ext4\n    tap_name: tap-mat-hum\n    host_ip: 172.30.10.13\n    guest_ip: 172.30.10.14\n    guest_mac: \"AA:FC:00:00:10:04\"\n",
+        );
+        assert!(check_network_collisions(&home, &unique).is_empty(), "unique slot must not collide");
+        let codex_self = spec_from_yaml(
+            "identity: { id: codex, name: codex, purpose: p }\nruntime: { harness: codex }\nvm:\n  provider: firecracker\n  guest_os: linux\n  firecracker:\n    kernel_image: img/vmlinux.bin\n    rootfs_image: img/codex.ext4\n    tap_name: tap-mat-codex\n    host_ip: 172.30.10.1\n    guest_ip: 172.30.10.2\n    guest_mac: \"AA:FC:00:00:10:01\"\n",
+        );
+        assert!(
+            check_network_collisions(&home, &codex_self).is_empty(),
+            "an agent must not collide with itself"
+        );
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

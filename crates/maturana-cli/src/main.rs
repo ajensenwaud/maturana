@@ -843,13 +843,26 @@ fn main() -> anyhow::Result<()> {
                 let spec = AgentSpec::from_maturana_markdown(&spec)
                     .with_context(|| format!("failed to read {}", spec.display()))?;
                 let report = validate_spec(&spec);
+                // Cross-agent uniqueness (relative to the agents already in this
+                // home): catches a copied/cloned Firecracker spec here, instead of
+                // a cryptic ResourceBusy at launch.
+                let collisions = maturana_core::check_network_collisions(&home, &spec);
                 if json {
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 } else {
                     print_report(&report);
+                    if !collisions.is_empty() {
+                        eprintln!("\nnetwork/image collisions:");
+                        for collision in &collisions {
+                            eprintln!("  ✗ {collision}");
+                        }
+                    }
                 }
                 if !report.valid {
                     anyhow::bail!("spec is invalid");
+                }
+                if !collisions.is_empty() {
+                    anyhow::bail!("spec collides with an existing agent — {}", collisions.join("; "));
                 }
             }
         },

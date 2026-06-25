@@ -24,7 +24,8 @@ pub mod validation;
 pub mod worker;
 
 pub use materialize::{
-    inspect_agent, materialize_agent, stop_agent, LaunchMode, MaterializedAgent,
+    check_network_collisions, inspect_agent, materialize_agent, stop_agent, LaunchMode,
+    MaterializedAgent,
 };
 pub use providers::LiveAgentStatus;
 pub use spec::{AgentSpec, HarnessRuntime, HostProvider};
