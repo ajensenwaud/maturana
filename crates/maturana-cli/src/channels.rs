@@ -5785,13 +5785,12 @@ fn discord_gateway_session(
         // answer reaches Discord within ~1s instead of waiting for another message.
         if last_flush.elapsed() >= Duration::from_millis(1000) {
             if let Some(chan) = last_channel.clone() {
-                let _ = deliver_channel_outbox(
+                let _ = deliver_discord_outbox(
                     home,
                     &config.agent_id,
                     &config.session_id,
-                    "discord",
+                    bot_token,
                     &chan,
-                    |reply, _| discord_post_message(bot_token, &chan, reply),
                 );
             }
             last_flush = std::time::Instant::now();
@@ -5872,11 +5871,24 @@ fn discord_gateway_session(
                             .map(str::to_string);
                     }
                     "MESSAGE_CREATE" => {
-                        if let Some((channel_id, content)) =
-                            discord_extract_prompt(&event, self_id.as_deref())
+                        if let Some((channel_id, content, attachments)) =
+                            discord_extract_message(&event, self_id.as_deref())
                         {
                             // Remember where to flush async replies (the 1s loop above).
                             last_channel = Some(channel_id.clone());
+                            // Inbound files: download + ingest each attachment so a
+                            // file-only message isn't dropped (parity with Telegram).
+                            if !attachments.is_empty() {
+                                handle_discord_attachments(
+                                    home,
+                                    config,
+                                    bot_token,
+                                    &channel_id,
+                                    &attachments,
+                                    &content,
+                                );
+                            }
+                            if !content.is_empty() {
                             let token = bot_token.to_string();
                             let chan = channel_id.clone();
                             // Slash commands share the TUI/Telegram dispatcher so
@@ -5987,15 +5999,15 @@ fn discord_gateway_session(
                                     };
                                     run_session_once(paths, &options, 20)?;
                                 }
-                                deliver_channel_outbox(
+                                deliver_discord_outbox(
                                     home,
                                     &config.agent_id,
                                     &config.session_id,
-                                    "discord",
+                                    bot_token,
                                     &channel_id,
-                                    |reply, _| discord_post_message(&token, &chan, reply),
                                 )?;
                             }
+                            } // end: content non-empty (file-only messages skip the turn)
                         }
                     }
                     "INTERACTION_CREATE" => {
@@ -6059,12 +6071,14 @@ fn discord_set_read_timeout(
     }
 }
 
-/// Pull (channel_id, content) from a MESSAGE_CREATE event; skip bot/own messages
-/// and empty content.
-fn discord_extract_prompt(
+/// Pull (channel_id, content, attachments) from a MESSAGE_CREATE event; skip
+/// bot/own messages. Content may be empty (a file-only message) as long as there
+/// are attachments — those are still returned so the bridge ingests them instead
+/// of dropping the message. Each attachment is (filename, cdn_url).
+fn discord_extract_message(
     event: &serde_json::Value,
     self_id: Option<&str>,
-) -> Option<(String, String)> {
+) -> Option<(String, String, Vec<(String, String)>)> {
     let d = event.get("d")?;
     if d.pointer("/author/bot").and_then(|v| v.as_bool()) == Some(true) {
         return None;
@@ -6083,10 +6097,26 @@ fn discord_extract_prompt(
         .unwrap_or("")
         .trim()
         .to_string();
-    if content.is_empty() {
+    let attachments: Vec<(String, String)> = d
+        .get("attachments")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| {
+                    let url = a.get("url").and_then(|v| v.as_str())?;
+                    let name = a
+                        .get("filename")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("attachment");
+                    Some((name.to_string(), url.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if content.is_empty() && attachments.is_empty() {
         return None;
     }
-    Some((channel_id, strip_discord_mention(&content)))
+    Some((channel_id, strip_discord_mention(&content), attachments))
 }
 
 /// Remove a leading `<@id>` / `<@!id>` bot mention so the prompt is clean.
@@ -6155,6 +6185,165 @@ fn discord_post_message_with_buttons(
             .map_err(|e| anyhow::anyhow!("discord send buttons failed: {e}"))?
             .into_json()?;
     Ok(resp.get("id").and_then(|v| v.as_str()).map(str::to_string))
+}
+
+/// Discord's upload limit for a standard (non-boosted) server.
+const MAX_DISCORD_UPLOAD_BYTES: u64 = 25 * 1024 * 1024;
+
+/// Post a message with one or more file attachments via multipart/form-data
+/// (`payload_json` + `files[n]`) — the real upload, not just the file names.
+/// Oversized/unreadable files are skipped; errors if none could be attached so
+/// the caller can fall back to a text reply.
+fn discord_post_message_with_files(
+    bot_token: &str,
+    channel_id: &str,
+    text: &str,
+    files: &[String],
+) -> anyhow::Result<Option<String>> {
+    let boundary = "maturanadiscordfileboundary7e3f";
+    let mut body: Vec<u8> = Vec::new();
+    let content: String = text.chars().take(2000).collect();
+    let payload = serde_json::json!({ "content": content }).to_string();
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        b"content-disposition: form-data; name=\"payload_json\"\r\ncontent-type: application/json\r\n\r\n",
+    );
+    body.extend_from_slice(payload.as_bytes());
+    body.extend_from_slice(b"\r\n");
+    let mut attached = 0usize;
+    for (i, path) in files.iter().enumerate() {
+        let p = Path::new(path);
+        match fs::metadata(p) {
+            Ok(meta) if meta.len() > MAX_DISCORD_UPLOAD_BYTES => {
+                eprintln!("discord: {path} exceeds the 25 MB upload limit, skipping");
+                continue;
+            }
+            Ok(_) => {}
+            Err(_) => continue,
+        }
+        let bytes = match fs::read(p) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let filename = p
+            .file_name()
+            .map(|n| n.to_string_lossy().replace(['"', '\r', '\n'], "_"))
+            .unwrap_or_else(|| format!("file{i}"));
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("content-disposition: form-data; name=\"files[{i}]\"; filename=\"{filename}\"\r\ncontent-type: application/octet-stream\r\n\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(&bytes);
+        body.extend_from_slice(b"\r\n");
+        attached += 1;
+    }
+    if attached == 0 {
+        anyhow::bail!("no attachable files (all missing or over 25 MB)");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    let resp: serde_json::Value =
+        ureq::post(&format!("{DISCORD_API}/channels/{channel_id}/messages"))
+            .set("authorization", &format!("Bot {bot_token}"))
+            .set("content-type", &format!("multipart/form-data; boundary={boundary}"))
+            .send_bytes(&body)
+            .map_err(|e| anyhow::anyhow!("discord file upload failed: {e}"))?
+            .into_json()?;
+    Ok(resp.get("id").and_then(|v| v.as_str()).map(str::to_string))
+}
+
+/// Download a Discord attachment (its CDN url is public — no auth) to `dest`,
+/// capping the size so a huge upload can't exhaust memory/disk.
+fn discord_download_attachment(url: &str, dest: &Path, max_bytes: u64) -> anyhow::Result<u64> {
+    let resp = ureq::get(url)
+        .call()
+        .map_err(|e| anyhow::anyhow!("discord attachment download failed: {e}"))?;
+    let mut reader = resp.into_reader().take(max_bytes + 1);
+    let mut bytes: Vec<u8> = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        anyhow::bail!("attachment exceeds {max_bytes} bytes");
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(dest, &bytes)?;
+    Ok(bytes.len() as u64)
+}
+
+/// Inbound Discord files: download each attachment, ingest supported document
+/// types into the agent's knowledge graph (so a VM-isolated guest can query
+/// them), save the rest to the inbox, and post one summary reply. Mirrors the
+/// Telegram document path so files aren't silently dropped.
+fn handle_discord_attachments(
+    home: &MaturanaHome,
+    config: &DiscordServe,
+    bot_token: &str,
+    channel_id: &str,
+    attachments: &[(String, String)],
+    caption: &str,
+) {
+    let knowledge_graph = agent_knowledge_graph(home, &config.agent_id);
+    let graph = match (
+        maturana_core::worker::read_graph_token(home.root()),
+        knowledge_graph.enabled,
+    ) {
+        (Some(token), true) => Some((token, crate::graph::agent_graph_name(&config.agent_id))),
+        _ => None,
+    };
+    let inbox = home.agent_dir(&config.agent_id).join("inbox");
+    let _ = fs::create_dir_all(&inbox);
+    let mut lines: Vec<String> = Vec::new();
+    for (name, url) in attachments {
+        let file_name = sanitize_document_name(Some(name));
+        let dest = inbox.join(format!("{}-{file_name}", Utc::now().format("%Y%m%dT%H%M%SZ")));
+        if let Err(error) = discord_download_attachment(url, &dest, MAX_DISCORD_UPLOAD_BYTES) {
+            lines.push(format!("• `{file_name}` — download failed: {error}"));
+            continue;
+        }
+        let supported = file_name
+            .rsplit_once('.')
+            .map(|(_, ext)| {
+                crate::graph::SUPPORTED_EXTS.contains(&ext.to_ascii_lowercase().as_str())
+            })
+            .unwrap_or(false);
+        match (&graph, supported) {
+            (Some((token, graph_name)), true) => match crate::graph::ingest_file_into_service(
+                crate::graph::DEFAULT_LOCAL_URL,
+                token,
+                graph_name,
+                &dest,
+                1800,
+            ) {
+                Ok(chunks) => {
+                    let _ = audit_channel_event(
+                        home,
+                        &config.agent_id,
+                        "channel.discord.document",
+                        &format!("ingested {file_name} ({chunks} chunks)"),
+                    );
+                    lines.push(format!(
+                        "• `{file_name}` → added to my knowledge graph ({chunks} chunks)"
+                    ));
+                }
+                Err(error) => lines.push(format!("• `{file_name}` — could not ingest: {error}")),
+            },
+            _ => lines.push(format!("• `{file_name}` — saved to my inbox")),
+        }
+    }
+    if lines.is_empty() {
+        return;
+    }
+    let trailer = if caption.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\n_re: {}_", caption.trim().chars().take(180).collect::<String>())
+    };
+    let _ = discord_post_message(
+        bot_token,
+        channel_id,
+        &format!("📎 Received:\n{}{trailer}", lines.join("\n")),
+    );
 }
 
 /// Respond to a Discord component interaction (button click) by editing the
@@ -6421,6 +6610,70 @@ where
     deliver_outbox(home, agent_id, &paths, channel, platform_id, key, None, &mut sink)
 }
 
+/// Outbound sink for Discord: posts text, and uploads any host-side files as real
+/// attachments (parity with Telegram) instead of just naming them.
+struct DiscordSink<'a> {
+    bot_token: &'a str,
+    channel_id: &'a str,
+}
+
+impl OutboundSink for DiscordSink<'_> {
+    fn send(
+        &mut self,
+        _inbound_id: Option<&str>,
+        text: &str,
+        _reply_to: Option<&str>,
+    ) -> anyhow::Result<Option<String>> {
+        discord_post_message(self.bot_token, self.channel_id, text)
+    }
+
+    fn send_files(
+        &mut self,
+        _inbound_id: Option<&str>,
+        text: &str,
+        files: &[String],
+        _reply_to: Option<&str>,
+    ) -> anyhow::Result<Option<String>> {
+        match discord_post_message_with_files(self.bot_token, self.channel_id, text, files) {
+            Ok(id) => Ok(id),
+            Err(error) => {
+                eprintln!("discord: file upload failed ({error:#}); sending text only");
+                let names: Vec<String> = files
+                    .iter()
+                    .filter_map(|f| {
+                        Path::new(f).file_name().map(|n| n.to_string_lossy().to_string())
+                    })
+                    .collect();
+                let msg = if text.trim().is_empty() {
+                    format!("(couldn't attach: {})", names.join(", "))
+                } else {
+                    format!("{text}\n(couldn't attach: {})", names.join(", "))
+                };
+                discord_post_message(self.bot_token, self.channel_id, &msg)
+            }
+        }
+    }
+}
+
+/// Deliver pending Discord replies for one channel, uploading any files as real
+/// attachments. Used by both the gateway loop's 1s flush and the inline path.
+fn deliver_discord_outbox(
+    home: &MaturanaHome,
+    agent_id: &str,
+    session_id: &str,
+    bot_token: &str,
+    channel_id: &str,
+) -> anyhow::Result<usize> {
+    let paths = session_paths(&home.agent_dir(agent_id), session_id);
+    ensure_session(&paths)?;
+    let key = stable_chat_key(channel_id);
+    let mut sink = DiscordSink {
+        bot_token,
+        channel_id,
+    };
+    deliver_outbox(home, agent_id, &paths, "discord", channel_id, key, None, &mut sink)
+}
+
 fn generate_pair_code() -> String {
     rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -6433,6 +6686,45 @@ fn generate_pair_code() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discord_extract_message_keeps_file_only_messages() {
+        // A message with an attachment but NO text must still be surfaced (with
+        // its attachments) instead of dropped — the bug behind "file upload
+        // doesn't work via Discord".
+        let ev = serde_json::json!({
+            "d": {
+                "channel_id": "123",
+                "content": "",
+                "author": { "id": "user1" },
+                "attachments": [
+                    { "filename": "report.pdf", "url": "https://cdn.discordapp.com/x/report.pdf" }
+                ]
+            }
+        });
+        let (chan, content, atts) = discord_extract_message(&ev, Some("bot9")).unwrap();
+        assert_eq!(chan, "123");
+        assert!(content.is_empty());
+        assert_eq!(
+            atts,
+            vec![(
+                "report.pdf".to_string(),
+                "https://cdn.discordapp.com/x/report.pdf".to_string()
+            )]
+        );
+        // The bot's own messages are still ignored (no echo loop).
+        let own = serde_json::json!({
+            "d": { "channel_id": "1", "content": "hi", "author": { "id": "bot9" } }
+        });
+        assert!(discord_extract_message(&own, Some("bot9")).is_none());
+        // A plain text message with no attachments still parses.
+        let txt = serde_json::json!({
+            "d": { "channel_id": "9", "content": "  hello  ", "author": { "id": "u" } }
+        });
+        let (_, c, a) = discord_extract_message(&txt, Some("bot9")).unwrap();
+        assert_eq!(c, "hello");
+        assert!(a.is_empty());
+    }
 
     #[test]
     fn recent_models_are_newest_first_and_filter_non_chat() {
@@ -6650,24 +6942,24 @@ mod tests {
                    "author": { "id": "42", "bot": false } }
         });
         assert_eq!(
-            discord_extract_prompt(&ev, Some("999")),
-            Some(("123".to_string(), "hello there".to_string()))
+            discord_extract_message(&ev, Some("999")),
+            Some(("123".to_string(), "hello there".to_string(), vec![]))
         );
         // Bot-authored message is ignored.
         let bot = serde_json::json!({
             "d": { "channel_id": "1", "content": "hi", "author": { "id": "7", "bot": true } }
         });
-        assert_eq!(discord_extract_prompt(&bot, Some("999")), None);
+        assert_eq!(discord_extract_message(&bot, Some("999")), None);
         // Our own message (author id == self) is ignored (no echo loop).
         let own = serde_json::json!({
             "d": { "channel_id": "1", "content": "hi", "author": { "id": "999" } }
         });
-        assert_eq!(discord_extract_prompt(&own, Some("999")), None);
-        // Empty content is ignored.
+        assert_eq!(discord_extract_message(&own, Some("999")), None);
+        // Empty content AND no attachments is ignored.
         let empty = serde_json::json!({
             "d": { "channel_id": "1", "content": "   ", "author": { "id": "42" } }
         });
-        assert_eq!(discord_extract_prompt(&empty, Some("999")), None);
+        assert_eq!(discord_extract_message(&empty, Some("999")), None);
     }
 
     #[test]
