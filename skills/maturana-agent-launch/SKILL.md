@@ -193,8 +193,38 @@ this order):
    token) and neither answers — give each agent its own bot/token.
 
 The three ready profiles are `codex-firecracker`, `claude-firecracker`,
-`opencode-firecracker`. Custom-named agents reuse one of those three networking
-slots; Maturana does not allocate new subnets per agent.
+`opencode-firecracker` — each owns a UNIQUE network slot (its own `tap_name`,
+`host_ip`/`guest_ip`, `guest_mac`) and its own rootfs image.
+
+### A NEW agent needs its OWN slot + OWN rootfs (do not copy a running agent)
+
+Adding an agent that runs **alongside** the existing three is not turnkey yet —
+the three profiles are the supported path. To stand up another one correctly:
+
+- **Give it a unique network slot.** Maturana does NOT auto-allocate, and it now
+  **rejects** a spec that reuses another agent's `tap_name` / `host_ip` /
+  `guest_ip` / `guest_mac` / `rootfs_image` — at both `spec validate` and `agent
+  launch`, naming the conflicting agent. So a copied profile fails fast with a
+  clear message instead of a cryptic `TapOpen ResourceBusy` deep in Firecracker.
+  Assign free values: `tap_name` must be **≤15 chars** (e.g. `tap-mat-<short>` —
+  `tap-mat-humberto` is 16 and too long), and an unused host/guest IP pair + MAC
+  (the existing pattern is host=odd/guest=even, +4 apart: `.1/.2`, `.5/.6`,
+  `.9/.10` → next free `.13/.14`).
+- **Never reuse another agent's rootfs image — not even a byte copy.** The guest's
+  **SSH host key and network identity are baked into the rootfs at build**, so a
+  copy of codex's disk presents codex's host key on the new agent's IP; host↔guest
+  SSH then fails the pinned `known_hosts` check even though the VM boots to a login
+  prompt. The new agent needs its OWN freshly-built rootfs (point
+  `kernel_image`/`rootfs_image` at its own `.maturana/images/firecracker/<name>/`
+  and build it), which bakes the correct per-agent key + network. Copying a
+  *running* agent's disk also snapshots a mounted-rw filesystem.
+- **Keep it supervised.** `launch` runs Firecracker as a child and returns; the
+  standing agents stay up because the **plane/fleet** supervises them. A bare
+  `agent launch --apply` over an interactive SSH session lets the VM get SIGHUP'd
+  when the session closes — bring the agent up via `maturana up` / the fleet, or
+  fully detach (`setsid nohup … </dev/null >/dev/null 2>&1 &`). **Never stop a
+  working agent to free its TAP** — that doesn't fix a duplicate slot, it just
+  breaks the working agent.
 
 ### Inspect before you relaunch (don't cycle a healthy VM)
 

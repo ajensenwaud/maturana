@@ -188,7 +188,21 @@ Write all three into `.maturana/agents/<id>/`:
   example and change values, not structure. Only include `channels`,
   `mcp_servers`, etc. when the user asked for them; omit (don't stub) the rest.
 
-Then validate:
+> **Firecracker agents: give the new agent its OWN network slot — don't copy the
+> example's `vm.firecracker` verbatim.** `tap_name`, `host_ip`, `guest_ip`,
+> `guest_mac`, and `rootfs_image` belong to the agent you copied from. If that
+> agent is running, reusing its slot collides — `spec validate` and `agent launch`
+> now **reject** a duplicate, naming the conflict (instead of a cryptic
+> `ResourceBusy` at the TAP). Assign a unique `tap_name` (**≤15 chars**), a free
+> host/guest IP pair + MAC, and the agent's OWN rootfs image — the guest's SSH host
+> key + network are **baked into the rootfs at build**, so a copy of another
+> agent's disk presents the wrong identity even though the VM boots. See
+> `maturana-agent-launch` ("A NEW agent needs its OWN slot + OWN rootfs") for free
+> values and the build/supervise steps. A new custom Firecracker agent is not
+> turnkey yet — the three built-in profiles are the supported path.
+
+Then validate (this now also flags a network/rootfs collision with an existing
+agent, not just single-spec issues):
 
 ```
 maturana spec validate .maturana/agents/<id>/MATURANA.md
