@@ -4412,19 +4412,30 @@ fn finalize_reply(
 /// dissolves instead of snapping to the answer or vanishing. Best-effort — a
 /// dropped frame (e.g. a transient 429 from the quick burst) just makes the swoosh
 /// slightly less smooth and never blocks delivery.
+/// The EXACT sequence of HTML message bodies the dissolve swoosh edits the live
+/// message through for a turn of `secs` elapsed seconds: the "Thinking… MM:SS" line
+/// crumbling into scattered dust. Pure (no I/O) so the emitted Telegram payloads are
+/// unit-testable end-to-end, not just the inner frame math. We crumble the SAME line
+/// the draft was showing so, in the common (no-tool) case, the dissolve continues
+/// seamlessly from what's on screen.
+fn dissolve_html_frames(secs: u64) -> Vec<String> {
+    let status = format!("💭 Thinking… {}:{:02}", secs / 60, secs % 60);
+    maturana_core::animation::dissolve_frames(&status)
+        .into_iter()
+        // Dust glyphs/spaces are HTML-safe; wrap in <pre> like the live draft.
+        .map(|f| format!("<pre>{f}</pre>"))
+        .collect()
+}
+
 fn dissolve_live_message(token: &str, chat_id: i64, id: i64, elapsed: Duration) {
     let secs = elapsed.as_secs();
-    // Crumble the SAME "Thinking… MM:SS" line the draft was showing, so in the
-    // common (no-tool) case the dissolve continues seamlessly from what's on screen.
-    let status = format!("💭 Thinking… {}:{:02}", secs / 60, secs % 60);
-    let frames = maturana_core::animation::dissolve_frames(&status);
+    let frames = dissolve_html_frames(secs);
     eprintln!(
         "telegram: dissolve swoosh ({} frames) on message {id} after {secs}s",
         frames.len()
     );
-    for f in frames {
-        // Dust glyphs/spaces are HTML-safe; wrap in <pre> like the live draft.
-        if edit_telegram_message_html(token, chat_id, id, &format!("<pre>{f}</pre>")).is_err() {
+    for html in frames {
+        if edit_telegram_message_html(token, chat_id, id, &html).is_err() {
             break;
         }
         thread::sleep(Duration::from_millis(170));
@@ -7950,6 +7961,28 @@ mod tests {
         ] {
             assert!(names.contains(&cmd), "catalog missing {cmd}");
         }
+    }
+
+    #[test]
+    fn dissolve_swoosh_emits_crumbling_thinking_payloads() {
+        // The exact Telegram edit payloads the swoosh sends for an 8s turn: the
+        // "💭 Thinking… 0:08" line crumbling into dust over four <pre> frames.
+        let frames = dissolve_html_frames(8);
+        assert_eq!(frames.len(), 4, "four swoosh frames");
+        // Every frame is a valid <pre> body (HTML-safe dust/spaces).
+        assert!(frames.iter().all(|f| f.starts_with("<pre>") && f.ends_with("</pre>")));
+        // It starts from the recognizable Thinking line (only partly dusted)…
+        assert!(frames[0].contains("Thinking") || frames[0].contains('·'));
+        // …and dust strictly grows as it crumbles, ending sparser than full dust.
+        let dust = |s: &str| s.chars().filter(|&c| c == '·').count();
+        assert!(dust(&frames[0]) < dust(&frames[1]));
+        assert!(dust(&frames[1]) < dust(&frames[2]));
+        assert!(dust(&frames[3]) < dust(&frames[2]));
+        // Deterministic (same turn length → identical payload sequence).
+        assert_eq!(dissolve_html_frames(8), frames);
+        // Whitespace/length preserved across the crumble (frames are equal length).
+        let len0 = frames[0].chars().count();
+        assert!(frames.iter().all(|f| f.chars().count() == len0));
     }
 
     #[test]
