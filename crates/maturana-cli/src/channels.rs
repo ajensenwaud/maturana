@@ -4414,7 +4414,9 @@ fn finalize_reply(
 /// slightly less smooth and never blocks delivery.
 fn dissolve_live_message(token: &str, chat_id: i64, id: i64, elapsed: Duration) {
     let secs = elapsed.as_secs();
-    let status = format!("✨ {}:{:02}", secs / 60, secs % 60);
+    // Crumble the SAME "Thinking… MM:SS" line the draft was showing, so in the
+    // common (no-tool) case the dissolve continues seamlessly from what's on screen.
+    let status = format!("💭 Thinking… {}:{:02}", secs / 60, secs % 60);
     let frames = maturana_core::animation::dissolve_frames(&status);
     eprintln!(
         "telegram: dissolve swoosh ({} frames) on message {id} after {secs}s",
