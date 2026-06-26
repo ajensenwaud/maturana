@@ -3,6 +3,7 @@
 
 import { CockpitSocket } from "/assets/js/ws.js";
 import { Console } from "/assets/js/console.js";
+import { Chat } from "/assets/js/chat.js";
 import * as dashboard from "/assets/js/dashboard.js";
 
 const socket = new CockpitSocket();
@@ -27,6 +28,7 @@ socket.onStatus((status) => {
 const panel = document.getElementById("panel");
 const nav = document.getElementById("nav");
 const consoleView = new Console(socket);
+const chatView = new Chat(socket);
 
 const views = {
   agents: dashboard.renderAgents,
@@ -51,6 +53,10 @@ nav.addEventListener("click", (event) => {
 });
 
 async function renderView(name) {
+  if (name === "chat") {
+    chatView.mount(panel);
+    return;
+  }
   if (name === "console") {
     consoleView.mount(panel);
     return;
@@ -73,5 +79,5 @@ async function renderView(name) {
   }
 }
 
-renderView("console");
+renderView("chat");
 socket.subscribe(["agents", "runtime"]);
