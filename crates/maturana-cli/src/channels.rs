@@ -4032,6 +4032,15 @@ fn send_telegram_document(
     Ok(parsed.result.map(|r| r.message_id))
 }
 
+/// Base URL for the Telegram Bot API. Overridable via `MATURANA_TELEGRAM_API_BASE`
+/// so a test can point the live-progress + dissolve path at a local mock server and
+/// capture the exact HTTP sequence it emits — exercising the real send/edit code
+/// end-to-end without touching real Telegram or a bot token.
+fn tg_api_base() -> String {
+    std::env::var("MATURANA_TELEGRAM_API_BASE")
+        .unwrap_or_else(|_| "https://api.telegram.org".to_string())
+}
+
 fn send_telegram(
     token: &str,
     chat_id: &str,
@@ -4073,7 +4082,7 @@ fn send_telegram_with(
         });
     }
     let response: TelegramSendResponse =
-        ureq::post(&format!("https://api.telegram.org/bot{token}/sendMessage"))
+        ureq::post(&format!("{}/bot{token}/sendMessage", tg_api_base()))
             .set("content-type", "application/json")
             .send_string(&body.to_string())
             .map_err(|error| anyhow::anyhow!("Telegram sendMessage failed: {error}"))
@@ -4801,7 +4810,8 @@ fn edit_telegram_message_with(
         body["parse_mode"] = serde_json::json!(mode);
     }
     let response: TelegramOkResponse = ureq::post(&format!(
-        "https://api.telegram.org/bot{token}/editMessageText"
+        "{}/bot{token}/editMessageText",
+        tg_api_base()
     ))
     .set("content-type", "application/json")
     .send_string(&body.to_string())
@@ -4825,7 +4835,8 @@ fn delete_telegram_message(token: &str, chat_id: i64, message_id: i64) -> anyhow
         "message_id": message_id,
     });
     let response: TelegramOkResponse = ureq::post(&format!(
-        "https://api.telegram.org/bot{token}/deleteMessage"
+        "{}/bot{token}/deleteMessage",
+        tg_api_base()
     ))
     .set("content-type", "application/json")
     .send_string(&body.to_string())
@@ -7983,6 +7994,105 @@ mod tests {
         // Whitespace/length preserved across the crumble (frames are equal length).
         let len0 = frames[0].chars().count();
         assert!(frames.iter().all(|f| f.chars().count() == len0));
+    }
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// A throwaway HTTP server that records each request (first line + body) and
+    /// replies with a generic Telegram-OK so the real send/edit code succeeds.
+    fn spawn_mock_telegram() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let cap = captured.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 2048];
+                loop {
+                    let n = match s.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&buf[..pos]).to_string();
+                        let cl = headers
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        let body_start = pos + 4;
+                        while buf.len() < body_start + cl {
+                            match s.read(&mut tmp) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                            }
+                        }
+                        let first = headers.lines().next().unwrap_or("").to_string();
+                        let body = String::from_utf8_lossy(
+                            &buf[body_start..(body_start + cl).min(buf.len())],
+                        )
+                        .to_string();
+                        cap.lock().unwrap().push(format!("{first}\n{body}"));
+                        break;
+                    }
+                }
+                let body = r#"{"ok":true,"result":{"message_id":4242}}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+                let _ = s.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), captured)
+    }
+
+    #[test]
+    fn dissolve_swoosh_emits_real_http_sequence_against_mock() {
+        // Drive the REAL Telegram send/edit code against a local mock and capture the
+        // exact HTTP it emits for a completing turn: post the "Thinking" draft, play
+        // the dissolve swoosh, then finalize into the answer. Proves the whole
+        // completion path end-to-end (the actual editMessageText burst) without real
+        // Telegram or a bot token.
+        let (base, captured) = spawn_mock_telegram();
+        std::env::set_var("MATURANA_TELEGRAM_API_BASE", &base);
+
+        let id = send_telegram_html("TESTTOKEN", "123", "<pre>💭 Thinking… 0:08</pre>", None)
+            .unwrap()
+            .expect("draft message id");
+        assert_eq!(id, 4242);
+        dissolve_live_message("TESTTOKEN", 123, id, std::time::Duration::from_secs(8));
+        finalize_reply("TESTTOKEN", 123, Some(id), "FINAL ANSWER", None).unwrap();
+
+        std::env::remove_var("MATURANA_TELEGRAM_API_BASE");
+
+        let reqs = captured.lock().unwrap().clone();
+        // 1 sendMessage (draft) + 4 editMessageText (dissolve) + 1 editMessageText (answer).
+        assert_eq!(reqs.len(), 6, "unexpected request sequence:\n{}", reqs.join("\n--\n"));
+        assert!(reqs[0].contains("/sendMessage") && reqs[0].contains("Thinking"), "{}", reqs[0]);
+        // The four dissolve frames are editMessageText carrying dust, with dust
+        // strictly growing then thinning (the crumble).
+        let dust = |s: &str| s.matches('·').count();
+        for r in &reqs[1..5] {
+            assert!(r.contains("/editMessageText"), "expected editMessageText: {r}");
+            assert!(dust(r) > 0, "dissolve frame should carry dust: {r}");
+        }
+        assert!(dust(&reqs[1]) < dust(&reqs[2]), "dust should grow 1→2");
+        assert!(dust(&reqs[2]) < dust(&reqs[3]), "dust should grow 2→3");
+        assert!(dust(&reqs[4]) < dust(&reqs[3]), "final frame should be sparser");
+        // The turn ends by editing the SAME message into the answer.
+        assert!(reqs[5].contains("/editMessageText") && reqs[5].contains("FINAL ANSWER"), "{}", reqs[5]);
     }
 
     #[test]
