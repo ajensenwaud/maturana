@@ -19,6 +19,28 @@ macro_rules! check_ids {
     };
 }
 
+/// Channels/kinds that are host-internal self-triggers, NOT part of the
+/// user<->agent conversation: the proactive self-check, heartbeats, schedule
+/// fires, and orchestration steps. A genuine proactive *message* to the user is
+/// routed to a real channel (web/telegram) and is NOT tagged with these, so it
+/// still shows; only the internal trigger prompts are hidden.
+const INTERNAL_TURN_TAGS: &[&str] = &["proactive", "heartbeat", "schedule", "orchestrate"];
+
+/// The agent's "say nothing" reply to a proactive/heartbeat check. Mirrors
+/// `crate::proactive::SILENCE_SENTINEL` in maturana-cli — kept in sync here as a
+/// stable protocol constant (maturana-web can't depend on the cli crate).
+const SILENCE_SENTINEL: &str = "[[MATURANA_SILENT]]";
+
+fn is_internal_inbound(m: &session_db::InboundMessage) -> bool {
+    INTERNAL_TURN_TAGS.contains(&m.kind.as_str()) || INTERNAL_TURN_TAGS.contains(&m.channel.as_str())
+}
+
+fn is_internal_outbound(m: &session_db::OutboundMessage) -> bool {
+    INTERNAL_TURN_TAGS.contains(&m.kind.as_str())
+        || INTERNAL_TURN_TAGS.contains(&m.channel.as_str())
+        || extract_text(&m.content).trim() == SILENCE_SENTINEL
+}
+
 /// Pull the display text out of a stored message's JSON `content` blob.
 fn extract_text(content: &str) -> String {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
@@ -134,8 +156,19 @@ pub async fn messages(
     let root = state.home_root.clone();
     match blocking(move || {
         let paths = session_db::session_paths(&root.join("agents").join(&agent), &session);
-        let inbound = session_db::list_recent_inbound(&paths, query.limit.min(200))?;
-        let outbound = session_db::list_recent_outbound(&paths, query.limit.min(200))?;
+        // Hide host-internal self-triggers (proactive checks, silence replies,
+        // heartbeats, orchestration) so the transcript reads as the real
+        // user<->agent conversation. We over-fetch a little because the filter
+        // can drop rows.
+        let fetch = (query.limit.min(200)).saturating_mul(2).clamp(1, 400);
+        let inbound: Vec<_> = session_db::list_recent_inbound(&paths, fetch)?
+            .into_iter()
+            .filter(|m| !is_internal_inbound(m))
+            .collect();
+        let outbound: Vec<_> = session_db::list_recent_outbound(&paths, fetch)?
+            .into_iter()
+            .filter(|m| !is_internal_outbound(m))
+            .collect();
         Ok(serde_json::json!({ "inbound": inbound, "outbound": outbound }))
     })
     .await
@@ -191,11 +224,17 @@ pub async fn search(State(state): State<AppState>, Query(query): Query<SearchQue
                     };
                     if let Ok(rows) = session_db::list_recent_inbound(&paths, 400) {
                         for m in rows {
+                            if is_internal_inbound(&m) {
+                                continue;
+                            }
                             scan("in", extract_text(&m.content), m.created_at.to_rfc3339());
                         }
                     }
                     if let Ok(rows) = session_db::list_recent_outbound(&paths, 400) {
                         for m in rows {
+                            if is_internal_outbound(&m) {
+                                continue;
+                            }
                             scan("out", extract_text(&m.content), m.created_at.to_rfc3339());
                         }
                     }
@@ -295,6 +334,56 @@ pub async fn prune(State(state): State<AppState>, Json(body): Json<PruneBody>) -
     {
         Ok(data) => ok(data),
         Err(response) => response,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use maturana_core::session_db::{InboundMessage, OutboundMessage};
+
+    fn inbound(kind: &str, channel: &str, text: &str) -> InboundMessage {
+        InboundMessage {
+            id: "i".into(),
+            kind: kind.into(),
+            channel: channel.into(),
+            platform_id: "p".into(),
+            thread_id: None,
+            content: serde_json::json!({ "text": text }).to_string(),
+            status: "done".into(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+    fn outbound(kind: &str, channel: &str, text: &str) -> OutboundMessage {
+        OutboundMessage {
+            id: "o".into(),
+            in_reply_to: None,
+            kind: kind.into(),
+            channel: channel.into(),
+            platform_id: "p".into(),
+            thread_id: None,
+            content: serde_json::json!({ "text": text }).to_string(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn hides_proactive_and_silence_but_keeps_real_conversation() {
+        // The internal proactive self-check prompt is hidden.
+        assert!(is_internal_inbound(&inbound(
+            "proactive",
+            "proactive",
+            "[PROACTIVE CHECK - you initiated this...]"
+        )));
+        // A real user message is kept.
+        assert!(!is_internal_inbound(&inbound("chat", "web", "hello there")));
+        // The agent's silence reply is hidden, whatever channel it lands on.
+        assert!(is_internal_outbound(&outbound("chat", "proactive", "[[MATURANA_SILENT]]")));
+        assert!(is_internal_outbound(&outbound("chat", "web", "[[MATURANA_SILENT]]")));
+        // A genuine agent reply is kept.
+        assert!(!is_internal_outbound(&outbound("chat", "web", "Here's the summary you asked for.")));
+        // A real proactive *message* (routed to a real channel) is kept.
+        assert!(!is_internal_outbound(&outbound("chat", "web", "Reminder: your build finished.")));
     }
 }
 

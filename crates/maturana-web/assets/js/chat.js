@@ -302,7 +302,10 @@ export class Chat {
     // Outbound poller sends either {queued:id} (our echo) or a full message.
     if (m.queued) return;
     const text = textFromContent(m.content ?? m.text ?? "");
-    if (text) this.appendMessage("agent", text, m.created_at, m.id);
+    // The agent's "say nothing" reply to a proactive/heartbeat check is internal
+    // — never render it as a chat bubble.
+    if (!text || text.trim() === "[[MATURANA_SILENT]]") return;
+    this.appendMessage("agent", text, m.created_at, m.id);
     this.scrollDown();
   }
 
