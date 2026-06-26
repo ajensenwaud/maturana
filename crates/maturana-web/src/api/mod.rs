@@ -31,6 +31,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/agents/:id/spec/validate", post(agents::spec_validate))
         .route("/api/agents/:id/apply", post(agents::apply))
         .route("/api/agents/:id/egress", get(agents::egress_get).put(agents::egress_put))
+        .route("/api/agents/:id/config", get(agents::config_get).put(agents::config_put))
         .route("/api/egress/approve", post(egress::approve))
         .route("/api/runtime/plan", get(runtime::plan))
         .route("/api/runtime/up", get(runtime::up_state))

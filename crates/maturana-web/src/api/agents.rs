@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::Json;
@@ -248,6 +248,115 @@ pub async fn egress_put(
         Ok(data) => ok(data),
         Err(response) => response,
     }
+}
+
+/// Spec sections the cockpit's Config panel may read/write directly. Editing is
+/// confined to these declarative blocks — never the identity/vm/runtime that
+/// define the agent's isolation.
+pub const CONFIG_SECTIONS: &[&str] = &[
+    "schedules",
+    "mcp_servers",
+    "channels",
+    "skills",
+    "tools",
+    "capabilities",
+];
+
+#[derive(serde::Deserialize)]
+pub struct ConfigQuery {
+    section: String,
+}
+
+/// Read one config section of an agent's spec as JSON.
+pub async fn config_get(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ConfigQuery>,
+) -> Response {
+    check_id!(id);
+    if !CONFIG_SECTIONS.contains(&q.section.as_str()) {
+        return err(StatusCode::BAD_REQUEST, "unknown config section");
+    }
+    let path = agent_spec_path(&state, &id);
+    match blocking(move || {
+        let spec = AgentSpec::from_maturana_markdown(&path)?;
+        let full = serde_json::to_value(&spec)?;
+        Ok(serde_json::json!({
+            "section": q.section,
+            "value": full.get(&q.section).cloned().unwrap_or(serde_json::Value::Null),
+            "editable": CONFIG_SECTIONS,
+        }))
+    })
+    .await
+    {
+        Ok(data) => ok(data),
+        Err(response) => response,
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct ConfigBody {
+    section: String,
+    value: serde_json::Value,
+}
+
+/// Replace one config section, re-validate the whole spec, and write it. A
+/// running agent picks up channel/MCP/schedule changes on its next
+/// materialize/restart (the spec is the source of truth, not live RPC).
+pub async fn config_put(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ConfigBody>,
+) -> Response {
+    check_id!(id);
+    if !CONFIG_SECTIONS.contains(&body.section.as_str()) {
+        return err(StatusCode::BAD_REQUEST, "unknown config section");
+    }
+    let path = agent_spec_path(&state, &id);
+    match blocking(move || {
+        let markdown = std::fs::read_to_string(&path)?;
+        let updated = update_spec_section(&markdown, &body.section, &body.value)?;
+        let report = validate_markdown(&updated)?;
+        if !report.valid {
+            anyhow::bail!("edited spec failed validation: {}", report.errors.join("; "));
+        }
+        std::fs::write(&path, &updated)?;
+        Ok(serde_json::json!({ "section": body.section, "report": report }))
+    })
+    .await
+    {
+        Ok(data) => ok(data),
+        Err(response) => response,
+    }
+}
+
+/// Replace ONE top-level frontmatter key with the given JSON value (null
+/// removes it), preserving the rest of the spec byte-for-byte structurally.
+pub fn update_spec_section(
+    markdown: &str,
+    section: &str,
+    value: &serde_json::Value,
+) -> anyhow::Result<String> {
+    let rest = markdown
+        .strip_prefix("---")
+        .ok_or_else(|| anyhow::anyhow!("spec has no frontmatter"))?;
+    let end = rest
+        .find("\n---")
+        .ok_or_else(|| anyhow::anyhow!("spec frontmatter is unterminated"))?;
+    let frontmatter = &rest[..end];
+    let body = &rest[end + 4..];
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(frontmatter)?;
+    let map = doc
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("spec frontmatter is not a mapping"))?;
+    let key = serde_yaml::Value::String(section.to_string());
+    if value.is_null() {
+        map.remove(&key);
+    } else {
+        map.insert(key, serde_yaml::to_value(value)?);
+    }
+    let new_frontmatter = serde_yaml::to_string(&doc)?;
+    Ok(format!("---\n{new_frontmatter}---{body}"))
 }
 
 fn validate_markdown(markdown: &str) -> anyhow::Result<maturana_core::validation::ValidationReport> {

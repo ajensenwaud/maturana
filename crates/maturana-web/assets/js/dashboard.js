@@ -194,6 +194,81 @@ export async function renderSystem(panel) {
   panel.replaceChildren(statsWrap, logWrap, aWrap);
 }
 
+// ---- config (browser-managed spec sections) ----
+
+const CONFIG_SECTIONS = ["schedules", "mcp_servers", "channels", "skills", "tools", "capabilities"];
+
+const CONFIG_HINTS = {
+  schedules: 'Scheduled jobs (cron). e.g. [{"cron":"0 9 * * *","prompt":"daily summary","channel":"telegram"}]',
+  mcp_servers: "Model-Context-Protocol servers this agent connects to.",
+  channels: 'Messaging surfaces. e.g. {"telegram":{"token_source":"pipelock:telegram/bot-token"}}',
+  skills: 'Skills enabled for this agent. e.g. ["maturana-web-search","maturana-browse"]',
+  tools: "WASM tool names enabled for this agent.",
+  capabilities: 'Opt-in capabilities, e.g. {"image_gen":true,"self_forge":false}',
+};
+
+export async function renderConfig(panel) {
+  const wrap = section("Agent config");
+  const agents = await api("/api/agents");
+  const agentSel = el("select", "model-input");
+  for (const a of agents) {
+    const o = el("option", null, a.agent_id);
+    o.value = a.agent_id;
+    agentSel.append(o);
+  }
+  const sectionSel = el("select", "model-input");
+  for (const s of CONFIG_SECTIONS) {
+    const o = el("option", null, s);
+    o.value = s;
+    sectionSel.append(o);
+  }
+  const hint = el("div", "status-dim");
+  const editor = el("textarea", "spec-editor");
+  editor.style.minHeight = "38vh";
+  const report = el("div");
+  const load = async () => {
+    report.replaceChildren();
+    hint.textContent = CONFIG_HINTS[sectionSel.value] || "";
+    try {
+      const d = await api(`/api/agents/${agentSel.value}/config?section=${sectionSel.value}`);
+      editor.value = JSON.stringify(d.value ?? null, null, 2);
+    } catch (error) {
+      report.replaceChildren(el("div", "status-bad", String(error)));
+    }
+  };
+  const save = async () => {
+    let value;
+    try {
+      value = JSON.parse(editor.value);
+    } catch {
+      report.replaceChildren(el("div", "status-bad", "invalid JSON"));
+      return;
+    }
+    try {
+      const d = await api(`/api/agents/${agentSel.value}/config`, {
+        method: "PUT",
+        body: JSON.stringify({ section: sectionSel.value, value }),
+      });
+      report.replaceChildren(el("div", "status-ok", `[ saved ${d.section} — spec valid; applies on next materialize/restart ]`));
+    } catch (error) {
+      report.replaceChildren(el("div", "status-bad", String(error)));
+    }
+  };
+  agentSel.addEventListener("change", load);
+  sectionSel.addEventListener("change", load);
+  const controls = el("div", "dash-actions");
+  controls.append(agentSel, sectionSel, button("load", load), button("save", save));
+  wrap.append(
+    controls,
+    hint,
+    el("div", "status-dim", "Validated before write. identity / vm / runtime (the isolation boundary) are not editable here — use the Agents → spec editor for those."),
+    editor,
+    report,
+  );
+  await load();
+  panel.replaceChildren(wrap);
+}
+
 // ---- agents ----
 
 export async function renderAgents(panel, socket) {
