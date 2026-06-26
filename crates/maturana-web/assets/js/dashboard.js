@@ -428,7 +428,38 @@ export async function renderRuntime(panel, socket) {
     }),
     out,
   );
-  panel.replaceChildren(wrap, health, doctor);
+
+  // Ops: plane lifecycle + config backup.
+  const ops = section("Ops");
+  const opsOut = el("div");
+  const gw = (action, danger) => button(`${action} plane`, async () => {
+    if (action !== "restart" && !confirm(`${action} the supervised plane?`)) return;
+    opsOut.replaceChildren(el("div", "label", `[ ${action}… ]`));
+    try {
+      await api(`/api/ops/gateway/${action}`, { method: "POST" });
+      opsOut.replaceChildren(el("div", "status-ok", `[ ${action} ok ]`));
+    } catch (error) {
+      opsOut.replaceChildren(el("div", "status-bad", String(error)));
+    }
+  }, danger);
+  const opsRow = el("div", "dash-actions");
+  opsRow.append(
+    gw("restart", false),
+    gw("stop", true),
+    gw("start", false),
+    button("backup config", async () => {
+      opsOut.replaceChildren(el("div", "label", "[ backing up… ]"));
+      try {
+        const r = await api("/api/ops/backup", { method: "POST" });
+        opsOut.replaceChildren(el("div", "status-ok", `[ backup → ${r.path} (${r.bytes} bytes) ]`));
+      } catch (error) {
+        opsOut.replaceChildren(el("div", "status-bad", String(error)));
+      }
+    }),
+  );
+  ops.append(opsRow, opsOut);
+
+  panel.replaceChildren(wrap, health, doctor, ops);
 }
 
 // ---- sessions ----

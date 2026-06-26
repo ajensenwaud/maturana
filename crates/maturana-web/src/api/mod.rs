@@ -6,6 +6,7 @@
 pub mod agents;
 pub mod egress;
 pub mod graph;
+pub mod ops;
 pub mod pipelock;
 pub mod runtime;
 pub mod search;
@@ -40,6 +41,8 @@ pub fn router() -> Router<AppState> {
         .route("/api/system/logs", get(system::logs))
         .route("/api/system/logs/sources", get(system::log_sources))
         .route("/api/system/analytics", get(system::analytics))
+        .route("/api/ops/gateway/:action", post(ops::gateway))
+        .route("/api/ops/backup", post(ops::backup))
         .route("/api/sessions", get(sessions::list))
         .route("/api/sessions/search", get(sessions::search))
         .route("/api/sessions/prune", post(sessions::prune))
