@@ -117,6 +117,98 @@ pub async fn stop(State(state): State<AppState>, Path(id): Path<String>) -> Resp
     }
 }
 
+/// Human-readable agent summary for the cockpit: identity, harness, the
+/// tools/skills/MCP/capabilities it actually carries, channels, egress size,
+/// worker state, graph — i.e. "what it is and what it can do" instead of a raw
+/// inspect dump.
+pub async fn detail(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    check_id!(id);
+    let spec_path = agent_spec_path(&state, &id);
+    let dir = home(&state).agent_dir(&id);
+    match blocking(move || {
+        let spec = AgentSpec::from_maturana_markdown(&spec_path)?;
+        let worker: Option<serde_json::Value> =
+            std::fs::read_to_string(dir.join("worker-status.json"))
+                .ok()
+                .and_then(|r| serde_json::from_str(&r).ok());
+        let mut channels: Vec<&str> = Vec::new();
+        let c = &spec.channels;
+        if c.tui {
+            channels.push("tui");
+        }
+        if c.telegram.is_some() {
+            channels.push("telegram");
+        }
+        if c.discord.is_some() {
+            channels.push("discord");
+        }
+        if c.slack.is_some() {
+            channels.push("slack");
+        }
+        if c.agentmail.is_some() {
+            channels.push("agentmail");
+        }
+        let mcp: Vec<String> = spec.mcp_servers.iter().map(|m| m.name.clone()).collect();
+        Ok(serde_json::json!({
+            "agent_id": id,
+            "name": spec.identity.name,
+            "purpose": spec.identity.purpose,
+            "harness": maturana_core::worker::harness_name(&spec.runtime.harness),
+            "provider": format!("{:?}", spec.vm.provider),
+            "vcpu": spec.vm.vcpu,
+            "memory_mib": spec.vm.memory_mib,
+            "skills": spec.skills,
+            "tools": spec.tools,
+            "mcp_servers": mcp,
+            "capabilities": spec.capabilities,
+            "channels": channels,
+            "knowledge_graph": spec.knowledge_graph.enabled,
+            "graph_name": spec.knowledge_graph.enabled.then(|| spec.knowledge_graph.graph_name(&id)),
+            "egress_allowlist": spec.network.egress_allowlist,
+            "schedules": spec.schedules.len(),
+            "worker_status": worker,
+        }))
+    })
+    .await
+    {
+        Ok(data) => ok(data),
+        Err(response) => response,
+    }
+}
+
+/// Restart a Firecracker agent: relaunch its microVM from the baked rootfs (the
+/// boot-recovery path stops the old one first), via the CLI's repair command.
+pub async fn restart(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    check_id!(id);
+    let home_root = state.home_root.clone();
+    match blocking(move || {
+        let exe = std::env::current_exe()?;
+        let output = std::process::Command::new(exe)
+            .arg("--home")
+            .arg(&home_root)
+            .args(["repair", "firecracker-harnesses", "--agent-id"])
+            .arg(&id)
+            .args(["--skip-services", "--skip-assets"])
+            .output()?;
+        let tail: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .rev()
+            .take(6)
+            .map(|l| l.to_string())
+            .collect();
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("restart failed: {}", err.trim());
+        }
+        Ok(serde_json::json!({ "restarted": id, "output": tail }))
+    })
+    .await
+    {
+        Ok(data) => ok(data),
+        Err(response) => response,
+    }
+}
+
 pub async fn spec_get(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     check_id!(id);
     let path = agent_spec_path(&state, &id);
@@ -124,6 +216,207 @@ pub async fn spec_get(State(state): State<AppState>, Path(id): Path<String>) -> 
         Ok(markdown) => ok(serde_json::json!({ "markdown": markdown })),
         Err(response) => response,
     }
+}
+
+/// List the agent's HOST-side files as a flat, relative tree (its spec,
+/// AGENTS.md, worker status, sessions, wiki). Read-only. The agent's in-VM
+/// working files are isolated by design and are NOT exposed here.
+pub async fn files(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    check_id!(id);
+    let dir = home(&state).agent_dir(&id);
+    match blocking(move || {
+        let mut out = Vec::new();
+        walk_files(&dir, &dir, 0, &mut out);
+        out.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+        Ok(serde_json::json!(out))
+    })
+    .await
+    {
+        Ok(data) => ok(data),
+        Err(response) => response,
+    }
+}
+
+fn walk_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    depth: usize,
+    out: &mut Vec<serde_json::Value>,
+) {
+    if depth > 4 || out.len() > 800 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let is_dir = path.is_dir();
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        out.push(serde_json::json!({ "path": rel, "dir": is_dir, "size": size }));
+        if is_dir {
+            walk_files(root, &path, depth + 1, out);
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct FileQuery {
+    path: String,
+}
+
+/// Read one text file under the agent's host directory. The path is validated to
+/// stay within that directory (no traversal); binary or oversized files are
+/// reported rather than dumped.
+pub async fn file_read(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<FileQuery>,
+) -> Response {
+    check_id!(id);
+    let dir = home(&state).agent_dir(&id);
+    let rel = q.path.clone();
+    match blocking(move || {
+        if rel.is_empty() || rel.contains("..") || rel.starts_with('/') || rel.starts_with('\\') {
+            anyhow::bail!("invalid path");
+        }
+        let target = dir.join(&rel);
+        let canon = target.canonicalize()?;
+        let base = dir.canonicalize()?;
+        if !canon.starts_with(&base) {
+            anyhow::bail!("path escapes the agent directory");
+        }
+        let meta = std::fs::metadata(&canon)?;
+        if meta.is_dir() {
+            anyhow::bail!("that is a directory");
+        }
+        if meta.len() > 256 * 1024 {
+            anyhow::bail!("file is too large to preview ({} bytes)", meta.len());
+        }
+        let bytes = std::fs::read(&canon)?;
+        if bytes.iter().take(8000).any(|b| *b == 0) {
+            anyhow::bail!("binary file — not previewable");
+        }
+        Ok(serde_json::json!({ "path": rel, "text": String::from_utf8_lossy(&bytes) }))
+    })
+    .await
+    {
+        Ok(data) => ok(data),
+        Err(response) => response,
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct CreateBody {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    purpose: String,
+    #[serde(default = "default_harness")]
+    harness: String,
+}
+
+fn default_harness() -> String {
+    "codex".to_string()
+}
+
+/// Scaffold a NEW agent: write a minimal, validated starter spec to
+/// `agents/<id>/MATURANA.md`. This only creates the declarative spec — no VM is
+/// provisioned. The operator then refines the spec and runs dry-run → apply
+/// (which does the real, slow materialize) from the Agents panel. Refuses to
+/// clobber an existing agent.
+pub async fn create(State(state): State<AppState>, Json(body): Json<CreateBody>) -> Response {
+    let id = body.id.trim().to_string();
+    check_id!(id);
+    if !matches!(body.harness.as_str(), "codex" | "claude" | "opencode") {
+        return err(StatusCode::BAD_REQUEST, "harness must be codex, claude, or opencode");
+    }
+    let dir = home(&state).agent_dir(&id);
+    let path = agent_spec_path(&state, &id);
+    let name = if body.name.trim().is_empty() {
+        id.clone()
+    } else {
+        body.name.trim().to_string()
+    };
+    let purpose = if body.purpose.trim().is_empty() {
+        format!("{name} — a Maturana agent.")
+    } else {
+        body.purpose.trim().to_string()
+    };
+    // The UI uses the friendly harness names; the spec enum wants the canonical
+    // ids (the Claude harness is `claude-code` in the spec).
+    let spec_harness = match body.harness.as_str() {
+        "claude" => "claude-code",
+        other => other,
+    }
+    .to_string();
+    match blocking(move || {
+        if path.exists() {
+            anyhow::bail!("agent '{id}' already exists");
+        }
+        let markdown = starter_spec(&id, &name, &purpose, &spec_harness);
+        // Validate before committing anything to disk.
+        let report = validate_markdown(&markdown)?;
+        if !report.valid {
+            anyhow::bail!("starter spec failed validation: {}", report.errors.join("; "));
+        }
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(&path, &markdown)?;
+        Ok(serde_json::json!({ "created": id, "report": report }))
+    })
+    .await
+    {
+        Ok(data) => ok(data),
+        Err(response) => response,
+    }
+}
+
+/// A structurally-complete, parseable starter spec for a Firecracker agent.
+/// Image paths follow the per-agent convention; the network identifiers
+/// (tap/host_ip/guest_ip/guest_mac) are PLACEHOLDERS the operator must make
+/// unique before provisioning — the collision guard refuses to launch a duplicate
+/// anyway. Egress starts empty; harness defaults are applied on parse. The
+/// operator broadens tools/skills/channels/egress from here.
+fn starter_spec(id: &str, name: &str, purpose: &str, harness: &str) -> String {
+    // tap_name must be <= 15 chars: "tap-mat-" (8) + up to 7 from the id.
+    let tap_suffix: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(7)
+        .collect();
+    // NOTE: every continuation line below starts at column 0 in the source and
+    // carries its YAML indentation as explicit `\n  ` / `\n    ` — a `\`-stripped
+    // source indent would push nested keys to column 0 and break the YAML.
+    let fc = format!(
+        "\n  firecracker:\
+\n    kernel_image: .maturana/images/firecracker/{id}/vmlinux.bin\
+\n    rootfs_image: .maturana/images/firecracker/{id}/ubuntu-rootfs.ext4\
+\n    tap_name: tap-mat-{tap_suffix}\
+\n    host_ip: 172.30.90.1\
+\n    guest_ip: 172.30.90.2\
+\n    guest_mac: AA:FC:00:00:90:01\
+\n    kernel_args: console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw virtio_mmio.device=4K@0xd0000000:5"
+    );
+    format!(
+        "---\
+\nidentity:\n  id: {id}\n  name: {name}\n  purpose: {purpose}\
+\nruntime:\n  harness: {harness}\
+\nvm:\n  provider: firecracker\n  guest_os: linux\n  vcpu: 2\n  memory_mib: 2048{fc}\
+\nnetwork:\n  egress_allowlist: []\
+\nmemory:\n  wiki_path: .maturana/wiki\
+\nknowledge_graph:\n  enabled: true\
+\n---\n\n# {name}\n\n{purpose}\n\n\
+You are {name}, running in an isolated Maturana microVM. Be concise and helpful.\n\n\
+> Before provisioning: give this agent a UNIQUE tap_name / host_ip / guest_ip / guest_mac \
+(the 172.30.90.x placeholders will collide with another agent), point kernel_image / \
+rootfs_image at prepared images, then dry-run -> apply.\n"
+    )
 }
 
 #[derive(serde::Deserialize)]
@@ -513,6 +806,23 @@ body text stays put
         assert!(valid_agent_id("codex-firecracker"));
         for bad in ["", "..", "a/b", "a\\b", "x y"] {
             assert!(!valid_agent_id(bad), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn starter_spec_parses_and_validates() {
+        // The scaffold must produce a structurally-valid spec (nested firecracker
+        // block at the right YAML depth) for every harness, or "add agent" writes
+        // a spec the fleet can't read.
+        for harness in ["codex", "claude-code", "opencode"] {
+            let md = starter_spec("new-bot", "New Bot", "A scaffolded agent.", harness);
+            let tmp = std::env::temp_dir()
+                .join(format!("mweb-starter-{harness}-{}.md", std::process::id()));
+            std::fs::write(&tmp, &md).unwrap();
+            let spec = AgentSpec::from_maturana_markdown(&tmp).expect("starter spec must parse");
+            let _ = std::fs::remove_file(&tmp);
+            assert_eq!(spec.identity.id, "new-bot");
+            assert!(validate_spec(&spec).valid, "starter spec for {harness} must validate");
         }
     }
 }

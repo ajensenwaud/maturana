@@ -1296,6 +1296,59 @@ pub(crate) fn dispatch_slash_command(
     }
 }
 
+/// Apply a [`dispatch_slash_command`] result for the web cockpit. The cockpit has
+/// no interactive TUI loop, so each [`ConsoleCommand`] maps to a concrete effect:
+/// a local `Reply`/`Select` becomes a `web` outbound the cockpit's poller streams
+/// straight back to the browser; a `Prompt` (skill/emerge/onboard) is enqueued as
+/// a real turn so the agent actually answers. Returns the id the cockpit treats as
+/// the "enqueued message id" (an outbound id for local replies, the inbound id for
+/// a real turn). Without this, `/model …` from the web chat would reach the agent
+/// as a literal user message instead of being handled like every other channel.
+pub(crate) fn apply_web_console_command(
+    home: &MaturanaHome,
+    agent_id: &str,
+    session_id: &str,
+    chat_id: i64,
+    cmd: ConsoleCommand,
+) -> anyhow::Result<String> {
+    let paths = session_paths(&home.agent_dir(agent_id), session_id);
+    ensure_session(&paths)?;
+    let reply = |text: String| -> anyhow::Result<String> {
+        let content = serde_json::json!({ "text": text }).to_string();
+        maturana_core::session_db::write_outbound(&paths, None, "chat", "web", "web", None, &content)
+    };
+    match cmd {
+        ConsoleCommand::Reply(text) => reply(text),
+        ConsoleCommand::Prompt(prompt) => enqueue_turn(
+            home,
+            agent_id,
+            session_id,
+            "web",
+            "web",
+            chat_id,
+            None,
+            &prompt,
+            serde_json::json!({}),
+        ),
+        ConsoleCommand::Clear | ConsoleCommand::NewSession => {
+            let _ = reset_channel_context(home, agent_id, chat_id);
+            reply("Conversation reset — starting fresh.".to_string())
+        }
+        ConsoleCommand::Quit => {
+            reply("Close the browser tab to end the session.".to_string())
+        }
+        // No modal picker over the WS yet — surface the choices as text so the
+        // operator can re-issue the command with a value (e.g. `/model <name>`).
+        ConsoleCommand::Select { title, options } => {
+            let labels: Vec<String> = options.into_iter().map(|o| o.label).collect();
+            reply(format!(
+                "{title}\nOptions: {}\n(Re-send the command with a value, e.g. `/model <name>`.)",
+                labels.join(", ")
+            ))
+        }
+    }
+}
+
 /// Per-channel send behavior for the shared [`deliver_outbox`] loop. The loop owns
 /// claiming, dropping unparseable rows, the silence-sentinel filter, transcript
 /// recording, mark-delivered, audit, and release-on-failure (a failed send is

@@ -66,7 +66,10 @@ function textFromContent(content) {
   return content;
 }
 
-const SLASH_HINTS = ["/model", "/reasoning", "/clear", "/new", "/status", "/help", "/stop", "/compact"];
+const SLASH_HINTS = [
+  "/model", "/reasoning", "/status", "/help", "/new", "/clear",
+  "/stop", "/compact", "/skill", "/emerge", "/onboard", "/good", "/bad",
+];
 
 export class Chat {
   constructor(socket) {
@@ -78,7 +81,7 @@ export class Chat {
     socket.on("session_outbound", (msg) => this.onOutbound(msg));
   }
 
-  async mount(panel) {
+  async mount(panel, agentId) {
     panel.replaceChildren();
     const wrap = elem("div", "chat");
 
@@ -118,12 +121,28 @@ export class Chat {
     composer.append(this.hint, this.input, sendBtn);
 
     main.append(this.headerEl, this.threadEl, composer);
-    wrap.append(side, main);
+
+    // ---- right: agent files (host-side, read-only) ----
+    this.filesEl = elem("div", "chat-files");
+    const filesHead = elem("div", "chat-files-head");
+    filesHead.append(elem("div", "chat-side-title", "Agent files"));
+    this.filesList = elem("div", "chat-files-list");
+    this.filesEl.append(filesHead, this.filesList);
+
+    wrap.append(side, main, this.filesEl);
     panel.append(wrap);
 
     await this.refreshList();
-    if (this.convos.length) this.open(this.convos[0]);
-    else this.headerEl.replaceChildren(elem("div", "chat-empty", "No conversations yet — pick ＋ New chat."));
+    if (agentId) {
+      // Opened for a specific agent (e.g. the Agents/Sessions "message" action):
+      // jump straight into its conversation, starting its main session if none.
+      const existing = this.convos.find((c) => c.agent_id === agentId);
+      this.open(existing || { agent_id: agentId, session_id: `${agentId}-main`, fresh: true });
+    } else if (this.convos.length) {
+      this.open(this.convos[0]);
+    } else {
+      this.headerEl.replaceChildren(elem("div", "chat-empty", "No conversations yet — pick ＋ New chat."));
+    }
   }
 
   async refreshList() {
@@ -177,6 +196,7 @@ export class Chat {
       elem("div", "chat-title", convo.label || convo.agent_id),
       elem("div", "chat-subtitle", `${convo.session_id}${model} · worker ${worker}`),
     );
+    this.loadFiles(convo.agent_id);
     this.threadEl.replaceChildren(elem("div", "chat-empty", "loading…"));
     if (convo.fresh) { this.threadEl.replaceChildren(elem("div", "chat-empty", "Say hi to start the conversation.")); this.input.focus(); return; }
     try {
@@ -209,6 +229,47 @@ export class Chat {
   }
 
   scrollDown() { this.threadEl.scrollTop = this.threadEl.scrollHeight; }
+
+  // Right-rail: the agent's host-side files (read-only). The in-VM workspace is
+  // isolated and not exposed; this shows the spec, AGENTS.md, worker status, etc.
+  async loadFiles(agentId) {
+    if (!this.filesList) return;
+    this.filesList.replaceChildren(elem("div", "chat-convo-sub", "loading…"));
+    try {
+      const files = await api(`/api/agents/${agentId}/files`);
+      const visible = files.filter((f) => !f.dir);
+      this.filesList.replaceChildren();
+      if (!visible.length) { this.filesList.append(elem("div", "chat-convo-sub", "no files")); return; }
+      for (const f of visible) {
+        const row = elem("div", "file-row", f.path);
+        row.title = `${f.size} bytes`;
+        row.addEventListener("click", () => this.viewFile(agentId, f.path));
+        this.filesList.append(row);
+      }
+    } catch (e) {
+      this.filesList.replaceChildren(elem("div", "status-bad", String(e)));
+    }
+  }
+
+  async viewFile(agentId, path) {
+    const overlay = elem("div", "file-overlay");
+    const card = elem("div", "file-card");
+    const head = elem("div", "file-card-head");
+    const closeBtn = elem("button", "primary", "close");
+    closeBtn.addEventListener("click", () => overlay.remove());
+    head.append(elem("div", "chat-title", path), closeBtn);
+    const body = elem("pre", "file-card-body", "loading…");
+    card.append(head, body);
+    overlay.append(card);
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
+    document.body.append(overlay);
+    try {
+      const data = await api(`/api/agents/${agentId}/files/read?path=${encodeURIComponent(path)}`);
+      body.textContent = data.text || "(empty)";
+    } catch (e) {
+      body.textContent = String(e);
+    }
+  }
 
   send() {
     const text = this.input.value.trim();

@@ -25,9 +25,14 @@ use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/agents", get(agents::list))
+        .route("/api/overview", get(system::overview))
+        .route("/api/agents", get(agents::list).post(agents::create))
         .route("/api/agents/:id/status", get(agents::status))
+        .route("/api/agents/:id/detail", get(agents::detail))
         .route("/api/agents/:id/stop", post(agents::stop))
+        .route("/api/agents/:id/restart", post(agents::restart))
+        .route("/api/agents/:id/files", get(agents::files))
+        .route("/api/agents/:id/files/read", get(agents::file_read))
         .route("/api/agents/:id/spec", get(agents::spec_get).put(agents::spec_put))
         .route("/api/agents/:id/spec/validate", post(agents::spec_validate))
         .route("/api/agents/:id/apply", post(agents::apply))
@@ -58,7 +63,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/voice/tts", post(voice::tts))
         .route("/api/voice/stt", post(voice::stt))
         .route("/api/tools", get(tools::list))
-        .route("/api/skills", get(skills::list))
+        .route("/api/skills", get(skills::list).post(skills::create))
         .route("/api/skills/:name", get(skills::detail))
         // PUT routes share the same mutating-CSRF gate as POST/DELETE.
         .route("/api/_csrf_probe", put(|| async { ok(serde_json::json!({})) }))

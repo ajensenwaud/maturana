@@ -61,6 +61,119 @@ function button(label, onClick, danger = false) {
   return b;
 }
 
+// One-line description under a panel title, so every view says what it is for.
+function desc(text) {
+  return el("div", "panel-desc", text);
+}
+
+function badge(text, kind) {
+  return el("span", `pill ${kind || ""}`, text);
+}
+
+// A row of pill badges from a string array (or "none").
+function chipsOf(arr) {
+  const box = el("div", "chips");
+  if (!arr || !arr.length) { box.append(el("span", "panel-desc", "none")); return box; }
+  for (const x of arr) box.append(badge(typeof x === "string" ? x : JSON.stringify(x)));
+  return box;
+}
+
+// Markdown → sanitized HTML string (strips script/handlers/javascript: hrefs).
+function renderMd(src) {
+  const html = marked.parse(src || "", { breaks: true });
+  const tpl = document.createElement("template");
+  tpl.innerHTML = html;
+  tpl.content.querySelectorAll("script, iframe, object, embed, link, style").forEach((n) => n.remove());
+  tpl.content.querySelectorAll("*").forEach((n) => {
+    for (const attr of [...n.attributes]) {
+      if (/^on/i.test(attr.name) || (attr.name === "href" && /^javascript:/i.test(attr.value.trim()))) {
+        n.removeAttribute(attr.name);
+      }
+    }
+  });
+  return tpl.innerHTML;
+}
+
+// ---- overview (cockpit landing) ----
+
+const WORKER_TEXT = {
+  idle: "waiting for a turn",
+  running: "answering a turn",
+  starting: "booting",
+  error: "needs attention",
+};
+
+export async function renderOverview(panel) {
+  const wrap = section("Overview");
+  wrap.append(desc("Your fleet at a glance — who's deployed, what they're doing, and whether the host plane is healthy."));
+  const cards = el("div", "ov-cards");
+  const body = el("div");
+  wrap.append(cards, body);
+  panel.replaceChildren(wrap);
+
+  const card = (label, value, kind) => {
+    const c = el("div", "ov-card");
+    c.append(el("div", `ov-card-val ${kind || ""}`, String(value)), el("div", "ov-card-label", label));
+    return c;
+  };
+
+  const draw = async () => {
+    let o;
+    try {
+      o = await api("/api/overview");
+    } catch (error) {
+      body.replaceChildren(el("div", "status-bad", String(error)));
+      return;
+    }
+    const c = o.counts || {};
+    const host = o.host || {};
+    const memPct = host.mem_total_bytes && host.mem_available_bytes != null
+      ? Math.round(100 * (1 - host.mem_available_bytes / host.mem_total_bytes)) : null;
+    cards.replaceChildren(
+      card("agents", c.agents ?? 0),
+      card("running", c.running ?? 0, (c.running ? "good" : "")),
+      card("idle", c.idle ?? 0),
+      card("with graph", c.graphs ?? 0),
+      card("plane", o.plane?.up ? "up" : "down", o.plane?.up ? "good" : "bad"),
+      card("load", (host.loadavg?.[0] ?? 0).toFixed(2)),
+      card("memory", memPct != null ? `${memPct}%` : "—", memPct > 90 ? "bad" : ""),
+    );
+
+    const agents = (o.agents || []);
+    const rows = agents.map((a) => {
+      const st = a.worker_status?.status || "unknown";
+      const doing = a.worker_status?.message || WORKER_TEXT[st] || "—";
+      return [
+        el("strong", null, a.agent_id),
+        a.harness || "—",
+        statusPill(st),
+        doing,
+        a.knowledge_graph ? `graph:${a.graph_name}` : "—",
+      ];
+    });
+    body.replaceChildren(
+      el("div", "label dash-title", "Agents"),
+      agents.length
+        ? table(["agent", "harness", "worker", "doing", "graph"], rows)
+        : el("div", "panel-desc", "No agents deployed yet — add one from the Agents panel."),
+      el("div", "panel-desc",
+        `Host: ${host.hostname || "?"} (${host.os || "?"}/${host.arch || "?"}) · ${host.cores ?? "?"} cores · up ${fmtUptime(host.uptime_seconds)}`),
+    );
+  };
+  await draw();
+  const timer = setInterval(() => {
+    if (panel.contains(wrap)) draw();
+    else clearInterval(timer);
+  }, 5000);
+}
+
+function statusPill(status) {
+  const kind = status === "running" ? "good"
+    : status === "error" ? "bad"
+    : status === "idle" ? "dim" : "";
+  return badge(status, kind);
+}
+
 // ---- system (observability) ----
 
 function fmtBytes(n) {
@@ -81,9 +194,65 @@ function fmtUptime(s) {
   return d > 0 ? `${d}d ${h}h` : h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
-export async function renderSystem(panel) {
+export async function renderSystem(panel, socket) {
+  // Runtime plane: the supervised host processes that run the whole fleet.
+  const planeWrap = section("Plane");
+  planeWrap.append(desc("The host control plane — supervised processes that run the fleet (sessiond, graph, channels, schedules, claude-refresh). Live."));
+  const planeBody = el("div");
+  planeWrap.append(planeBody);
+  const drawPlane = (up) => {
+    const processes = (up.processes ?? []).map((p) => [
+      p.name, String(p.pid), p.critical ? "critical" : "—", String(p.restarts), `${p.uptime_seconds}s`,
+    ]);
+    planeBody.replaceChildren(
+      el("div", up.running !== false ? "status-ok" : "status-bad",
+        up.running !== false ? `[ up · supervisor pid ${up.pid ?? "?"} ]` : "[ maturana up is not running ]"),
+      table(["process", "pid", "critical", "restarts", "uptime"], processes),
+    );
+  };
+  if (socket) socket.on("dash_update", (msg) => { if (msg.topic === "runtime" && panel.contains(planeWrap)) drawPlane(msg.data); });
+  try { drawPlane(await api("/api/runtime/up")); } catch (e) { planeBody.replaceChildren(el("div", "status-bad", String(e))); }
+
+  // Ops: plane lifecycle + config backup.
+  const opsWrap = section("Ops");
+  opsWrap.append(desc("Operate the plane: restart/stop/start the supervisor, or snapshot the config to a timestamped backup."));
+  const opsOut = el("div");
+  const gw = (action, danger) => button(`${action} plane`, async () => {
+    if (action !== "restart" && !confirm(`${action} the supervised plane?`)) return;
+    opsOut.replaceChildren(el("div", "label", `[ ${action}… ]`));
+    try {
+      await api(`/api/ops/gateway/${action}`, { method: "POST" });
+      opsOut.replaceChildren(el("div", "status-ok", `[ ${action} ok ]`));
+    } catch (error) {
+      opsOut.replaceChildren(el("div", "status-bad", String(error)));
+    }
+  }, danger);
+  const opsRow = el("div", "dash-actions");
+  opsRow.append(
+    gw("restart", false), gw("stop", true), gw("start", false),
+    button("backup config", async () => {
+      opsOut.replaceChildren(el("div", "label", "[ backing up… ]"));
+      try {
+        const r = await api("/api/ops/backup", { method: "POST" });
+        opsOut.replaceChildren(el("div", "status-ok", `[ backup → ${r.path} (${r.bytes} bytes) ]`));
+      } catch (error) {
+        opsOut.replaceChildren(el("div", "status-bad", String(error)));
+      }
+    }),
+    button("run doctor", async () => {
+      opsOut.replaceChildren(el("div", "label", "[ running diagnostics… ]"));
+      try {
+        opsOut.replaceChildren(el("div", "status-ok", "[ doctor: health checks across the install ]"), jsonBlock(await api("/api/doctor")));
+      } catch (error) {
+        opsOut.replaceChildren(el("div", "status-bad", String(error)));
+      }
+    }),
+  );
+  opsWrap.append(opsRow, opsOut);
+
   // Host stats (auto-refresh every 5s while visible).
   const statsWrap = section("Host");
+  statsWrap.append(desc("The physical/VM host this control plane runs on."));
   const statsBody = el("div");
   statsWrap.append(statsBody);
   const drawStats = async () => {
@@ -114,6 +283,7 @@ export async function renderSystem(panel) {
 
   // Logs (source dropdown + optional auto-tail).
   const logWrap = section("Logs");
+  logWrap.append(desc("Tail the plane/web/fleet units or any agent's egress audit log. Toggle auto-tail to follow live."));
   const controls = el("div", "dash-actions");
   const sourceSel = el("select", "model-input");
   const linesInput = el("input", "model-input");
@@ -159,6 +329,7 @@ export async function renderSystem(panel) {
 
   // Activity analytics (we don't meter token cost — that lives in the guest VMs).
   const aWrap = section("Activity");
+  aWrap.append(desc("Per-agent activity across all sessions — turns and message volume. Token/cost metering happens inside each agent's VM and isn't visible to the host."));
   const daysSel = el("select", "model-input");
   for (const d of [7, 30, 90]) {
     const o = el("option", null, `${d} days`);
@@ -191,7 +362,7 @@ export async function renderSystem(panel) {
   aWrap.append(daysSel, aBody);
   await loadA();
 
-  panel.replaceChildren(statsWrap, logWrap, aWrap);
+  panel.replaceChildren(planeWrap, opsWrap, statsWrap, logWrap, aWrap);
 }
 
 // ---- config (browser-managed spec sections) ----
@@ -207,115 +378,203 @@ const CONFIG_HINTS = {
   capabilities: 'Opt-in capabilities, e.g. {"image_gen":true,"self_forge":false}',
 };
 
-export async function renderConfig(panel) {
-  const wrap = section("Agent config");
-  const agents = await api("/api/agents");
-  const agentSel = el("select", "model-input");
-  for (const a of agents) {
-    const o = el("option", null, a.agent_id);
-    o.value = a.agent_id;
-    agentSel.append(o);
+// ---- agents ----
+
+export async function renderAgents(panel, socket) {
+  const wrap = section("Agents");
+  wrap.append(desc("Every deployed agent, what it can do, and its single source of truth — its spec. Select one to see details, edit its config, restart, or message it."));
+  const listBox = el("div");
+  const detail = el("div", "agent-detail");
+  let selected = null;
+
+  const draw = (agents) => {
+    const rows = agents.map((agent) => {
+      const open = () => { selected = agent.agent_id; showAgent(detail, socket, agent.agent_id); };
+      const name = el("a", "row-link", agent.agent_id);
+      name.addEventListener("click", open);
+      const st = agent.worker_status?.status || "unknown";
+      return [
+        name,
+        agent.harness || "—",
+        agent.name || "—",
+        statusPill(st),
+        agent.knowledge_graph ? `graph:${agent.graph_name}` : "—",
+        button("open", open),
+      ];
+    });
+    listBox.replaceChildren(
+      table(["agent", "harness", "display name", "worker", "graph", ""], rows),
+    );
+  };
+
+  const addRow = el("div", "dash-actions");
+  addRow.append(button("+ add agent", () => addAgent(detail, () => refresh())));
+  const refresh = async () => draw(await api("/api/agents"));
+
+  socket.on("dash_update", (msg) => {
+    if (msg.topic === "agents" && panel.contains(wrap)) {
+      draw(msg.data);
+      // Keep an open detail in sync with the worker status.
+      if (selected) {
+        const a = msg.data.find((x) => x.agent_id === selected);
+        const pill = detail.querySelector(".agent-worker-pill");
+        if (a && pill) pill.replaceWith(workerPill(a.worker_status));
+      }
+    }
+  });
+  await refresh();
+  wrap.append(addRow, listBox);
+  panel.replaceChildren(wrap, detail);
+}
+
+function workerPill(ws) {
+  const st = ws?.status || "unknown";
+  const p = statusPill(st);
+  p.classList.add("agent-worker-pill");
+  if (ws?.message) p.append(document.createTextNode(` · ${ws.message}`));
+  return p;
+}
+
+// Readable agent detail: identity + capabilities + spec actions, no raw dumps.
+async function showAgent(detail, socket, agentId) {
+  detail.replaceChildren(el("div", "label", `[ loading ${agentId}… ]`));
+  let d;
+  try {
+    d = await api(`/api/agents/${agentId}/detail`);
+  } catch (error) {
+    detail.replaceChildren(el("div", "status-bad", String(error)));
+    return;
   }
+
+  const head = el("div", "agent-head");
+  head.append(
+    el("div", "agent-title", d.name || d.agent_id),
+    workerPill(d.worker_status),
+  );
+  const sub = el("div", "panel-desc", d.purpose || "");
+
+  // Readable summary grid.
+  const chips = (arr) => {
+    const box = el("div", "chips");
+    if (!arr || !arr.length) { box.append(el("span", "panel-desc", "none")); return box; }
+    for (const x of arr) box.append(badge(typeof x === "string" ? x : JSON.stringify(x)));
+    return box;
+  };
+  const capList = Object.entries(d.capabilities || {})
+    .filter(([, v]) => v === true).map(([k]) => k);
+  const grid = el("div", "kv-grid");
+  const kv = (k, v) => { grid.append(el("div", "kv-k", k)); grid.append(v instanceof Node ? v : el("div", "kv-v", v ?? "—")); };
+  kv("harness", `${d.harness} · ${d.provider}`);
+  kv("resources", `${d.vcpu} vCPU · ${d.memory_mib} MiB`);
+  kv("knowledge graph", d.knowledge_graph ? `on · ${d.graph_name}` : "off");
+  kv("skills", chips(d.skills));
+  kv("tools", chips(d.tools));
+  kv("MCP servers", chips(d.mcp_servers));
+  kv("channels", chips(d.channels));
+  kv("capabilities", chips(capList));
+  kv("egress hosts", `${(d.egress_allowlist || []).length} allowed (see Egress panel)`);
+  kv("schedules", String(d.schedules ?? 0));
+
+  // Action bar.
+  const actions = el("div", "dash-actions");
+  const out = el("div");
+  actions.append(
+    button("message", () => window.cockpitOpenChat(agentId)),
+    button("config", () => agentConfig(out, agentId)),
+    button("edit spec", () => editSpec(out, agentId)),
+    button("restart", async () => {
+      if (!confirm(`Restart ${agentId}? Relaunches its microVM from the baked image.`)) return;
+      out.replaceChildren(el("div", "label", "[ restarting… this can take a moment ]"));
+      try {
+        const r = await api(`/api/agents/${agentId}/restart`, { method: "POST" });
+        out.replaceChildren(el("div", "status-ok", `[ restarted ${agentId} ]`), jsonBlock((r.output || []).join("\n")));
+      } catch (error) {
+        out.replaceChildren(el("div", "status-bad", String(error)));
+      }
+    }),
+    button("stop", async () => {
+      if (!confirm(`Stop ${agentId}?`)) return;
+      try {
+        await api(`/api/agents/${agentId}/stop`, { method: "POST" });
+        out.replaceChildren(el("div", "status-ok", `[ stopped ${agentId} ]`));
+      } catch (error) {
+        out.replaceChildren(el("div", "status-bad", String(error)));
+      }
+    }, true),
+  );
+
+  detail.replaceChildren(head, sub, grid, actions, out);
+}
+
+// Add-agent scaffold: creates a validated starter spec, then opens it for
+// refinement. No VM is provisioned until the operator runs dry-run → apply.
+function addAgent(detail, onCreated) {
+  const wrap = section("Add agent");
+  wrap.append(desc("Scaffold a new agent's spec. This only writes the declarative spec — provision the VM afterwards with dry-run → apply (slow: copies the rootfs)."));
+  const id = el("input", "model-input"); id.placeholder = "id (a-z 0-9 - _)";
+  const name = el("input", "model-input"); name.placeholder = "display name";
+  const purpose = el("input", "model-input"); purpose.placeholder = "one-line purpose"; purpose.style.flex = "1";
+  const harness = el("select", "model-input");
+  for (const h of ["codex", "claude", "opencode"]) { const o = el("option", null, h); o.value = h; harness.append(o); }
+  const out = el("div");
+  const row1 = el("div", "dash-actions"); row1.append(id, name, harness);
+  const row2 = el("div", "dash-actions"); row2.append(purpose, button("create", async () => {
+    if (!id.value.trim()) { out.replaceChildren(el("div", "status-bad", "id is required")); return; }
+    out.replaceChildren(el("div", "label", "[ creating… ]"));
+    try {
+      await api("/api/agents", { method: "POST", body: JSON.stringify({
+        id: id.value.trim(), name: name.value.trim(), purpose: purpose.value.trim(), harness: harness.value,
+      }) });
+      out.replaceChildren(el("div", "status-ok", `[ created ${id.value.trim()} — edit its spec, then dry-run → apply to provision ]`));
+      onCreated?.();
+      editSpec(out, id.value.trim());
+    } catch (error) {
+      out.replaceChildren(el("div", "status-bad", String(error)));
+    }
+  }));
+  wrap.append(row1, row2, out);
+  detail.replaceChildren(wrap);
+}
+
+// Per-agent config: form over the declarative spec sections (the old standalone
+// "Config" panel, now living where it belongs — on the agent).
+async function agentConfig(out, agentId) {
+  const wrap = section(`Config — ${agentId}`);
+  wrap.append(desc("Edit the agent's declarative spec sections. Validated before write; a running agent applies channel/MCP/schedule changes on its next restart. Identity / VM / runtime (the isolation boundary) are edited via 'edit spec'."));
   const sectionSel = el("select", "model-input");
-  for (const s of CONFIG_SECTIONS) {
-    const o = el("option", null, s);
-    o.value = s;
-    sectionSel.append(o);
-  }
-  const hint = el("div", "status-dim");
-  const editor = el("textarea", "spec-editor");
-  editor.style.minHeight = "38vh";
+  for (const s of CONFIG_SECTIONS) { const o = el("option", null, s); o.value = s; sectionSel.append(o); }
+  const hint = el("div", "panel-desc");
+  const editor = el("textarea", "spec-editor"); editor.style.minHeight = "32vh";
   const report = el("div");
   const load = async () => {
     report.replaceChildren();
     hint.textContent = CONFIG_HINTS[sectionSel.value] || "";
     try {
-      const d = await api(`/api/agents/${agentSel.value}/config?section=${sectionSel.value}`);
-      editor.value = JSON.stringify(d.value ?? null, null, 2);
+      const dd = await api(`/api/agents/${agentId}/config?section=${sectionSel.value}`);
+      editor.value = JSON.stringify(dd.value ?? null, null, 2);
     } catch (error) {
       report.replaceChildren(el("div", "status-bad", String(error)));
     }
   };
   const save = async () => {
     let value;
+    try { value = JSON.parse(editor.value); }
+    catch { report.replaceChildren(el("div", "status-bad", "invalid JSON")); return; }
     try {
-      value = JSON.parse(editor.value);
-    } catch {
-      report.replaceChildren(el("div", "status-bad", "invalid JSON"));
-      return;
-    }
-    try {
-      const d = await api(`/api/agents/${agentSel.value}/config`, {
-        method: "PUT",
-        body: JSON.stringify({ section: sectionSel.value, value }),
+      const dd = await api(`/api/agents/${agentId}/config`, {
+        method: "PUT", body: JSON.stringify({ section: sectionSel.value, value }),
       });
-      report.replaceChildren(el("div", "status-ok", `[ saved ${d.section} — spec valid; applies on next materialize/restart ]`));
+      report.replaceChildren(el("div", "status-ok", `[ saved ${dd.section} — spec valid; applies on next restart ]`));
     } catch (error) {
       report.replaceChildren(el("div", "status-bad", String(error)));
     }
   };
-  agentSel.addEventListener("change", load);
   sectionSel.addEventListener("change", load);
   const controls = el("div", "dash-actions");
-  controls.append(agentSel, sectionSel, button("load", load), button("save", save));
-  wrap.append(
-    controls,
-    hint,
-    el("div", "status-dim", "Validated before write. identity / vm / runtime (the isolation boundary) are not editable here — use the Agents → spec editor for those."),
-    editor,
-    report,
-  );
+  controls.append(sectionSel, button("load", load), button("save", save));
+  wrap.append(controls, hint, editor, report);
   await load();
-  panel.replaceChildren(wrap);
-}
-
-// ---- agents ----
-
-export async function renderAgents(panel, socket) {
-  const wrap = section("Agent fleet");
-  const detail = el("div");
-  const draw = (agents) => {
-    const rows = agents.map((agent) => [
-      agent.agent_id,
-      agent.harness,
-      agent.provider,
-      agent.knowledge_graph ? `graph:${agent.graph_name}` : "—",
-      agent.worker_status?.status ?? "—",
-      (() => {
-        const cell = el("div", "dash-actions");
-        cell.append(
-          button("status", async () => {
-            detail.replaceChildren(el("div", "label", `[ ${agent.agent_id} status ]`));
-            try {
-              detail.append(jsonBlock(await api(`/api/agents/${agent.agent_id}/status`)));
-            } catch (error) {
-              detail.append(el("div", "status-bad", String(error)));
-            }
-          }),
-          button("spec", () => editSpec(detail, agent.agent_id)),
-          button("stop", async () => {
-            if (!confirm(`Stop ${agent.agent_id}?`)) return;
-            try {
-              await api(`/api/agents/${agent.agent_id}/stop`, { method: "POST" });
-              detail.replaceChildren(el("div", "status-ok", `[ stopped ${agent.agent_id} ]`));
-            } catch (error) {
-              detail.replaceChildren(el("div", "status-bad", String(error)));
-            }
-          }, true),
-        );
-        return cell;
-      })(),
-    ]);
-    wrap.replaceChildren(
-      el("div", "label dash-title", "Agent fleet"),
-      table(["agent", "harness", "provider", "graph", "worker", "actions"], rows),
-    );
-  };
-  socket.on("dash_update", (msg) => {
-    if (msg.topic === "agents" && panel.contains(wrap)) draw(msg.data);
-  });
-  draw(await api("/api/agents"));
-  panel.replaceChildren(wrap, detail);
+  out.replaceChildren(wrap);
 }
 
 async function editSpec(detail, agentId) {
@@ -387,98 +646,25 @@ async function editSpec(detail, agentId) {
   detail.append(report);
 }
 
-// ---- runtime ----
-
-export async function renderRuntime(panel, socket) {
-  const wrap = section("Runtime plane");
-  const draw = (up) => {
-    const processes = (up.processes ?? []).map((p) => [
-      p.name,
-      String(p.pid),
-      p.critical ? "critical" : "—",
-      String(p.restarts),
-      `${p.uptime_seconds}s`,
-    ]);
-    wrap.replaceChildren(
-      el("div", "label dash-title", "Runtime plane"),
-      el("div", up.running !== false ? "status-ok" : "status-bad",
-        up.running !== false ? `[ up · supervisor pid ${up.pid ?? "?"} ]` : "[ maturana up is not running ]"),
-      table(["process", "pid", "critical", "restarts", "uptime"], processes),
-    );
-  };
-  socket.on("dash_update", (msg) => {
-    if (msg.topic === "runtime" && panel.contains(wrap)) draw(msg.data);
-  });
-  draw(await api("/api/runtime/up"));
-
-  const health = section("Services");
-  const plan = await api("/api/runtime/plan");
-  health.append(jsonBlock(plan));
-
-  const doctor = section("Doctor");
-  const out = el("div");
-  doctor.append(
-    button("run doctor", async () => {
-      out.replaceChildren(el("div", "label", "[ running… ]"));
-      try {
-        out.replaceChildren(jsonBlock(await api("/api/doctor")));
-      } catch (error) {
-        out.replaceChildren(el("div", "status-bad", String(error)));
-      }
-    }),
-    out,
-  );
-
-  // Ops: plane lifecycle + config backup.
-  const ops = section("Ops");
-  const opsOut = el("div");
-  const gw = (action, danger) => button(`${action} plane`, async () => {
-    if (action !== "restart" && !confirm(`${action} the supervised plane?`)) return;
-    opsOut.replaceChildren(el("div", "label", `[ ${action}… ]`));
-    try {
-      await api(`/api/ops/gateway/${action}`, { method: "POST" });
-      opsOut.replaceChildren(el("div", "status-ok", `[ ${action} ok ]`));
-    } catch (error) {
-      opsOut.replaceChildren(el("div", "status-bad", String(error)));
-    }
-  }, danger);
-  const opsRow = el("div", "dash-actions");
-  opsRow.append(
-    gw("restart", false),
-    gw("stop", true),
-    gw("start", false),
-    button("backup config", async () => {
-      opsOut.replaceChildren(el("div", "label", "[ backing up… ]"));
-      try {
-        const r = await api("/api/ops/backup", { method: "POST" });
-        opsOut.replaceChildren(el("div", "status-ok", `[ backup → ${r.path} (${r.bytes} bytes) ]`));
-      } catch (error) {
-        opsOut.replaceChildren(el("div", "status-bad", String(error)));
-      }
-    }),
-  );
-  ops.append(opsRow, opsOut);
-
-  panel.replaceChildren(wrap, health, doctor, ops);
-}
-
 // ---- sessions ----
 
 export async function renderSessions(panel, socket) {
   const wrap = section("Sessions");
+  wrap.append(desc("Conversation history per agent. Open one to read it, export it, or jump into the chat to continue it. Search runs across every message; prune clears out idle sessions."));
   const detail = el("div");
   const listBox = el("div");
 
   const draw = (sessions) => {
     const rows = sessions.map((s) => [
       s.agent_id,
-      labelCell(detail, s),
+      (s.label ? `${s.label} · ` : "") + s.session_id,
       s.last_active ? new Date(s.last_active).toLocaleString() : "—",
       `${s.stats?.completed ?? 0}✓ / ${s.stats?.pending ?? 0}⏳`,
       (() => {
         const cell = el("div", "dash-actions");
         cell.append(
-          button("open", () => openSession(detail, socket, s.agent_id, s.session_id)),
+          button("open", () => openSession(detail, socket, s)),
+          button("message", () => window.cockpitOpenChat(s.agent_id)),
           button("export", () => exportSession(s.agent_id, s.session_id)),
         );
         return cell;
@@ -502,7 +688,7 @@ export async function renderSessions(panel, socket) {
       if (!hits.length) { searchOut.replaceChildren(el("div", "status-dim", "no matches")); return; }
       searchOut.replaceChildren(table(["agent", "session", "dir", "snippet", ""], hits.map((h) => [
         h.agent_id, h.session_id, h.direction, h.snippet,
-        button("open", () => openSession(detail, socket, h.agent_id, h.session_id)),
+        button("open", () => openSession(detail, socket, { agent_id: h.agent_id, session_id: h.session_id })),
       ])));
     } catch (error) {
       searchOut.replaceChildren(el("div", "status-bad", String(error)));
@@ -539,22 +725,6 @@ export async function renderSessions(panel, socket) {
   panel.replaceChildren(wrap, detail);
 }
 
-function labelCell(detail, s) {
-  const cell = el("span");
-  cell.append(document.createTextNode((s.label ? `${s.label} ` : "") + s.session_id + " "));
-  cell.append(button("rename", async () => {
-    const label = prompt("Session label (empty to clear):", s.label || "");
-    if (label === null) return;
-    try {
-      await api(`/api/sessions/${s.agent_id}/${s.session_id}/label`, { method: "PUT", body: JSON.stringify({ label }) });
-      detail.replaceChildren(el("div", "status-ok", `[ relabeled ${s.session_id} ]`));
-    } catch (error) {
-      detail.replaceChildren(el("div", "status-bad", String(error)));
-    }
-  }));
-  return cell;
-}
-
 async function exportSession(agentId, sessionId) {
   try {
     const data = await api(`/api/sessions/${agentId}/${sessionId}/export`);
@@ -570,8 +740,26 @@ async function exportSession(agentId, sessionId) {
   }
 }
 
-async function openSession(detail, socket, agentId, sessionId) {
-  detail.replaceChildren(el("div", "label dash-title", `[ ${agentId} / ${sessionId} ]`));
+async function openSession(detail, socket, s) {
+  const agentId = s.agent_id;
+  const sessionId = s.session_id;
+  const title = el("div", "label dash-title", `${agentId} / ${s.label ? s.label + " · " : ""}${sessionId}`);
+  const head = el("div", "dash-actions");
+  head.append(
+    title,
+    button("continue in chat", () => window.cockpitOpenChat(agentId)),
+    button("rename", async () => {
+      const label = prompt("Session label (empty to clear):", s.label || "");
+      if (label === null) return;
+      try {
+        await api(`/api/sessions/${agentId}/${sessionId}/label`, { method: "PUT", body: JSON.stringify({ label }) });
+        s.label = label;
+        title.textContent = `${agentId} / ${label ? label + " · " : ""}${sessionId}`;
+      } catch (error) {
+        detail.append(el("div", "status-bad", String(error)));
+      }
+    }),
+  );
   const log = el("div", "session-log");
   const refresh = async () => {
     const data = await api(`/api/sessions/${agentId}/${sessionId}/messages`);
@@ -596,32 +784,15 @@ async function openSession(detail, socket, agentId, sessionId) {
   socket.on("session_outbound", (msg) => {
     if (msg.agent_id === agentId && detail.isConnected) refresh();
   });
+  detail.replaceChildren(head, log);
   await refresh();
-
-  const composer = el("div", "dash-actions");
-  const input = el("input", "model-input");
-  input.placeholder = "message the agent…";
-  input.style.flex = "1";
-  const send = () => {
-    if (!input.value.trim()) return;
-    socket.send({
-      type: "session_send",
-      agent_id: agentId,
-      session_id: sessionId,
-      text: input.value.trim(),
-    });
-    input.value = "";
-    setTimeout(refresh, 400);
-  };
-  input.addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
-  composer.append(input, button("send", send));
-  detail.append(log, composer);
 }
 
 // ---- graph ----
 
 export async function renderGraph(panel) {
   const wrap = section("Knowledge graph");
+  wrap.append(desc("MaturanaGraph — the agents' shared memory store. Check a graph's size, run a retrieval query (returns the top relevant entities, not the whole document), or ingest a file (PDF/DOCX/PPTX/MD/TXT)."));
   const graphInput = el("input", "model-input");
   graphInput.value = "personal";
   const out = el("div");
@@ -695,7 +866,9 @@ export async function renderGraph(panel) {
 // ---- pipelock ----
 
 export async function renderPipelock(panel) {
-  const wrap = section("Pipelock secrets (names only)");
+  const wrap = section("Pipelock secrets");
+  wrap.append(desc(
+    "Host-side secret vault. Agents reference a secret by name (e.g. pipelock:brave/api-key); the host proxy injects the value into outbound requests — it is NEVER sent to the browser or into a VM. You can set or delete a value here, but not read it back, by design."));
   const out = el("div");
   const draw = async () => {
     const data = await api("/api/pipelock/secrets");
@@ -707,7 +880,7 @@ export async function renderPipelock(panel) {
         draw();
       }, true),
     ]);
-    out.replaceChildren(table(["name", ""], rows));
+    out.replaceChildren(rows.length ? table(["name", ""], rows) : el("div", "panel-desc", "no secrets stored"));
   };
   await draw();
 
@@ -716,84 +889,119 @@ export async function renderPipelock(panel) {
   name.placeholder = "name (e.g. brave/api-key)";
   const value = el("input", "model-input");
   value.type = "password";
-  value.placeholder = "value";
+  value.placeholder = "value (write-only)";
+  const addOut = el("div");
   add.append(name, value, button("set", async () => {
     if (!name.value.trim() || !value.value) return;
-    await api("/api/pipelock/secrets", {
-      method: "POST",
-      body: JSON.stringify({ name: name.value.trim(), value: value.value }),
-    });
-    value.value = "";
-    draw();
+    try {
+      await api("/api/pipelock/secrets", {
+        method: "POST",
+        body: JSON.stringify({ name: name.value.trim(), value: value.value }),
+      });
+      addOut.replaceChildren(el("div", "status-ok", `[ set ${name.value.trim()} ]`));
+      value.value = "";
+      draw();
+    } catch (error) {
+      addOut.replaceChildren(el("div", "status-bad", String(error)));
+    }
   }));
 
-  const egress = section("Egress allowlist editor");
-  const agentPick = el("input", "model-input");
-  agentPick.placeholder = "agent id";
-  const hosts = el("textarea", "spec-editor");
-  hosts.placeholder = "one host per line";
-  hosts.style.minHeight = "90px";
-  const egressOut = el("div");
-  const egressRow = el("div", "dash-actions");
-  egressRow.append(
-    agentPick,
-    button("load", async () => {
-      try {
-        const data = await api(`/api/agents/${agentPick.value.trim()}/egress`);
-        hosts.value = data.egress_allowlist.join("\n");
-        egressOut.replaceChildren(jsonBlock(data.inject_headers));
-      } catch (error) {
-        egressOut.replaceChildren(el("div", "status-bad", String(error)));
-      }
-    }),
-    button("save", async () => {
-      try {
-        const data = await api(`/api/agents/${agentPick.value.trim()}/egress`, {
-          method: "PUT",
-          body: JSON.stringify({
-            egress_allowlist: hosts.value.split("\n").map((h) => h.trim()).filter(Boolean),
-          }),
-        });
-        egressOut.replaceChildren(el("div", "status-ok", "[ saved + validated ]"), jsonBlock(data.report));
-      } catch (error) {
-        egressOut.replaceChildren(el("div", "status-bad", String(error)));
-      }
-    }),
+  wrap.append(
+    add,
+    el("div", "panel-desc", "Set writes (or silently overwrites) a value — there is no read-back to confirm the previous one. To rotate a key, just set the new value."),
+    out,
   );
-  egress.append(egressRow, hosts, egressOut);
-
-  wrap.append(add);
-  panel.replaceChildren(wrap, out, egress);
+  panel.replaceChildren(wrap);
 }
 
 // ---- tools / skills ----
 
 export async function renderTools(panel) {
-  const wrap = section("WASM tools");
-  const tools = await api("/api/tools");
-  const rows = (tools ?? []).map((t) => [
-    t.name,
-    t.version,
-    t.description,
-    JSON.stringify(t.capabilities ?? {}),
-  ]);
-  wrap.append(
-    rows.length
-      ? table(["name", "version", "description", "capabilities"], rows)
-      : el("div", "label", "[ no tools registered — maturana tool register ]"),
-  );
+  const wrap = section("Tools");
+  wrap.append(desc("What each agent can actually do — its tools, skills, MCP servers, and opt-in capabilities, read from each agent's spec. Edit these per agent under Agents → config."));
+  const body = el("div", "label", "[ loading… ]");
+  wrap.append(body);
   panel.replaceChildren(wrap);
+  try {
+    const agents = await api("/api/agents");
+    const details = await Promise.all(
+      agents.map((a) => api(`/api/agents/${a.agent_id}/detail`).catch(() => null)),
+    );
+    const rows = details.filter(Boolean).map((d) => [
+      el("strong", null, d.agent_id),
+      chipsOf(d.tools),
+      chipsOf(d.skills),
+      chipsOf(d.mcp_servers),
+      chipsOf(Object.entries(d.capabilities || {}).filter(([, v]) => v === true).map(([k]) => k)),
+    ]);
+    body.replaceChildren(
+      rows.length
+        ? table(["agent", "tools", "skills", "MCP servers", "capabilities"], rows)
+        : el("div", "panel-desc", "no agents deployed"),
+    );
+  } catch (error) {
+    body.replaceChildren(el("div", "status-bad", String(error)));
+  }
+
+  // Host-side WASM tool registry, secondary.
+  const reg = section("WASM tool registry");
+  reg.append(desc("Host-registered WASM tools available to wire into an agent (maturana tool register)."));
+  try {
+    const tools = await api("/api/tools");
+    const rows = (tools ?? []).map((t) => [t.name, t.version, t.description]);
+    reg.append(rows.length
+      ? table(["name", "version", "description"], rows)
+      : el("div", "panel-desc", "none registered"));
+  } catch (error) {
+    reg.append(el("div", "status-bad", String(error)));
+  }
+  panel.append(reg);
 }
 
 // ---- egress (live governance) ----
 
 export async function renderEgress(panel, socket) {
-  const wrap = section("Egress feed (live)");
-  const note = el("div", "label", "[ proxy audit — allowed/denied egress as it happens ]");
+  // 1) Per-agent allowlist editor — the single place egress hosts are managed.
+  const editor = section("Allowlist");
+  editor.append(desc("The hosts each agent is allowed to reach; everything else is blocked by the host proxy. Edits re-validate the whole spec before writing — a running agent picks them up on its next restart."));
+  const agentSel = el("select", "model-input");
+  try {
+    for (const a of await api("/api/agents")) { const o = el("option", null, a.agent_id); o.value = a.agent_id; agentSel.append(o); }
+  } catch {}
+  const hosts = el("textarea", "spec-editor");
+  hosts.placeholder = "one host per line, e.g. api.openai.com";
+  hosts.style.minHeight = "120px";
+  const editorOut = el("div");
+  const loadHosts = async () => {
+    if (!agentSel.value) return;
+    try {
+      const data = await api(`/api/agents/${agentSel.value}/egress`);
+      hosts.value = (data.egress_allowlist || []).join("\n");
+      editorOut.replaceChildren(el("div", "panel-desc",
+        `${(data.inject_headers || []).length} header injection(s) configured for this agent (managed in its spec).`));
+    } catch (error) { editorOut.replaceChildren(el("div", "status-bad", String(error))); }
+  };
+  agentSel.addEventListener("change", loadHosts);
+  const editorRow = el("div", "dash-actions");
+  editorRow.append(agentSel, button("reload", loadHosts), button("save", async () => {
+    try {
+      await api(`/api/agents/${agentSel.value}/egress`, {
+        method: "PUT",
+        body: JSON.stringify({ egress_allowlist: hosts.value.split("\n").map((h) => h.trim()).filter(Boolean) }),
+      });
+      editorOut.replaceChildren(el("div", "status-ok", "[ saved + validated — applies on next restart ]"));
+    } catch (error) { editorOut.replaceChildren(el("div", "status-bad", String(error))); }
+  }));
+  editor.append(editorRow, hosts, editorOut);
+  await loadHosts();
+
+  // 2) Live feed of proxy decisions, with hot-approve for denials.
+  const wrap = section("Live feed");
+  wrap.append(desc("Egress decisions from the host proxy as they happen — allowed or denied. Approve a denied host to grant it (tick 'perm' to also write it to the agent's spec)."));
   const feed = el("div", "session-log");
-  feed.style.maxHeight = "70vh";
-  wrap.append(note, feed);
-  panel.replaceChildren(wrap);
+  feed.style.maxHeight = "55vh";
+  wrap.append(feed);
+  panel.replaceChildren(editor, wrap);
 
   socket.subscribe(["egress"]);
 
@@ -845,17 +1053,62 @@ export async function renderEgress(panel, socket) {
 }
 
 export async function renderSkills(panel) {
-  const wrap = section("Skill catalog");
-  const detail = el("div", "turn-output");
-  const skills = await api("/api/skills");
-  const rows = skills.map((s) => [
-    s.name,
-    s.summary,
-    button("view", async () => {
-      const data = await api(`/api/skills/${s.name}`);
-      detail.innerHTML = marked.parse(data.markdown);
-    }),
-  ]);
-  wrap.append(table(["skill", "use when", ""], rows));
-  panel.replaceChildren(wrap, detail);
+  const wrap = section("Skills");
+  wrap.append(desc("Reusable procedures agents can load. View one, or define a new skill — it's written to skills/<name>/SKILL.md and becomes available to wire into an agent."));
+  const detail = el("div", "skill-view");
+  const listBox = el("div");
+
+  const draw = async () => {
+    const skills = await api("/api/skills");
+    const rows = skills.map((s) => [
+      el("strong", null, s.name),
+      s.summary || "—",
+      button("view", async () => {
+        detail.replaceChildren(el("div", "label", `[ loading ${s.name}… ]`));
+        try {
+          const data = await api(`/api/skills/${s.name}`);
+          const md = el("div", "turn-output");
+          md.innerHTML = renderMd(data.markdown);
+          detail.replaceChildren(el("div", "label dash-title", s.name), md);
+          detail.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        } catch (error) {
+          detail.replaceChildren(el("div", "status-bad", String(error)));
+        }
+      }),
+    ]);
+    listBox.replaceChildren(
+      rows.length ? table(["skill", "use when", ""], rows) : el("div", "panel-desc", "no skills defined yet"),
+    );
+  };
+
+  // Define a new skill.
+  const create = section("Define a skill");
+  create.append(desc("Write a SKILL.md. The first paragraph after the heading is the 'use this when' summary shown above."));
+  const nameI = el("input", "model-input");
+  nameI.placeholder = "skill-name (a-z 0-9 - _)";
+  const md = el("textarea", "spec-editor");
+  md.style.minHeight = "30vh";
+  md.placeholder = "# My Skill\n\nUse this when …\n\n## Steps\n1. …";
+  const createOut = el("div");
+  const row = el("div", "dash-actions");
+  row.append(nameI, button("create skill", async () => {
+    if (!nameI.value.trim() || !md.value.trim()) {
+      createOut.replaceChildren(el("div", "status-bad", "name and body are required"));
+      return;
+    }
+    try {
+      await api("/api/skills", { method: "POST", body: JSON.stringify({ name: nameI.value.trim(), markdown: md.value }) });
+      createOut.replaceChildren(el("div", "status-ok", `[ created skill ${nameI.value.trim()} ]`));
+      nameI.value = "";
+      md.value = "";
+      draw();
+    } catch (error) {
+      createOut.replaceChildren(el("div", "status-bad", String(error)));
+    }
+  }));
+  create.append(row, md, createOut);
+
+  await draw();
+  wrap.append(listBox);
+  panel.replaceChildren(wrap, create, detail);
 }

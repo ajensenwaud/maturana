@@ -218,6 +218,41 @@ fn tail_file(path: &Path, lines: usize) -> String {
     all[start..].join("\n")
 }
 
+// ---- overview (cockpit landing) -------------------------------------------
+
+/// One call powering the Overview home page: the fleet, the plane, host load.
+pub async fn overview(State(state): State<AppState>) -> Response {
+    let root = state.home_root.clone();
+    match blocking(move || {
+        let agents = crate::api::agents::snapshot(&root).unwrap_or_else(|_| serde_json::json!([]));
+        let arr = agents.as_array().cloned().unwrap_or_default();
+        let count = arr.len();
+        let idle = arr
+            .iter()
+            .filter(|a| a["worker_status"]["status"].as_str() == Some("idle"))
+            .count();
+        let running = arr
+            .iter()
+            .filter(|a| a["worker_status"]["status"].as_str() == Some("running"))
+            .count();
+        let graphs = arr.iter().filter(|a| a["knowledge_graph"] == true).count();
+        let plane = std::fs::read_to_string(root.join("up").join("state.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+        Ok(serde_json::json!({
+            "agents": agents,
+            "counts": { "agents": count, "idle": idle, "running": running, "graphs": graphs },
+            "plane": { "up": plane.is_some(), "state": plane },
+            "host": host_stats(),
+        }))
+    })
+    .await
+    {
+        Ok(data) => ok(data),
+        Err(response) => response,
+    }
+}
+
 // ---- activity analytics ----------------------------------------------------
 
 #[derive(Deserialize)]

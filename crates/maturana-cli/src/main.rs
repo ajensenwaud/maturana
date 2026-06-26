@@ -1459,13 +1459,33 @@ fn main() -> anyhow::Result<()> {
                      session_id: &str,
                      text: &str| {
                         let home = MaturanaHome::new(home_root.to_path_buf());
+                        let chat_key =
+                            crate::channels::stable_chat_key(&format!("web:{session_id}"));
+                        // A leading `/` is a slash command — dispatch it through the
+                        // SAME shared handler as every other channel, so `/model`,
+                        // `/status`, `/skill`, etc. behave identically in the cockpit
+                        // instead of reaching the agent as a literal user message.
+                        if text.trim_start().starts_with('/') {
+                            let cmd = crate::channels::dispatch_slash_command(
+                                &home,
+                                agent_id,
+                                session_id,
+                                chat_key,
+                                "web",
+                                "web",
+                                text.trim_start(),
+                            );
+                            return crate::channels::apply_web_console_command(
+                                &home, agent_id, session_id, chat_key, cmd,
+                            );
+                        }
                         crate::channels::enqueue_turn(
                             &home,
                             agent_id,
                             session_id,
                             "web",
                             "web",
-                            crate::channels::stable_chat_key(&format!("web:{session_id}")),
+                            chat_key,
                             None,
                             text,
                             serde_json::json!({}),

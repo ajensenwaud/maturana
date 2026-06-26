@@ -31,9 +31,8 @@ const consoleView = new Console(socket);
 const chatView = new Chat(socket);
 
 const views = {
+  overview: dashboard.renderOverview,
   agents: dashboard.renderAgents,
-  config: dashboard.renderConfig,
-  runtime: dashboard.renderRuntime,
   system: dashboard.renderSystem,
   sessions: dashboard.renderSessions,
   graph: dashboard.renderGraph,
@@ -51,6 +50,15 @@ nav.addEventListener("click", (event) => {
   }
   renderView(button.dataset.view);
 });
+
+// Let dashboard views jump into the chat for a specific agent (e.g. the
+// Sessions "message" action) instead of the old per-panel composer.
+window.cockpitOpenChat = (agentId) => {
+  for (const other of nav.querySelectorAll("button")) {
+    other.classList.toggle("active", other.dataset.view === "chat");
+  }
+  chatView.mount(panel, agentId);
+};
 
 async function renderView(name) {
   if (name === "chat") {
@@ -79,5 +87,5 @@ async function renderView(name) {
   }
 }
 
-renderView("chat");
+renderView("overview");
 socket.subscribe(["agents", "runtime"]);
