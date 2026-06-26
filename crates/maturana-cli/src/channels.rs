@@ -4406,6 +4406,29 @@ fn finalize_reply(
     }
 }
 
+/// Play the dissolve "swoosh" on the live progress message before it is replaced
+/// by the answer (or removed for a silent turn): a short burst of edits that
+/// crumble the elapsed-clock status into dust, so the thinking indicator visibly
+/// dissolves instead of snapping to the answer or vanishing. Best-effort — a
+/// dropped frame (e.g. a transient 429 from the quick burst) just makes the swoosh
+/// slightly less smooth and never blocks delivery.
+fn dissolve_live_message(token: &str, chat_id: i64, id: i64, elapsed: Duration) {
+    let secs = elapsed.as_secs();
+    let status = format!("✨ {}:{:02}", secs / 60, secs % 60);
+    let frames = maturana_core::animation::dissolve_frames(&status);
+    eprintln!(
+        "telegram: dissolve swoosh ({} frames) on message {id} after {secs}s",
+        frames.len()
+    );
+    for f in frames {
+        // Dust glyphs/spaces are HTML-safe; wrap in <pre> like the live draft.
+        if edit_telegram_message_html(token, chat_id, id, &format!("<pre>{f}</pre>")).is_err() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(170));
+    }
+}
+
 /// OpenClaw-style live progress for a turn: post ONE message immediately, tick a
 /// spinner on it while the agent works (showing the tools it runs + streamed
 /// text), then — the instant the reply lands — edit that SAME message in place
@@ -4483,6 +4506,8 @@ fn stream_turn_to_telegram(
             // — a failed delete must never wedge the turn into an endless retry.
             if reply.trim() == crate::proactive::SILENCE_SENTINEL {
                 if let Some(id) = message_id {
+                    // Crumble the thinking indicator away, then remove it.
+                    dissolve_live_message(token, chat_id, id, started.elapsed());
                     let _ = delete_telegram_message(token, chat_id, id);
                 }
                 clear_telegram_status(paths, inbound_id);
@@ -4490,9 +4515,14 @@ fn stream_turn_to_telegram(
                 let _ = clear_progress(paths, inbound_id);
                 return Ok(());
             }
-            // Edit the live message in place into the answer (the progress
-            // disappears, the answer stays — one clean message). finalize_reply
+            // Dissolve the thinking indicator first (the swoosh), THEN edit the live
+            // message in place into the answer — so the progress visibly crumbles
+            // away and the answer settles in, rather than snapping over. The dust
+            // settling into the answer is the whole effect. finalize_reply still
             // guarantees a failed edit never leaves two messages.
+            if let Some(id) = message_id {
+                dissolve_live_message(token, chat_id, id, started.elapsed());
+            }
             match finalize_reply(token, chat_id, message_id, &reply, reply_to) {
                 Ok(platform_id) => {
                     // Finalize the claim (the row already exists from claim_delivery,
@@ -4531,17 +4561,16 @@ fn stream_turn_to_telegram(
             last_typing = std::time::Instant::now();
         }
         // Render the rich tool/thinking draft, plus an always-ticking elapsed clock
-        // so the user is NEVER staring at a frozen message. The clock is bucketed to
-        // 10s, so it (and therefore the draft) visibly updates at least every 10s even
-        // when the agent streams nothing — the per-turn node boot, a long quiet tool
-        // call, or sparse events no longer read as "stalled / dropped". Real progress
-        // still appears the instant it arrives (the content changes immediately).
+        // so the user is NEVER staring at a frozen message. The clock ticks every
+        // SECOND (the loop wakes ~every 900ms, so we push at most ~1 edit/sec — well
+        // within Telegram's edit budget) instead of jumping in 10s steps, which read
+        // as frozen. Real progress still appears the instant it arrives.
         let progress = render_progress_html(&read_progress(paths, inbound_id).unwrap_or_default());
-        let secs = (started.elapsed().as_secs() / 10) * 10;
+        let secs = started.elapsed().as_secs();
         let clock = format!("{}:{:02}", secs / 60, secs % 60);
         let rendered = if progress.is_empty() {
             if started.elapsed() >= Duration::from_secs(2) {
-                format!("<pre>⏳ Working… {clock}</pre>")
+                format!("<pre>💭 Thinking… {clock}</pre>")
             } else {
                 String::new()
             }

@@ -48,6 +48,58 @@ pub fn is_terminal(phase: &Phase) -> bool {
     matches!(phase, Phase::Done { .. } | Phase::Failed { .. })
 }
 
+/// The "dust" glyph a dissolving status crumbles into.
+pub const DUST: char = '·';
+
+/// Frames that "dissolve" a status line into dust — the swoosh shown when the
+/// thinking indicator is replaced by the answer (or removed). A chat channel has
+/// no animation primitive, so the effect is simulated: the channel layer plays
+/// these frames in quick succession via `editMessageText`. Pure + deterministic so
+/// it is testable.
+///
+/// Each frame replaces a growing, SCATTERED fraction of the visible characters
+/// with the dust glyph (so the text crumbles like sand rather than wiping straight
+/// across), ending on a sparse frame with just a few motes drifting. Whitespace is
+/// preserved so a multi-line block keeps its shape as it falls apart. Returns an
+/// empty vec for blank input (nothing to dissolve).
+pub fn dissolve_frames(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut order: Vec<usize> = chars
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.is_whitespace())
+        .map(|(i, _)| i)
+        .collect();
+    let total = order.len();
+    if total == 0 {
+        return Vec::new();
+    }
+    // Scatter the crumble order deterministically (Knuth multiplicative hash on the
+    // index) so dissolution looks like dust, not a left-to-right wipe.
+    order.sort_by_key(|&i| i.wrapping_mul(2_654_435_761) & 0xffff);
+    let mut frames = Vec::new();
+    for &pct in &[45usize, 75, 100] {
+        let take = (total * pct + 99) / 100; // ceil(total * pct / 100)
+        let mut buf = chars.clone();
+        for &i in order.iter().take(take) {
+            buf[i] = DUST;
+        }
+        frames.push(buf.into_iter().collect());
+    }
+    // Final sparse frame: thin most of the dust back to spaces, leaving a few motes.
+    let mut sparse: Vec<char> = chars
+        .iter()
+        .map(|c| if c.is_whitespace() { *c } else { ' ' })
+        .collect();
+    for (n, &i) in order.iter().enumerate() {
+        if n % 4 == 0 {
+            sparse[i] = DUST;
+        }
+    }
+    frames.push(sparse.into_iter().collect());
+    frames
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,6 +118,30 @@ mod tests {
         let run = frame(&Phase::Running { tool: "weather".to_string() }, 3);
         assert!(run.contains("Running `weather`"));
         assert!(!is_terminal(&Phase::Running { tool: "weather".to_string() }));
+    }
+
+    #[test]
+    fn dissolve_crumbles_text_to_dust() {
+        let frames = dissolve_frames("Working 00:12");
+        // Four frames: 45% / 75% / 100% dust, then a sparse mote frame.
+        assert_eq!(frames.len(), 4);
+        let dust = |s: &str| s.chars().filter(|&c| c == DUST).count();
+        // Increasing dust through the first three frames…
+        assert!(dust(&frames[0]) < dust(&frames[1]));
+        assert!(dust(&frames[1]) < dust(&frames[2]));
+        // …the third is fully dusted (every visible glyph), the last is sparser.
+        let visible = "Working 00:12".chars().filter(|c| !c.is_whitespace()).count();
+        assert_eq!(dust(&frames[2]), visible);
+        assert!(dust(&frames[3]) < dust(&frames[2]));
+        // Whitespace positions are preserved (the space stays a space everywhere).
+        for f in &frames {
+            assert_eq!(f.chars().count(), "Working 00:12".chars().count());
+            assert_eq!(f.chars().nth(7), Some(' '));
+        }
+        // Deterministic.
+        assert_eq!(dissolve_frames("Working 00:12"), frames);
+        // Nothing to dissolve → no frames.
+        assert!(dissolve_frames("   ").is_empty());
     }
 
     #[test]
