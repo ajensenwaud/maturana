@@ -262,14 +262,22 @@ enum ToolSubcommand {
     },
 }
 
-/// Web cockpit server. Binds a LAN-reachable port; access is gated by the
-/// token at `<home>/web/token` exchanged for a session cookie at /login.
+/// Web cockpit server. Access is gated by the token at `<home>/web/token`
+/// exchanged for a session cookie at /login. If `--bind` is omitted and
+/// Tailscale is up, an interactive run asks whether to bind to your tailnet
+/// (recommended), all interfaces, or localhost.
 #[derive(Debug, Args)]
 struct WebCommand {
     #[command(subcommand)]
     command: Option<WebSubcommand>,
-    #[arg(long, default_value = "0.0.0.0:47836")]
-    bind: String,
+    /// Bind address (host:port). Omit to be asked (interactive) or default to
+    /// 0.0.0.0:47836 (non-interactive).
+    #[arg(long)]
+    bind: Option<String>,
+    /// Bind only to this host's Tailscale (tailnet) IP — reachable from your
+    /// tailnet, not the LAN/internet. Errors if Tailscale isn't up.
+    #[arg(long)]
+    tailnet: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1436,9 +1444,11 @@ fn main() -> anyhow::Result<()> {
                 println!("{}", maturana_web::login_token(home.root())?);
             }
             None => {
-                eprintln!(
-                    "note: the web cockpit is experimental and not yet stabilized; \
-                     it is not installed or started by default."
+                let bind = resolve_web_bind(command.bind.clone(), command.tailnet)?;
+                println!("Maturana web cockpit → http://{bind}");
+                println!(
+                    "  login token: `maturana web token` (stored at {}/web/token)",
+                    home.root().display()
                 );
                 // Inject the shared channel front door so cockpit turns get the
                 // same transcript memory + model/reasoning + routing as every other
@@ -1462,7 +1472,7 @@ fn main() -> anyhow::Result<()> {
                         )
                     },
                 );
-                maturana_web::run_web(home.root().to_path_buf(), &command.bind, enqueue)?
+                maturana_web::run_web(home.root().to_path_buf(), &bind, enqueue)?
             }
         },
         Command::Search(command) => run_search(&home, command)?,
@@ -4928,6 +4938,85 @@ fn run_status(home: &MaturanaHome, command: StatusCommand) -> anyhow::Result<()>
     Ok(())
 }
 
+const WEB_PORT: u16 = 47836;
+
+/// This host's Tailscale IPv4 (100.64.0.0/10), if Tailscale is installed + up.
+fn tailscale_ipv4() -> Option<String> {
+    let out = ProcessCommand::new("tailscale")
+        .arg("ip")
+        .arg("-4")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let ip = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .to_string();
+    if ip.is_empty() {
+        None
+    } else {
+        Some(ip)
+    }
+}
+
+/// Pure bind resolver (testable). Explicit `--bind` always wins. `--tailnet`
+/// forces the tailnet IP (error if absent). With Tailscale present, an
+/// interactive `choice` ("1"=tailnet, "2"=all, "3"=localhost) picks; a `None`
+/// choice (non-interactive) keeps the historical all-interfaces default rather
+/// than silently scoping to the tailnet.
+fn web_bind_for(
+    explicit: Option<&str>,
+    tailnet: bool,
+    tailscale_ip: Option<&str>,
+    choice: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(b) = explicit {
+        return Ok(b.to_string());
+    }
+    if tailnet {
+        let ip = tailscale_ip.ok_or_else(|| {
+            anyhow::anyhow!("--tailnet requested but Tailscale isn't up (no `tailscale ip -4`)")
+        })?;
+        return Ok(format!("{ip}:{WEB_PORT}"));
+    }
+    match (tailscale_ip, choice) {
+        (Some(ip), Some("1")) => Ok(format!("{ip}:{WEB_PORT}")),
+        (Some(_), Some("2")) => Ok(format!("0.0.0.0:{WEB_PORT}")),
+        (Some(_), Some("3")) => Ok(format!("127.0.0.1:{WEB_PORT}")),
+        (Some(ip), Some(_)) => Ok(format!("{ip}:{WEB_PORT}")),
+        _ => Ok(format!("0.0.0.0:{WEB_PORT}")),
+    }
+}
+
+/// Resolve where `maturana web` should bind: explicit/--tailnet honored; else,
+/// on an interactive terminal with Tailscale up, ASK (defaulting to tailnet);
+/// otherwise 0.0.0.0.
+fn resolve_web_bind(explicit: Option<String>, tailnet: bool) -> anyhow::Result<String> {
+    use std::io::{IsTerminal, Write};
+    let ip = if explicit.is_some() { None } else { tailscale_ipv4() };
+    let mut choice: Option<String> = None;
+    if explicit.is_none() && !tailnet {
+        if let Some(ip) = ip.as_deref() {
+            if std::io::stdin().is_terminal() {
+                println!("Tailscale detected at {ip}. Where should the web cockpit listen?");
+                println!("  [1] tailnet only   {ip}:{WEB_PORT}   (recommended — your tailnet only)");
+                println!("  [2] all interfaces 0.0.0.0:{WEB_PORT}  (LAN + tailnet; put TLS in front)");
+                println!("  [3] localhost only 127.0.0.1:{WEB_PORT}");
+                print!("Choose [1]: ");
+                let _ = std::io::stdout().flush();
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                let c = line.trim();
+                choice = Some(if c.is_empty() { "1".to_string() } else { c.to_string() });
+            }
+        }
+    }
+    web_bind_for(explicit.as_deref(), tailnet, ip.as_deref(), choice.as_deref())
+}
+
 pub(crate) fn discover_agent_ids(home: &MaturanaHome) -> anyhow::Result<Vec<String>> {
     let agents_dir = home.agents_dir();
     if !agents_dir.exists() {
@@ -6553,6 +6642,41 @@ fn hostd_token() -> anyhow::Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_bind_resolves_tailnet_and_explicit() {
+        // Explicit --bind always wins, Tailscale or not.
+        assert_eq!(
+            web_bind_for(Some("0.0.0.0:9000"), false, Some("100.1.2.3"), None).unwrap(),
+            "0.0.0.0:9000"
+        );
+        // --tailnet uses the tailscale ip; errors without one.
+        assert_eq!(
+            web_bind_for(None, true, Some("100.1.2.3"), None).unwrap(),
+            "100.1.2.3:47836"
+        );
+        assert!(web_bind_for(None, true, None, None).is_err());
+        // Interactive choices map to tailnet / all / localhost.
+        assert_eq!(
+            web_bind_for(None, false, Some("100.1.2.3"), Some("1")).unwrap(),
+            "100.1.2.3:47836"
+        );
+        assert_eq!(
+            web_bind_for(None, false, Some("100.1.2.3"), Some("2")).unwrap(),
+            "0.0.0.0:47836"
+        );
+        assert_eq!(
+            web_bind_for(None, false, Some("100.1.2.3"), Some("3")).unwrap(),
+            "127.0.0.1:47836"
+        );
+        // Non-interactive (no choice) keeps the historical all-interfaces default,
+        // even with Tailscale present.
+        assert_eq!(
+            web_bind_for(None, false, Some("100.1.2.3"), None).unwrap(),
+            "0.0.0.0:47836"
+        );
+        assert_eq!(web_bind_for(None, false, None, None).unwrap(), "0.0.0.0:47836");
+    }
 
     #[test]
     fn guest_transfer_paths_allow_declared_roots() {
