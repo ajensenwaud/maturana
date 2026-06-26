@@ -361,15 +361,107 @@ export async function renderRuntime(panel, socket) {
 export async function renderSessions(panel, socket) {
   const wrap = section("Sessions");
   const detail = el("div");
-  const sessions = await api("/api/sessions");
-  const rows = sessions.map((s) => [
-    s.agent_id,
-    s.session_id,
-    JSON.stringify(s.stats ?? {}),
-    button("open", () => openSession(detail, socket, s.agent_id, s.session_id)),
-  ]);
-  wrap.append(table(["agent", "session", "queue", ""], rows));
+  const listBox = el("div");
+
+  const draw = (sessions) => {
+    const rows = sessions.map((s) => [
+      s.agent_id,
+      labelCell(detail, s),
+      s.last_active ? new Date(s.last_active).toLocaleString() : "—",
+      `${s.stats?.completed ?? 0}✓ / ${s.stats?.pending ?? 0}⏳`,
+      (() => {
+        const cell = el("div", "dash-actions");
+        cell.append(
+          button("open", () => openSession(detail, socket, s.agent_id, s.session_id)),
+          button("export", () => exportSession(s.agent_id, s.session_id)),
+        );
+        return cell;
+      })(),
+    ]);
+    listBox.replaceChildren(table(["agent", "session", "last active", "queue", ""], rows));
+  };
+
+  // Search across every session's messages.
+  const searchRow = el("div", "dash-actions");
+  const searchInput = el("input", "model-input");
+  searchInput.placeholder = "search all messages…";
+  searchInput.style.flex = "1";
+  const searchOut = el("div");
+  const doSearch = async () => {
+    const q = searchInput.value.trim();
+    if (!q) { searchOut.replaceChildren(); return; }
+    searchOut.replaceChildren(el("div", "label", "[ searching… ]"));
+    try {
+      const { hits } = await api(`/api/sessions/search?q=${encodeURIComponent(q)}`);
+      if (!hits.length) { searchOut.replaceChildren(el("div", "status-dim", "no matches")); return; }
+      searchOut.replaceChildren(table(["agent", "session", "dir", "snippet", ""], hits.map((h) => [
+        h.agent_id, h.session_id, h.direction, h.snippet,
+        button("open", () => openSession(detail, socket, h.agent_id, h.session_id)),
+      ])));
+    } catch (error) {
+      searchOut.replaceChildren(el("div", "status-bad", String(error)));
+    }
+  };
+  searchInput.addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
+  searchRow.append(searchInput, button("search", doSearch));
+
+  // Prune idle sessions.
+  const pruneRow = el("div", "dash-actions");
+  const pruneDays = el("input", "model-input");
+  pruneDays.type = "number";
+  pruneDays.value = "30";
+  pruneDays.style.width = "90px";
+  pruneRow.append(
+    el("span", "label", "prune sessions idle >"),
+    pruneDays,
+    el("span", "label", "days"),
+    button("prune", async () => {
+      const days = parseInt(pruneDays.value || "30", 10);
+      if (!confirm(`Delete sessions with no activity in ${days} days? This cannot be undone.`)) return;
+      try {
+        const r = await api("/api/sessions/prune", { method: "POST", body: JSON.stringify({ days }) });
+        detail.replaceChildren(el("div", "status-ok", `[ pruned ${r.count} session(s) ]`));
+        draw(await api("/api/sessions"));
+      } catch (error) {
+        detail.replaceChildren(el("div", "status-bad", String(error)));
+      }
+    }, true),
+  );
+
+  draw(await api("/api/sessions"));
+  wrap.append(searchRow, searchOut, pruneRow, listBox);
   panel.replaceChildren(wrap, detail);
+}
+
+function labelCell(detail, s) {
+  const cell = el("span");
+  cell.append(document.createTextNode((s.label ? `${s.label} ` : "") + s.session_id + " "));
+  cell.append(button("rename", async () => {
+    const label = prompt("Session label (empty to clear):", s.label || "");
+    if (label === null) return;
+    try {
+      await api(`/api/sessions/${s.agent_id}/${s.session_id}/label`, { method: "PUT", body: JSON.stringify({ label }) });
+      detail.replaceChildren(el("div", "status-ok", `[ relabeled ${s.session_id} ]`));
+    } catch (error) {
+      detail.replaceChildren(el("div", "status-bad", String(error)));
+    }
+  }));
+  return cell;
+}
+
+async function exportSession(agentId, sessionId) {
+  try {
+    const data = await api(`/api/sessions/${agentId}/${sessionId}/export`);
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${agentId}-${sessionId}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    alert(String(error));
+  }
 }
 
 async function openSession(detail, socket, agentId, sessionId) {
