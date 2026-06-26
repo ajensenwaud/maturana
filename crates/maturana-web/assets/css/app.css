@@ -327,3 +327,16 @@ button.primary:hover {
 }
 .session-msg.in { color: var(--ink); }
 .session-msg.out { color: var(--accent); }
+
+/* tool-call cards in the console (structured turn items) */
+.turn-items { display: flex; flex-direction: column; gap: 6px; margin: 6px 0; }
+.tool-card {
+  border: 1px solid var(--border, #2a2a2a);
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: var(--surface-2, rgba(255,255,255,0.03));
+}
+.tool-card-head { color: var(--accent, #69c0ff); }
+.tool-card-summary { font-size: 0.9em; opacity: 0.92; margin: 2px 0; white-space: pre-wrap; }
+.tool-card details { margin-top: 4px; }
+.tool-card summary { cursor: pointer; opacity: 0.7; }
