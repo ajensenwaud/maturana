@@ -2,12 +2,22 @@
 //! search / export / prune / label (the "sessions depth" features).
 
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::response::Response;
 use axum::Json;
 use maturana_core::session_db;
 
-use super::{blocking, ok};
+use super::{blocking, err, ok, valid_id};
 use crate::state::AppState;
+
+/// Reject agent/session ids that aren't safe path segments (traversal guard).
+macro_rules! check_ids {
+    ($agent:expr, $session:expr) => {
+        if !valid_id(&$agent) || !valid_id(&$session) {
+            return err(StatusCode::BAD_REQUEST, "invalid agent or session id");
+        }
+    };
+}
 
 /// Pull the display text out of a stored message's JSON `content` blob.
 fn extract_text(content: &str) -> String {
@@ -120,6 +130,7 @@ pub async fn messages(
     Path((agent, session)): Path<(String, String)>,
     Query(query): Query<MessagesQuery>,
 ) -> Response {
+    check_ids!(agent, session);
     let root = state.home_root.clone();
     match blocking(move || {
         let paths = session_db::session_paths(&root.join("agents").join(&agent), &session);
@@ -210,6 +221,7 @@ pub async fn export(
     State(state): State<AppState>,
     Path((agent, session)): Path<(String, String)>,
 ) -> Response {
+    check_ids!(agent, session);
     let root = state.home_root.clone();
     match blocking(move || {
         let paths = session_db::session_paths(&root.join("agents").join(&agent), &session);
@@ -262,8 +274,15 @@ pub async fn prune(State(state): State<AppState>, Json(body): Json<PruneBody>) -
                     }
                     let session_id = session.file_name().to_string_lossy().to_string();
                     let paths = session_db::session_paths(&agent_path, &session_id);
+                    // Never prune a session that still has un-run work queued.
+                    let busy = session_db::queue_stats(&paths)
+                        .map(|s| s.pending > 0 || s.processing > 0)
+                        .unwrap_or(false);
                     if let Some(last) = last_activity(&paths) {
-                        if last < cutoff && std::fs::remove_dir_all(session.path()).is_ok() {
+                        if !busy
+                            && last < cutoff
+                            && std::fs::remove_dir_all(session.path()).is_ok()
+                        {
                             deleted.push(format!("{agent_id}/{session_id}"));
                         }
                     }
@@ -291,6 +310,7 @@ pub async fn set_label(
     Path((agent, session)): Path<(String, String)>,
     Json(body): Json<LabelBody>,
 ) -> Response {
+    check_ids!(agent, session);
     let root = state.home_root.clone();
     match blocking(move || {
         let dir = root

@@ -480,7 +480,16 @@ body text stays put
         std::fs::write(&tmp, &updated).unwrap();
         let spec = AgentSpec::from_maturana_markdown(&tmp).unwrap();
         let _ = std::fs::remove_file(&tmp);
-        assert_eq!(spec.network.egress_allowlist, allowlist);
+        // Parsing a codex spec now applies the harness egress defaults
+        // (auth.openai.com, chatgpt.com via apply_egress_defaults), so assert the
+        // explicitly-set hosts are present rather than exact set equality.
+        for host in &allowlist {
+            assert!(
+                spec.network.egress_allowlist.contains(host),
+                "egress allowlist missing {host}: {:?}",
+                spec.network.egress_allowlist
+            );
+        }
         let proxy = spec.network.proxy.unwrap();
         assert_eq!(proxy.inject_headers.len(), 1);
         assert_eq!(proxy.inject_headers[0].host, "api.search.brave.com");

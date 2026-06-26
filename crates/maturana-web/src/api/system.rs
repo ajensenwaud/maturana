@@ -123,6 +123,11 @@ pub async fn logs(State(state): State<AppState>, Query(q): Query<LogQuery>) -> R
             "fleet" => journalctl("maturana-fleet.service", lines),
             other => {
                 if let Some(agent) = other.strip_prefix("agent:") {
+                    // Validate the agent id — it goes into a filename; a `..`/`/`
+                    // would let `source=agent:../../..` traverse out of audit/.
+                    if !super::valid_id(agent) {
+                        anyhow::bail!("invalid agent id in log source");
+                    }
                     tail_file(
                         &root
                             .join("audit")
@@ -130,6 +135,11 @@ pub async fn logs(State(state): State<AppState>, Query(q): Query<LogQuery>) -> R
                         lines,
                     )
                 } else {
+                    // Bare filename under <home>/logs/ — must be a single safe
+                    // segment, never a traversal to an arbitrary host file.
+                    if !super::valid_id(other) {
+                        anyhow::bail!("invalid log source");
+                    }
                     tail_file(&root.join("logs").join(other), lines)
                 }
             }

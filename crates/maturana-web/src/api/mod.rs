@@ -80,6 +80,19 @@ where
     }
 }
 
+/// True for an id/name safe to use as a single path segment: non-empty, ≤128
+/// chars, only `[A-Za-z0-9._-]`, and never a `..` traversal. Guards every handler
+/// that builds a filesystem path from a URL segment (agent/session ids, log
+/// filenames) — axum's Path/Query extractors percent-decode, so `%2e%2e`/`%2F`
+/// would otherwise let an authed operator escape the home tree.
+pub fn valid_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && !s.contains("..")
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 pub fn ok(data: serde_json::Value) -> Response {
     Json(serde_json::json!({ "ok": true, "data": data })).into_response()
 }
@@ -90,4 +103,27 @@ pub fn err(status: StatusCode, message: &str) -> Response {
         Json(serde_json::json!({ "ok": false, "error": message })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_id;
+
+    #[test]
+    fn valid_id_blocks_traversal() {
+        // Legit ids/filenames.
+        assert!(valid_id("codex-firecracker"));
+        assert!(valid_id("humberto-maturana-main"));
+        assert!(valid_id("up-maturana.out.log"));
+        // Traversal + separators (incl. what percent-decoding yields) are rejected.
+        assert!(!valid_id(".."));
+        assert!(!valid_id("../.."));
+        assert!(!valid_id("../../etc/passwd"));
+        assert!(!valid_id("a/b"));
+        assert!(!valid_id("a\\b"));
+        assert!(!valid_id("..%2f"));
+        assert!(!valid_id("/etc/passwd"));
+        assert!(!valid_id(""));
+        assert!(!valid_id(&"x".repeat(200)));
+    }
 }

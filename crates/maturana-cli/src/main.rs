@@ -4974,6 +4974,9 @@ fn web_bind_for(
     choice: Option<&str>,
 ) -> anyhow::Result<String> {
     if let Some(b) = explicit {
+        if tailnet {
+            anyhow::bail!("pass either --bind or --tailnet, not both");
+        }
         return Ok(b.to_string());
     }
     if tailnet {
@@ -6650,6 +6653,8 @@ mod tests {
             web_bind_for(Some("0.0.0.0:9000"), false, Some("100.1.2.3"), None).unwrap(),
             "0.0.0.0:9000"
         );
+        // --bind + --tailnet together is a conflict, not a silent ignore.
+        assert!(web_bind_for(Some("0.0.0.0:9000"), true, Some("100.1.2.3"), None).is_err());
         // --tailnet uses the tailscale ip; errors without one.
         assert_eq!(
             web_bind_for(None, true, Some("100.1.2.3"), None).unwrap(),
