@@ -1,55 +1,106 @@
 # maturana-web
 
-Use this skill to start, expose, and operate the **Maturana web cockpit** — the
-browser control plane for the agent fleet (`:47836`, WebSocket + REST, token
-login). It complements the Codex CLI and TUI; it does not replace them.
+Use this skill when you need to start, expose, or operate the **Maturana web
+cockpit** — the browser control plane for the agent fleet (`:47836`, WebSocket +
+REST, token login). It complements the Codex CLI and TUI; it does not replace
+them. Because the cockpit has no TLS of its own, **the bind address is the
+security boundary** — so this skill's core job is to choose where it listens,
+always asking the operator when Tailscale is available.
 
-## Starting the cockpit
+## Grounding
 
-The binary is `maturana web`. **Before starting it, decide where it should
-listen — always ask the operator when Tailscale is available**, because the
-cockpit has no TLS of its own and the bind address is the security boundary:
+1. Read `AGENTS.md` first; confirm the operator actually wants the cockpit
+   started/exposed (vs. the CLI/TUI), and on which host.
+2. Check for Tailscale: `tailscale ip -4`. A `100.x.y.z` address means the host
+   is on a tailnet and the cockpit can be bound to it (reachable only from the
+   tailnet, not the LAN/internet).
+3. The login token lives at `<home>/web/token`; print it with `maturana web
+   token`. The operator pastes it at `/login` to get a session cookie.
 
-1. Check for Tailscale: `tailscale ip -4` (a `100.x.y.z` address means it's up).
-2. If Tailscale is up, **ask the operator** which to use:
-   - **tailnet only** (recommended) — reachable only from their tailnet:
-     `maturana web --tailnet`
-   - **all interfaces** — LAN + tailnet; only if a TLS reverse proxy fronts it:
-     `maturana web --bind 0.0.0.0:47836`
-   - **localhost only** — same machine: `maturana web --bind 127.0.0.1:47836`
-3. If Tailscale is NOT up, default to localhost or an explicit `--bind`; never
-   expose `0.0.0.0` to an untrusted network without TLS in front.
+## Preflight
 
-Running `maturana web` interactively with **no `--bind`** prints this same menu
-and asks — so a human at the terminal is prompted automatically. When you start
-it on the operator's behalf, ask first and pass the chosen flag.
+- Decide the bind, and **ask the operator when Tailscale is up** — never expose
+  the cockpit beyond a trusted network without TLS in front:
+  - tailnet only (recommended): `maturana web --tailnet`
+  - all interfaces (only behind a TLS reverse proxy): `maturana web --bind 0.0.0.0:47836`
+  - localhost only: `maturana web --bind 127.0.0.1:47836`
+- Confirm port `47836` is free (`ss -ltnp | grep 47836`); a stale instance will
+  hold it (`Address already in use`).
+- Confirm the home is correct (`--home <path>`); the cockpit reads
+  `<home>/agents`, `<home>/web/token`, `<home>/audit`.
 
-The login token is at `<home>/web/token`; print it with `maturana web token`.
-The operator pastes it at `/login` to get a session cookie.
+## Decision Path
 
-## Running it as a service
+- Started **interactively** with no `--bind`: `maturana web` prints the tailnet/
+  all/localhost menu and asks — let the human choose.
+- Started **on the operator's behalf** (you run it): ask first, then pass the
+  chosen flag explicitly (`--tailnet` or `--bind`).
+- Run as a **service**: `maturana service install web` registers a supervised
+  unit. To pin it to the tailnet, set its `ExecStart` to `maturana web
+  --tailnet` (edit the unit), or front it with Tailscale Serve.
+- Tailscale **not** up: default to localhost or an explicit `--bind`; do not
+  expose `0.0.0.0` on an untrusted network.
 
-`maturana service install web` registers a supervised unit (Linux systemd user
-service / Windows scheduled task) that restarts on failure and at boot. By
-default the service binds `0.0.0.0:47836`; to pin it to the tailnet, install it
-to run `maturana web --tailnet` (edit the unit's ExecStart) or front it with
-Tailscale Serve.
+## Actions
 
-## What the cockpit exposes
+```bash
+# Print/create the login token
+maturana web token
 
-A single page with a left-nav: **Console** (drive an agent turn, streaming),
-**Agents** (fleet table; per-agent spec validate → dry-run → apply, stop,
-inspect), **Runtime** (supervisor + processes, health, doctor), **Sessions**
-(transcripts; send a message into a session), **Graph** (GraphRAG stats/query +
-document ingest), **Pipelock** (secret names; set/delete — values never sent to
-the browser), **Egress** (live allow/deny feed + one-click approve), **Tools**
-(WASM registry), **Skills** (catalog). Mutating calls require the `x-maturana-web`
-header (CSRF) and a valid session cookie; the WebSocket upgrade checks Origin.
+# Start it, asking where to bind (Tailscale detected → interactive menu)
+maturana web
+
+# Bind to the tailnet only (recommended when Tailscale is up)
+maturana web --tailnet
+
+# Explicit bind (skips the prompt)
+maturana web --bind 127.0.0.1:47836
+
+# Supervised service (restarts on failure + at boot)
+maturana service install web
+```
+
+The cockpit's left-nav exposes: **Console** (drive a turn; tool-call cards),
+**Agents** (fleet; spec validate → dry-run → apply, stop, inspect), **Config**
+(edit schedules/MCP/channels/skills — validated), **System** (host stats, logs,
+activity), **Sessions** (transcripts, search, export, prune, send a message),
+**Graph** (GraphRAG + ingest), **Pipelock** (secret names; set/delete — values
+never sent to the browser), **Egress** (live allow/deny + approve), **Runtime**
+(supervisor + ops: restart plane, backup), **Tools**, **Skills**.
+
+## Evidence
+
+Before reporting the cockpit up, collect:
+
+- `curl -s http://<bind-host>:47836/health` returns `{"ok":true}`.
+- The startup log prints the exact bind it chose, e.g. `Maturana web cockpit →
+  http://100.93.69.127:47836` — and it matches what the operator approved.
+- A login round-trip works: `POST /login` with `{token}` returns `{"ok":true}`
+  and sets the `maturana_web_session` cookie.
+- When `--tailnet` was used, the bind host is the `tailscale ip -4` address (not
+  `0.0.0.0`), so the cockpit is NOT reachable from the LAN.
+
+## Recovery
+
+- `Address already in use`: a cockpit (often the supervised service) already
+  holds `:47836` — restart that service instead of starting a second copy, or
+  stop it first.
+- `404` on `/api/system/*` or other new routes: the running binary is stale —
+  rebuild and restart the unit (the web service may point at an installed binary
+  separate from `target/release`).
+- `--tailnet` errors "Tailscale isn't up": `tailscale ip -4` returned nothing —
+  start Tailscale or bind explicitly with `--bind`.
+- Cockpit reachable but every `/api/*` is `401`: the session cookie was lost
+  (server restart drops in-memory sessions) — log in again at `/login`.
 
 ## Boundaries
 
-- The bind address is the security boundary — never widen it (e.g. to `0.0.0.0`
-  on a public box) without TLS in front. Prefer the tailnet.
-- Secrets are never serialized to the browser (pipelock lists names only).
-- The cockpit drives the SAME front door as every channel
-  (`channels::enqueue_turn`), so a turn run here gets the same memory + routing.
+- Do not expose the cockpit on `0.0.0.0` or a public address without TLS in
+  front — prefer `--tailnet`; the bind address is the only network gate.
+- Do not start a second cockpit on a port a supervised one already owns — manage
+  the existing service rather than spawning a competitor.
+- Do not treat the cockpit as a remote shell: it has no UI shell-hooks, no
+  self-update of the running host, and no `--insecure` mode — those are declined
+  on zero-trust grounds.
+- Do not edit identity / vm / runtime (the isolation boundary) from the browser;
+  the Config panel only touches declarative blocks, validated before write.
