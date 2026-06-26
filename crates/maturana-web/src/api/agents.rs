@@ -218,9 +218,60 @@ pub async fn spec_get(State(state): State<AppState>, Path(id): Path<String>) -> 
     }
 }
 
-/// List the agent's HOST-side files as a flat, relative tree (its spec,
-/// AGENTS.md, worker status, sessions, wiki). Read-only. The agent's in-VM
-/// working files are isolated by design and are NOT exposed here.
+// SECURITY: the agent's host directory holds SECRETS the zero-trust model keeps
+// host-side — `state/` (sessiond + MaturanaGraph token VALUES, the guest SSH host
+// PRIVATE key), `cloud-init/` (that key again, in user-data), `host-auth/`, the
+// pipelock material, and the session DBs. The cockpit file view MUST NOT serve any
+// of these to the browser. We default-deny: a file is browsable only if it is not
+// under a sensitive directory, has no secret-hinting name, and has a known
+// text/document extension. (A traversal guard alone is NOT enough — these paths
+// are legitimately *inside* agent_dir.)
+
+/// Directories never descended into or read from (secrets, auth, raw session DBs).
+const SKIP_DIRS: &[&str] = &[
+    "state",
+    "cloud-init",
+    "host-auth",
+    "secrets",
+    "pipelock",
+    ".ssh",
+    ".codex",
+    ".claude",
+    "sessions",
+];
+/// Only these extensions are previewable (no `.env`, `.pem`, `.key`, keys, sqlite…).
+const SAFE_EXTS: &[&str] = &["md", "json", "txt", "yaml", "yml", "toml", "log", "csv"];
+/// Filename substrings that mark a secret even with a safe extension.
+const SECRET_HINTS: &[&str] = &[
+    "secret",
+    "token",
+    "password",
+    "credential",
+    "private",
+    "ed25519",
+    "id_rsa",
+];
+
+/// Default-deny: is this relative path safe to list/read in the cockpit?
+fn is_browsable_rel(rel: &str) -> bool {
+    let lower = rel.to_ascii_lowercase();
+    if lower.split('/').any(|c| SKIP_DIRS.contains(&c)) {
+        return false;
+    }
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    if SECRET_HINTS.iter().any(|h| name.contains(h)) {
+        return false;
+    }
+    match std::path::Path::new(name).extension().and_then(|e| e.to_str()) {
+        Some(ext) => SAFE_EXTS.contains(&ext),
+        None => false,
+    }
+}
+
+/// List the agent's HOST-side *document* files (spec, AGENTS.md, IDENTITY.md,
+/// worker status) as a flat, relative tree. Read-only and default-deny: secret
+/// state, host auth, and session DBs are never listed. The agent's in-VM working
+/// files are isolated and are not exposed here.
 pub async fn files(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     check_id!(id);
     let dir = home(&state).agent_dir(&id);
@@ -243,24 +294,34 @@ fn walk_files(
     depth: usize,
     out: &mut Vec<serde_json::Value>,
 ) {
-    if depth > 4 || out.len() > 800 {
+    if depth > 4 {
         return;
     }
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in rd.flatten() {
+        // Cap checked INSIDE the loop so one large directory can't blow up the
+        // response.
+        if out.len() >= 800 {
+            return;
+        }
         let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
         let rel = path
             .strip_prefix(root)
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        let is_dir = path.is_dir();
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        out.push(serde_json::json!({ "path": rel, "dir": is_dir, "size": size }));
-        if is_dir {
+        if path.is_dir() {
+            // Never descend into secret/auth/session directories.
+            if SKIP_DIRS.contains(&name.as_str()) {
+                continue;
+            }
             walk_files(root, &path, depth + 1, out);
+        } else if is_browsable_rel(&rel) {
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            out.push(serde_json::json!({ "path": rel, "dir": false, "size": size }));
         }
     }
 }
@@ -270,9 +331,9 @@ pub struct FileQuery {
     path: String,
 }
 
-/// Read one text file under the agent's host directory. The path is validated to
-/// stay within that directory (no traversal); binary or oversized files are
-/// reported rather than dumped.
+/// Read one previewable text file under the agent's host directory. Guards, in
+/// order: no traversal, must be a browsable document (default-deny secrets), stays
+/// within the dir (canonicalized), not a dir, size- and binary-capped.
 pub async fn file_read(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -284,6 +345,12 @@ pub async fn file_read(
     match blocking(move || {
         if rel.is_empty() || rel.contains("..") || rel.starts_with('/') || rel.starts_with('\\') {
             anyhow::bail!("invalid path");
+        }
+        // Default-deny: refuse secret state, host auth, keys, session DBs — these
+        // live legitimately inside agent_dir, so the traversal guard alone misses
+        // them.
+        if !is_browsable_rel(&rel) {
+            anyhow::bail!("not a browsable file");
         }
         let target = dir.join(&rel);
         let canon = target.canonicalize()?;
@@ -390,29 +457,41 @@ fn starter_spec(id: &str, name: &str, purpose: &str, harness: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric())
         .take(7)
         .collect();
-    // NOTE: every continuation line below starts at column 0 in the source and
-    // carries its YAML indentation as explicit `\n  ` / `\n    ` — a `\`-stripped
-    // source indent would push nested keys to column 0 and break the YAML.
-    let fc = format!(
-        "\n  firecracker:\
-\n    kernel_image: .maturana/images/firecracker/{id}/vmlinux.bin\
-\n    rootfs_image: .maturana/images/firecracker/{id}/ubuntu-rootfs.ext4\
-\n    tap_name: tap-mat-{tap_suffix}\
-\n    host_ip: 172.30.90.1\
-\n    guest_ip: 172.30.90.2\
-\n    guest_mac: AA:FC:00:00:90:01\
-\n    kernel_args: console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw virtio_mmio.device=4K@0xd0000000:5"
-    );
+    // SECURITY: build the frontmatter as data and let serde_yaml serialize it, so
+    // a newline (or any YAML metacharacter) in `name`/`purpose` is escaped into a
+    // string value — NOT interpolated as new sibling keys. String-formatting these
+    // user inputs into YAML let a crafted `purpose` inject e.g. a `harness_auth`
+    // block (host arbitrary-file read into the guest) or a `filesystem.mounts`.
+    let frontmatter = serde_json::json!({
+        "identity": { "id": id, "name": name, "purpose": purpose },
+        "runtime": { "harness": harness },
+        "vm": {
+            "provider": "firecracker",
+            "guest_os": "linux",
+            "vcpu": 2,
+            "memory_mib": 2048,
+            "firecracker": {
+                "kernel_image": format!(".maturana/images/firecracker/{id}/vmlinux.bin"),
+                "rootfs_image": format!(".maturana/images/firecracker/{id}/ubuntu-rootfs.ext4"),
+                "tap_name": format!("tap-mat-{tap_suffix}"),
+                "host_ip": "172.30.90.1",
+                "guest_ip": "172.30.90.2",
+                "guest_mac": "AA:FC:00:00:90:01",
+                "kernel_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw virtio_mmio.device=4K@0xd0000000:5",
+            },
+        },
+        "network": { "egress_allowlist": [] },
+        "memory": { "wiki_path": ".maturana/wiki" },
+        "knowledge_graph": { "enabled": true },
+    });
+    let yaml = serde_yaml::to_string(&frontmatter).unwrap_or_default();
+    // The body is free markdown (not parsed as YAML), but flatten newlines in the
+    // heading/system-prompt for tidiness.
+    let name1 = name.replace(['\n', '\r'], " ");
+    let purpose1 = purpose.replace(['\n', '\r'], " ");
     format!(
-        "---\
-\nidentity:\n  id: {id}\n  name: {name}\n  purpose: {purpose}\
-\nruntime:\n  harness: {harness}\
-\nvm:\n  provider: firecracker\n  guest_os: linux\n  vcpu: 2\n  memory_mib: 2048{fc}\
-\nnetwork:\n  egress_allowlist: []\
-\nmemory:\n  wiki_path: .maturana/wiki\
-\nknowledge_graph:\n  enabled: true\
-\n---\n\n# {name}\n\n{purpose}\n\n\
-You are {name}, running in an isolated Maturana microVM. Be concise and helpful.\n\n\
+        "---\n{yaml}---\n\n# {name1}\n\n{purpose1}\n\n\
+You are {name1}, running in an isolated Maturana microVM. Be concise and helpful.\n\n\
 > Before provisioning: give this agent a UNIQUE tap_name / host_ip / guest_ip / guest_mac \
 (the 172.30.90.x placeholders will collide with another agent), point kernel_image / \
 rootfs_image at prepared images, then dry-run -> apply.\n"
@@ -823,6 +902,45 @@ body text stays put
             let _ = std::fs::remove_file(&tmp);
             assert_eq!(spec.identity.id, "new-bot");
             assert!(validate_spec(&spec).valid, "starter spec for {harness} must validate");
+        }
+    }
+
+    #[test]
+    fn starter_spec_resists_yaml_injection() {
+        // A crafted `purpose` that tries to inject a sibling `harness_auth` block
+        // (which would read a host file into the guest) must NOT become a real key —
+        // it must round-trip as a plain string value of `purpose`.
+        let evil = "ok\nharness_auth:\n- runtime: codex\n  source_path: /etc/shadow\n  guest_path: /tmp/x";
+        let md = starter_spec("bot", "Bot", evil, "codex");
+        let tmp = std::env::temp_dir().join(format!("mweb-inj-{}.md", std::process::id()));
+        std::fs::write(&tmp, &md).unwrap();
+        let spec = AgentSpec::from_maturana_markdown(&tmp).expect("must still parse");
+        let _ = std::fs::remove_file(&tmp);
+        // The injected block did not take effect: harness_auth stays empty, and the
+        // payload is contained verbatim in purpose.
+        assert!(spec.harness_auth.is_empty(), "injection created harness_auth entries");
+        assert!(spec.identity.purpose.contains("/etc/shadow"), "purpose lost the literal text");
+    }
+
+    #[test]
+    fn file_browser_denies_secrets_allows_docs() {
+        // The confirmed HIGH leaks: state tokens, the SSH host private key, cloud-init.
+        for deny in [
+            "state/sessiond.env",
+            "state/proxy.env",
+            "state/ssh_host_ed25519",
+            "cloud-init/user-data",
+            "host-auth/codex/auth.json",
+            "secrets/whatever.json",
+            ".ssh/id_rsa",
+            "graph-token.json",
+            "MATURANA.md/../state/sessiond.env",
+        ] {
+            assert!(!is_browsable_rel(deny), "should DENY {deny}");
+        }
+        // The user-facing identity/contract docs stay browsable.
+        for allow in ["MATURANA.md", "AGENTS.md", "IDENTITY.md", "worker-status.json"] {
+            assert!(is_browsable_rel(allow), "should ALLOW {allow}");
         }
     }
 }

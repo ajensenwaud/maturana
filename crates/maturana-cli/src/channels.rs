@@ -3055,6 +3055,17 @@ fn spawn_loop_process(
     Ok(())
 }
 
+/// A run id is safe to use as a single path segment under `orchestration/`:
+/// non-empty, no traversal, only `[A-Za-z0-9._-]`. Guards `/loop abort|status`,
+/// which join the operator-supplied id into a filesystem path.
+fn valid_run_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && !s.contains("..")
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 /// `/loop` — start a multi-agent orchestration loop on a goal (it posts progress
 /// + the result back here), or manage one (`status` / `abort`). Available on every
 /// text channel through the shared command handler.
@@ -3078,6 +3089,12 @@ fn handle_loop_command(
             if rest.is_empty() {
                 return "Usage: /loop abort <run_id>".to_string();
             }
+            // run_id becomes a path segment under orchestration/ — reject anything
+            // that could traverse out (a `/loop abort ../../x` would otherwise drop
+            // an `abort` file at an attacker-chosen path).
+            if !valid_run_id(rest) {
+                return "Invalid run id.".to_string();
+            }
             let dir = home.root().join("orchestration").join(rest);
             if !dir.exists() {
                 return format!("No loop `{rest}` found.");
@@ -3092,6 +3109,8 @@ fn handle_loop_command(
         "status" => {
             if rest.is_empty() {
                 loop_list_text(home)
+            } else if !valid_run_id(rest) {
+                "Invalid run id.".to_string()
             } else {
                 loop_status_text(home, rest)
             }
