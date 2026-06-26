@@ -61,6 +61,139 @@ function button(label, onClick, danger = false) {
   return b;
 }
 
+// ---- system (observability) ----
+
+function fmtBytes(n) {
+  if (n == null) return "—";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${u[i]}`;
+}
+
+function fmtUptime(s) {
+  if (s == null) return "—";
+  s = Math.floor(s);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return d > 0 ? `${d}d ${h}h` : h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+export async function renderSystem(panel) {
+  // Host stats (auto-refresh every 5s while visible).
+  const statsWrap = section("Host");
+  const statsBody = el("div");
+  statsWrap.append(statsBody);
+  const drawStats = async () => {
+    try {
+      const s = await api("/api/system/stats");
+      const memUsed = s.mem_total_bytes != null && s.mem_available_bytes != null
+        ? s.mem_total_bytes - s.mem_available_bytes : null;
+      const diskUsed = s.disk_total_bytes != null && s.disk_available_bytes != null
+        ? s.disk_total_bytes - s.disk_available_bytes : null;
+      const pairs = [
+        ["host", `${s.hostname} (${s.os}/${s.arch})`],
+        ["cpu cores", String(s.cores)],
+        ["uptime", fmtUptime(s.uptime_seconds)],
+        ["load avg", (s.loadavg || []).map((x) => x.toFixed(2)).join("  ") || "—"],
+        ["memory", memUsed != null ? `${fmtBytes(memUsed)} / ${fmtBytes(s.mem_total_bytes)}` : "—"],
+        ["disk", diskUsed != null ? `${fmtBytes(diskUsed)} / ${fmtBytes(s.disk_total_bytes)}` : "—"],
+      ];
+      statsBody.replaceChildren(table(["metric", "value"], pairs));
+    } catch (error) {
+      statsBody.replaceChildren(el("div", "status-bad", String(error)));
+    }
+  };
+  await drawStats();
+  const statsTimer = setInterval(() => {
+    if (panel.contains(statsWrap)) drawStats();
+    else clearInterval(statsTimer);
+  }, 5000);
+
+  // Logs (source dropdown + optional auto-tail).
+  const logWrap = section("Logs");
+  const controls = el("div", "dash-actions");
+  const sourceSel = el("select", "model-input");
+  const linesInput = el("input", "model-input");
+  linesInput.type = "number";
+  linesInput.value = "200";
+  linesInput.style.width = "90px";
+  const logPre = el("pre", "dash-json");
+  logPre.style.maxHeight = "42vh";
+  logPre.style.overflow = "auto";
+  const loadLog = async () => {
+    try {
+      const d = await api(`/api/system/logs?source=${encodeURIComponent(sourceSel.value)}&lines=${encodeURIComponent(linesInput.value || 200)}`);
+      logPre.textContent = d.text || "(empty)";
+      logPre.scrollTop = logPre.scrollHeight;
+    } catch (error) {
+      logPre.textContent = String(error);
+    }
+  };
+  try {
+    const srcs = (await api("/api/system/logs/sources")).sources || ["plane"];
+    for (const s of srcs) {
+      const o = el("option", null, s);
+      o.value = s;
+      sourceSel.append(o);
+    }
+  } catch {
+    const o = el("option", null, "plane");
+    o.value = "plane";
+    sourceSel.append(o);
+  }
+  sourceSel.addEventListener("change", loadLog);
+  const tailChk = el("input");
+  tailChk.type = "checkbox";
+  const tailLabel = el("label", "label");
+  tailLabel.append(tailChk, document.createTextNode(" auto-tail"));
+  controls.append(sourceSel, linesInput, button("refresh", loadLog), tailLabel);
+  logWrap.append(controls, logPre);
+  await loadLog();
+  const logTimer = setInterval(() => {
+    if (!panel.contains(logWrap)) { clearInterval(logTimer); return; }
+    if (tailChk.checked) loadLog();
+  }, 5000);
+
+  // Activity analytics (we don't meter token cost — that lives in the guest VMs).
+  const aWrap = section("Activity");
+  const daysSel = el("select", "model-input");
+  for (const d of [7, 30, 90]) {
+    const o = el("option", null, `${d} days`);
+    o.value = String(d);
+    daysSel.append(o);
+  }
+  daysSel.value = "30";
+  const aBody = el("div");
+  const loadA = async () => {
+    aBody.replaceChildren(el("div", "label", "[ loading… ]"));
+    try {
+      const a = await api(`/api/system/analytics?days=${daysSel.value}`);
+      const rows = a.per_agent.map((p) => [
+        p.agent_id,
+        String(p.sessions),
+        String(p.inbound),
+        String(p.completed_turns),
+        p.last_active ? new Date(p.last_active).toLocaleString() : "—",
+      ]);
+      aBody.replaceChildren(
+        el("div", "label", `totals: ${a.totals.sessions} sessions · ${a.totals.inbound} inbound · ${a.totals.completed_turns} completed`),
+        table(["agent", "sessions", "inbound", "completed", "last active"], rows),
+        el("div", "status-dim", a.note),
+      );
+    } catch (error) {
+      aBody.replaceChildren(el("div", "status-bad", String(error)));
+    }
+  };
+  daysSel.addEventListener("change", loadA);
+  aWrap.append(daysSel, aBody);
+  await loadA();
+
+  panel.replaceChildren(statsWrap, logWrap, aWrap);
+}
+
 // ---- agents ----
 
 export async function renderAgents(panel, socket) {

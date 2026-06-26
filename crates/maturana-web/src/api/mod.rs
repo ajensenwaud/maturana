@@ -11,6 +11,7 @@ pub mod runtime;
 pub mod search;
 pub mod sessions;
 pub mod skills;
+pub mod system;
 pub mod tools;
 pub mod voice;
 
@@ -34,6 +35,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/runtime/plan", get(runtime::plan))
         .route("/api/runtime/up", get(runtime::up_state))
         .route("/api/doctor", get(runtime::doctor))
+        .route("/api/system/stats", get(system::stats))
+        .route("/api/system/logs", get(system::logs))
+        .route("/api/system/logs/sources", get(system::log_sources))
+        .route("/api/system/analytics", get(system::analytics))
         .route("/api/sessions", get(sessions::list))
         .route("/api/sessions/:agent/:session/messages", get(sessions::messages))
         .route("/api/graph/stats", post(graph::stats))

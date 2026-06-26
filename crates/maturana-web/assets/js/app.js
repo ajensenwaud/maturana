@@ -31,6 +31,7 @@ const consoleView = new Console(socket);
 const views = {
   agents: dashboard.renderAgents,
   runtime: dashboard.renderRuntime,
+  system: dashboard.renderSystem,
   sessions: dashboard.renderSessions,
   graph: dashboard.renderGraph,
   pipelock: dashboard.renderPipelock,
