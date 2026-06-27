@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use maturana_core::{
     audit::{append_event, AuditEvent},
-    session_db::{ensure_session, insert_inbound, session_paths},
     state::MaturanaHome,
 };
 
@@ -38,6 +37,11 @@ pub enum ProactiveSubcommand {
         /// Minimum spacing between proactive messages (anti-nag).
         #[arg(long, default_value_t = 7200)]
         min_gap_seconds: u64,
+        /// Override the self-check directive with a specific nudge (e.g. a scheduled
+        /// "morning briefing"). Default: the open-ended "is anything worth saying?"
+        /// self-check that may stay silent.
+        #[arg(long)]
+        directive: Option<String>,
         #[arg(long)]
         once: bool,
     },
@@ -56,6 +60,7 @@ pub fn handle_proactive(command: ProactiveCommand, home: &MaturanaHome) -> anyho
             session_id,
             interval_seconds,
             min_gap_seconds,
+            directive,
             once,
         } => serve(
             home,
@@ -63,6 +68,7 @@ pub fn handle_proactive(command: ProactiveCommand, home: &MaturanaHome) -> anyho
             &session_id,
             interval_seconds.max(30),
             min_gap_seconds,
+            directive.as_deref(),
             once,
         ),
     }
@@ -107,11 +113,12 @@ fn serve(
     session_id: &str,
     interval_seconds: u64,
     min_gap_seconds: u64,
+    directive: Option<&str>,
     once: bool,
 ) -> anyhow::Result<()> {
     println!("proactive loop serving agent {agent_id}");
     loop {
-        if let Err(error) = maybe_fire(home, agent_id, session_id, min_gap_seconds) {
+        if let Err(error) = maybe_fire(home, agent_id, session_id, min_gap_seconds, directive) {
             eprintln!("proactive: {error:#}");
         }
         if once {
@@ -122,33 +129,50 @@ fn serve(
     Ok(())
 }
 
-/// Enqueue a proactive turn if not idle and the anti-nag gap has elapsed.
-/// Returns whether a turn was enqueued.
+/// Pure gate: not idle AND the anti-nag gap has elapsed. No side effects, so the
+/// idle/gap policy stays unit-testable without a running plane or a paired chat.
+fn should_fire(home: &MaturanaHome, agent_id: &str, min_gap_seconds: u64) -> bool {
+    if is_idle(home, agent_id) {
+        return false;
+    }
+    let state = load_state(home, agent_id);
+    let gap_ms = (min_gap_seconds as i64) * 1000;
+    now_ms() - state.last_fired_ms >= gap_ms
+}
+
+/// Enqueue a proactive turn if the gate allows AND the agent has a paired chat to
+/// reach. Returns whether a turn was enqueued.
 fn maybe_fire(
     home: &MaturanaHome,
     agent_id: &str,
     session_id: &str,
     min_gap_seconds: u64,
+    directive: Option<&str>,
 ) -> anyhow::Result<bool> {
-    if is_idle(home, agent_id) {
+    if !should_fire(home, agent_id, min_gap_seconds) {
         return Ok(false);
     }
-    let mut state = load_state(home, agent_id);
-    let gap_ms = (min_gap_seconds as i64) * 1000;
-    if now_ms() - state.last_fired_ms < gap_ms {
+    // No paired outreach channel => no one to message => don't fire (and don't
+    // pile up undeliverable rows). Route the turn through the shared front door
+    // tagged for the REAL chat: a turn tagged "proactive" had its reply filtered
+    // out by every channel's delivery loop and never reached the user. Going
+    // through the front door also injects context (memory + recent conversation +
+    // graph), so the agent can actually find something worth saying instead of
+    // defaulting to silence with nothing to reference.
+    let Some(chat_id) = crate::channels::current_paired_telegram_chat_id(home, agent_id) else {
         return Ok(false);
-    }
-    let paths = session_paths(&home.agent_dir(agent_id), session_id);
-    ensure_session(&paths)?;
-    let prompt = proactive_prompt();
-    insert_inbound(
-        &paths,
+    };
+    let prompt = directive.map(str::to_string).unwrap_or_else(proactive_prompt);
+    crate::channels::enqueue_outreach_turn(
+        home,
+        agent_id,
+        session_id,
+        chat_id,
+        &prompt,
         "proactive",
-        "proactive",
-        &format!("proactive-{}", now_ms()),
-        None,
-        &serde_json::json!({ "text": prompt, "prompt": prompt }).to_string(),
+        serde_json::json!({}),
     )?;
+    let mut state = load_state(home, agent_id);
     state.last_fired_ms = now_ms();
     save_state(home, agent_id, &state)?;
     append_event(
@@ -187,10 +211,18 @@ mod tests {
         let home = MaturanaHome::new(temp.join(".maturana"));
         std::fs::create_dir_all(home.agent_dir("a")).unwrap();
 
-        // First fire allowed (no prior state).
-        assert!(maybe_fire(&home, "a", "telegram-main", 7200).unwrap());
-        // Immediately after, the gap blocks a second fire.
-        assert!(!maybe_fire(&home, "a", "telegram-main", 7200).unwrap());
+        // Gap elapsed (no prior fire) => the gate opens.
+        assert!(should_fire(&home, "a", 7200));
+        // Record a fire just now => the anti-nag gap closes the gate.
+        save_state(
+            &home,
+            "a",
+            &ProactiveState {
+                last_fired_ms: now_ms(),
+            },
+        )
+        .unwrap();
+        assert!(!should_fire(&home, "a", 7200));
 
         // Idle suppresses firing even with the gap elapsed.
         std::fs::write(
@@ -198,7 +230,7 @@ mod tests {
             "{\"idle\":true}",
         )
         .unwrap();
-        assert!(!maybe_fire(&home, "a", "telegram-main", 0).unwrap());
+        assert!(!should_fire(&home, "a", 0));
 
         let _ = std::fs::remove_dir_all(&temp);
     }
