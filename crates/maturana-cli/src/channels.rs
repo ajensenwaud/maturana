@@ -4579,22 +4579,52 @@ fn stream_turn_to_telegram(
     let mut last_typing = started
         .checked_sub(Duration::from_secs(10))
         .unwrap_or(started);
-    loop {
-        // Per-iteration timing so a stall (DB lock, hung HTTP) is pinpointed in the
-        // journal instead of silently freezing the clock.
-        let t_list = std::time::Instant::now();
-        // Final reply ready? Tolerate a transient DB read so a hiccup never leaves
-        // the live spinner orphaned — just keep animating and re-check next tick.
-        let final_msg = match list_undelivered(paths) {
-            Ok(list) => list.into_iter().find(|m| {
-                m.channel == "telegram" && m.in_reply_to.as_deref() == Some(inbound_id)
-            }),
-            Err(error) => {
-                eprintln!("telegram: list_undelivered failed (retrying): {error:#}");
-                None
+    // Reply detection runs on a BACKGROUND thread, NOT in this loop. `list_undelivered`
+    // opens two SQLite connections and occasionally spikes to ~2.5s; doing it every
+    // tick made the live clock jump in multi-second steps. The watcher polls for the
+    // reply and hands it over via a channel, so the loop below only does the ~1s
+    // editMessageText and the counter ticks like a stopwatch. The watcher only
+    // DETECTS the reply — the loop still claims + finalizes it — so there is no
+    // double-delivery.
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let watcher_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let paths = paths.clone();
+        let inbound_id = inbound_id.to_string();
+        let stop = watcher_stop.clone();
+        thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match list_undelivered(&paths) {
+                    Ok(list) => {
+                        if let Some(m) = list.into_iter().find(|m| {
+                            m.channel == "telegram"
+                                && m.in_reply_to.as_deref() == Some(inbound_id.as_str())
+                        }) {
+                            let _ = reply_tx.send(m);
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("telegram: reply watcher list failed (retrying): {error:#}")
+                    }
+                }
+                thread::sleep(Duration::from_millis(1000));
             }
-        };
-        let list_ms = t_list.elapsed().as_millis();
+        });
+    }
+    // Stop the watcher on EVERY return path (including `?` early-returns) so the
+    // detached thread doesn't keep polling a finished turn.
+    struct StopGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for StopGuard {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let _stop_guard = StopGuard(watcher_stop.clone());
+    loop {
+        // Reply ready? A cheap, non-blocking check of the background watcher's
+        // channel — never the multi-second DB read, so the counter is never stalled.
+        let final_msg = reply_rx.try_recv().ok();
         if let Some(final_msg) = final_msg {
             // Lost the claim → the delivery thread owns delivery and will edit the
             // live message (via the marker) into the answer. Just drop our state.
@@ -4751,12 +4781,10 @@ fn stream_turn_to_telegram(
         }
         let edit_ms = t_edit.elapsed().as_millis();
         // Surface any per-step stall (>800ms) so a jumpy/frozen clock is explained
-        // in the journal instead of being invisible. With WAL reads + the keep-alive
-        // edit agent these should all be well under this.
-        if list_ms > 800 || prog_ms > 800 || edit_ms > 800 {
-            eprintln!(
-                "telegram loop slow @ {clock}: list={list_ms}ms progress={prog_ms}ms edit={edit_ms}ms"
-            );
+        // in the journal instead of being invisible. The DB read is off this loop
+        // now (background watcher), so the only blocking step left is the edit.
+        if prog_ms > 800 || edit_ms > 800 {
+            eprintln!("telegram loop slow @ {clock}: progress={prog_ms}ms edit={edit_ms}ms");
         }
         if std::time::Instant::now() >= deadline {
             // Gave up waiting; leave the (undelivered) reply to the delivery thread,
