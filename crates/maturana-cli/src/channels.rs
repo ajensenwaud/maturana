@@ -4777,7 +4777,12 @@ fn stream_turn_to_telegram(
                     }
                 }
             }
-            next_edit_at = std::time::Instant::now() + edit_interval;
+            // Schedule the next edit from when THIS one STARTED (t_edit), not from
+            // now (after it). editMessageText takes ~1s, so `now() + interval`
+            // double-counted the edit duration → effective 2s ticks. Start-to-start
+            // means the cadence is max(interval, edit_duration) ≈ 1s, so the clock
+            // advances ~1s/step like a stopwatch.
+            next_edit_at = t_edit + edit_interval;
         }
         let edit_ms = t_edit.elapsed().as_millis();
         // Surface any per-step stall (>800ms) so a jumpy/frozen clock is explained
@@ -4791,8 +4796,14 @@ fn stream_turn_to_telegram(
             // which will edit this same live message via the marker.
             return Ok(());
         }
-        // Short sleep so the ~1s counter cadence isn't bounded by the poll period.
-        thread::sleep(Duration::from_millis(400));
+        // Sleep only until the next edit is due — not a fixed poll. When an edit
+        // just landed the next is due ~immediately (the ~1s edit IS the cadence),
+        // so the counter ticks ~1s; clamped to [100ms, 500ms] so we never busy-spin
+        // and the background reply is still picked up promptly.
+        let nap = next_edit_at
+            .saturating_duration_since(std::time::Instant::now())
+            .clamp(Duration::from_millis(100), Duration::from_millis(500));
+        thread::sleep(nap);
     }
 }
 
