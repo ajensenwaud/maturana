@@ -33,6 +33,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/agents/:id/restart", post(agents::restart))
         .route("/api/agents/:id/files", get(agents::files))
         .route("/api/agents/:id/files/read", get(agents::file_read))
+        .route("/api/agents/:id/files/write", post(agents::file_write))
         .route("/api/agents/:id/spec", get(agents::spec_get).put(agents::spec_put))
         .route("/api/agents/:id/spec/validate", post(agents::spec_validate))
         .route("/api/agents/:id/apply", post(agents::apply))

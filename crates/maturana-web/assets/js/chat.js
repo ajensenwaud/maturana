@@ -140,10 +140,13 @@ export class Chat {
 
     main.append(this.headerEl, this.threadEl, composer);
 
-    // ---- right: agent files (host-side, read-only) ----
+    // ---- right: agent files (host-side; prose docs are editable) ----
     this.filesEl = elem("div", "chat-files");
     const filesHead = elem("div", "chat-files-head");
-    filesHead.append(elem("div", "chat-side-title", "Agent files"));
+    const newFileBtn = elem("button", "file-new-btn", "＋");
+    newFileBtn.title = "New document (e.g. SOUL.md)";
+    newFileBtn.addEventListener("click", () => { const a = this.current?.agent_id; if (a) this.newFile(a); });
+    filesHead.append(elem("div", "chat-side-title", "Agent files"), newFileBtn);
     this.filesList = elem("div", "chat-files-list");
     this.filesEl.append(filesHead, this.filesList);
 
@@ -269,29 +272,91 @@ export class Chat {
     }
   }
 
-  async viewFile(agentId, path) {
+  async viewFile(agentId, path, opts = {}) {
+    const create = !!opts.create;
+    // The spec (MATURANA.md) and the machine-written status file are not edited
+    // through this generic editor — the spec has its own validated flow.
+    const editable = !/(^|\/)(MATURANA\.md|worker-status\.json)$/.test(path);
+
     const overlay = elem("div", "file-overlay");
     const card = elem("div", "file-card");
     const head = elem("div", "file-card-head");
-    const closeBtn = elem("button", "primary", "close");
+    const actions = elem("div", "file-card-actions");
+    const status = elem("span", "file-card-status");
+    const saveBtn = elem("button", "primary", "Save");
+    const closeBtn = elem("button", "primary", "Close");
     closeBtn.addEventListener("click", () => overlay.remove());
-    head.append(elem("div", "chat-title", path), closeBtn);
-    const body = elem("pre", "file-card-body", "loading…");
+    if (editable) actions.append(status, saveBtn);
+    actions.append(closeBtn);
+    head.append(elem("div", "chat-title", path), actions);
+
+    let body;
+    if (editable) {
+      body = elem("textarea", "file-edit");
+      body.spellcheck = false;
+      if (!create) { body.value = "loading…"; body.disabled = true; }
+    } else {
+      body = elem("pre", "file-card-body", "loading…");
+    }
     card.append(head, body);
     overlay.append(card);
     overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
     document.body.append(overlay);
-    try {
-      const data = await api(`/api/agents/${agentId}/files/read?path=${encodeURIComponent(path)}`);
-      body.textContent = data.text || "(empty)";
-    } catch (e) {
-      body.textContent = String(e);
+
+    if (!create) {
+      try {
+        const data = await api(`/api/agents/${agentId}/files/read?path=${encodeURIComponent(path)}`);
+        if (editable) { body.value = data.text || ""; body.disabled = false; }
+        else body.textContent = data.text || "(empty)";
+      } catch (e) {
+        if (editable) { body.value = ""; body.disabled = false; status.textContent = String(e); status.className = "file-card-status bad"; }
+        else body.textContent = String(e);
+      }
     }
+    if (!editable) return;
+
+    body.focus();
+    const save = async () => {
+      saveBtn.disabled = true;
+      status.textContent = "saving…"; status.className = "file-card-status";
+      try {
+        const res = await api(`/api/agents/${agentId}/files/write`, {
+          method: "POST",
+          body: JSON.stringify({ path, text: body.value }),
+        });
+        status.textContent = `saved · ${res.size} bytes`; status.className = "file-card-status ok";
+        this.loadFiles(agentId); // refresh sizes; a newly-created file appears in the list
+      } catch (e) {
+        status.textContent = `save failed: ${e}`; status.className = "file-card-status bad";
+      } finally {
+        saveBtn.disabled = false;
+      }
+    };
+    saveBtn.addEventListener("click", save);
+    body.addEventListener("keydown", (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); save(); }
+    });
+  }
+
+  // Create a new host-side document (e.g. SOUL.md) — opens the editor empty; the
+  // file is written on first Save (the backend confirms it's a safe doc path).
+  newFile(agentId) {
+    const name = (prompt("New document filename (e.g. SOUL.md):", "SOUL.md") || "").trim();
+    if (!name) return;
+    if (/[\\/]/.test(name)) { alert("Use a plain filename (no folders)."); return; }
+    if (!/\.(md|txt|json|yaml|yml|toml|csv|log)$/i.test(name)) {
+      alert("Use a .md / .txt / .json / .yaml / .toml / .csv / .log filename.");
+      return;
+    }
+    this.viewFile(agentId, name, { create: true });
   }
 
   send() {
     const text = this.input.value.trim();
     if (!text || !this.current) return;
+    // /clear and /new reset the conversation — wipe the visible thread right away;
+    // the server resets context and streams back a confirmation into the cleared view.
+    const isReset = /^\/(clear|new)\b/i.test(text);
     this.appendMessage("user", text, new Date().toISOString(), null);
     this.scrollDown();
     this.socket.send({
@@ -303,7 +368,13 @@ export class Chat {
     this.input.value = "";
     this.closeSlash();
     this.autoGrow();
-    this.showTyping();
+    if (isReset) {
+      this.hideTyping();
+      this.seen = new Set();
+      this.threadEl.replaceChildren(elem("div", "chat-empty", "Conversation cleared."));
+    } else {
+      this.showTyping();
+    }
   }
 
   // Animated "responding…" indicator — three pulsing dots in an agent bubble,

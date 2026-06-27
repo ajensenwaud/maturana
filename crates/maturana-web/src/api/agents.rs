@@ -380,6 +380,72 @@ pub async fn file_read(
     }
 }
 
+/// Documents the generic file editor must NOT write: the spec has its own
+/// validated edit flow (Agents panel), and worker-status.json is machine-written.
+const NO_DIRECT_EDIT: &[&str] = &["MATURANA.md", "worker-status.json"];
+
+#[derive(serde::Deserialize)]
+pub struct FileWriteBody {
+    path: String,
+    text: String,
+}
+
+/// Write one editable text document under the agent's host directory (e.g.
+/// AGENTS.md, SOUL.md, IDENTITY.md, notes). Guards mirror `file_read` — no
+/// traversal, must be a browsable document (default-deny secrets), stays within
+/// the dir — plus: refuse the spec + machine files, and cap the size. Creating a
+/// new top-level doc is allowed (its parent is the agent dir, which already
+/// exists and canonicalizes inside the base).
+pub async fn file_write(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<FileWriteBody>,
+) -> Response {
+    check_id!(id);
+    let dir = home(&state).agent_dir(&id);
+    let rel = body.path.clone();
+    let text = body.text;
+    match blocking(move || {
+        if rel.is_empty() || rel.contains("..") || rel.starts_with('/') || rel.starts_with('\\') {
+            anyhow::bail!("invalid path");
+        }
+        // Default-deny: same gate as reading — only browsable docs, never secrets.
+        if !is_browsable_rel(&rel) {
+            anyhow::bail!("not an editable document");
+        }
+        let name = rel.rsplit('/').next().unwrap_or(&rel);
+        if NO_DIRECT_EDIT.contains(&name) {
+            anyhow::bail!("{name} is edited from the Agents panel, not here");
+        }
+        if text.len() > 512 * 1024 {
+            anyhow::bail!("content too large ({} bytes)", text.len());
+        }
+        let base = dir.canonicalize()?;
+        let target = dir.join(&rel);
+        // Existing file → canonicalize it; new file → canonicalize its parent.
+        // Either resolved path must stay inside the agent dir (no symlink escape).
+        let probe = if target.exists() {
+            target.clone()
+        } else {
+            target.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| dir.clone())
+        };
+        let canon = probe.canonicalize()?;
+        if !canon.starts_with(&base) {
+            anyhow::bail!("path escapes the agent directory");
+        }
+        if target.is_dir() {
+            anyhow::bail!("that is a directory");
+        }
+        std::fs::write(&target, text.as_bytes())?;
+        Ok(serde_json::json!({ "path": rel, "written": true, "size": text.len() }))
+    })
+    .await
+    {
+        Ok(data) => ok(data),
+        Err(response) => response,
+    }
+}
+
 #[derive(serde::Deserialize)]
 pub struct CreateBody {
     id: String,
@@ -1005,6 +1071,29 @@ body text stays put
         // The user-facing identity/contract docs stay browsable.
         for allow in ["MATURANA.md", "AGENTS.md", "IDENTITY.md", "worker-status.json"] {
             assert!(is_browsable_rel(allow), "should ALLOW {allow}");
+        }
+    }
+
+    #[test]
+    fn file_write_allows_prose_docs_denies_spec_and_secrets() {
+        // The generic editor may write prose docs (AGENTS.md, SOUL.md, …) but never
+        // the validated spec, machine files, or anything the read guard denies.
+        let editable = |rel: &str| {
+            let name = rel.rsplit('/').next().unwrap_or(rel);
+            is_browsable_rel(rel) && !NO_DIRECT_EDIT.contains(&name)
+        };
+        for ok in ["AGENTS.md", "SOUL.md", "IDENTITY.md", "notes/todo.md"] {
+            assert!(editable(ok), "should allow editing {ok}");
+        }
+        for deny in [
+            "MATURANA.md",
+            "worker-status.json",
+            "state/sessiond.env",
+            ".ssh/id_rsa",
+            "secrets/x.json",
+            "host-auth/codex/auth.json",
+        ] {
+            assert!(!editable(deny), "should refuse editing {deny}");
         }
     }
 }
