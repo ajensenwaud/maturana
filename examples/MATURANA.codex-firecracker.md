@@ -32,6 +32,9 @@ network:
     - api.openai.com
     - chatgpt.com
     - github.com
+  proxy:
+    enabled: true
+    bind: 172.30.10.1:47833
 memory:
   wiki_path: .maturana/wiki
   agent_memory_path: .maturana/agents/codex-firecracker/memory

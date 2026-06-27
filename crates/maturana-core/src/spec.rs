@@ -548,6 +548,49 @@ mod tests {
     }
 
     #[test]
+    fn proxy_block_survives_markdown_round_trip() {
+        // Egress-proxy outage class: a spec with `network.proxy` must round-trip
+        // through to_maturana_markdown -> from_maturana_markdown WITHOUT losing the
+        // block (Network::proxy has no `skip_serializing_if`). If this regresses, a
+        // regenerated spec silently drops the proxy and the guest gets ConnectionRefused.
+        let yaml = r#"
+identity: { id: fc, name: FC, purpose: Firecracker agent with a bounded policy. }
+runtime: { harness: claude-code }
+vm:
+  provider: firecracker
+  guest_os: linux
+  firecracker:
+    kernel_image: img/vmlinux.bin
+    rootfs_image: img/rootfs.ext4
+    tap_name: tap-mat-fc
+    host_ip: 172.30.10.9
+    guest_ip: 172.30.10.10
+    guest_mac: AA:FC:00:00:10:03
+network:
+  egress_allowlist: [api.anthropic.com]
+  proxy:
+    enabled: true
+    bind: 172.30.10.9:47833
+"#;
+        let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
+        let markdown = spec.to_maturana_markdown().unwrap();
+        assert!(
+            markdown.contains("proxy:") && markdown.contains("172.30.10.9:47833"),
+            "serialized spec must keep the proxy block:\n{markdown}"
+        );
+        let tmp = std::env::temp_dir().join(format!("mat-spec-rt-{}.md", std::process::id()));
+        std::fs::write(&tmp, &markdown).unwrap();
+        let reparsed = AgentSpec::from_maturana_markdown(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        let proxy = reparsed
+            .network
+            .proxy
+            .expect("proxy block must survive the markdown round-trip");
+        assert!(proxy.enabled);
+        assert_eq!(proxy.bind, "172.30.10.9:47833");
+    }
+
+    #[test]
     fn mcp_servers_parse_stdio_and_http() {
         let yaml = r#"
 identity: { id: demo, name: Demo, purpose: Test agent for MCP. }
