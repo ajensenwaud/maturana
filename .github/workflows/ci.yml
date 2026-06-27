@@ -1,0 +1,57 @@
+name: ci
+
+# The test gate that was missing: build + test the whole workspace on every PR
+# and every push to main, so a human never has to be the one who remembers to run
+# `cargo test` before a release. Mirrors the release build (`--locked`) so a
+# Cargo.lock drift fails here, not at tag time.
+#
+# `test` is REQUIRED (it fails the run). `lint` (rustfmt + clippy) is advisory —
+# it runs and reports but does not block, because the tree isn't fully
+# rustfmt-clean yet; tighten it to required once it is.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (locked, like the release)
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  lint:
+    runs-on: ubuntu-22.04
+    # Advisory only: surfaces fmt/clippy drift without blocking the merge until the
+    # tree is clean. Flip `continue-on-error` to false (or delete it) to enforce.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + components
+        run: rustup toolchain install stable --profile minimal --component rustfmt clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets
