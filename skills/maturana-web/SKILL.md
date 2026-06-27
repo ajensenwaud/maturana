@@ -60,13 +60,14 @@ maturana web --bind 127.0.0.1:47836
 maturana service install web
 ```
 
-The cockpit's left-nav exposes: **Console** (drive a turn; tool-call cards),
-**Agents** (fleet; spec validate → dry-run → apply, stop, inspect), **Config**
-(edit schedules/MCP/channels/skills — validated), **System** (host stats, logs,
-activity), **Sessions** (transcripts, search, export, prune, send a message),
-**Graph** (GraphRAG + ingest), **Pipelock** (secret names; set/delete — values
-never sent to the browser), **Egress** (live allow/deny + approve), **Runtime**
-(supervisor + ops: restart plane, backup), **Tools**, **Skills**.
+The cockpit's left-nav exposes (in order): **Overview** (fleet + plane at a
+glance), **Chat** (talk to an agent), **Agents** (fleet; spec validate → dry-run
+→ apply, stop, inspect, and edit config — schedules/MCP/channels, validated),
+**Sessions** (transcripts, search, export, prune, send a message), **Graph**
+(GraphRAG + ingest), **Egress** (live allow/deny + approve), **Pipelock** (secret
+names; set/delete — values never sent to the browser), **Tools**, **Skills**
+(view/create), **System** (host stats, logs, activity, plane lifecycle + ops:
+restart plane, backup), **Console** (drive a turn; tool-call cards).
 
 ## Evidence
 
