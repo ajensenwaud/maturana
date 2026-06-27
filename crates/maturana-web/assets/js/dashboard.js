@@ -27,7 +27,7 @@ function el(tag, className, text) {
 
 function section(title) {
   const wrap = el("div", "dash-section");
-  wrap.append(el("div", "label dash-title", title));
+  wrap.append(el("div", "dash-title", title));
   return wrap;
 }
 
@@ -291,23 +291,58 @@ export async function renderSystem(panel, socket) {
 
   // Logs (source dropdown + optional auto-tail).
   const logWrap = section("Logs");
-  logWrap.append(desc("Tail the plane/web/fleet units or any agent's egress audit log. Toggle auto-tail to follow live."));
+  logWrap.append(desc("Tail the plane/web/fleet units or any agent's egress audit log. JSON lines render as readable rows — time, action, message; toggle Raw for the verbatim text, auto-tail to follow live."));
   const controls = el("div", "dash-actions");
   const sourceSel = el("select", "model-input");
   const linesInput = el("input", "model-input");
   linesInput.type = "number";
   linesInput.value = "200";
   linesInput.style.width = "90px";
+  const logView = el("div", "log-view");
   const logPre = el("pre", "dash-json");
-  logPre.style.maxHeight = "42vh";
-  logPre.style.overflow = "auto";
+  logPre.style.display = "none";
+  // Parse each line as JSON → a readable row; non-JSON (journalctl) passes through.
+  const renderLogLines = (text) => {
+    logView.replaceChildren();
+    const lines = (text || "").split("\n").filter((l) => l.trim());
+    if (!lines.length) { logView.append(el("div", "panel-desc", "(empty)")); return; }
+    for (const line of lines) {
+      let obj = null;
+      try { obj = JSON.parse(line); } catch {}
+      if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+        const row = el("div", "log-row");
+        const ts = obj.at || obj.timestamp || obj.time || "";
+        const tstr = typeof ts === "string" && ts.length >= 19 ? ts.slice(11, 19) : String(ts).slice(0, 8);
+        row.append(el("span", "log-time", tstr));
+        const action = obj.action || obj.level || obj.kind || "";
+        const bad = /deny|denied|error|fail|block|warn/i.test(`${action} ${obj.reason || ""}`);
+        if (action) row.append(badge(String(action), bad ? "bad" : "good"));
+        const msg = obj.message || obj.msg || [obj.method, obj.host, obj.target].filter(Boolean).join(" ") || "";
+        row.append(el("span", "log-msg", msg));
+        const skip = new Set(["at", "timestamp", "time", "action", "level", "kind", "message", "msg", "method", "host", "target"]);
+        const extra = Object.entries(obj)
+          .filter(([k, v]) => !skip.has(k) && v != null && v !== "" && typeof v !== "object")
+          .map(([k, v]) => `${k}=${v}`)
+          .join("  ");
+        if (extra) row.append(el("span", "log-extra", extra));
+        logView.append(row);
+      } else {
+        logView.append(el("div", "log-row log-plain", line));
+      }
+    }
+    logView.scrollTop = logView.scrollHeight;
+  };
+  let rawOn = false;
+  let lastText = "";
   const loadLog = async () => {
     try {
       const d = await api(`/api/system/logs?source=${encodeURIComponent(sourceSel.value)}&lines=${encodeURIComponent(linesInput.value || 200)}`);
-      logPre.textContent = d.text || "(empty)";
+      lastText = d.text || "";
+      renderLogLines(lastText);
+      logPre.textContent = lastText || "(empty)";
       logPre.scrollTop = logPre.scrollHeight;
     } catch (error) {
-      logPre.textContent = String(error);
+      logView.replaceChildren(el("div", "status-bad", String(error)));
     }
   };
   try {
@@ -323,12 +358,21 @@ export async function renderSystem(panel, socket) {
     sourceSel.append(o);
   }
   sourceSel.addEventListener("change", loadLog);
+  const rawChk = el("input");
+  rawChk.type = "checkbox";
+  const rawLabel = el("label", "label");
+  rawLabel.append(rawChk, document.createTextNode(" raw"));
+  rawChk.addEventListener("change", () => {
+    rawOn = rawChk.checked;
+    logPre.style.display = rawOn ? "" : "none";
+    logView.style.display = rawOn ? "none" : "";
+  });
   const tailChk = el("input");
   tailChk.type = "checkbox";
   const tailLabel = el("label", "label");
   tailLabel.append(tailChk, document.createTextNode(" auto-tail"));
-  controls.append(sourceSel, linesInput, button("refresh", loadLog), tailLabel);
-  logWrap.append(controls, logPre);
+  controls.append(sourceSel, linesInput, button("refresh", loadLog), rawLabel, tailLabel);
+  logWrap.append(controls, logView, logPre);
   await loadLog();
   const logTimer = setInterval(() => {
     if (!panel.contains(logWrap)) { clearInterval(logTimer); return; }
@@ -843,10 +887,17 @@ export async function renderGraph(panel) {
   queryRow.append(terms, button("query", runQuery));
 
   const uploadRow = el("div", "dash-actions");
-  const file = el("input");
+  const file = el("input", "file-input");
   file.type = "file";
+  file.id = "graph-file";
+  const pickLabel = el("label", "file-pick", "Choose file");
+  pickLabel.htmlFor = "graph-file";
+  const fileName = el("span", "file-name", "no file selected");
+  file.addEventListener("change", () => { fileName.textContent = file.files?.[0]?.name || "no file selected"; });
   uploadRow.append(
+    pickLabel,
     file,
+    fileName,
     button("ingest", async () => {
       const picked = file.files?.[0];
       if (!picked) return;
@@ -927,7 +978,8 @@ export async function renderPipelock(panel) {
 export async function renderTools(panel) {
   const wrap = section("Tools");
   wrap.append(desc("What each agent can actually do — its tools, skills, MCP servers, and opt-in capabilities, read from each agent's spec. Edit these per agent under Agents → config."));
-  const body = el("div", "label", "[ loading… ]");
+  const body = el("div");
+  body.append(el("div", "panel-desc", "loading…"));
   wrap.append(body);
   panel.replaceChildren(wrap);
   try {

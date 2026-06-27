@@ -55,6 +55,77 @@ function fmtTime(iso) {
   return isNaN(d) ? "" : d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 
+// Humanize a session_id into the channel it represents, so the conversation
+// list distinguishes the same agent's Telegram vs Web threads instead of
+// showing the agent id twice.
+function channelLabel(sessionId) {
+  const s = String(sessionId || "");
+  if (s.startsWith("telegram")) return "Telegram";
+  if (s.startsWith("web")) return "Web";
+  if (s.startsWith("discord")) return "Discord";
+  if (s.startsWith("slack")) return "Slack";
+  if (s.startsWith("agentmail")) return "Mail";
+  if (s.startsWith("orch-")) return "Orchestrator";
+  if (s.endsWith("-main")) return "Main";
+  return s;
+}
+
+// A centered, styled picker dialog (replaces window.prompt for choosing one of a
+// known set — new chat, /model). items: [{title, sub, value}].
+function pickerDialog(title, sub, items, onPick) {
+  const overlay = elem("div", "pick-overlay");
+  const card = elem("div", "pick-card");
+  const head = elem("div", "pick-head");
+  head.append(elem("div", "pick-title", title));
+  if (sub) head.append(elem("div", "pick-sub", sub));
+  const list = elem("div", "pick-list");
+  const close = () => { overlay.remove(); document.removeEventListener("keydown", onKey); };
+  function onKey(e) { if (e.key === "Escape") close(); }
+  for (const it of items) {
+    const row = elem("button", "pick-row");
+    row.append(elem("span", "pick-row-title", it.title));
+    if (it.sub) row.append(elem("span", "pick-row-sub", it.sub));
+    row.addEventListener("click", () => { close(); onPick(it.value); });
+    list.append(row);
+  }
+  if (!items.length) list.append(elem("div", "pick-sub", "nothing to choose"));
+  card.append(head, list);
+  overlay.append(card);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  document.addEventListener("keydown", onKey);
+  document.body.append(overlay);
+}
+
+// A small styled text-input dialog (replaces window.prompt for free text).
+function promptDialog(title, sub, initial, onSubmit) {
+  const overlay = elem("div", "pick-overlay");
+  const card = elem("div", "pick-card");
+  const head = elem("div", "pick-head");
+  head.append(elem("div", "pick-title", title));
+  if (sub) head.append(elem("div", "pick-sub", sub));
+  const body = elem("div", "pick-prompt");
+  const input = elem("input", "model-input");
+  input.value = initial || "";
+  input.placeholder = "name (leave empty to clear)";
+  const actions = elem("div", "pick-actions");
+  const save = elem("button", "primary", "Save");
+  const cancel = elem("button", "primary ghost", "Cancel");
+  const close = () => overlay.remove();
+  save.addEventListener("click", () => { close(); onSubmit(input.value); });
+  cancel.addEventListener("click", close);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { close(); onSubmit(input.value); }
+    if (e.key === "Escape") close();
+  });
+  actions.append(save, cancel);
+  body.append(input, actions);
+  card.append(head, body);
+  overlay.append(card);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  document.body.append(overlay);
+  setTimeout(() => input.focus(), 30);
+}
+
 function textFromContent(content) {
   if (content == null) return "";
   if (typeof content !== "string") return JSON.stringify(content);
@@ -86,6 +157,24 @@ const SLASH_COMMANDS = [
   { c: "/bad", d: "mark the last reply bad" },
 ];
 
+// Per-harness model quick-picks for the /model selector. The worker accepts any
+// id via "/model <id>" (the Custom… row), these are the common ones — parity
+// with the inline model keyboard on Telegram.
+const MODEL_CHOICES = {
+  codex: [{ title: "gpt-5.5", sub: "ChatGPT subscription", value: "gpt-5.5" }],
+  "claude-code": [
+    { title: "Opus", sub: "most capable", value: "opus" },
+    { title: "Sonnet", sub: "balanced", value: "sonnet" },
+    { title: "Haiku", sub: "fastest", value: "haiku" },
+  ],
+  opencode: [
+    { title: "Claude Sonnet 4.5", sub: "anthropic/claude-sonnet-4.5", value: "anthropic/claude-sonnet-4.5" },
+    { title: "GPT-5.5", sub: "openai/gpt-5.5", value: "openai/gpt-5.5" },
+    { title: "Gemini 2.5 Pro", sub: "google/gemini-2.5-pro", value: "google/gemini-2.5-pro" },
+    { title: "Llama 3.3 70B", sub: "meta-llama/llama-3.3-70b-instruct", value: "meta-llama/llama-3.3-70b-instruct" },
+  ],
+};
+
 export class Chat {
   constructor(socket) {
     this.socket = socket;
@@ -99,6 +188,9 @@ export class Chat {
   async mount(panel, agentId) {
     panel.replaceChildren();
     const wrap = elem("div", "chat");
+    this.wrapEl = wrap;
+    if (this.showFiles === undefined) this.showFiles = false;
+    wrap.classList.toggle("show-files", this.showFiles);
 
     // ---- left: conversation list ----
     const side = elem("div", "chat-side");
@@ -188,22 +280,51 @@ export class Chat {
       }
       row.append(
         elem("div", "chat-convo-title", title),
-        elem("div", "chat-convo-sub", `${c.agent_id} · ${fmtTime(c.last_active) || "no activity"}`),
+        elem("div", "chat-convo-sub", `${channelLabel(c.session_id)} · ${fmtTime(c.last_active) || "no activity"}`),
       );
       row.addEventListener("click", () => this.open(c));
+      row.addEventListener("dblclick", () => this.renameConvo(c));
       this.listEl.append(row);
     }
   }
 
   async newChat() {
-    const ids = this.agents.map((a) => a.agent_id);
-    if (!ids.length) { alert("No agents available."); return; }
-    const pick = ids.length === 1 ? ids[0] : prompt(`Chat with which agent?\n${ids.join(", ")}`, ids[0]);
-    if (!pick || !ids.includes(pick)) return;
-    // Route to the agent's existing conversation (its worker answers one session);
-    // if none exists yet, start its canonical "<id>-main".
-    const existing = this.convos.find((c) => c.agent_id === pick);
-    this.open(existing || { agent_id: pick, session_id: `${pick}-main`, fresh: true });
+    if (!this.agents.length) {
+      this.headerEl.replaceChildren(elem("div", "chat-empty", "No agents yet — launch one from the Agents panel."));
+      return;
+    }
+    // Styled in-app picker over the known agents (no native prompt()).
+    pickerDialog("New conversation", "Choose an agent to talk to", this.agents.map((a) => ({
+      title: a.name || a.agent_id,
+      sub: a.harness || a.provider || "",
+      value: a.agent_id,
+    })), (agentId) => {
+      const existing = this.convos.find((c) => c.agent_id === agentId);
+      this.open(existing || { agent_id: agentId, session_id: `${agentId}-main`, fresh: true });
+    });
+  }
+
+  // Rename a conversation via the existing label endpoint (non-destructive: the
+  // session_id stays the canonical key; an empty value clears the custom label).
+  async renameConvo(convo) {
+    const current = convo.label || "";
+    promptDialog("Rename conversation", `${convo.agent_id} · ${channelLabel(convo.session_id)}`, current, async (label) => {
+      try {
+        await api(`/api/sessions/${convo.agent_id}/${convo.session_id}/label`, {
+          method: "PUT",
+          body: JSON.stringify({ label: label.trim() }),
+        });
+        convo.label = label.trim();
+        const inMem = this.convos.find((c) => c.agent_id === convo.agent_id && c.session_id === convo.session_id);
+        if (inMem) inMem.label = label.trim();
+        this.drawList();
+        if (this.current && this.current.agent_id === convo.agent_id && this.current.session_id === convo.session_id) {
+          this.open(inMem || convo);
+        }
+      } catch (e) {
+        alert(`Rename failed: ${e}`);
+      }
+    });
   }
 
   async open(convo) {
@@ -213,11 +334,26 @@ export class Chat {
     const agent = this.agents.find((a) => a.agent_id === convo.agent_id);
     const worker = agent?.worker_status?.status ?? "—";
     const model = agent?.model ? ` · ${agent.model}` : "";
-    this.headerEl.replaceChildren(
-      elem("div", "chat-title", convo.label || convo.agent_id),
-      elem("div", "chat-subtitle", `${convo.session_id}${model} · worker ${worker}`),
+    const info = elem("div", "chat-header-info");
+    const titleRow = elem("div", "chat-title-row");
+    titleRow.append(elem("div", "chat-title", convo.label || convo.agent_id));
+    const renameBtn = elem("button", "chat-rename", "✎");
+    renameBtn.title = "Rename conversation";
+    renameBtn.addEventListener("click", () => this.renameConvo(convo));
+    titleRow.append(renameBtn);
+    info.append(
+      titleRow,
+      elem("div", "chat-subtitle", `${channelLabel(convo.session_id)} · ${convo.session_id}${model} · worker ${worker}`),
     );
-    this.loadFiles(convo.agent_id);
+    const filesToggle = elem("button", "chat-files-toggle" + (this.showFiles ? " on" : ""), "⌗ Files");
+    filesToggle.addEventListener("click", () => {
+      this.showFiles = !this.showFiles;
+      this.wrapEl.classList.toggle("show-files", this.showFiles);
+      filesToggle.classList.toggle("on", this.showFiles);
+      if (this.showFiles) this.loadFiles(convo.agent_id);
+    });
+    this.headerEl.replaceChildren(info, filesToggle);
+    if (this.showFiles) this.loadFiles(convo.agent_id);
     this.threadEl.replaceChildren(elem("div", "chat-empty", "loading…"));
     if (convo.fresh) { this.threadEl.replaceChildren(elem("div", "chat-empty", "Say hi to start the conversation.")); this.input.focus(); return; }
     try {
@@ -351,9 +487,38 @@ export class Chat {
     this.viewFile(agentId, name, { create: true });
   }
 
+  sendCommand(cmd) { this.input.value = cmd; this.send(); }
+
+  openModelPicker() {
+    const agent = this.agents.find((a) => a.agent_id === this.current?.agent_id);
+    const harness = agent?.harness || "codex";
+    const items = (MODEL_CHOICES[harness] || []).map((c) => ({ title: c.title, sub: c.sub, value: c.value }));
+    items.push({ title: "Custom…", sub: "enter a model id", value: "__custom__" });
+    pickerDialog(`Model · ${harness}`, "Switch the model for this agent", items, (val) => {
+      if (val === "__custom__") {
+        promptDialog("Custom model", "model id the harness accepts", "", (m) => { if (m.trim()) this.sendCommand(`/model ${m.trim()}`); });
+        return;
+      }
+      this.sendCommand(`/model ${val}`);
+    });
+  }
+
+  openReasoningPicker() {
+    const items = [
+      { title: "Low", sub: "fast, cheap", value: "low" },
+      { title: "Medium", sub: "balanced", value: "medium" },
+      { title: "High", sub: "deepest", value: "high" },
+    ];
+    pickerDialog("Reasoning effort", "Set the agent's reasoning effort", items, (val) => this.sendCommand(`/reasoning ${val}`));
+  }
+
   send() {
     const text = this.input.value.trim();
     if (!text || !this.current) return;
+    // Bare selector commands open a styled picker (parity with the Telegram
+    // inline keyboard) rather than sending the word as a message.
+    if (/^\/model$/i.test(text)) { this.input.value = ""; this.closeSlash(); this.openModelPicker(); return; }
+    if (/^\/reasoning$/i.test(text)) { this.input.value = ""; this.closeSlash(); this.openReasoningPicker(); return; }
     // /clear and /new reset the conversation — wipe the visible thread right away;
     // the server resets context and streams back a confirmation into the cleared view.
     const isReset = /^\/(clear|new)\b/i.test(text);
@@ -447,8 +612,10 @@ export class Chat {
 
   renderSlashMenu() {
     this.slashMenu.replaceChildren();
+    let selRow = null;
     this.slashItems.forEach((s, i) => {
       const row = elem("div", "slash-row" + (i === this.acIndex ? " sel" : ""));
+      if (i === this.acIndex) selRow = row;
       row.append(elem("span", "cmd", s.c), elem("span", "desc", s.d));
       // mousedown (not click) so it fires before the input's blur handler.
       row.addEventListener("mousedown", (e) => { e.preventDefault(); this.acIndex = i; this.acceptSlash(); });
@@ -457,6 +624,8 @@ export class Chat {
     const foot = elem("div", "slash-menu-foot");
     foot.innerHTML = "<kbd>Tab</kbd> complete · <kbd>↑</kbd><kbd>↓</kbd> move · <kbd>Esc</kbd> dismiss";
     this.slashMenu.append(foot);
+    // Keep the highlighted row visible as arrow-keys move past the scroll window.
+    if (selRow) selRow.scrollIntoView({ block: "nearest" });
   }
 
   closeSlash() {

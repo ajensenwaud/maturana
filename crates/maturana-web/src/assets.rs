@@ -21,6 +21,26 @@ pub async fn asset(UrlPath(path): UrlPath<String>) -> Response {
 }
 
 fn file_response(path: &str) -> Response {
+    // Dev ergonomics: in DEBUG builds, serve assets live from the on-disk crate
+    // dir so frontend edits show on reload without recompiling the binary. The
+    // release build (e.g. aidev) is unaffected — debug_assertions is off, so this
+    // block compiles out and assets are always served from the embedded copy.
+    #[cfg(debug_assertions)]
+    if !path.contains("..") {
+        let disk = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join(path);
+        if let Ok(bytes) = std::fs::read(&disk) {
+            return (
+                [
+                    (header::CONTENT_TYPE, content_type(path)),
+                    (header::CACHE_CONTROL, "no-store"),
+                ],
+                bytes,
+            )
+                .into_response();
+        }
+    }
     let Some(file) = ASSETS.get_file(path) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
