@@ -4041,6 +4041,13 @@ fn tg_api_base() -> String {
         .unwrap_or_else(|_| "https://api.telegram.org".to_string())
 }
 
+/// Hard ceiling on every Telegram HTTP call. ureq has NO default timeout, so
+/// without this a single hung request (a stalled egress proxy, a slow Telegram
+/// edit) blocks the synchronous progress loop indefinitely — which is exactly how
+/// the live "Thinking…" clock froze mid-turn with no error logged. With a ceiling,
+/// a slow call fails fast, the loop logs + retries, and the clock keeps ticking.
+const TG_HTTP_TIMEOUT: Duration = Duration::from_secs(12);
+
 fn send_telegram(
     token: &str,
     chat_id: &str,
@@ -4083,6 +4090,7 @@ fn send_telegram_with(
     }
     let response: TelegramSendResponse =
         ureq::post(&format!("{}/bot{token}/sendMessage", tg_api_base()))
+            .timeout(TG_HTTP_TIMEOUT)
             .set("content-type", "application/json")
             .send_string(&body.to_string())
             .map_err(|error| anyhow::anyhow!("Telegram sendMessage failed: {error}"))
@@ -4213,6 +4221,7 @@ fn send_telegram_chat_action(token: &str, chat_id: &str, action: &str) -> anyhow
         "{}/bot{token}/sendChatAction",
         tg_api_base()
     ))
+    .timeout(TG_HTTP_TIMEOUT)
     .set("content-type", "application/json")
     .send_string(&body.to_string())
     .map_err(|error| anyhow::anyhow!("Telegram sendChatAction failed: {error}"))
@@ -4475,6 +4484,9 @@ fn stream_turn_to_telegram(
         .checked_sub(Duration::from_secs(10))
         .unwrap_or(started);
     loop {
+        // Per-iteration timing so a stall (DB lock, hung HTTP) is pinpointed in the
+        // journal instead of silently freezing the clock.
+        let t_list = std::time::Instant::now();
         // Final reply ready? Tolerate a transient DB read so a hiccup never leaves
         // the live spinner orphaned — just keep animating and re-check next tick.
         let final_msg = match list_undelivered(paths) {
@@ -4486,6 +4498,7 @@ fn stream_turn_to_telegram(
                 None
             }
         };
+        let list_ms = t_list.elapsed().as_millis();
         if let Some(final_msg) = final_msg {
             // Lost the claim → the delivery thread owns delivery and will edit the
             // live message (via the marker) into the answer. Just drop our state.
@@ -4573,7 +4586,9 @@ fn stream_turn_to_telegram(
         // SECOND (the loop wakes ~every 900ms, so we push at most ~1 edit/sec — well
         // within Telegram's edit budget) instead of jumping in 10s steps, which read
         // as frozen. Real progress still appears the instant it arrives.
+        let t_prog = std::time::Instant::now();
         let progress = render_progress_html(&read_progress(paths, inbound_id).unwrap_or_default());
+        let prog_ms = t_prog.elapsed().as_millis();
         let secs = started.elapsed().as_secs();
         let clock = format!("{}:{:02}", secs / 60, secs % 60);
         let rendered = if progress.is_empty() {
@@ -4587,6 +4602,7 @@ fn stream_turn_to_telegram(
         };
         // Re-send when the content changed OR the previous update failed. Advance
         // last_render only on a landed update so a failure can't desync us.
+        let t_edit = std::time::Instant::now();
         if !rendered.is_empty() && (rendered != last_render || !last_edit_ok) {
             match message_id {
                 Some(id) => match edit_telegram_message_html(token, chat_id, id, &rendered) {
@@ -4616,6 +4632,14 @@ fn stream_turn_to_telegram(
                     }
                 }
             }
+        }
+        let edit_ms = t_edit.elapsed().as_millis();
+        // Surface any stall (>1.5s in a step) so a frozen clock is explained in the
+        // journal instead of being invisible.
+        if list_ms > 1500 || prog_ms > 1500 || edit_ms > 1500 {
+            eprintln!(
+                "telegram loop slow @ {clock}: list={list_ms}ms progress={prog_ms}ms edit={edit_ms}ms"
+            );
         }
         if std::time::Instant::now() >= deadline {
             // Gave up waiting; leave the (undelivered) reply to the delivery thread,
@@ -4799,6 +4823,7 @@ fn edit_telegram_message_with(
         "{}/bot{token}/editMessageText",
         tg_api_base()
     ))
+    .timeout(TG_HTTP_TIMEOUT)
     .set("content-type", "application/json")
     .send_string(&body.to_string())
     .map_err(|error| anyhow::anyhow!("Telegram editMessageText failed: {error}"))
@@ -4824,6 +4849,7 @@ fn delete_telegram_message(token: &str, chat_id: i64, message_id: i64) -> anyhow
         "{}/bot{token}/deleteMessage",
         tg_api_base()
     ))
+    .timeout(TG_HTTP_TIMEOUT)
     .set("content-type", "application/json")
     .send_string(&body.to_string())
     .map_err(|error| anyhow::anyhow!("Telegram deleteMessage failed: {error}"))
