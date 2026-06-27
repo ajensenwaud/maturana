@@ -4500,6 +4500,16 @@ fn clear_telegram_status(paths: &SessionPaths, inbound_id: &str) {
 /// then send a fresh copy — but if that delete cannot be confirmed, return `Err`
 /// WITHOUT sending, so a failed delete can never leave two messages in the chat.
 /// On `Err` the caller releases the claim and a later pass retries.
+/// Finish a turn the way the user asked for: deliver the answer as its OWN new
+/// message, then delete the live "Thinking…" bubble so Telegram plays its native
+/// particle-dissolve on it — the exact effect of manually deleting a message.
+/// (Editing the bubble into the answer, as we used to, morphs it in place and
+/// never triggers that animation, which is why the dissolve never appeared.)
+///
+/// Order is load-bearing: SEND first and propagate any failure, so the delivery
+/// claim is retried and the answer is never lost; then best-effort delete the
+/// indicator. A failed delete only leaves the (stale) indicator behind — it can
+/// never duplicate or drop the answer.
 fn finalize_reply(
     token: &str,
     chat_id: i64,
@@ -4507,69 +4517,12 @@ fn finalize_reply(
     reply: &str,
     reply_to: Option<i64>,
 ) -> anyhow::Result<Option<i64>> {
-    match live_id {
-        Some(id) => match edit_telegram_message(token, chat_id, id, reply) {
-            Ok(()) => Ok(Some(id)),
-            Err(edit_err) => {
-                delete_telegram_message(token, chat_id, id).map_err(|del_err| {
-                    anyhow::anyhow!(
-                        "edit failed ({edit_err}); refusing to send a duplicate because the stale live message could not be removed ({del_err})"
-                    )
-                })?;
-                send_telegram(token, &chat_id.to_string(), reply, reply_to)
-            }
-        },
-        None => send_telegram(token, &chat_id.to_string(), reply, reply_to),
+    let platform_id = send_telegram(token, &chat_id.to_string(), reply, reply_to)?;
+    if let Some(id) = live_id {
+        // Native dissolve. Best-effort: the answer is already out.
+        let _ = delete_telegram_message(token, chat_id, id);
     }
-}
-
-/// OpenClaw-style finish: rather than snapping the thinking/tool draft straight to
-/// the full answer, "flow" the answer into the SAME live message in a couple of
-/// growing chunks over ~0.4s — the way OpenClaw streams its preview into the reply.
-/// The caller then does the authoritative full edit (`finalize_reply`), so a
-/// dropped intermediate edit (e.g. a transient 429 from the short burst) never
-/// matters. Plain text, no parse mode, so cutting the answer mid-string can't break
-/// HTML, and short answers skip the reveal (one clean edit reads fine).
-fn reveal_answer(token: &str, chat_id: i64, id: i64, answer: &str) {
-    let chars: Vec<char> = answer.chars().collect();
-    let n = chars.len();
-    if n < 48 {
-        return;
-    }
-    for frac in [0.45_f32, 0.75] {
-        let take = ((n as f32 * frac) as usize).min(n);
-        let partial: String = chars[..take].iter().collect();
-        // Bounded agent: this runs right after a turn that may have been throttled,
-        // so a stalled chunk must fail in seconds (not block the real answer ~15s).
-        if !matches!(
-            edit_telegram_live(token, chat_id, id, &format!("{partial} …"), None),
-            LiveEditOutcome::Ok
-        ) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(180));
-    }
-}
-
-/// The "5000 pieces" dissolve: on completion, edit the thinking line into a
-/// Telegram NATIVE spoiler (`<tg-spoiler>`) so the client renders it as the
-/// dotted/particle effect before the answer replaces it. Telegram animates the
-/// dissolve on mobile/iOS; desktop shows static dotted text (a bot can mark a
-/// spoiler but can't force the reveal animation to auto-play — a client limit).
-/// Best-effort: a failed edit just means the answer lands without the flourish.
-fn spoiler_dissolve(token: &str, chat_id: i64, id: i64, elapsed: Duration) {
-    let secs = elapsed.as_secs();
-    let html = format!(
-        "<tg-spoiler>💭 Thinking… {}:{:02}</tg-spoiler>",
-        secs / 60,
-        secs % 60
-    );
-    if matches!(
-        edit_telegram_live_html(token, chat_id, id, &html),
-        LiveEditOutcome::Ok
-    ) {
-        thread::sleep(Duration::from_millis(800));
-    }
+    Ok(platform_id)
 }
 
 /// OpenClaw-style live progress for a turn: post ONE message immediately, tick a
@@ -4658,11 +4611,8 @@ fn stream_turn_to_telegram(
             // — a failed delete must never wedge the turn into an endless retry.
             if reply.trim() == crate::proactive::SILENCE_SENTINEL {
                 if let Some(id) = message_id {
-                    // Nothing worth saying — dissolve the indicator into spoiler
-                    // particles (only if Telegram is responsive), then remove it.
-                    if last_edit_ok {
-                        spoiler_dissolve(token, chat_id, id, started.elapsed());
-                    }
+                    // Nothing worth saying — delete the thinking bubble, which
+                    // plays Telegram's native particle-dissolve on it.
                     let _ = delete_telegram_message(token, chat_id, id);
                 }
                 clear_telegram_status(paths, inbound_id);
@@ -4670,22 +4620,9 @@ fn stream_turn_to_telegram(
                 let _ = clear_progress(paths, inbound_id);
                 return Ok(());
             }
-            // Dissolve the thinking indicator into Telegram's native spoiler
-            // particles (the "5000 pieces" effect), then flow the answer into the
-            // SAME message (OpenClaw-style) so it reads as the reply settling into
-            // place, THEN the authoritative full edit. finalize_reply still
-            // guarantees a failed edit never leaves two messages.
-            // Only play the cosmetic dissolve+reveal when Telegram is actually
-            // responsive (the last live edit landed). If we were being throttled,
-            // skip the flourish and go straight to delivering the answer — the
-            // user's reply matters more than the effect, and extra edits would only
-            // deepen the throttle and delay it.
-            if let Some(id) = message_id {
-                if last_edit_ok {
-                    spoiler_dissolve(token, chat_id, id, started.elapsed());
-                    reveal_answer(token, chat_id, id, &reply);
-                }
-            }
+            // Deliver the answer as its own message and dissolve the thinking
+            // bubble (finalize_reply sends, then deletes the live message → the
+            // native Telegram particle-dissolve the user asked for).
             match finalize_reply(token, chat_id, message_id, &reply, reply_to) {
                 Ok(platform_id) => {
                     // Finalize the claim (the row already exists from claim_delivery,
@@ -8306,68 +8243,50 @@ mod tests {
     }
 
     #[test]
-    fn answer_reveal_emits_clean_http_sequence_against_mock() {
-        // Drive the REAL Telegram send/edit code against a local mock and capture the
-        // exact HTTP for a completing turn: post the "Thinking" draft, flow the answer
-        // in (reveal), then finalize into the full answer. OpenClaw-style — the message
-        // streams into the reply in place, with NO dust/crumble frames.
+    fn finalize_sends_answer_then_dissolves_thinking_bubble() {
+        // The finish the user asked for: deliver the answer as its OWN new message,
+        // then DELETE the live "Thinking…" bubble so Telegram plays its native
+        // particle-dissolve on it (identical to manually deleting a message). The
+        // old in-place edit (morph) never triggered that animation — so the answer
+        // must be a fresh sendMessage and the bubble must be deleted, NOT edited.
         let (base, captured) = spawn_mock_telegram();
-        let answer =
-            "Three biggest stories: one, two, and three — with a short note on each and why it matters.";
-        with_tg_base(&base, || {
+        let answer = "Three biggest stories: one, two, and three with a short note on each.";
+        let returned = with_tg_base(&base, || {
             let id = send_telegram_html("TESTTOKEN", "123", "<pre>💭 Thinking… 0:08</pre>", None)
                 .unwrap()
                 .expect("draft message id");
-            assert_eq!(id, 4242);
-            reveal_answer("TESTTOKEN", 123, id, answer);
-            finalize_reply("TESTTOKEN", 123, Some(id), answer, None).unwrap();
+            finalize_reply("TESTTOKEN", 123, Some(id), answer, None).unwrap()
         });
 
         let reqs = captured.lock().unwrap().clone();
-        // 1 sendMessage (draft) + 2 editMessageText (reveal chunks) + 1 editMessageText (full answer).
-        assert_eq!(reqs.len(), 4, "unexpected request sequence:\n{}", reqs.join("\n--\n"));
+        // sendMessage(draft) + sendMessage(answer) + deleteMessage(draft).
+        assert_eq!(reqs.len(), 3, "unexpected sequence:\n{}", reqs.join("\n--\n"));
         assert!(reqs[0].contains("/sendMessage") && reqs[0].contains("Thinking"), "{}", reqs[0]);
-        // No dust ANYWHERE — the cheap crumble is gone for good.
-        assert!(reqs.iter().all(|r| !r.contains('·')), "no dust frames");
-        // The two reveal chunks are growing prefixes of the answer.
-        assert!(reqs[1].contains("/editMessageText") && reqs[2].contains("/editMessageText"));
-        assert!(reqs[1].len() < reqs[2].len(), "reveal should grow 1→2");
-        // The final edit carries the COMPLETE answer.
-        assert!(reqs[3].contains("/editMessageText") && reqs[3].contains("why it matters"), "{}", reqs[3]);
-    }
-
-    #[test]
-    fn spoiler_dissolve_emits_native_tg_spoiler_frame() {
-        // The "5000 pieces" dissolve must edit the live message to a real Telegram
-        // <tg-spoiler> so the client renders the particle effect.
-        let (base, captured) = spawn_mock_telegram();
-        with_tg_base(&base, || {
-            let id = send_telegram_html("TESTTOKEN", "123", "<pre>💭 Thinking… 0:05</pre>", None)
-                .unwrap()
-                .expect("draft id");
-            spoiler_dissolve("TESTTOKEN", 123, id, std::time::Duration::from_secs(5));
-        });
-        let reqs = captured.lock().unwrap().clone();
-        // draft sendMessage + one editMessageText carrying the native spoiler.
-        assert_eq!(reqs.len(), 2, "unexpected sequence:\n{}", reqs.join("\n--\n"));
-        assert!(reqs[1].contains("/editMessageText"), "{}", reqs[1]);
+        // The answer is its OWN new message, not an edit of the thinking bubble.
         assert!(
-            reqs[1].contains("tg-spoiler"),
-            "dissolve frame must use a native <tg-spoiler>: {}",
+            reqs[1].contains("/sendMessage") && reqs[1].contains("short note on each"),
+            "answer must be a fresh sendMessage: {}",
             reqs[1]
         );
-        assert!(reqs[1].contains("Thinking"), "{}", reqs[1]);
+        // The thinking bubble is DELETED (native dissolve) — never edited in place.
+        assert!(reqs[2].contains("/deleteMessage"), "thinking bubble must be deleted: {}", reqs[2]);
+        assert!(
+            reqs.iter().all(|r| !r.contains("/editMessageText")),
+            "no in-place edit — the bubble is deleted so Telegram dissolves it"
+        );
+        // finalize returns the NEW answer message's id.
+        assert_eq!(returned, Some(4242));
     }
 
     #[test]
-    fn live_loop_ticks_counter_on_cadence_then_reveals_answer() {
+    fn live_loop_ticks_counter_then_dissolves_into_answer() {
         // Drive the REAL stream_turn_to_telegram loop against the mock, with a worker
         // reply that lands after ~8s. Asserts the captured HTTP shows the counter
         // ADVANCING (≥2 distinct "💭 Thinking… 0:0X" frames — the old 10s-frozen bug
         // would emit only one) but NOT hammering Telegram (≤6 frames over the ~6s
-        // pre-reply window — the per-second edits that tripped flood control and
-        // caused the 15s freeze would emit far more), the answer revealed at the end,
-        // and NO dust anywhere. This exercises the LIVE behaviour, not just helpers.
+        // pre-reply window), then the FINISH the user asked for: the answer arrives as
+        // its own new sendMessage and the thinking bubble is DELETED (Telegram plays
+        // its native particle-dissolve), never edited in place.
         let (base, captured) = spawn_mock_telegram();
 
         let tmp = std::env::temp_dir().join(format!("mat-streamloop-{}", std::process::id()));
@@ -8390,7 +8309,7 @@ mod tests {
 
         // The worker's reply lands after ~8s so the counter advances across a few
         // cadence ticks (base 2.5s) before the answer arrives.
-        let answer = "Here is a reasonably long answer that should be revealed in two growing chunks before the final edit lands.";
+        let answer = "Here is a reasonably long answer delivered as its own message while the thinking bubble dissolves.";
         let paths_w = paths.clone();
         let reply_to = inbound_id.clone();
         let worker = std::thread::spawn(move || {
@@ -8445,12 +8364,19 @@ mod tests {
             thinking.len(),
             thinking.into_iter().collect::<Vec<_>>().join("\n--\n")
         );
-        // No dust anywhere — the dots are gone for good.
+        // No dust anywhere — the simulated dots/crumble are gone for good.
         assert!(reqs.iter().all(|r| !r.contains('·')), "no dust frames");
-        // The full answer was delivered into the live message.
+        // The answer was delivered as its OWN new message (sendMessage), not by
+        // editing the thinking bubble.
         assert!(
-            reqs.iter().any(|r| r.contains("before the final edit lands")),
-            "answer not delivered:\n{}",
+            reqs.iter().any(|r| r.contains("/sendMessage") && r.contains("its own message while the thinking bubble dissolves")),
+            "answer not delivered as a new message:\n{}",
+            reqs.join("\n--\n")
+        );
+        // And the thinking bubble was DELETED so Telegram dissolves it natively.
+        assert!(
+            reqs.iter().any(|r| r.contains("/deleteMessage")),
+            "thinking bubble was not deleted (no native dissolve):\n{}",
             reqs.join("\n--\n")
         );
     }
