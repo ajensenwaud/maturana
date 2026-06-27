@@ -54,6 +54,36 @@ pub fn validate_spec(spec: &AgentSpec) -> ValidationReport {
                         .to_string(),
                 );
             }
+            // A Firecracker guest's egress is proxy-routed: the worker bakes
+            // HTTP_PROXY=<host_ip>:47833 into the guest, and the host plane only
+            // launches that proxy when `network.proxy.enabled` is set. A spec that
+            // declares egress (an allowlist or allow-all) but omits/disables the
+            // proxy can't enforce that egress AND leaves a proxy-provisioned guest
+            // hitting a dead port → "ConnectionRefused" on every turn (this is
+            // exactly how claude/codex broke when their `network.proxy` block went
+            // missing). Refuse it loudly instead of shipping a silently-broken agent.
+            let declares_egress =
+                !spec.network.egress_allowlist.is_empty() || spec.network.egress_allow_all;
+            let proxy_on = spec
+                .network
+                .proxy
+                .as_ref()
+                .map(|proxy| proxy.enabled)
+                .unwrap_or(false);
+            if declares_egress && !proxy_on {
+                let bind = spec
+                    .vm
+                    .firecracker
+                    .as_ref()
+                    .map(|fc| format!("{}:47833", fc.host_ip))
+                    .unwrap_or_else(|| "<host_ip>:47833".to_string());
+                errors.push(format!(
+                    "network: this Firecracker agent declares egress (egress_allowlist/egress_allow_all) \
+                     but has no enabled network.proxy. Firecracker egress is proxy-routed, so without it \
+                     the allowlist is unenforced and a proxy-provisioned guest gets ConnectionRefused on \
+                     every turn. Add:\n  proxy:\n    enabled: true\n    bind: {bind}"
+                ));
+            }
         }
     }
 
@@ -432,6 +462,72 @@ network:
         let spec: AgentSpec = serde_yaml::from_str(raw).unwrap();
         let report = validate_spec(&spec);
         assert!(report.valid, "{:?}", report.errors);
+    }
+
+    #[test]
+    fn firecracker_egress_without_proxy_is_rejected() {
+        // The claude/codex outage: a Firecracker agent that declares egress but has
+        // no enabled proxy can't enforce its allowlist AND a proxy-routed guest gets
+        // ConnectionRefused on every turn. Validation must refuse it loudly so a
+        // regenerated/edited spec can never silently lose its egress proxy again.
+        let spec_yaml = |proxy: &str| {
+            format!(
+                r#"
+identity:
+  id: fc-demo
+  name: FC Demo
+  purpose: A firecracker agent with a bounded network policy.
+runtime:
+  harness: claude-code
+vm:
+  provider: firecracker
+  guest_os: linux
+  vcpu: 2
+  memory_mib: 2048
+  firecracker:
+    kernel_image: .maturana/images/firecracker/x/vmlinux.bin
+    rootfs_image: .maturana/images/firecracker/x/ubuntu-rootfs.ext4
+    tap_name: tap-mat-x
+    host_ip: 172.30.10.9
+    guest_ip: 172.30.10.10
+    guest_mac: AA:FC:00:00:10:03
+filesystem:
+  mounts:
+    - host_path: .maturana/agents/fc-demo/workspace
+      guest_path: /workspace
+      writable: true
+network:
+  egress_allowlist:
+    - api.anthropic.com
+{proxy}memory:
+  wiki_path: .maturana/wiki
+  agent_memory_path: .maturana/agents/fc-demo/memory
+"#
+            )
+        };
+        // No proxy block → rejected, with an actionable message.
+        let no_proxy: AgentSpec = serde_yaml::from_str(&spec_yaml("")).unwrap();
+        let report = validate_spec(&no_proxy);
+        assert!(!report.valid, "egress without a proxy must be invalid");
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("network.proxy") && e.contains("ConnectionRefused")),
+            "error should name the missing proxy + the failure: {:?}",
+            report.errors
+        );
+        // With the proxy block (bind derived from host_ip) → valid.
+        let with_proxy: AgentSpec = serde_yaml::from_str(&spec_yaml(
+            "  proxy:\n    enabled: true\n    bind: 172.30.10.9:47833\n",
+        ))
+        .unwrap();
+        let report = validate_spec(&with_proxy);
+        assert!(
+            report.valid,
+            "egress WITH a proxy must be valid: {:?}",
+            report.errors
+        );
     }
 
     #[test]
