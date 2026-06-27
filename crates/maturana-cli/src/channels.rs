@@ -9,8 +9,8 @@ use maturana_core::{
     secrets::resolve_secret_source_with_home,
     session_db::{
         cancel_pending_inbound, claim_delivery, clear_progress, ensure_session, insert_inbound,
-        list_undelivered, mark_delivered, read_progress, session_paths, unclaim_delivery,
-        ProgressEvent, SessionPaths,
+        list_undelivered, mark_delivered, read_progress, request_cancel_in_progress, session_paths,
+        unclaim_delivery, ProgressEvent, SessionPaths,
     },
     spec::{AgentSpec, HarnessRuntime},
     state::MaturanaHome,
@@ -3314,17 +3314,24 @@ fn handle_channel_command(
             "Session reset — durable memory and wiki are preserved.".to_string()
         }
         "stop" => {
-            // Drop queued-but-unclaimed turns for this session. A turn already
-            // being processed by the guest worker runs to completion (the in-guest
-            // shell worker has no mid-turn cancel), so we report that honestly.
+            // Two halves: drop queued-but-unclaimed turns, AND flag any IN-PROGRESS
+            // turn so the guest worker (which polls sessiond) kills the running
+            // harness mid-turn and replies "Stopped." The in-progress kill is async
+            // (the worker notices within a couple of seconds), so we acknowledge it.
             let paths = session_paths(&home.agent_dir(&config.agent_id), &config.session_id);
-            match cancel_pending_inbound(&paths) {
-                Ok(0) => "Nothing queued to stop. A reply already in progress will finish on its own.".to_string(),
-                Ok(n) => format!(
-                    "Stopped {n} queued message{}. A reply already in progress will still finish.",
-                    if n == 1 { "" } else { "s" }
+            let queued = cancel_pending_inbound(&paths).unwrap_or(0);
+            let in_progress = request_cancel_in_progress(&paths).unwrap_or(0);
+            match (queued, in_progress) {
+                (0, 0) => "Nothing to stop — nothing is queued or in progress.".to_string(),
+                (q, 0) => format!(
+                    "Stopped {q} queued message{}.",
+                    if q == 1 { "" } else { "s" }
                 ),
-                Err(error) => format!("Couldn't clear the queue: {error:#}"),
+                (0, _) => "Stopping the reply in progress…".to_string(),
+                (q, _) => format!(
+                    "Stopping the reply in progress and dropped {q} queued message{}.",
+                    if q == 1 { "" } else { "s" }
+                ),
             }
         }
         "compact" => {

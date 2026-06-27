@@ -5,7 +5,8 @@ use maturana_core::{
     improvement::TrajectoryStore,
     session_db::{
         append_progress, claim_pending_inbound, ensure_session, insert_inbound,
-        list_recent_inbound, list_undelivered, mark_delivered, mark_inbound_completed,
+        is_cancel_requested, list_recent_inbound, list_undelivered, mark_delivered,
+        mark_inbound_completed,
         session_paths, write_outbound, ProgressEvent, SessionPaths,
     },
     state::MaturanaHome,
@@ -154,6 +155,13 @@ struct CompleteRequest {
 }
 
 #[derive(Debug, serde::Deserialize)]
+struct CancelStatusRequest {
+    agent_id: String,
+    session_id: String,
+    message_id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct OutboundRequest {
     agent_id: String,
     session_id: String,
@@ -286,6 +294,24 @@ fn handle_sessiond_request(
             ensure_session(&paths)?;
             mark_inbound_completed(&paths, &body.message_ids)?;
             write_json_response(stream, 200, &serde_json::json!({ "ok": true }))
+        }
+        // The guest worker polls this while the harness runs to learn whether the
+        // user asked to /stop the in-flight turn (the host flags it directly in the
+        // session db). On `cancelled: true` the worker kills the harness and posts
+        // a "Stopped." reply instead of the partial answer.
+        ("POST", "/session/cancel-status") => {
+            let body: CancelStatusRequest = serde_json::from_slice(&request.body)?;
+            if let Err(error) = check_identifiers(&body.agent_id, &body.session_id) {
+                return write_json_response(stream, 400, &error);
+            }
+            let paths = session_paths(&home.agent_dir(&body.agent_id), &body.session_id);
+            ensure_session(&paths)?;
+            let cancelled = is_cancel_requested(&paths, &body.message_id)?;
+            write_json_response(
+                stream,
+                200,
+                &serde_json::json!({ "ok": true, "cancelled": cancelled }),
+            )
         }
         ("POST", "/session/outbound") => {
             let body: OutboundRequest = serde_json::from_slice(&request.body)?;

@@ -905,6 +905,36 @@ PY
   run_harness() {
     timeout --kill-after=10s "${harness_timeout}s" "$@"
   }
+  # --- /stop (in-progress cancel): a background watcher polls sessiond for a
+  # cancel request for THIS turn and kills the running harness so the turn ends
+  # promptly. The post-harness block then replaces the partial with "Stopped." ---
+  rm -f /tmp/maturana-cancelled
+  : > /tmp/maturana-turn-active
+  case "${MATURANA_HARNESS}" in
+    codex) cancel_pat="codex exec" ;;
+    claude-code) cancel_pat="claude -p" ;;
+    opencode) cancel_pat="opencode run" ;;
+    *) cancel_pat="" ;;
+  esac
+  cancel_body="{\"agent_id\":\"$MATURANA_AGENT_ID\",\"session_id\":\"$MATURANA_SESSION_ID\",\"message_id\":\"$msg_id\"}"
+  (
+    while [ -f /tmp/maturana-turn-active ]; do
+      sleep 2
+      [ -f /tmp/maturana-turn-active ] || break
+      cs="$(curl -fsS -X POST "$sessiond_url/session/cancel-status" "${headers[@]}" --data "$cancel_body" 2>/dev/null || true)"
+      case "$cs" in
+        *'"cancelled":true'*)
+          touch /tmp/maturana-cancelled
+          if [ -n "$cancel_pat" ]; then pkill -TERM -f "$cancel_pat" 2>/dev/null || true; fi
+          pkill -TERM -f 'maturana-stream' 2>/dev/null || true
+          sleep 2
+          if [ -n "$cancel_pat" ]; then pkill -KILL -f "$cancel_pat" 2>/dev/null || true; fi
+          break
+          ;;
+      esac
+    done
+  ) &
+  cancel_watcher_pid=$!
   if [ "${MATURANA_HARNESS}" = "codex" ]; then
     # Stream `codex exec --json`: the streamer POSTs live progress to sessiond and
     # prints the final agent text. `set -o pipefail` makes a codex failure fail
@@ -1031,6 +1061,16 @@ PY
     fi
   else
     response="Unsupported harness: ${MATURANA_HARNESS}"
+  fi
+  # Turn finished (or was killed by /stop): stop the cancel watcher. If the user
+  # cancelled this turn, replace whatever partial/error the killed harness left
+  # with a clean acknowledgement.
+  rm -f /tmp/maturana-turn-active
+  kill "$cancel_watcher_pid" 2>/dev/null || true
+  wait "$cancel_watcher_pid" 2>/dev/null || true
+  if [ -f /tmp/maturana-cancelled ]; then
+    response="🛑 Stopped."
+    rm -f /tmp/maturana-cancelled
   fi
   if [ -z "$response" ]; then
     response="I processed that message but did not receive a text response from the harness."

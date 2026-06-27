@@ -1,6 +1,6 @@
 use anyhow::Context;
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -97,6 +97,39 @@ pub fn cancel_pending_inbound(paths: &SessionPaths) -> anyhow::Result<usize> {
         params![now],
     )?;
     Ok(n)
+}
+
+/// Request cancellation of any IN-PROGRESS (`processing`) turn for this session:
+/// records its message id so the polling guest worker can abort the live harness
+/// run mid-turn. Unlike [`cancel_pending_inbound`] (which only drops queued work),
+/// this reaches a turn the worker has already claimed. Returns how many in-flight
+/// turns were flagged (0 = nothing is currently running). The worker clears the
+/// flag when it finishes (`mark_inbound_completed`).
+pub fn request_cancel_in_progress(paths: &SessionPaths) -> anyhow::Result<usize> {
+    let db = open_rw(&paths.inbound_db)?;
+    ensure_inbound_schema(&db)?;
+    let now = Utc::now().to_rfc3339();
+    let n = db.execute(
+        "INSERT OR IGNORE INTO cancels (message_id, requested_at)
+         SELECT id, ?1 FROM messages_in WHERE status = 'processing'",
+        params![now],
+    )?;
+    Ok(n)
+}
+
+/// Whether a specific in-flight message has a pending cancel request. The guest
+/// worker polls this (via sessiond) while the harness runs and aborts if true.
+pub fn is_cancel_requested(paths: &SessionPaths, message_id: &str) -> anyhow::Result<bool> {
+    let db = open_rw(&paths.inbound_db)?;
+    ensure_inbound_schema(&db)?;
+    let found: Option<i64> = db
+        .query_row(
+            "SELECT 1 FROM cancels WHERE message_id = ?1",
+            params![message_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
 }
 
 /// Visibility / retry policy for the inbound work queue.
@@ -331,6 +364,9 @@ pub fn mark_inbound_completed(paths: &SessionPaths, message_ids: &[String]) -> a
     )?;
     for id in message_ids {
         stmt.execute(params![now, id])?;
+        // Drop any cancel flag now that the turn is done, so it can't bleed into a
+        // future turn that happens to reuse polling on this id.
+        db.execute("DELETE FROM cancels WHERE message_id = ?1", params![id])?;
     }
     Ok(())
 }
@@ -606,6 +642,10 @@ fn ensure_inbound_schema(db: &Connection) -> anyhow::Result<()> {
             platform_message_id TEXT,
             delivered_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS cancels (
+            message_id TEXT PRIMARY KEY,
+            requested_at TEXT NOT NULL
+        );
         "#,
     )?;
     Ok(())
@@ -752,6 +792,32 @@ mod tests {
 
         // Nothing left to claim (the in-flight one stays in 'processing').
         assert!(claim_pending_inbound(&paths, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn request_cancel_in_progress_flags_claimed_turn_and_clears_on_complete() {
+        let temp = temp_dir();
+        let paths = session_paths(&temp, "telegram-main");
+        ensure_session(&paths).unwrap();
+
+        let id =
+            insert_inbound(&paths, "chat", "telegram", "chat-1", None, r#"{"text":"hi"}"#).unwrap();
+        // Not claimed yet → nothing in progress to cancel, and the flag is unset.
+        assert_eq!(request_cancel_in_progress(&paths).unwrap(), 0);
+        assert!(!is_cancel_requested(&paths, &id).unwrap());
+
+        // The worker claims it (status → processing).
+        assert_eq!(claim_pending_inbound(&paths, 1).unwrap().len(), 1);
+
+        // /stop flags the in-flight turn; the worker's poll would see it.
+        assert_eq!(request_cancel_in_progress(&paths).unwrap(), 1);
+        assert!(is_cancel_requested(&paths, &id).unwrap());
+        // Idempotent: a second /stop doesn't double-flag.
+        assert_eq!(request_cancel_in_progress(&paths).unwrap(), 0);
+
+        // Completing the turn clears the flag so it can't bleed into a later turn.
+        mark_inbound_completed(&paths, &[id.clone()]).unwrap();
+        assert!(!is_cancel_requested(&paths, &id).unwrap());
     }
 
     #[test]
