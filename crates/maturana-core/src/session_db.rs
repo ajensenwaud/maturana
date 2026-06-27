@@ -471,6 +471,34 @@ pub fn list_undelivered(paths: &SessionPaths) -> anyhow::Result<Vec<OutboundMess
         .collect())
 }
 
+/// Find the outbound reply for a given inbound, REGARDLESS of delivered status.
+/// Unlike [`list_undelivered`], this still returns the reply after it has been
+/// delivered. An active streaming loop uses it to detect "my reply exists" even
+/// when a concurrent backstop already delivered it — so the loop can claim-or-
+/// clean-up instead of ticking its live bubble forever (the lingering-counter /
+/// duplicate-message class). Targeted query (`WHERE in_reply_to = ?`), so it is
+/// cheap to poll every tick.
+pub fn find_reply_outbound(
+    paths: &SessionPaths,
+    inbound_id: &str,
+) -> anyhow::Result<Option<OutboundMessage>> {
+    let outbound = open_ro(&paths.outbound_db)?;
+    let mut stmt = outbound.prepare(
+        r#"
+        SELECT id, in_reply_to, kind, channel, platform_id, thread_id, content, created_at
+        FROM messages_out
+        WHERE in_reply_to = ?1
+        ORDER BY seq ASC
+        LIMIT 1
+        "#,
+    )?;
+    let mut rows = stmt.query_map(params![inbound_id], outbound_from_row)?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
+}
+
 pub fn mark_delivered(
     paths: &SessionPaths,
     message_id: &str,

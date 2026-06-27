@@ -8,9 +8,9 @@ use maturana_core::{
     pipelock::PipelockVault,
     secrets::resolve_secret_source_with_home,
     session_db::{
-        cancel_pending_inbound, claim_delivery, clear_progress, ensure_session, insert_inbound,
-        list_undelivered, mark_delivered, read_progress, request_cancel_in_progress, session_paths,
-        unclaim_delivery, ProgressEvent, SessionPaths,
+        cancel_pending_inbound, claim_delivery, clear_progress, ensure_session, find_reply_outbound,
+        insert_inbound, list_undelivered, mark_delivered, read_progress,
+        request_cancel_in_progress, session_paths, unclaim_delivery, ProgressEvent, SessionPaths,
     },
     spec::{AgentSpec, HarnessRuntime},
     state::MaturanaHome,
@@ -1584,11 +1584,17 @@ impl OutboundSink for TelegramSink<'_> {
     }
 
     fn has_pending_stream(&self, inbound_id: Option<&str>) -> bool {
-        // A live "working…" status marker means an inline streamer set it and may
-        // still be editing that message; the backstop must not race it.
+        // An active streamer owns delivery for its turn; the backstop must not race
+        // it. The `.tgactive` lock is set at the streamer's ENTRY (before any send),
+        // so it covers the whole turn — including the early window before the live
+        // "working…" message exists. The message-id marker is a secondary signal for
+        // a streamer that set it but whose lock was somehow lost.
         inbound_id
-            .and_then(|inbound| peek_telegram_status(self.paths, inbound))
-            .is_some()
+            .map(|inbound| {
+                telegram_active_exists(self.paths, inbound)
+                    || peek_telegram_status(self.paths, inbound).is_some()
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -4502,6 +4508,39 @@ fn clear_telegram_status(paths: &SessionPaths, inbound_id: &str) {
     let _ = std::fs::remove_file(telegram_status_path(paths, inbound_id));
 }
 
+/// An "active streamer" lock for a turn, distinct from the message-id marker.
+/// The marker only appears once the live bubble has been SENT (≥2s in, and later
+/// still if the first send is retried/backed-off), which left an early window
+/// where the backstop saw no marker and delivered the reply as a fresh duplicate
+/// while a late bubble lingered as a never-ending counter. This lock is written
+/// at loop ENTRY (before any send) and cleared on EVERY exit (RAII), so the
+/// backstop reliably defers to the streamer for the whole turn — the streamer is
+/// the sole deliverer. A crashed streamer leaves the lock behind, but the
+/// backstop's `STREAM_BACKSTOP_AGE` gate still takes over once the reply ages out.
+fn telegram_active_path(paths: &SessionPaths, inbound_id: &str) -> PathBuf {
+    let safe: String = inbound_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    paths.dir.join("progress").join(format!("{safe}.tgactive"))
+}
+
+fn set_telegram_active(paths: &SessionPaths, inbound_id: &str) {
+    let path = telegram_active_path(paths, inbound_id);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, b"1");
+}
+
+fn clear_telegram_active(paths: &SessionPaths, inbound_id: &str) {
+    let _ = std::fs::remove_file(telegram_active_path(paths, inbound_id));
+}
+
+fn telegram_active_exists(paths: &SessionPaths, inbound_id: &str) -> bool {
+    telegram_active_path(paths, inbound_id).exists()
+}
+
 /// Turn the live progress message into the final reply as exactly ONE message:
 /// edit it in place; if the edit fails, delete the stale live message and only
 /// then send a fresh copy — but if that delete cannot be confirmed, return `Err`
@@ -4579,13 +4618,19 @@ fn stream_turn_to_telegram(
     let mut last_typing = started
         .checked_sub(Duration::from_secs(10))
         .unwrap_or(started);
-    // Reply detection runs on a BACKGROUND thread, NOT in this loop. `list_undelivered`
-    // opens two SQLite connections and occasionally spikes to ~2.5s; doing it every
-    // tick made the live clock jump in multi-second steps. The watcher polls for the
-    // reply and hands it over via a channel, so the loop below only does the ~1s
-    // editMessageText and the counter ticks like a stopwatch. The watcher only
-    // DETECTS the reply — the loop still claims + finalizes it — so there is no
-    // double-delivery.
+    // Mark this turn as actively streamed BEFORE anything is sent. The backstop
+    // delivery thread defers to an active streamer (see `has_pending_stream`), so
+    // the streamer is the SOLE deliverer for the whole turn. This closes the
+    // window where the backstop saw no live-message marker yet (the first bubble
+    // send is ≥2s in, and later still if it is retried/backed-off) and delivered
+    // the reply as a fresh duplicate while the late bubble lingered as a counter.
+    set_telegram_active(paths, inbound_id);
+    // Reply detection runs on a BACKGROUND thread, NOT in this loop, so the only
+    // thing pacing the counter is the ~1s editMessageText. The watcher detects the
+    // reply by EXISTENCE (`find_reply_outbound`, a cheap `WHERE in_reply_to=?`),
+    // NOT by undelivered status — so even if some pass delivered it first, the loop
+    // still finds it and cleans up instead of ticking forever. The loop still
+    // claims + finalizes, so there is no double-delivery.
     let (reply_tx, reply_rx) = mpsc::channel();
     let watcher_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
@@ -4594,41 +4639,54 @@ fn stream_turn_to_telegram(
         let stop = watcher_stop.clone();
         thread::spawn(move || {
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                match list_undelivered(&paths) {
-                    Ok(list) => {
-                        if let Some(m) = list.into_iter().find(|m| {
-                            m.channel == "telegram"
-                                && m.in_reply_to.as_deref() == Some(inbound_id.as_str())
-                        }) {
-                            let _ = reply_tx.send(m);
-                            return;
-                        }
+                match find_reply_outbound(&paths, &inbound_id) {
+                    Ok(Some(m)) if m.channel == "telegram" => {
+                        let _ = reply_tx.send(m);
+                        return;
                     }
+                    Ok(_) => {}
                     Err(error) => {
-                        eprintln!("telegram: reply watcher list failed (retrying): {error:#}")
+                        eprintln!("telegram: reply watcher query failed (retrying): {error:#}")
                     }
                 }
                 thread::sleep(Duration::from_millis(1000));
             }
         });
     }
-    // Stop the watcher on EVERY return path (including `?` early-returns) so the
-    // detached thread doesn't keep polling a finished turn.
-    struct StopGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
-    impl Drop for StopGuard {
+    // Stop the watcher AND release the active-streamer lock on EVERY return path
+    // (including `?` early-returns) so a finished turn isn't still being polled and
+    // the backstop can take over immediately if we exited without delivering.
+    struct TurnGuard<'a> {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        paths: &'a SessionPaths,
+        inbound_id: &'a str,
+    }
+    impl Drop for TurnGuard<'_> {
         fn drop(&mut self) {
-            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            clear_telegram_active(self.paths, self.inbound_id);
         }
     }
-    let _stop_guard = StopGuard(watcher_stop.clone());
+    let _turn_guard = TurnGuard {
+        stop: watcher_stop.clone(),
+        paths,
+        inbound_id,
+    };
     loop {
         // Reply ready? A cheap, non-blocking check of the background watcher's
         // channel — never the multi-second DB read, so the counter is never stalled.
         let final_msg = reply_rx.try_recv().ok();
         if let Some(final_msg) = final_msg {
-            // Lost the claim → the delivery thread owns delivery and will edit the
-            // live message (via the marker) into the answer. Just drop our state.
+            // Lost the claim → someone else already delivered this reply (a backstop
+            // pass that ran before our live bubble existed, or a prior streamer).
+            // Our live "Thinking…" bubble is now an orphan that would linger as a
+            // duplicate message + a counter that never stops — delete it so the chat
+            // shows exactly the one delivered answer, then exit.
             if !claim_delivery(paths, &final_msg.id)? {
+                if let Some(id) = message_id {
+                    let _ = delete_telegram_message(token, chat_id, id);
+                }
+                clear_telegram_status(paths, inbound_id);
                 let _ = clear_progress(paths, inbound_id);
                 return Ok(());
             }
@@ -8361,20 +8419,6 @@ mod tests {
         let answer = "Here is a reasonably long answer that the live bubble is edited into when the turn completes.";
         let paths_w = paths.clone();
         let reply_to = inbound_id.clone();
-        let worker = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(8000));
-            let body = serde_json::json!({ "text": answer }).to_string();
-            let _ = maturana_core::session_db::write_outbound(
-                &paths_w,
-                Some(&reply_to),
-                "chat",
-                "telegram",
-                &chat_id.to_string(),
-                None,
-                &body,
-            );
-        });
-
         let config = TelegramServe {
             agent_id: agent.to_string(),
             session_id: session.to_string(),
@@ -8385,6 +8429,23 @@ mod tests {
             timeout_seconds: 600,
         };
         with_tg_base(&base, || {
+            // Spawn the worker INSIDE the serialized section so its reply-delay timer
+            // starts at the loop's start, not before this test acquired the shared
+            // TG_ENV_LOCK — otherwise a slow earlier test makes the reply land early
+            // and the counter shows too few frames (flaky under test contention).
+            let worker = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(8000));
+                let body = serde_json::json!({ "text": answer }).to_string();
+                let _ = maturana_core::session_db::write_outbound(
+                    &paths_w,
+                    Some(&reply_to),
+                    "chat",
+                    "telegram",
+                    &chat_id.to_string(),
+                    None,
+                    &body,
+                );
+            });
             stream_turn_to_telegram(
                 &home,
                 "TESTTOKEN",
@@ -8396,8 +8457,8 @@ mod tests {
                 std::time::Duration::from_secs(25),
             )
             .unwrap();
+            worker.join().unwrap();
         });
-        worker.join().unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
 
         let reqs = captured.lock().unwrap().clone();
@@ -8425,6 +8486,105 @@ mod tests {
         assert!(
             reqs.iter().all(|r| !r.contains("/deleteMessage")),
             "no delete on a normal answer — the bubble becomes the answer:\n{}",
+            reqs.join("\n--\n")
+        );
+    }
+
+    #[test]
+    fn live_loop_deletes_orphan_bubble_when_reply_already_delivered() {
+        // Regression for the duplicate-message + never-ending-counter class
+        // (the "Snak dansk" incident): if a backstop pass delivers the reply while
+        // the streamer is mid-turn (its live bubble already on screen), the streamer
+        // must DELETE its now-orphan bubble and send NO duplicate — the chat shows
+        // exactly the one delivered answer, and the counter stops. The streamer
+        // detects the reply by EXISTENCE (not undelivered status), so it can't tick
+        // forever against a reply someone else already delivered.
+        let (base, captured) = spawn_mock_telegram();
+
+        let tmp = std::env::temp_dir().join(format!("mat-orphanbubble-{}", std::process::id()));
+        let home = MaturanaHome::new(tmp.clone());
+        let agent = "claude";
+        let session = "telegram-main";
+        let chat_id = 778i64;
+        std::fs::create_dir_all(home.agent_dir(agent)).unwrap();
+        let paths = session_paths(&home.agent_dir(agent), session);
+        ensure_session(&paths).unwrap();
+        let inbound_id = insert_inbound(
+            &paths,
+            "chat",
+            "telegram",
+            &chat_id.to_string(),
+            None,
+            &serde_json::json!({ "text": "hi" }).to_string(),
+        )
+        .unwrap();
+
+        // After ~3.5s the streamer's live bubble exists; THEN a backstop delivers the
+        // reply (write outbound + atomically claim it) out from under the streamer.
+        let answer = "Already delivered by the backstop.";
+        let paths_w = paths.clone();
+        let reply_to = inbound_id.clone();
+        let config = TelegramServe {
+            agent_id: agent.to_string(),
+            session_id: session.to_string(),
+            token_source: "x".to_string(),
+            once: false,
+            run_once_provider: None,
+            poll_seconds: 5,
+            timeout_seconds: 600,
+        };
+        with_tg_base(&base, || {
+            // Spawn the worker INSIDE the serialized section so its timer starts at
+            // the loop's start (see the sibling live-loop test for why).
+            let worker = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(3500));
+                let body = serde_json::json!({ "text": answer }).to_string();
+                let _ = maturana_core::session_db::write_outbound(
+                    &paths_w,
+                    Some(&reply_to),
+                    "chat",
+                    "telegram",
+                    &chat_id.to_string(),
+                    None,
+                    &body,
+                );
+                // Simulate the backstop winning the atomic claim before the streamer.
+                if let Ok(Some(msg)) = find_reply_outbound(&paths_w, &reply_to) {
+                    let _ = claim_delivery(&paths_w, &msg.id);
+                }
+            });
+            stream_turn_to_telegram(
+                &home,
+                "TESTTOKEN",
+                &config,
+                chat_id,
+                &inbound_id,
+                None,
+                &paths,
+                std::time::Duration::from_secs(25),
+            )
+            .unwrap();
+            worker.join().unwrap();
+        });
+
+        // The active-streamer lock is released on every exit path.
+        assert!(
+            !telegram_active_exists(&paths, &inbound_id),
+            "the .tgactive lock must be cleared when the streamer exits"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let reqs = captured.lock().unwrap().clone();
+        // The orphan bubble was DELETED (cleanup) ...
+        assert!(
+            reqs.iter().any(|r| r.contains("/deleteMessage")),
+            "orphan bubble should be deleted on a lost claim:\n{}",
+            reqs.join("\n--\n")
+        );
+        // ... and the streamer did NOT re-send the answer (no duplicate).
+        assert!(
+            reqs.iter().all(|r| !r.contains("Already delivered by the backstop")),
+            "streamer must NOT send the answer the backstop already delivered:\n{}",
             reqs.join("\n--\n")
         );
     }
