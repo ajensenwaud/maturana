@@ -30,6 +30,7 @@ try {
         "install.ps1",
         "launch-ubuntu-cloudimg-hyperv.ps1",
         "maturana.ps1",
+        "release.sh",
         "test-pipelock-proxy-aidev.ps1",
         "test-pipelock-proxy-firecracker-live.sh",
         "test-pipelock-proxy-live.ps1",

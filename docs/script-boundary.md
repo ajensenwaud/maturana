@@ -27,6 +27,10 @@ These scripts are acceptable as host setup or host primitive wrappers:
 - `scripts/install.ps1`: the single Windows installer (downloads the prebuilt
   binary, or `-FromSource` builds it; self-elevates once; sets up hostd, the
   Ubuntu image, and the up/web boot services).
+- `scripts/release.sh`: developer release helper. Sanity-checks `main`, picks the
+  next version, runs the workspace tests, then pushes the tag that triggers
+  `.github/workflows/release.yml`. It owns no release policy (the build/publish
+  lives in the workflow) — only the git/`gh` plumbing around the tag push.
 - `scripts/install-hostd-task.ps1`, `scripts/uninstall-hostd-task.ps1`:
   scheduled task registration for the Rust `maturana hostd serve` daemon.
 - Windows session/channel runners are started and optionally registered by the

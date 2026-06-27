@@ -1,0 +1,55 @@
+name: ci
+
+# The test gate that was missing: build + test the whole workspace on every PR
+# and every push to main, so a human never has to be the one who remembers to run
+# `cargo test` before a release. Mirrors the release build (`--locked`) so a
+# Cargo.lock drift fails here, not at tag time.
+#
+# `test` is REQUIRED (it fails the run). `lint` (rustfmt + clippy) is advisory —
+# it runs and reports but does not block, because the tree isn't fully
+# rustfmt-clean yet; tighten it to required once it is.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (locked, like the release)
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  lint:
+    runs-on: ubuntu-22.04
+    # Advisory only: surfaces fmt/clippy drift as warnings but never goes red, so
+    # the check stays green signal (the tree isn't fully rustfmt-clean yet). The
+    # GitHub runner ships stable rust with rustfmt+clippy preinstalled. To enforce
+    # later, drop the `|| echo` guards so a finding fails the job.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt (advisory)
+        run: cargo fmt --all --check || echo "::warning::rustfmt drift — run 'cargo fmt --all'"
+
+      - name: clippy (advisory)
+        run: cargo clippy --workspace --all-targets || echo "::warning::clippy findings (advisory)"
