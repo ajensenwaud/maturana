@@ -4,6 +4,10 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Maturana — Control Plane</title>
+  <script>
+    // Apply the saved palette before first paint (no flash of the default theme).
+    try { document.documentElement.dataset.theme = localStorage.getItem("maturana.theme") || "teal"; } catch (e) {}
+  </script>
   <link rel="stylesheet" href="/assets/css/tokens.css" />
   <link rel="stylesheet" href="/assets/css/app.css" />
 </head>
@@ -11,7 +15,10 @@
   <div class="shell">
     <header class="top">
       <div class="brand">Maturana <span class="accent">/</span> <span class="status-dim">control plane</span></div>
-      <div id="link-status" class="status-dim">[link --]</div>
+      <div class="top-right">
+        <div id="theme-switch"></div>
+        <div id="link-status" class="status-dim">[link --]</div>
+      </div>
     </header>
     <nav class="side" id="nav">
       <button data-view="overview" class="active">Overview</button>

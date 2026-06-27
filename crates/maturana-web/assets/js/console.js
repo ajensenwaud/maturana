@@ -160,7 +160,7 @@ export class Console {
               border: "none",
             },
             "&.cm-focused .cm-selectionBackground, ::selection": {
-              backgroundColor: "rgba(29, 180, 176, 0.25)",
+              backgroundColor: "rgba(255, 189, 56, 0.22)",
             },
           },
           { dark: true },

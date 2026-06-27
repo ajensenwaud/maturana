@@ -1,46 +1,99 @@
-/* Maturana cockpit design tokens — the Recursant trademark language.
-   Extracted from recursant.ai/pitch: #0C1117 ground, #E0E8F0 ink, #1DB4B0
-   teal accent with a soft 60px glow, #5a6877 dim, JetBrains Mono, wide
-   letter-spaced all-caps labels, hairline progress bars, [000%] counters. */
+/* Maturana cockpit design tokens.
+
+   The default palette ("Deep Teal") is a warm dark-teal / cream / amber look.
+   Every other token is DERIVED from a small base set (bg / ink / accent / …)
+   via color-mix, so a new palette only has to override that base set and the
+   rest (dims, borders, surfaces, glows) recompute automatically — this is what
+   lets the header palette switcher swap whole themes, including a real light
+   mode, by changing ~10 variables. Palettes live at the bottom of this file,
+   keyed on html[data-theme="…"]. */
 
 :root {
-  --bg: #0c1117;
-  --bg-raised: #111823;
-  --bg-inset: #080c11;
-  --ink: #e0e8f0;
-  --dim: #5a6877;
-  --accent: #1db4b0;
-  --accent-glow: rgba(29, 180, 176, 0.55);
-  --danger: #e0635a;
-  --ok: #1db4b0;
-  --hairline: rgba(224, 232, 240, 0.08);
-  --track: rgba(255, 255, 255, 0.05);
+  /* ============================================================
+     BASE PALETTE — a theme overrides only these.
+     ============================================================ */
+  --bg: #041c1c;            /* page ground */
+  --bg-raised: #0a2625;     /* panels / cards */
+  --bg-inset: #02100f;      /* inputs, code wells */
+  --ink: #ffe8d2;           /* primary text (the warm cream) */
+  --ink-strong: #fff6ea;    /* headings / emphasis */
+  --accent: #ffbd38;        /* interactive accent / glow */
+  --accent-ink: #1a1205;    /* text drawn on an accent fill */
+  --ok: #34d399;            /* online / success */
+  --danger: #ff6b61;        /* errors / destructive */
+  --warn: #f7b955;          /* warnings */
+
+  /* fonts + shape (a theme may override these too) */
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, sans-serif;
   --mono: "JetBrains Mono", "Cascadia Code", ui-monospace, "SF Mono",
     Menlo, Consolas, monospace;
-  --track-spacing-wide: 0.4em;
-  --track-spacing: 0.3em;
+  --radius: 12px;
+  --radius-sm: 9px;
+  --radius-lg: 16px;
+
+  /* ============================================================
+     DERIVED — computed from the base; themes never set these.
+     ============================================================ */
+  /* ink at decreasing strength — adapts to light or dark automatically */
+  --dim: color-mix(in srgb, var(--ink) 58%, transparent);
+  --faint: color-mix(in srgb, var(--ink) 34%, transparent);
+
+  /* cream-tint (or ink-tint) overlay surfaces */
+  --surface: color-mix(in srgb, var(--ink) 5%, transparent);
+  --surface-2: color-mix(in srgb, var(--ink) 7.5%, transparent);
+  --surface-hover: color-mix(in srgb, var(--ink) 6%, transparent);
+
+  /* hairlines + tracks */
+  --hairline: color-mix(in srgb, var(--ink) 10%, transparent);
+  --border: color-mix(in srgb, var(--ink) 13%, transparent);
+  --border-strong: color-mix(in srgb, var(--ink) 22%, transparent);
+  --track: color-mix(in srgb, var(--ink) 6%, transparent);
+
+  /* scrollbars */
+  --scroll-thumb: color-mix(in srgb, var(--ink) 16%, transparent);
+  --scroll-thumb-hover: color-mix(in srgb, var(--ink) 32%, transparent);
+
+  /* accent tints + glow */
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-bg: color-mix(in srgb, var(--accent) 12%, transparent);
+  --accent-glow: color-mix(in srgb, var(--accent) 42%, transparent);
+  --accent-hi: color-mix(in srgb, var(--accent), white 16%);
+
+  /* translucent panel/header backdrop + faint page halos */
+  --bg-blur: color-mix(in srgb, var(--bg) 72%, transparent);
+  --halo-1: color-mix(in srgb, var(--accent) 7%, transparent);
+  --halo-2: color-mix(in srgb, var(--ok) 6%, transparent);
+
+  /* shadows */
+  --shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+  --shadow-soft: 0 6px 22px rgba(0, 0, 0, 0.28);
+
+  /* eyebrow-label tracking */
+  --track-spacing-wide: 0.18em;
+  --track-spacing: 0.12em;
 }
 
-/* All-caps tracked labels — the signature. */
+/* All-caps tracked eyebrow labels — used sparingly for section headers. */
 .label {
   font-family: var(--mono);
   text-transform: uppercase;
   letter-spacing: var(--track-spacing);
   color: var(--dim);
-  font-size: 0.7rem;
+  font-size: 0.74rem;
 }
 
 .label-lg {
-  font-family: var(--mono);
-  text-transform: uppercase;
-  letter-spacing: var(--track-spacing-wide);
-  color: var(--ink);
-  font-weight: 300;
-  font-size: 1.25rem;
+  font-family: var(--sans);
+  letter-spacing: 0.01em;
+  color: var(--ink-strong);
+  font-weight: 500;
+  font-size: 1.6rem;
 }
 
-/* [042%]-style bracket counter. */
+/* [042%]-style bracket counter (boot screen). */
 .bracket {
+  font-family: var(--mono);
   color: var(--dim);
   letter-spacing: var(--track-spacing);
 }
@@ -48,9 +101,9 @@
   color: var(--accent);
 }
 
-/* Hairline progress bar: 2px track + accent fill. */
+/* Hairline progress bar: thin track + accent fill. */
 .bar {
-  height: 2px;
+  height: 3px;
   width: 100%;
   overflow: hidden;
   border-radius: 9999px;
@@ -59,13 +112,101 @@
 .bar > .fill {
   height: 100%;
   background: var(--accent);
+  box-shadow: 0 0 16px var(--accent-glow);
   transition: width 240ms ease;
 }
 
 .glow {
-  filter: drop-shadow(0 0 60px var(--accent-glow));
+  text-shadow: 0 0 38px var(--accent-glow);
 }
 
 .status-ok { color: var(--ok); }
 .status-bad { color: var(--danger); }
 .status-dim { color: var(--dim); }
+
+/* ============================================================
+   PALETTES — each overrides only the base set. Names are
+   deliberately our own (not the upstream theme names).
+   ============================================================ */
+
+/* Deep Teal is the :root default; data-theme="teal" simply falls back to it. */
+
+html[data-theme="indigo"] {
+  --bg: #0b0b1f;
+  --bg-raised: #161636;
+  --bg-inset: #07071a;
+  --ink: #e7e1ff;
+  --ink-strong: #ffffff;
+  --accent: #a78bfa;
+  --accent-ink: #160c2e;
+  --ok: #4ade80;
+  --danger: #fb7185;
+  --warn: #fbbf24;
+}
+
+html[data-theme="crimson"] {
+  --bg: #1a0a06;
+  --bg-raised: #2a1109;
+  --bg-inset: #120603;
+  --ink: #ffdcc0;
+  --ink-strong: #fff0e2;
+  --accent: #fb7233;
+  --accent-ink: #2a0d02;
+  --ok: #a3e635;
+  --danger: #ef4444;
+  --warn: #f59e0b;
+}
+
+html[data-theme="graphite"] {
+  --bg: #101012;
+  --bg-raised: #1c1c20;
+  --bg-inset: #0a0a0c;
+  --ink: #e7e7ea;
+  --ink-strong: #ffffff;
+  --accent: #d4d4d8;
+  --accent-ink: #18181b;
+  --ok: #a7c0b0;
+  --danger: #d9a8a8;
+  --warn: #d0c4a3;
+}
+
+html[data-theme="neon"] {
+  --bg: #050805;
+  --bg-raised: #0c160c;
+  --bg-inset: #020402;
+  --ink: #bdf5c5;
+  --ink-strong: #eaffea;
+  --accent: #39ff14;
+  --accent-ink: #052b08;
+  --ok: #39ff14;
+  --danger: #ff4d6d;
+  --warn: #faff00;
+  --sans: "JetBrains Mono", "Cascadia Code", ui-monospace, Menlo, Consolas, monospace;
+}
+
+/* Solarized — Ethan Schoonover's palette (its own real name, not upstream's). */
+html[data-theme="solar-dark"] {
+  --bg: #002b36;            /* base03 */
+  --bg-raised: #073642;     /* base02 */
+  --bg-inset: #00212b;
+  --ink: #a9bcbc;           /* between base0/base1, a touch brighter for UI */
+  --ink-strong: #fdf6e3;    /* base3 */
+  --accent: #268bd2;        /* blue */
+  --accent-ink: #002b36;
+  --ok: #859900;            /* green */
+  --danger: #dc322f;        /* red */
+  --warn: #b58900;          /* yellow */
+}
+
+html[data-theme="solar-light"] {
+  --bg: #fdf6e3;            /* base3 */
+  --bg-raised: #eee8d5;     /* base2 */
+  --bg-inset: #efe7cf;
+  --ink: #586e75;           /* base01 — dark text on light */
+  --ink-strong: #073642;    /* base02 */
+  --accent: #268bd2;        /* blue */
+  --accent-ink: #fdf6e3;
+  --ok: #859900;
+  --danger: #dc322f;
+  --warn: #b58900;
+}

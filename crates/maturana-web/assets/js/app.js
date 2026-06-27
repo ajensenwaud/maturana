@@ -5,6 +5,9 @@ import { CockpitSocket } from "/assets/js/ws.js";
 import { Console } from "/assets/js/console.js";
 import { Chat } from "/assets/js/chat.js";
 import * as dashboard from "/assets/js/dashboard.js";
+import { mountThemeSwitcher } from "/assets/js/themes.js";
+
+mountThemeSwitcher(document.getElementById("theme-switch"));
 
 const socket = new CockpitSocket();
 const linkStatus = document.getElementById("link-status");

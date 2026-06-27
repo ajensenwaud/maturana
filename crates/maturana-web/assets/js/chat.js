@@ -66,9 +66,24 @@ function textFromContent(content) {
   return content;
 }
 
-const SLASH_HINTS = [
-  "/model", "/reasoning", "/status", "/help", "/new", "/clear",
-  "/stop", "/compact", "/skill", "/emerge", "/onboard", "/good", "/bad",
+// Slash commands offered by the composer's Tab-completion menu. Keep in sync
+// with the shared dispatch_slash_command set so the web surface matches the
+// other channels (Telegram/Discord/TUI).
+const SLASH_COMMANDS = [
+  { c: "/model", d: "switch the model" },
+  { c: "/reasoning", d: "set reasoning effort (low/medium/high)" },
+  { c: "/status", d: "agent + worker status" },
+  { c: "/help", d: "list available commands" },
+  { c: "/new", d: "start a fresh conversation" },
+  { c: "/clear", d: "clear this session's history" },
+  { c: "/stop", d: "abort the in-flight reply" },
+  { c: "/compact", d: "summarize & shrink the context" },
+  { c: "/skill", d: "run a skill by name" },
+  { c: "/loop", d: "run a goal on a loop" },
+  { c: "/emerge", d: "self-improvement pass" },
+  { c: "/onboard", d: "(re)run onboarding" },
+  { c: "/good", d: "mark the last reply good" },
+  { c: "/bad", d: "mark the last reply bad" },
 ];
 
 export class Chat {
@@ -110,15 +125,18 @@ export class Chat {
     this.input = elem("textarea", "chat-input");
     this.input.placeholder = "Message the agent…  (Enter to send · Shift+Enter newline · / for commands)";
     this.input.rows = 1;
-    this.input.addEventListener("input", () => this.autoGrow());
-    this.input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); this.send(); }
-    });
+    this.input.addEventListener("input", () => { this.autoGrow(); this.updateSlashMenu(); });
+    this.input.addEventListener("keydown", (e) => this.onComposerKey(e));
+    this.input.addEventListener("blur", () => setTimeout(() => this.closeSlash(), 120));
     const sendBtn = elem("button", "chat-send", "➤");
     sendBtn.title = "Send (Enter)";
     sendBtn.addEventListener("click", () => this.send());
-    this.hint = elem("div", "chat-slash-hint");
-    composer.append(this.hint, this.input, sendBtn);
+    // Tab-completion menu for slash commands (hidden until "/" is typed).
+    this.slashMenu = elem("div", "slash-menu");
+    this.slashMenu.hidden = true;
+    this.slashItems = [];
+    this.acIndex = 0;
+    composer.append(this.slashMenu, this.input, sendBtn);
 
     main.append(this.headerEl, this.threadEl, composer);
 
@@ -283,12 +301,32 @@ export class Chat {
       text,
     });
     this.input.value = "";
+    this.closeSlash();
     this.autoGrow();
-    // A pending indicator until the reply streams back.
-    this.pending = elem("div", "chat-msg agent pending");
-    this.pending.append(elem("div", "chat-bubble", "…"));
-    this.threadEl.append(this.pending);
+    this.showTyping();
+  }
+
+  // Animated "responding…" indicator — three pulsing dots in an agent bubble,
+  // plus a breathing "responding" line in the header, until the reply streams
+  // back (cleared in onOutbound).
+  showTyping() {
+    this.hideTyping();
+    const row = elem("div", "chat-msg agent typing");
+    const bubble = elem("div", "chat-bubble");
+    for (let i = 0; i < 3; i++) bubble.append(elem("span", "chat-typing-dot"));
+    row.append(bubble);
+    this.threadEl.append(row);
+    this.pending = row;
+    if (this.headerEl) {
+      this.respondingEl = elem("div", "chat-responding", "responding…");
+      this.headerEl.append(this.respondingEl);
+    }
     this.scrollDown();
+  }
+
+  hideTyping() {
+    if (this.pending) { this.pending.remove(); this.pending = null; }
+    if (this.respondingEl) { this.respondingEl.remove(); this.respondingEl = null; }
   }
 
   onOutbound(msg) {
@@ -297,7 +335,7 @@ export class Chat {
       this.refreshList();
       return;
     }
-    if (this.pending) { this.pending.remove(); this.pending = null; }
+    this.hideTyping();
     const m = msg.message || {};
     // Outbound poller sends either {queued:id} (our echo) or a full message.
     if (m.queued) return;
@@ -311,13 +349,89 @@ export class Chat {
 
   autoGrow() {
     this.input.style.height = "auto";
-    this.input.style.height = Math.min(this.input.scrollHeight, 160) + "px";
-    const v = this.input.value.trimStart();
-    if (v.startsWith("/")) {
-      const matches = SLASH_HINTS.filter((s) => s.startsWith(v.split(/\s/)[0]));
-      this.hint.textContent = matches.length ? `commands: ${matches.join("  ")}` : "";
-    } else {
-      this.hint.textContent = "";
+    this.input.style.height = Math.min(this.input.scrollHeight, 180) + "px";
+  }
+
+  // ---- slash-command autocomplete ----
+
+  // The menu is live only while the user is typing the *command token*: the
+  // text starts with "/" and has no space yet (once they type an argument the
+  // command is chosen, so the menu gets out of the way).
+  slashQuery() {
+    const v = this.input.value;
+    if (!v.startsWith("/") || /\s/.test(v)) return null;
+    return v;
+  }
+
+  updateSlashMenu() {
+    const q = this.slashQuery();
+    if (q === null) return this.closeSlash();
+    const matches = SLASH_COMMANDS.filter((s) => s.c.startsWith(q));
+    if (!matches.length) return this.closeSlash();
+    this.slashItems = matches;
+    if (this.acIndex >= matches.length) this.acIndex = 0;
+    this.renderSlashMenu();
+    this.slashMenu.hidden = false;
+  }
+
+  renderSlashMenu() {
+    this.slashMenu.replaceChildren();
+    this.slashItems.forEach((s, i) => {
+      const row = elem("div", "slash-row" + (i === this.acIndex ? " sel" : ""));
+      row.append(elem("span", "cmd", s.c), elem("span", "desc", s.d));
+      // mousedown (not click) so it fires before the input's blur handler.
+      row.addEventListener("mousedown", (e) => { e.preventDefault(); this.acIndex = i; this.acceptSlash(); });
+      this.slashMenu.append(row);
+    });
+    const foot = elem("div", "slash-menu-foot");
+    foot.innerHTML = "<kbd>Tab</kbd> complete · <kbd>↑</kbd><kbd>↓</kbd> move · <kbd>Esc</kbd> dismiss";
+    this.slashMenu.append(foot);
+  }
+
+  closeSlash() {
+    if (this.slashMenu) this.slashMenu.hidden = true;
+    this.slashItems = [];
+    this.acIndex = 0;
+  }
+
+  slashOpen() {
+    return this.slashMenu && !this.slashMenu.hidden && this.slashItems.length;
+  }
+
+  acceptSlash() {
+    const pick = this.slashItems[this.acIndex];
+    if (!pick) return;
+    this.input.value = pick.c + " ";
+    this.closeSlash();
+    this.input.focus();
+    this.autoGrow();
+  }
+
+  onComposerKey(e) {
+    if (this.slashOpen()) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        this.acIndex = (this.acIndex + 1) % this.slashItems.length;
+        this.renderSlashMenu();
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        this.acIndex = (this.acIndex - 1 + this.slashItems.length) % this.slashItems.length;
+        this.renderSlashMenu();
+        return;
+      }
+      if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+        e.preventDefault();
+        this.acceptSlash();
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        this.closeSlash();
+        return;
+      }
     }
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); this.send(); }
   }
 }
