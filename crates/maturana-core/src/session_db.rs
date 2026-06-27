@@ -615,7 +615,16 @@ fn open_ro(path: &Path) -> anyhow::Result<Connection> {
 }
 
 fn tune(db: &Connection) -> anyhow::Result<()> {
-    db.pragma_update(None, "journal_mode", "DELETE")?;
+    // WAL so readers never block on the writer. The host runs several processes
+    // against these per-session DBs at once (the channel stream loop reading
+    // `list_undelivered` every tick, sessiond writing claims/outbounds, the
+    // delivery threads, proactive/scheduler). In rollback mode a write blocked the
+    // stream loop's read, which stalled the synchronous loop and made the live
+    // "Thinking…" counter jump in multi-second steps. WAL lets the read proceed
+    // concurrently, so the counter ticks smoothly. (Guests never open these files
+    // directly — they go through sessiond over HTTP — so this is host-only.)
+    db.pragma_update(None, "journal_mode", "WAL")?;
+    db.pragma_update(None, "synchronous", "NORMAL")?;
     db.pragma_update(None, "busy_timeout", 5000)?;
     Ok(())
 }

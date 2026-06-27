@@ -4058,14 +4058,14 @@ fn tg_api_base() -> String {
 /// a slow call fails fast, the loop logs + retries, and the clock keeps ticking.
 const TG_HTTP_TIMEOUT: Duration = Duration::from_secs(12);
 
-/// Flood-safe cadence for the live "Thinking…" edits, and the ceiling we back off
-/// to when Telegram pushes back. Editing the draft ~once/second over a long turn
-/// trips Telegram flood control, which throttles by *slow-responding* — each edit
-/// then blocks this synchronous loop for many seconds and the clock visibly
-/// freezes (the exact bug the user kept hitting). So the loop edits at most every
-/// `LIVE_EDIT_BASE`, doubles the interval up to `LIVE_EDIT_MAX` on a stall/429, and
-/// snaps back to base the instant an edit lands.
-const LIVE_EDIT_BASE: Duration = Duration::from_millis(2500);
+/// Target cadence for the live "Thinking…" counter, and the ceiling we back off
+/// to when Telegram pushes back. ~1s gives a smooth, stopwatch-like count instead
+/// of multi-second jumps. Edits go through the persistent keep-alive agent (no
+/// per-edit TLS handshake) and the session DBs are WAL (reads don't stall on the
+/// worker's writes), so the synchronous loop keeps up; if Telegram ever 429s or an
+/// edit stalls, the interval doubles up to `LIVE_EDIT_MAX` and snaps back to base
+/// the instant an edit lands again.
+const LIVE_EDIT_BASE: Duration = Duration::from_millis(1000);
 const LIVE_EDIT_MAX: Duration = Duration::from_secs(20);
 
 /// A persistent, tightly-bounded HTTP agent for the high-frequency live-progress
@@ -4750,9 +4750,10 @@ fn stream_turn_to_telegram(
             next_edit_at = std::time::Instant::now() + edit_interval;
         }
         let edit_ms = t_edit.elapsed().as_millis();
-        // Surface any stall (>1.5s in a step) so a frozen clock is explained in the
-        // journal instead of being invisible.
-        if list_ms > 1500 || prog_ms > 1500 || edit_ms > 1500 {
+        // Surface any per-step stall (>800ms) so a jumpy/frozen clock is explained
+        // in the journal instead of being invisible. With WAL reads + the keep-alive
+        // edit agent these should all be well under this.
+        if list_ms > 800 || prog_ms > 800 || edit_ms > 800 {
             eprintln!(
                 "telegram loop slow @ {clock}: list={list_ms}ms progress={prog_ms}ms edit={edit_ms}ms"
             );
@@ -4762,7 +4763,8 @@ fn stream_turn_to_telegram(
             // which will edit this same live message via the marker.
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(900));
+        // Short sleep so the ~1s counter cadence isn't bounded by the poll period.
+        thread::sleep(Duration::from_millis(400));
     }
 }
 
@@ -8360,15 +8362,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
 
         let reqs = captured.lock().unwrap().clone();
-        // Counter ADVANCED but did not HAMMER: between 2 and 6 distinct "Thinking…"
-        // payloads over the ~6s pre-reply window. ≥2 proves the clock isn't frozen
-        // (the old bucketed bug emitted one); ≤6 proves we edit on a flood-safe
-        // cadence (the per-second edits that tripped throttling would emit ~6–8+).
+        // Counter ADVANCED smoothly: several DISTINCT "💭 Thinking… 0:0X" payloads
+        // over the ~6s pre-reply window (~1/s cadence). ≥3 proves the clock isn't
+        // frozen/jumpy (the old bucketed bug emitted one, the 2.5s cadence ~2–3);
+        // the upper bound just guards against an unbounded edit storm.
         let thinking: std::collections::BTreeSet<String> =
             reqs.iter().filter(|r| r.contains("Thinking")).cloned().collect();
         assert!(
-            (2..=6).contains(&thinking.len()),
-            "counter should advance on a flood-safe cadence (2..=6 frames), got {}:\n{}",
+            (3..=14).contains(&thinking.len()),
+            "counter should advance ~1/s (expect several distinct frames over the ~6s window), got {}:\n{}",
             thinking.len(),
             thinking.into_iter().collect::<Vec<_>>().join("\n--\n")
         );
