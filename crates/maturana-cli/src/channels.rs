@@ -4415,39 +4415,26 @@ fn finalize_reply(
     }
 }
 
-/// Play the dissolve "swoosh" on the live progress message before it is replaced
-/// by the answer (or removed for a silent turn): a short burst of edits that
-/// crumble the elapsed-clock status into dust, so the thinking indicator visibly
-/// dissolves instead of snapping to the answer or vanishing. Best-effort — a
-/// dropped frame (e.g. a transient 429 from the quick burst) just makes the swoosh
-/// slightly less smooth and never blocks delivery.
-/// The EXACT sequence of HTML message bodies the dissolve swoosh edits the live
-/// message through for a turn of `secs` elapsed seconds: the "Thinking… MM:SS" line
-/// crumbling into scattered dust. Pure (no I/O) so the emitted Telegram payloads are
-/// unit-testable end-to-end, not just the inner frame math. We crumble the SAME line
-/// the draft was showing so, in the common (no-tool) case, the dissolve continues
-/// seamlessly from what's on screen.
-fn dissolve_html_frames(secs: u64) -> Vec<String> {
-    let status = format!("💭 Thinking… {}:{:02}", secs / 60, secs % 60);
-    maturana_core::animation::dissolve_frames(&status)
-        .into_iter()
-        // Dust glyphs/spaces are HTML-safe; wrap in <pre> like the live draft.
-        .map(|f| format!("<pre>{f}</pre>"))
-        .collect()
-}
-
-fn dissolve_live_message(token: &str, chat_id: i64, id: i64, elapsed: Duration) {
-    let secs = elapsed.as_secs();
-    let frames = dissolve_html_frames(secs);
-    eprintln!(
-        "telegram: dissolve swoosh ({} frames) on message {id} after {secs}s",
-        frames.len()
-    );
-    for html in frames {
-        if edit_telegram_message_html(token, chat_id, id, &html).is_err() {
-            break;
+/// OpenClaw-style finish: rather than snapping the thinking/tool draft straight to
+/// the full answer, "flow" the answer into the SAME live message in a couple of
+/// growing chunks over ~0.4s — the way OpenClaw streams its preview into the reply.
+/// The caller then does the authoritative full edit (`finalize_reply`), so a
+/// dropped intermediate edit (e.g. a transient 429 from the short burst) never
+/// matters. Plain text, no parse mode, so cutting the answer mid-string can't break
+/// HTML, and short answers skip the reveal (one clean edit reads fine).
+fn reveal_answer(token: &str, chat_id: i64, id: i64, answer: &str) {
+    let chars: Vec<char> = answer.chars().collect();
+    let n = chars.len();
+    if n < 48 {
+        return;
+    }
+    for frac in [0.45_f32, 0.75] {
+        let take = ((n as f32 * frac) as usize).min(n);
+        let partial: String = chars[..take].iter().collect();
+        if edit_telegram_message(token, chat_id, id, &format!("{partial} …")).is_err() {
+            return;
         }
-        thread::sleep(Duration::from_millis(170));
+        thread::sleep(Duration::from_millis(180));
     }
 }
 
@@ -4528,8 +4515,7 @@ fn stream_turn_to_telegram(
             // — a failed delete must never wedge the turn into an endless retry.
             if reply.trim() == crate::proactive::SILENCE_SENTINEL {
                 if let Some(id) = message_id {
-                    // Crumble the thinking indicator away, then remove it.
-                    dissolve_live_message(token, chat_id, id, started.elapsed());
+                    // Nothing worth saying — just remove the thinking indicator.
                     let _ = delete_telegram_message(token, chat_id, id);
                 }
                 clear_telegram_status(paths, inbound_id);
@@ -4537,13 +4523,12 @@ fn stream_turn_to_telegram(
                 let _ = clear_progress(paths, inbound_id);
                 return Ok(());
             }
-            // Dissolve the thinking indicator first (the swoosh), THEN edit the live
-            // message in place into the answer — so the progress visibly crumbles
-            // away and the answer settles in, rather than snapping over. The dust
-            // settling into the answer is the whole effect. finalize_reply still
-            // guarantees a failed edit never leaves two messages.
+            // Flow the answer into the live message (OpenClaw-style) so it reads as
+            // the reply streaming into place rather than snapping over, THEN do the
+            // authoritative full edit. finalize_reply still guarantees a failed edit
+            // never leaves two messages.
             if let Some(id) = message_id {
-                dissolve_live_message(token, chat_id, id, started.elapsed());
+                reveal_answer(token, chat_id, id, &reply);
             }
             match finalize_reply(token, chat_id, message_id, &reply, reply_to) {
                 Ok(platform_id) => {
@@ -7974,28 +7959,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn dissolve_swoosh_emits_crumbling_thinking_payloads() {
-        // The exact Telegram edit payloads the swoosh sends for an 8s turn: the
-        // "💭 Thinking… 0:08" line crumbling into dust over four <pre> frames.
-        let frames = dissolve_html_frames(8);
-        assert_eq!(frames.len(), 4, "four swoosh frames");
-        // Every frame is a valid <pre> body (HTML-safe dust/spaces).
-        assert!(frames.iter().all(|f| f.starts_with("<pre>") && f.ends_with("</pre>")));
-        // It starts from the recognizable Thinking line (only partly dusted)…
-        assert!(frames[0].contains("Thinking") || frames[0].contains('·'));
-        // …and dust strictly grows as it crumbles, ending sparser than full dust.
-        let dust = |s: &str| s.chars().filter(|&c| c == '·').count();
-        assert!(dust(&frames[0]) < dust(&frames[1]));
-        assert!(dust(&frames[1]) < dust(&frames[2]));
-        assert!(dust(&frames[3]) < dust(&frames[2]));
-        // Deterministic (same turn length → identical payload sequence).
-        assert_eq!(dissolve_html_frames(8), frames);
-        // Whitespace/length preserved across the crumble (frames are equal length).
-        let len0 = frames[0].chars().count();
-        assert!(frames.iter().all(|f| f.chars().count() == len0));
-    }
-
     fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         haystack.windows(needle.len()).position(|w| w == needle)
     }
@@ -8059,40 +8022,36 @@ mod tests {
     }
 
     #[test]
-    fn dissolve_swoosh_emits_real_http_sequence_against_mock() {
+    fn answer_reveal_emits_clean_http_sequence_against_mock() {
         // Drive the REAL Telegram send/edit code against a local mock and capture the
-        // exact HTTP it emits for a completing turn: post the "Thinking" draft, play
-        // the dissolve swoosh, then finalize into the answer. Proves the whole
-        // completion path end-to-end (the actual editMessageText burst) without real
-        // Telegram or a bot token.
+        // exact HTTP for a completing turn: post the "Thinking" draft, flow the answer
+        // in (reveal), then finalize into the full answer. OpenClaw-style — the message
+        // streams into the reply in place, with NO dust/crumble frames.
         let (base, captured) = spawn_mock_telegram();
         std::env::set_var("MATURANA_TELEGRAM_API_BASE", &base);
 
+        let answer =
+            "Three biggest stories: one, two, and three — with a short note on each and why it matters.";
         let id = send_telegram_html("TESTTOKEN", "123", "<pre>💭 Thinking… 0:08</pre>", None)
             .unwrap()
             .expect("draft message id");
         assert_eq!(id, 4242);
-        dissolve_live_message("TESTTOKEN", 123, id, std::time::Duration::from_secs(8));
-        finalize_reply("TESTTOKEN", 123, Some(id), "FINAL ANSWER", None).unwrap();
+        reveal_answer("TESTTOKEN", 123, id, answer);
+        finalize_reply("TESTTOKEN", 123, Some(id), answer, None).unwrap();
 
         std::env::remove_var("MATURANA_TELEGRAM_API_BASE");
 
         let reqs = captured.lock().unwrap().clone();
-        // 1 sendMessage (draft) + 4 editMessageText (dissolve) + 1 editMessageText (answer).
-        assert_eq!(reqs.len(), 6, "unexpected request sequence:\n{}", reqs.join("\n--\n"));
+        // 1 sendMessage (draft) + 2 editMessageText (reveal chunks) + 1 editMessageText (full answer).
+        assert_eq!(reqs.len(), 4, "unexpected request sequence:\n{}", reqs.join("\n--\n"));
         assert!(reqs[0].contains("/sendMessage") && reqs[0].contains("Thinking"), "{}", reqs[0]);
-        // The four dissolve frames are editMessageText carrying dust, with dust
-        // strictly growing then thinning (the crumble).
-        let dust = |s: &str| s.matches('·').count();
-        for r in &reqs[1..5] {
-            assert!(r.contains("/editMessageText"), "expected editMessageText: {r}");
-            assert!(dust(r) > 0, "dissolve frame should carry dust: {r}");
-        }
-        assert!(dust(&reqs[1]) < dust(&reqs[2]), "dust should grow 1→2");
-        assert!(dust(&reqs[2]) < dust(&reqs[3]), "dust should grow 2→3");
-        assert!(dust(&reqs[4]) < dust(&reqs[3]), "final frame should be sparser");
-        // The turn ends by editing the SAME message into the answer.
-        assert!(reqs[5].contains("/editMessageText") && reqs[5].contains("FINAL ANSWER"), "{}", reqs[5]);
+        // No dust ANYWHERE — the cheap crumble is gone for good.
+        assert!(reqs.iter().all(|r| !r.contains('·')), "no dust frames");
+        // The two reveal chunks are growing prefixes of the answer.
+        assert!(reqs[1].contains("/editMessageText") && reqs[2].contains("/editMessageText"));
+        assert!(reqs[1].len() < reqs[2].len(), "reveal should grow 1→2");
+        // The final edit carries the COMPLETE answer.
+        assert!(reqs[3].contains("/editMessageText") && reqs[3].contains("why it matters"), "{}", reqs[3]);
     }
 
     #[test]
