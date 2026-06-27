@@ -1,6 +1,6 @@
 use anyhow::Context;
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -97,6 +97,39 @@ pub fn cancel_pending_inbound(paths: &SessionPaths) -> anyhow::Result<usize> {
         params![now],
     )?;
     Ok(n)
+}
+
+/// Request cancellation of any IN-PROGRESS (`processing`) turn for this session:
+/// records its message id so the polling guest worker can abort the live harness
+/// run mid-turn. Unlike [`cancel_pending_inbound`] (which only drops queued work),
+/// this reaches a turn the worker has already claimed. Returns how many in-flight
+/// turns were flagged (0 = nothing is currently running). The worker clears the
+/// flag when it finishes (`mark_inbound_completed`).
+pub fn request_cancel_in_progress(paths: &SessionPaths) -> anyhow::Result<usize> {
+    let db = open_rw(&paths.inbound_db)?;
+    ensure_inbound_schema(&db)?;
+    let now = Utc::now().to_rfc3339();
+    let n = db.execute(
+        "INSERT OR IGNORE INTO cancels (message_id, requested_at)
+         SELECT id, ?1 FROM messages_in WHERE status = 'processing'",
+        params![now],
+    )?;
+    Ok(n)
+}
+
+/// Whether a specific in-flight message has a pending cancel request. The guest
+/// worker polls this (via sessiond) while the harness runs and aborts if true.
+pub fn is_cancel_requested(paths: &SessionPaths, message_id: &str) -> anyhow::Result<bool> {
+    let db = open_rw(&paths.inbound_db)?;
+    ensure_inbound_schema(&db)?;
+    let found: Option<i64> = db
+        .query_row(
+            "SELECT 1 FROM cancels WHERE message_id = ?1",
+            params![message_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
 }
 
 /// Visibility / retry policy for the inbound work queue.
@@ -331,6 +364,9 @@ pub fn mark_inbound_completed(paths: &SessionPaths, message_ids: &[String]) -> a
     )?;
     for id in message_ids {
         stmt.execute(params![now, id])?;
+        // Drop any cancel flag now that the turn is done, so it can't bleed into a
+        // future turn that happens to reuse polling on this id.
+        db.execute("DELETE FROM cancels WHERE message_id = ?1", params![id])?;
     }
     Ok(())
 }
@@ -433,6 +469,34 @@ pub fn list_undelivered(paths: &SessionPaths) -> anyhow::Result<Vec<OutboundMess
         .into_iter()
         .filter(|message| !delivered.contains(&message.id))
         .collect())
+}
+
+/// Find the outbound reply for a given inbound, REGARDLESS of delivered status.
+/// Unlike [`list_undelivered`], this still returns the reply after it has been
+/// delivered. An active streaming loop uses it to detect "my reply exists" even
+/// when a concurrent backstop already delivered it — so the loop can claim-or-
+/// clean-up instead of ticking its live bubble forever (the lingering-counter /
+/// duplicate-message class). Targeted query (`WHERE in_reply_to = ?`), so it is
+/// cheap to poll every tick.
+pub fn find_reply_outbound(
+    paths: &SessionPaths,
+    inbound_id: &str,
+) -> anyhow::Result<Option<OutboundMessage>> {
+    let outbound = open_ro(&paths.outbound_db)?;
+    let mut stmt = outbound.prepare(
+        r#"
+        SELECT id, in_reply_to, kind, channel, platform_id, thread_id, content, created_at
+        FROM messages_out
+        WHERE in_reply_to = ?1
+        ORDER BY seq ASC
+        LIMIT 1
+        "#,
+    )?;
+    let mut rows = stmt.query_map(params![inbound_id], outbound_from_row)?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
 }
 
 pub fn mark_delivered(
@@ -579,7 +643,16 @@ fn open_ro(path: &Path) -> anyhow::Result<Connection> {
 }
 
 fn tune(db: &Connection) -> anyhow::Result<()> {
-    db.pragma_update(None, "journal_mode", "DELETE")?;
+    // WAL so readers never block on the writer. The host runs several processes
+    // against these per-session DBs at once (the channel stream loop reading
+    // `list_undelivered` every tick, sessiond writing claims/outbounds, the
+    // delivery threads, proactive/scheduler). In rollback mode a write blocked the
+    // stream loop's read, which stalled the synchronous loop and made the live
+    // "Thinking…" counter jump in multi-second steps. WAL lets the read proceed
+    // concurrently, so the counter ticks smoothly. (Guests never open these files
+    // directly — they go through sessiond over HTTP — so this is host-only.)
+    db.pragma_update(None, "journal_mode", "WAL")?;
+    db.pragma_update(None, "synchronous", "NORMAL")?;
     db.pragma_update(None, "busy_timeout", 5000)?;
     Ok(())
 }
@@ -605,6 +678,10 @@ fn ensure_inbound_schema(db: &Connection) -> anyhow::Result<()> {
             message_id TEXT PRIMARY KEY,
             platform_message_id TEXT,
             delivered_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS cancels (
+            message_id TEXT PRIMARY KEY,
+            requested_at TEXT NOT NULL
         );
         "#,
     )?;
@@ -752,6 +829,32 @@ mod tests {
 
         // Nothing left to claim (the in-flight one stays in 'processing').
         assert!(claim_pending_inbound(&paths, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn request_cancel_in_progress_flags_claimed_turn_and_clears_on_complete() {
+        let temp = temp_dir();
+        let paths = session_paths(&temp, "telegram-main");
+        ensure_session(&paths).unwrap();
+
+        let id =
+            insert_inbound(&paths, "chat", "telegram", "chat-1", None, r#"{"text":"hi"}"#).unwrap();
+        // Not claimed yet → nothing in progress to cancel, and the flag is unset.
+        assert_eq!(request_cancel_in_progress(&paths).unwrap(), 0);
+        assert!(!is_cancel_requested(&paths, &id).unwrap());
+
+        // The worker claims it (status → processing).
+        assert_eq!(claim_pending_inbound(&paths, 1).unwrap().len(), 1);
+
+        // /stop flags the in-flight turn; the worker's poll would see it.
+        assert_eq!(request_cancel_in_progress(&paths).unwrap(), 1);
+        assert!(is_cancel_requested(&paths, &id).unwrap());
+        // Idempotent: a second /stop doesn't double-flag.
+        assert_eq!(request_cancel_in_progress(&paths).unwrap(), 0);
+
+        // Completing the turn clears the flag so it can't bleed into a later turn.
+        mark_inbound_completed(&paths, &[id.clone()]).unwrap();
+        assert!(!is_cancel_requested(&paths, &id).unwrap());
     }
 
     #[test]

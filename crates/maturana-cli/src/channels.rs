@@ -8,9 +8,9 @@ use maturana_core::{
     pipelock::PipelockVault,
     secrets::resolve_secret_source_with_home,
     session_db::{
-        cancel_pending_inbound, claim_delivery, clear_progress, ensure_session, insert_inbound,
-        list_undelivered, mark_delivered, read_progress, session_paths, unclaim_delivery,
-        ProgressEvent, SessionPaths,
+        cancel_pending_inbound, claim_delivery, clear_progress, ensure_session, find_reply_outbound,
+        insert_inbound, list_undelivered, mark_delivered, read_progress,
+        request_cancel_in_progress, session_paths, unclaim_delivery, ProgressEvent, SessionPaths,
     },
     spec::{AgentSpec, HarnessRuntime},
     state::MaturanaHome,
@@ -1584,11 +1584,17 @@ impl OutboundSink for TelegramSink<'_> {
     }
 
     fn has_pending_stream(&self, inbound_id: Option<&str>) -> bool {
-        // A live "working…" status marker means an inline streamer set it and may
-        // still be editing that message; the backstop must not race it.
+        // An active streamer owns delivery for its turn; the backstop must not race
+        // it. The `.tgactive` lock is set at the streamer's ENTRY (before any send),
+        // so it covers the whole turn — including the early window before the live
+        // "working…" message exists. The message-id marker is a secondary signal for
+        // a streamer that set it but whose lock was somehow lost.
         inbound_id
-            .and_then(|inbound| peek_telegram_status(self.paths, inbound))
-            .is_some()
+            .map(|inbound| {
+                telegram_active_exists(self.paths, inbound)
+                    || peek_telegram_status(self.paths, inbound).is_some()
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -3314,17 +3320,24 @@ fn handle_channel_command(
             "Session reset — durable memory and wiki are preserved.".to_string()
         }
         "stop" => {
-            // Drop queued-but-unclaimed turns for this session. A turn already
-            // being processed by the guest worker runs to completion (the in-guest
-            // shell worker has no mid-turn cancel), so we report that honestly.
+            // Two halves: drop queued-but-unclaimed turns, AND flag any IN-PROGRESS
+            // turn so the guest worker (which polls sessiond) kills the running
+            // harness mid-turn and replies "Stopped." The in-progress kill is async
+            // (the worker notices within a couple of seconds), so we acknowledge it.
             let paths = session_paths(&home.agent_dir(&config.agent_id), &config.session_id);
-            match cancel_pending_inbound(&paths) {
-                Ok(0) => "Nothing queued to stop. A reply already in progress will finish on its own.".to_string(),
-                Ok(n) => format!(
-                    "Stopped {n} queued message{}. A reply already in progress will still finish.",
-                    if n == 1 { "" } else { "s" }
+            let queued = cancel_pending_inbound(&paths).unwrap_or(0);
+            let in_progress = request_cancel_in_progress(&paths).unwrap_or(0);
+            match (queued, in_progress) {
+                (0, 0) => "Nothing to stop — nothing is queued or in progress.".to_string(),
+                (q, 0) => format!(
+                    "Stopped {q} queued message{}.",
+                    if q == 1 { "" } else { "s" }
                 ),
-                Err(error) => format!("Couldn't clear the queue: {error:#}"),
+                (0, _) => "Stopping the reply in progress…".to_string(),
+                (q, _) => format!(
+                    "Stopping the reply in progress and dropped {q} queued message{}.",
+                    if q == 1 { "" } else { "s" }
+                ),
             }
         }
         "compact" => {
@@ -4051,14 +4064,14 @@ fn tg_api_base() -> String {
 /// a slow call fails fast, the loop logs + retries, and the clock keeps ticking.
 const TG_HTTP_TIMEOUT: Duration = Duration::from_secs(12);
 
-/// Flood-safe cadence for the live "Thinking…" edits, and the ceiling we back off
-/// to when Telegram pushes back. Editing the draft ~once/second over a long turn
-/// trips Telegram flood control, which throttles by *slow-responding* — each edit
-/// then blocks this synchronous loop for many seconds and the clock visibly
-/// freezes (the exact bug the user kept hitting). So the loop edits at most every
-/// `LIVE_EDIT_BASE`, doubles the interval up to `LIVE_EDIT_MAX` on a stall/429, and
-/// snaps back to base the instant an edit lands.
-const LIVE_EDIT_BASE: Duration = Duration::from_millis(2500);
+/// Target cadence for the live "Thinking…" counter, and the ceiling we back off
+/// to when Telegram pushes back. ~1s gives a smooth, stopwatch-like count instead
+/// of multi-second jumps. Edits go through the persistent keep-alive agent (no
+/// per-edit TLS handshake) and the session DBs are WAL (reads don't stall on the
+/// worker's writes), so the synchronous loop keeps up; if Telegram ever 429s or an
+/// edit stalls, the interval doubles up to `LIVE_EDIT_MAX` and snaps back to base
+/// the instant an edit lands again.
+const LIVE_EDIT_BASE: Duration = Duration::from_millis(1000);
 const LIVE_EDIT_MAX: Duration = Duration::from_secs(20);
 
 /// A persistent, tightly-bounded HTTP agent for the high-frequency live-progress
@@ -4495,11 +4508,53 @@ fn clear_telegram_status(paths: &SessionPaths, inbound_id: &str) {
     let _ = std::fs::remove_file(telegram_status_path(paths, inbound_id));
 }
 
+/// An "active streamer" lock for a turn, distinct from the message-id marker.
+/// The marker only appears once the live bubble has been SENT (≥2s in, and later
+/// still if the first send is retried/backed-off), which left an early window
+/// where the backstop saw no marker and delivered the reply as a fresh duplicate
+/// while a late bubble lingered as a never-ending counter. This lock is written
+/// at loop ENTRY (before any send) and cleared on EVERY exit (RAII), so the
+/// backstop reliably defers to the streamer for the whole turn — the streamer is
+/// the sole deliverer. A crashed streamer leaves the lock behind, but the
+/// backstop's `STREAM_BACKSTOP_AGE` gate still takes over once the reply ages out.
+fn telegram_active_path(paths: &SessionPaths, inbound_id: &str) -> PathBuf {
+    let safe: String = inbound_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    paths.dir.join("progress").join(format!("{safe}.tgactive"))
+}
+
+fn set_telegram_active(paths: &SessionPaths, inbound_id: &str) {
+    let path = telegram_active_path(paths, inbound_id);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, b"1");
+}
+
+fn clear_telegram_active(paths: &SessionPaths, inbound_id: &str) {
+    let _ = std::fs::remove_file(telegram_active_path(paths, inbound_id));
+}
+
+fn telegram_active_exists(paths: &SessionPaths, inbound_id: &str) -> bool {
+    telegram_active_path(paths, inbound_id).exists()
+}
+
 /// Turn the live progress message into the final reply as exactly ONE message:
 /// edit it in place; if the edit fails, delete the stale live message and only
 /// then send a fresh copy — but if that delete cannot be confirmed, return `Err`
 /// WITHOUT sending, so a failed delete can never leave two messages in the chat.
 /// On `Err` the caller releases the claim and a later pass retries.
+/// Finalize a turn into its reply as ONE message: edit the live "Thinking…" bubble
+/// in place into the answer (exactly-once, can never duplicate or orphan). If the
+/// edit fails, delete the stale bubble first and only then send a fresh message —
+/// so a failed edit still can't leave two messages. With no live bubble, just send.
+///
+/// (The native delete-dissolve was attempted by sending the answer as a separate
+/// message and deleting the bubble, but that destabilized delivery — duplicate
+/// bubble + a counter that kept ticking — so it was reverted to this reliable
+/// in-place finish. See the channel notes / [[maturana-telegram-swoosh]].)
 fn finalize_reply(
     token: &str,
     chat_id: i64,
@@ -4520,55 +4575,6 @@ fn finalize_reply(
             }
         },
         None => send_telegram(token, &chat_id.to_string(), reply, reply_to),
-    }
-}
-
-/// OpenClaw-style finish: rather than snapping the thinking/tool draft straight to
-/// the full answer, "flow" the answer into the SAME live message in a couple of
-/// growing chunks over ~0.4s — the way OpenClaw streams its preview into the reply.
-/// The caller then does the authoritative full edit (`finalize_reply`), so a
-/// dropped intermediate edit (e.g. a transient 429 from the short burst) never
-/// matters. Plain text, no parse mode, so cutting the answer mid-string can't break
-/// HTML, and short answers skip the reveal (one clean edit reads fine).
-fn reveal_answer(token: &str, chat_id: i64, id: i64, answer: &str) {
-    let chars: Vec<char> = answer.chars().collect();
-    let n = chars.len();
-    if n < 48 {
-        return;
-    }
-    for frac in [0.45_f32, 0.75] {
-        let take = ((n as f32 * frac) as usize).min(n);
-        let partial: String = chars[..take].iter().collect();
-        // Bounded agent: this runs right after a turn that may have been throttled,
-        // so a stalled chunk must fail in seconds (not block the real answer ~15s).
-        if !matches!(
-            edit_telegram_live(token, chat_id, id, &format!("{partial} …"), None),
-            LiveEditOutcome::Ok
-        ) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(180));
-    }
-}
-
-/// The "5000 pieces" dissolve: on completion, edit the thinking line into a
-/// Telegram NATIVE spoiler (`<tg-spoiler>`) so the client renders it as the
-/// dotted/particle effect before the answer replaces it. Telegram animates the
-/// dissolve on mobile/iOS; desktop shows static dotted text (a bot can mark a
-/// spoiler but can't force the reveal animation to auto-play — a client limit).
-/// Best-effort: a failed edit just means the answer lands without the flourish.
-fn spoiler_dissolve(token: &str, chat_id: i64, id: i64, elapsed: Duration) {
-    let secs = elapsed.as_secs();
-    let html = format!(
-        "<tg-spoiler>💭 Thinking… {}:{:02}</tg-spoiler>",
-        secs / 60,
-        secs % 60
-    );
-    if matches!(
-        edit_telegram_live_html(token, chat_id, id, &html),
-        LiveEditOutcome::Ok
-    ) {
-        thread::sleep(Duration::from_millis(800));
     }
 }
 
@@ -4612,26 +4618,75 @@ fn stream_turn_to_telegram(
     let mut last_typing = started
         .checked_sub(Duration::from_secs(10))
         .unwrap_or(started);
-    loop {
-        // Per-iteration timing so a stall (DB lock, hung HTTP) is pinpointed in the
-        // journal instead of silently freezing the clock.
-        let t_list = std::time::Instant::now();
-        // Final reply ready? Tolerate a transient DB read so a hiccup never leaves
-        // the live spinner orphaned — just keep animating and re-check next tick.
-        let final_msg = match list_undelivered(paths) {
-            Ok(list) => list.into_iter().find(|m| {
-                m.channel == "telegram" && m.in_reply_to.as_deref() == Some(inbound_id)
-            }),
-            Err(error) => {
-                eprintln!("telegram: list_undelivered failed (retrying): {error:#}");
-                None
+    // Mark this turn as actively streamed BEFORE anything is sent. The backstop
+    // delivery thread defers to an active streamer (see `has_pending_stream`), so
+    // the streamer is the SOLE deliverer for the whole turn. This closes the
+    // window where the backstop saw no live-message marker yet (the first bubble
+    // send is ≥2s in, and later still if it is retried/backed-off) and delivered
+    // the reply as a fresh duplicate while the late bubble lingered as a counter.
+    set_telegram_active(paths, inbound_id);
+    // Reply detection runs on a BACKGROUND thread, NOT in this loop, so the only
+    // thing pacing the counter is the ~1s editMessageText. The watcher detects the
+    // reply by EXISTENCE (`find_reply_outbound`, a cheap `WHERE in_reply_to=?`),
+    // NOT by undelivered status — so even if some pass delivered it first, the loop
+    // still finds it and cleans up instead of ticking forever. The loop still
+    // claims + finalizes, so there is no double-delivery.
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let watcher_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let paths = paths.clone();
+        let inbound_id = inbound_id.to_string();
+        let stop = watcher_stop.clone();
+        thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match find_reply_outbound(&paths, &inbound_id) {
+                    Ok(Some(m)) if m.channel == "telegram" => {
+                        let _ = reply_tx.send(m);
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!("telegram: reply watcher query failed (retrying): {error:#}")
+                    }
+                }
+                thread::sleep(Duration::from_millis(1000));
             }
-        };
-        let list_ms = t_list.elapsed().as_millis();
+        });
+    }
+    // Stop the watcher AND release the active-streamer lock on EVERY return path
+    // (including `?` early-returns) so a finished turn isn't still being polled and
+    // the backstop can take over immediately if we exited without delivering.
+    struct TurnGuard<'a> {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        paths: &'a SessionPaths,
+        inbound_id: &'a str,
+    }
+    impl Drop for TurnGuard<'_> {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            clear_telegram_active(self.paths, self.inbound_id);
+        }
+    }
+    let _turn_guard = TurnGuard {
+        stop: watcher_stop.clone(),
+        paths,
+        inbound_id,
+    };
+    loop {
+        // Reply ready? A cheap, non-blocking check of the background watcher's
+        // channel — never the multi-second DB read, so the counter is never stalled.
+        let final_msg = reply_rx.try_recv().ok();
         if let Some(final_msg) = final_msg {
-            // Lost the claim → the delivery thread owns delivery and will edit the
-            // live message (via the marker) into the answer. Just drop our state.
+            // Lost the claim → someone else already delivered this reply (a backstop
+            // pass that ran before our live bubble existed, or a prior streamer).
+            // Our live "Thinking…" bubble is now an orphan that would linger as a
+            // duplicate message + a counter that never stops — delete it so the chat
+            // shows exactly the one delivered answer, then exit.
             if !claim_delivery(paths, &final_msg.id)? {
+                if let Some(id) = message_id {
+                    let _ = delete_telegram_message(token, chat_id, id);
+                }
+                clear_telegram_status(paths, inbound_id);
                 let _ = clear_progress(paths, inbound_id);
                 return Ok(());
             }
@@ -4658,11 +4713,8 @@ fn stream_turn_to_telegram(
             // — a failed delete must never wedge the turn into an endless retry.
             if reply.trim() == crate::proactive::SILENCE_SENTINEL {
                 if let Some(id) = message_id {
-                    // Nothing worth saying — dissolve the indicator into spoiler
-                    // particles (only if Telegram is responsive), then remove it.
-                    if last_edit_ok {
-                        spoiler_dissolve(token, chat_id, id, started.elapsed());
-                    }
+                    // Nothing worth saying — delete the thinking bubble, which
+                    // plays Telegram's native particle-dissolve on it.
                     let _ = delete_telegram_message(token, chat_id, id);
                 }
                 clear_telegram_status(paths, inbound_id);
@@ -4670,22 +4722,9 @@ fn stream_turn_to_telegram(
                 let _ = clear_progress(paths, inbound_id);
                 return Ok(());
             }
-            // Dissolve the thinking indicator into Telegram's native spoiler
-            // particles (the "5000 pieces" effect), then flow the answer into the
-            // SAME message (OpenClaw-style) so it reads as the reply settling into
-            // place, THEN the authoritative full edit. finalize_reply still
-            // guarantees a failed edit never leaves two messages.
-            // Only play the cosmetic dissolve+reveal when Telegram is actually
-            // responsive (the last live edit landed). If we were being throttled,
-            // skip the flourish and go straight to delivering the answer — the
-            // user's reply matters more than the effect, and extra edits would only
-            // deepen the throttle and delay it.
-            if let Some(id) = message_id {
-                if last_edit_ok {
-                    spoiler_dissolve(token, chat_id, id, started.elapsed());
-                    reveal_answer(token, chat_id, id, &reply);
-                }
-            }
+            // Deliver the answer as its own message and dissolve the thinking
+            // bubble (finalize_reply sends, then deletes the live message → the
+            // native Telegram particle-dissolve the user asked for).
             match finalize_reply(token, chat_id, message_id, &reply, reply_to) {
                 Ok(platform_id) => {
                     // Finalize the claim (the row already exists from claim_delivery,
@@ -4796,22 +4835,33 @@ fn stream_turn_to_telegram(
                     }
                 }
             }
-            next_edit_at = std::time::Instant::now() + edit_interval;
+            // Schedule the next edit from when THIS one STARTED (t_edit), not from
+            // now (after it). editMessageText takes ~1s, so `now() + interval`
+            // double-counted the edit duration → effective 2s ticks. Start-to-start
+            // means the cadence is max(interval, edit_duration) ≈ 1s, so the clock
+            // advances ~1s/step like a stopwatch.
+            next_edit_at = t_edit + edit_interval;
         }
         let edit_ms = t_edit.elapsed().as_millis();
-        // Surface any stall (>1.5s in a step) so a frozen clock is explained in the
-        // journal instead of being invisible.
-        if list_ms > 1500 || prog_ms > 1500 || edit_ms > 1500 {
-            eprintln!(
-                "telegram loop slow @ {clock}: list={list_ms}ms progress={prog_ms}ms edit={edit_ms}ms"
-            );
+        // Surface any per-step stall (>800ms) so a jumpy/frozen clock is explained
+        // in the journal instead of being invisible. The DB read is off this loop
+        // now (background watcher), so the only blocking step left is the edit.
+        if prog_ms > 800 || edit_ms > 800 {
+            eprintln!("telegram loop slow @ {clock}: progress={prog_ms}ms edit={edit_ms}ms");
         }
         if std::time::Instant::now() >= deadline {
             // Gave up waiting; leave the (undelivered) reply to the delivery thread,
             // which will edit this same live message via the marker.
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(900));
+        // Sleep only until the next edit is due — not a fixed poll. When an edit
+        // just landed the next is due ~immediately (the ~1s edit IS the cadence),
+        // so the counter ticks ~1s; clamped to [100ms, 500ms] so we never busy-spin
+        // and the background reply is still picked up promptly.
+        let nap = next_edit_at
+            .saturating_duration_since(std::time::Instant::now())
+            .clamp(Duration::from_millis(100), Duration::from_millis(500));
+        thread::sleep(nap);
     }
 }
 
@@ -8306,68 +8356,44 @@ mod tests {
     }
 
     #[test]
-    fn answer_reveal_emits_clean_http_sequence_against_mock() {
-        // Drive the REAL Telegram send/edit code against a local mock and capture the
-        // exact HTTP for a completing turn: post the "Thinking" draft, flow the answer
-        // in (reveal), then finalize into the full answer. OpenClaw-style — the message
-        // streams into the reply in place, with NO dust/crumble frames.
+    fn finalize_edits_thinking_bubble_into_answer() {
+        // Reliable single-message finish: the live "Thinking…" bubble is EDITED in
+        // place into the answer — exactly one message, no new send, no delete (so it
+        // can never duplicate or orphan a bubble). finalize returns the bubble id.
         let (base, captured) = spawn_mock_telegram();
-        let answer =
-            "Three biggest stories: one, two, and three — with a short note on each and why it matters.";
-        with_tg_base(&base, || {
+        let answer = "Three biggest stories: one, two, and three with a short note on each.";
+        let returned = with_tg_base(&base, || {
             let id = send_telegram_html("TESTTOKEN", "123", "<pre>💭 Thinking… 0:08</pre>", None)
                 .unwrap()
                 .expect("draft message id");
-            assert_eq!(id, 4242);
-            reveal_answer("TESTTOKEN", 123, id, answer);
-            finalize_reply("TESTTOKEN", 123, Some(id), answer, None).unwrap();
+            finalize_reply("TESTTOKEN", 123, Some(id), answer, None).unwrap()
         });
 
         let reqs = captured.lock().unwrap().clone();
-        // 1 sendMessage (draft) + 2 editMessageText (reveal chunks) + 1 editMessageText (full answer).
-        assert_eq!(reqs.len(), 4, "unexpected request sequence:\n{}", reqs.join("\n--\n"));
-        assert!(reqs[0].contains("/sendMessage") && reqs[0].contains("Thinking"), "{}", reqs[0]);
-        // No dust ANYWHERE — the cheap crumble is gone for good.
-        assert!(reqs.iter().all(|r| !r.contains('·')), "no dust frames");
-        // The two reveal chunks are growing prefixes of the answer.
-        assert!(reqs[1].contains("/editMessageText") && reqs[2].contains("/editMessageText"));
-        assert!(reqs[1].len() < reqs[2].len(), "reveal should grow 1→2");
-        // The final edit carries the COMPLETE answer.
-        assert!(reqs[3].contains("/editMessageText") && reqs[3].contains("why it matters"), "{}", reqs[3]);
-    }
-
-    #[test]
-    fn spoiler_dissolve_emits_native_tg_spoiler_frame() {
-        // The "5000 pieces" dissolve must edit the live message to a real Telegram
-        // <tg-spoiler> so the client renders the particle effect.
-        let (base, captured) = spawn_mock_telegram();
-        with_tg_base(&base, || {
-            let id = send_telegram_html("TESTTOKEN", "123", "<pre>💭 Thinking… 0:05</pre>", None)
-                .unwrap()
-                .expect("draft id");
-            spoiler_dissolve("TESTTOKEN", 123, id, std::time::Duration::from_secs(5));
-        });
-        let reqs = captured.lock().unwrap().clone();
-        // draft sendMessage + one editMessageText carrying the native spoiler.
+        // sendMessage(draft) + editMessageText(answer). No second send, no delete.
         assert_eq!(reqs.len(), 2, "unexpected sequence:\n{}", reqs.join("\n--\n"));
-        assert!(reqs[1].contains("/editMessageText"), "{}", reqs[1]);
+        assert!(reqs[0].contains("/sendMessage") && reqs[0].contains("Thinking"), "{}", reqs[0]);
         assert!(
-            reqs[1].contains("tg-spoiler"),
-            "dissolve frame must use a native <tg-spoiler>: {}",
+            reqs[1].contains("/editMessageText") && reqs[1].contains("short note on each"),
+            "answer must edit the bubble in place: {}",
             reqs[1]
         );
-        assert!(reqs[1].contains("Thinking"), "{}", reqs[1]);
+        assert!(
+            reqs.iter().all(|r| !r.contains("/deleteMessage")),
+            "no delete — the one bubble becomes the answer"
+        );
+        // finalize returns the (reused) bubble id, not a new message id.
+        assert_eq!(returned, Some(4242));
     }
 
     #[test]
-    fn live_loop_ticks_counter_on_cadence_then_reveals_answer() {
+    fn live_loop_ticks_counter_then_edits_into_answer() {
         // Drive the REAL stream_turn_to_telegram loop against the mock, with a worker
         // reply that lands after ~8s. Asserts the captured HTTP shows the counter
         // ADVANCING (≥2 distinct "💭 Thinking… 0:0X" frames — the old 10s-frozen bug
         // would emit only one) but NOT hammering Telegram (≤6 frames over the ~6s
-        // pre-reply window — the per-second edits that tripped flood control and
-        // caused the 15s freeze would emit far more), the answer revealed at the end,
-        // and NO dust anywhere. This exercises the LIVE behaviour, not just helpers.
+        // pre-reply window), then a reliable finish: the live bubble is EDITED in
+        // place into the answer (one message, no duplicate, no leftover bubble).
         let (base, captured) = spawn_mock_telegram();
 
         let tmp = std::env::temp_dir().join(format!("mat-streamloop-{}", std::process::id()));
@@ -8390,23 +8416,9 @@ mod tests {
 
         // The worker's reply lands after ~8s so the counter advances across a few
         // cadence ticks (base 2.5s) before the answer arrives.
-        let answer = "Here is a reasonably long answer that should be revealed in two growing chunks before the final edit lands.";
+        let answer = "Here is a reasonably long answer that the live bubble is edited into when the turn completes.";
         let paths_w = paths.clone();
         let reply_to = inbound_id.clone();
-        let worker = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(8000));
-            let body = serde_json::json!({ "text": answer }).to_string();
-            let _ = maturana_core::session_db::write_outbound(
-                &paths_w,
-                Some(&reply_to),
-                "chat",
-                "telegram",
-                &chat_id.to_string(),
-                None,
-                &body,
-            );
-        });
-
         let config = TelegramServe {
             agent_id: agent.to_string(),
             session_id: session.to_string(),
@@ -8417,6 +8429,23 @@ mod tests {
             timeout_seconds: 600,
         };
         with_tg_base(&base, || {
+            // Spawn the worker INSIDE the serialized section so its reply-delay timer
+            // starts at the loop's start, not before this test acquired the shared
+            // TG_ENV_LOCK — otherwise a slow earlier test makes the reply land early
+            // and the counter shows too few frames (flaky under test contention).
+            let worker = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(8000));
+                let body = serde_json::json!({ "text": answer }).to_string();
+                let _ = maturana_core::session_db::write_outbound(
+                    &paths_w,
+                    Some(&reply_to),
+                    "chat",
+                    "telegram",
+                    &chat_id.to_string(),
+                    None,
+                    &body,
+                );
+            });
             stream_turn_to_telegram(
                 &home,
                 "TESTTOKEN",
@@ -8428,29 +8457,134 @@ mod tests {
                 std::time::Duration::from_secs(25),
             )
             .unwrap();
+            worker.join().unwrap();
         });
-        worker.join().unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
 
         let reqs = captured.lock().unwrap().clone();
-        // Counter ADVANCED but did not HAMMER: between 2 and 6 distinct "Thinking…"
-        // payloads over the ~6s pre-reply window. ≥2 proves the clock isn't frozen
-        // (the old bucketed bug emitted one); ≤6 proves we edit on a flood-safe
-        // cadence (the per-second edits that tripped throttling would emit ~6–8+).
+        // Counter ADVANCED smoothly: several DISTINCT "💭 Thinking… 0:0X" payloads
+        // over the ~6s pre-reply window (~1/s cadence). ≥3 proves the clock isn't
+        // frozen/jumpy (the old bucketed bug emitted one, the 2.5s cadence ~2–3);
+        // the upper bound just guards against an unbounded edit storm.
         let thinking: std::collections::BTreeSet<String> =
             reqs.iter().filter(|r| r.contains("Thinking")).cloned().collect();
         assert!(
-            (2..=6).contains(&thinking.len()),
-            "counter should advance on a flood-safe cadence (2..=6 frames), got {}:\n{}",
+            (3..=14).contains(&thinking.len()),
+            "counter should advance ~1/s (expect several distinct frames over the ~6s window), got {}:\n{}",
             thinking.len(),
             thinking.into_iter().collect::<Vec<_>>().join("\n--\n")
         );
-        // No dust anywhere — the dots are gone for good.
+        // No dust anywhere — the simulated dots/crumble are gone for good.
         assert!(reqs.iter().all(|r| !r.contains('·')), "no dust frames");
-        // The full answer was delivered into the live message.
+        // The answer was delivered by EDITING the live bubble in place (one message),
+        // not a second send and not a delete.
         assert!(
-            reqs.iter().any(|r| r.contains("before the final edit lands")),
-            "answer not delivered:\n{}",
+            reqs.iter().any(|r| r.contains("/editMessageText") && r.contains("edited into when the turn completes")),
+            "answer not delivered by editing the bubble:\n{}",
+            reqs.join("\n--\n")
+        );
+        assert!(
+            reqs.iter().all(|r| !r.contains("/deleteMessage")),
+            "no delete on a normal answer — the bubble becomes the answer:\n{}",
+            reqs.join("\n--\n")
+        );
+    }
+
+    #[test]
+    fn live_loop_deletes_orphan_bubble_when_reply_already_delivered() {
+        // Regression for the duplicate-message + never-ending-counter class
+        // (the "Snak dansk" incident): if a backstop pass delivers the reply while
+        // the streamer is mid-turn (its live bubble already on screen), the streamer
+        // must DELETE its now-orphan bubble and send NO duplicate — the chat shows
+        // exactly the one delivered answer, and the counter stops. The streamer
+        // detects the reply by EXISTENCE (not undelivered status), so it can't tick
+        // forever against a reply someone else already delivered.
+        let (base, captured) = spawn_mock_telegram();
+
+        let tmp = std::env::temp_dir().join(format!("mat-orphanbubble-{}", std::process::id()));
+        let home = MaturanaHome::new(tmp.clone());
+        let agent = "claude";
+        let session = "telegram-main";
+        let chat_id = 778i64;
+        std::fs::create_dir_all(home.agent_dir(agent)).unwrap();
+        let paths = session_paths(&home.agent_dir(agent), session);
+        ensure_session(&paths).unwrap();
+        let inbound_id = insert_inbound(
+            &paths,
+            "chat",
+            "telegram",
+            &chat_id.to_string(),
+            None,
+            &serde_json::json!({ "text": "hi" }).to_string(),
+        )
+        .unwrap();
+
+        // After ~3.5s the streamer's live bubble exists; THEN a backstop delivers the
+        // reply (write outbound + atomically claim it) out from under the streamer.
+        let answer = "Already delivered by the backstop.";
+        let paths_w = paths.clone();
+        let reply_to = inbound_id.clone();
+        let config = TelegramServe {
+            agent_id: agent.to_string(),
+            session_id: session.to_string(),
+            token_source: "x".to_string(),
+            once: false,
+            run_once_provider: None,
+            poll_seconds: 5,
+            timeout_seconds: 600,
+        };
+        with_tg_base(&base, || {
+            // Spawn the worker INSIDE the serialized section so its timer starts at
+            // the loop's start (see the sibling live-loop test for why).
+            let worker = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(3500));
+                let body = serde_json::json!({ "text": answer }).to_string();
+                let _ = maturana_core::session_db::write_outbound(
+                    &paths_w,
+                    Some(&reply_to),
+                    "chat",
+                    "telegram",
+                    &chat_id.to_string(),
+                    None,
+                    &body,
+                );
+                // Simulate the backstop winning the atomic claim before the streamer.
+                if let Ok(Some(msg)) = find_reply_outbound(&paths_w, &reply_to) {
+                    let _ = claim_delivery(&paths_w, &msg.id);
+                }
+            });
+            stream_turn_to_telegram(
+                &home,
+                "TESTTOKEN",
+                &config,
+                chat_id,
+                &inbound_id,
+                None,
+                &paths,
+                std::time::Duration::from_secs(25),
+            )
+            .unwrap();
+            worker.join().unwrap();
+        });
+
+        // The active-streamer lock is released on every exit path.
+        assert!(
+            !telegram_active_exists(&paths, &inbound_id),
+            "the .tgactive lock must be cleared when the streamer exits"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let reqs = captured.lock().unwrap().clone();
+        // The orphan bubble was DELETED (cleanup) ...
+        assert!(
+            reqs.iter().any(|r| r.contains("/deleteMessage")),
+            "orphan bubble should be deleted on a lost claim:\n{}",
+            reqs.join("\n--\n")
+        );
+        // ... and the streamer did NOT re-send the answer (no duplicate).
+        assert!(
+            reqs.iter().all(|r| !r.contains("Already delivered by the backstop")),
+            "streamer must NOT send the answer the backstop already delivered:\n{}",
             reqs.join("\n--\n")
         );
     }
