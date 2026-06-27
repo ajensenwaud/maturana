@@ -37,7 +37,10 @@ pub fn codex_program() -> String {
     }
     #[cfg(not(windows))]
     {
-        "codex".to_string()
+        // Resolve the absolute path: a systemd --user service's minimal PATH
+        // doesn't include ~/.npm-global/bin where codex is installed, so a bare
+        // "codex" ENOENTs (the Console `turn_spawn_failed` bug).
+        crate::harness::resolve_program("codex")
     }
 }
 

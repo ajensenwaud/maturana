@@ -63,11 +63,31 @@ pub(crate) fn snapshot(root: &std::path::Path) -> anyhow::Result<serde_json::Val
                 }
                 let agent_id = entry.file_name().to_string_lossy().to_string();
                 let spec = AgentSpec::from_maturana_markdown(&spec_path).ok();
-                let worker_status: Option<serde_json::Value> = std::fs::read_to_string(
-                    dir.join("worker-status.json"),
-                )
-                .ok()
-                .and_then(|raw| serde_json::from_str(&raw).ok());
+                let status_path = dir.join("worker-status.json");
+                let worker_status: Option<serde_json::Value> =
+                    std::fs::read_to_string(&status_path)
+                        .ok()
+                        .and_then(|raw| serde_json::from_str(&raw).ok());
+                // Liveness by heartbeat FRESHNESS, not the literal status string.
+                // The guest worker rewrites worker-status.json every ~1s while
+                // idle and only ever writes idle/claimed/completed/error — it
+                // never writes "running", so the Overview's old status=="running"
+                // count was always 0 for a healthy idle fleet. An agent is "up"
+                // when its heartbeat is fresh and not in an error state; "busy"
+                // means a turn is actually in flight (status "claimed").
+                let worker_age_s: Option<u64> = std::fs::metadata(&status_path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|d| d.as_secs());
+                let status_str = worker_status
+                    .as_ref()
+                    .and_then(|w| w.get("status"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let live = worker_age_s.map(|age| age <= 90).unwrap_or(false)
+                    && status_str != "error";
                 agents.push(serde_json::json!({
                     "agent_id": agent_id,
                     "name": spec.as_ref().map(|s| s.identity.name.clone()),
@@ -79,6 +99,9 @@ pub(crate) fn snapshot(root: &std::path::Path) -> anyhow::Result<serde_json::Val
                     "egress_allowlist": spec.as_ref().map(|s| s.network.egress_allowlist.clone()).unwrap_or_default(),
                     "egress_allow_all": spec.as_ref().map(|s| s.network.egress_allow_all).unwrap_or(false),
                     "worker_status": worker_status,
+                    "status": status_str,
+                    "live": live,
+                    "worker_age_s": worker_age_s,
                     "spec_parses": spec.is_some(),
                 }));
             }

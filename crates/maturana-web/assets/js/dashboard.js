@@ -131,8 +131,8 @@ export async function renderOverview(panel) {
       ? Math.round(100 * (1 - host.mem_available_bytes / host.mem_total_bytes)) : null;
     cards.replaceChildren(
       card("agents", c.agents ?? 0),
-      card("running", c.running ?? 0, (c.running ? "good" : "")),
-      card("idle", c.idle ?? 0),
+      card("up", c.up ?? 0, ((c.up ?? 0) > 0 ? "good" : "bad")),
+      card("busy", c.busy ?? 0),
       card("with graph", c.graphs ?? 0),
       card("plane", o.plane?.up ? "up" : "down", o.plane?.up ? "good" : "bad"),
       card("load", (host.loadavg?.[0] ?? 0).toFixed(2)),
@@ -141,12 +141,12 @@ export async function renderOverview(panel) {
 
     const agents = (o.agents || []);
     const rows = agents.map((a) => {
-      const st = a.worker_status?.status || "unknown";
+      const st = a.status || a.worker_status?.status || "unknown";
       const doing = a.worker_status?.message || WORKER_TEXT[st] || "—";
       return [
         el("strong", null, a.agent_id),
         a.harness || "—",
-        statusPill(st),
+        statusPill(st, a.live),
         doing,
         a.knowledge_graph ? `graph:${a.graph_name}` : "—",
       ];
@@ -167,11 +167,19 @@ export async function renderOverview(panel) {
   }, 5000);
 }
 
-function statusPill(status) {
-  const kind = status === "running" ? "good"
-    : status === "error" ? "bad"
-    : status === "idle" ? "dim" : "";
-  return badge(status, kind);
+// Liveness pill. `live` (fresh heartbeat) is what decides up vs offline; the
+// raw status only distinguishes busy (a turn in flight) from idle. The guest
+// worker never writes "running", so we synthesize the human labels here:
+//   error → "error" (red) · stale/no heartbeat → "offline" (dim)
+//   claimed → "busy" (green) · idle+fresh → "up" (green).
+// `live` is optional so legacy callers (Agents view) that pass only a status
+// still get a sensible pill.
+function statusPill(status, live) {
+  if (status === "error") return badge("error", "bad");
+  if (live === false) return badge(status ? `offline (${status})` : "offline", "dim");
+  if (status === "claimed") return badge("busy", "good");
+  if (status === "idle" || live === true) return badge("up", "good");
+  return badge(status || "—", "dim");
 }
 
 // ---- system (observability) ----

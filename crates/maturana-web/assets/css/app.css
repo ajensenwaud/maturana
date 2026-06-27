@@ -40,9 +40,26 @@ a:hover { text-decoration: underline; }
 .shell {
   display: grid;
   grid-template-columns: 232px 1fr;
-  grid-template-rows: 56px 1fr;
-  grid-template-areas: "head head" "nav main";
+  grid-template-rows: 56px 1fr 28px;
+  grid-template-areas: "head head" "nav main" "foot foot";
   height: 100vh;
+  transition: grid-template-columns 200ms ease;
+}
+
+/* Collapsible left nav (Hermes-style): the grid column animates to 0 and the
+   nav slides/fades out. Driven off html[data-nav-collapsed] so the pre-paint
+   inline script can set it with no flash. */
+html[data-nav-collapsed="1"] .shell { grid-template-columns: 0 1fr; }
+html[data-nav-collapsed="1"] nav.side {
+  padding-left: 0;
+  padding-right: 0;
+  opacity: 0;
+  border-right: 0;
+  pointer-events: none;
+}
+nav.side { transition: opacity 140ms ease, padding 200ms ease; }
+@media (prefers-reduced-motion: reduce) {
+  .shell, nav.side { transition: none; }
 }
 
 header.top {
@@ -755,3 +772,189 @@ button.primary:hover {
 }
 .theme-check { margin-left: auto; opacity: 0; color: var(--accent); }
 .theme-item.active .theme-check { opacity: 1; }
+
+/* ============================================================
+   Hermes-structure components (Maturana tokens) — added in the
+   cockpit uplift: collapsible nav, status bar, card panels,
+   card selectors, styled file input, picker dialog.
+   ============================================================ */
+
+/* header brand row + sidebar collapse toggle */
+.brand-row { display: flex; align-items: center; gap: 12px; }
+.nav-toggle {
+  appearance: none;
+  background: none;
+  border: 1px solid var(--hairline);
+  color: var(--dim);
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.05rem;
+  cursor: pointer;
+  flex: none;
+  transition: color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+}
+.nav-toggle:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  box-shadow: 0 0 16px var(--accent-glow);
+}
+
+/* bottom status bar (grid-area foot) */
+.statusbar {
+  grid-area: foot;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 18px;
+  border-top: 1px solid var(--hairline);
+  background: var(--bg-blur);
+  backdrop-filter: blur(8px);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  color: var(--dim);
+  overflow: hidden;
+  white-space: nowrap;
+}
+.statusbar .sb-item { display: inline-flex; align-items: center; gap: 6px; }
+.statusbar .sb-sep { color: var(--faint); }
+.statusbar .sb-host { margin-left: auto; color: var(--faint); }
+.sb-dot { width: 7px; height: 7px; border-radius: 999px; background: var(--dim); flex: none; }
+.sb-dot.ok { background: var(--ok); box-shadow: 0 0 8px color-mix(in srgb, var(--ok) 60%, transparent); }
+.sb-dot.bad { background: var(--danger); box-shadow: 0 0 8px color-mix(in srgb, var(--danger) 60%, transparent); }
+.sb-dot.warn { background: var(--warn); }
+.sb-dot.dim { background: var(--faint); }
+
+/* CodeMirror editable area needs a definite height on the SCROLLER/CONTENT,
+   not just the wrapper — otherwise CM6's percentage heights collapse to one
+   line (the "long thin strip" bug). */
+.editor-host .cm-scroller { min-height: 92px; max-height: 240px; }
+.editor-host .cm-content { min-height: 92px; }
+
+/* Data-table headers: quiet sentence-case, not shouty mono caps (Tools page). */
+.dash-table th {
+  text-transform: none;
+  font-family: var(--sans);
+  letter-spacing: 0.01em;
+  font-weight: 600;
+  font-size: 0.76rem;
+  color: var(--dim);
+}
+
+/* styled file input (label-as-button) — replaces the native "Choose file". */
+.file-input { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); border: 0; }
+.file-pick {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font-family: var(--sans);
+  font-weight: 600;
+  font-size: 0.82rem;
+  padding: 7px 13px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, box-shadow 120ms ease;
+}
+.file-pick:hover { background: var(--accent); color: var(--accent-ink); box-shadow: 0 0 20px var(--accent-glow); }
+.file-input:focus + .file-pick { box-shadow: 0 0 0 3px var(--accent-soft); }
+.file-name { color: var(--dim); font-size: 0.85rem; }
+
+.pill.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+
+/* Hermes "section card": bordered panel with a title row (title + value tag),
+   a one-line description, then the body. The cockpit's primary content block. */
+.panel-card {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 18px 20px;
+  margin-bottom: 18px;
+  box-shadow: var(--shadow-soft);
+}
+.panel-card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.panel-card-title { color: var(--ink-strong); font-weight: 600; font-size: 0.98rem; }
+.panel-card-tag {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+  padding: 2px 9px;
+  border: 1px solid var(--accent-soft);
+  border-radius: 999px;
+  background: var(--accent-bg);
+}
+.panel-card-desc { color: var(--dim); font-size: 0.88rem; margin: 4px 0 14px; max-width: 78ch; }
+.panel-card-body { display: flex; flex-direction: column; gap: 12px; }
+
+/* Visual card selector (Hermes "Product / Technical" pattern) — replaces
+   dropdowns and JSON for picking one option of a small set. */
+.opt-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.opt-card {
+  position: relative;
+  text-align: left;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease, box-shadow 120ms ease;
+}
+.opt-card:hover { border-color: var(--border-strong); background: var(--surface); }
+.opt-card.sel { border-color: var(--accent); background: var(--accent-bg); box-shadow: 0 0 0 1px var(--accent-soft); }
+.opt-card-title { color: var(--ink-strong); font-weight: 600; font-size: 0.92rem; display: flex; align-items: center; gap: 8px; }
+.opt-card-sub { color: var(--dim); font-size: 0.84rem; margin-top: 4px; }
+.opt-card .opt-check { margin-left: auto; color: var(--accent); opacity: 0; }
+.opt-card.sel .opt-check { opacity: 1; }
+
+/* Centered picker dialog (new-chat agent picker, /model selector). */
+.pick-overlay {
+  position: fixed;
+  inset: 0;
+  background: color-mix(in srgb, var(--bg) 66%, transparent);
+  backdrop-filter: blur(3px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 60;
+}
+.pick-card {
+  width: min(480px, 92vw);
+  max-height: 76vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.pick-head { padding: 16px 18px 10px; }
+.pick-title { color: var(--ink-strong); font-weight: 600; font-size: 1rem; }
+.pick-sub { color: var(--dim); font-size: 0.85rem; margin-top: 3px; }
+.pick-list { overflow-y: auto; padding: 6px; }
+.pick-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--ink);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  cursor: pointer;
+  font-family: var(--sans);
+  font-size: 0.92rem;
+}
+.pick-row:hover, .pick-row.sel { background: var(--accent-bg); color: var(--accent); }
+.pick-row-title { font-weight: 600; }
+.pick-row-sub { color: var(--dim); font-size: 0.82rem; margin-left: auto; }
+.pick-row:hover .pick-row-sub, .pick-row.sel .pick-row-sub { color: inherit; }

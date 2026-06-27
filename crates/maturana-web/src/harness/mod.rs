@@ -77,6 +77,48 @@ pub fn adapter_for(kind: &HarnessKind) -> Box<dyn HarnessAdapter> {
     }
 }
 
+/// Resolve a harness CLI (`codex`, `opencode`, …) to an absolute path on Unix.
+/// A `systemd --user` service runs with a minimal PATH (no `~/.npm-global/bin`,
+/// `~/.local/bin`, nvm, …), so a bare program name fails with `No such file or
+/// directory (os error 2)` even though the operator's login shell can run it —
+/// which is exactly why the cockpit Console showed `turn_spawn_failed`. Scan
+/// `$PATH`, then the common npm/local install dirs, and fall back to the bare
+/// name (so a normal PATH still works and the Windows shim logic is untouched).
+/// Cross-platform-compilable (only invoked on the Unix spawn path at runtime).
+pub(crate) fn resolve_program(name: &str) -> String {
+    use std::path::Path;
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in path.split(':').filter(|d| !d.is_empty()) {
+            let cand = Path::new(dir).join(name);
+            if cand.is_file() {
+                return cand.display().to_string();
+            }
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        for rel in [
+            ".npm-global/bin",
+            ".local/bin",
+            ".local/share/npm/bin",
+            ".volta/bin",
+            ".bun/bin",
+            ".nvm/current/bin",
+        ] {
+            let cand = Path::new(&home).join(rel).join(name);
+            if cand.is_file() {
+                return cand.display().to_string();
+            }
+        }
+    }
+    for dir in ["/usr/local/bin", "/usr/bin", "/opt/homebrew/bin"] {
+        let cand = Path::new(dir).join(name);
+        if cand.is_file() {
+            return cand.display().to_string();
+        }
+    }
+    name.to_string()
+}
+
 /// Spawn `command`, stream stdout lines through `map_line`, forward stderr
 /// tails into the completion detail on failure, and emit a synthetic
 /// completion if the parser never produced one. Shared by both adapters.

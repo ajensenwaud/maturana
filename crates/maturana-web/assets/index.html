@@ -5,8 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Maturana — Control Plane</title>
   <script>
-    // Apply the saved palette before first paint (no flash of the default theme).
-    try { document.documentElement.dataset.theme = localStorage.getItem("maturana.theme") || "teal"; } catch (e) {}
+    // Apply the saved palette + sidebar-collapsed state before first paint (no
+    // flash of the default theme or an expanded-then-collapsed sidebar jump).
+    try {
+      document.documentElement.dataset.theme = localStorage.getItem("maturana.theme") || "teal";
+      if (localStorage.getItem("maturana.nav.collapsed") === "1") document.documentElement.dataset.navCollapsed = "1";
+    } catch (e) {}
   </script>
   <link rel="stylesheet" href="/assets/css/tokens.css" />
   <link rel="stylesheet" href="/assets/css/app.css" />
@@ -14,7 +18,10 @@
 <body>
   <div class="shell">
     <header class="top">
-      <div class="brand">Maturana <span class="accent">/</span> <span class="status-dim">control plane</span></div>
+      <div class="brand-row">
+        <button id="nav-toggle" class="nav-toggle" type="button" aria-label="Collapse sidebar" aria-expanded="true" title="Toggle sidebar">☰</button>
+        <div class="brand">Maturana <span class="accent">/</span> <span class="status-dim">control plane</span></div>
+      </div>
       <div class="top-right">
         <div id="theme-switch"></div>
         <div id="link-status" class="status-dim">[link --]</div>
@@ -40,6 +47,13 @@
         <div class="bracket">[<span class="value" id="boot-pct">000</span>%] establishing link</div>
       </div>
     </main>
+    <footer class="statusbar" id="statusbar">
+      <span class="sb-item" id="sb-link"><span class="sb-dot dim"></span>link…</span>
+      <span class="sb-item" id="sb-plane"><span class="sb-dot dim"></span>plane</span>
+      <span class="sb-item" id="sb-agents"><span class="sb-dot dim"></span>agents</span>
+      <span class="sb-sep">·</span>
+      <span class="sb-item sb-host" id="sb-host"></span>
+    </footer>
   </div>
   <script type="module" src="/assets/js/app.js"></script>
 </body>
