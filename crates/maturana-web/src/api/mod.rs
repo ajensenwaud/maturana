@@ -31,6 +31,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/agents/:id/detail", get(agents::detail))
         .route("/api/agents/:id/stop", post(agents::stop))
         .route("/api/agents/:id/restart", post(agents::restart))
+        .route("/api/agents/:id/deploy-skill", post(agents::deploy_skill))
         .route("/api/agents/:id/files", get(agents::files))
         .route("/api/agents/:id/files/read", get(agents::file_read))
         .route("/api/agents/:id/files/write", post(agents::file_write))

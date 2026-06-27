@@ -982,8 +982,9 @@ export async function renderTools(panel) {
   body.append(el("div", "panel-desc", "loading…"));
   wrap.append(body);
   panel.replaceChildren(wrap);
+  let agents = [];
   try {
-    const agents = await api("/api/agents");
+    agents = await api("/api/agents");
     const details = await Promise.all(
       agents.map((a) => api(`/api/agents/${a.agent_id}/detail`).catch(() => null)),
     );
@@ -1002,6 +1003,34 @@ export async function renderTools(panel) {
   } catch (error) {
     body.replaceChildren(el("div", "status-bad", String(error)));
   }
+
+  // Enable a tool for an agent — composes the existing per-agent config API
+  // (GET the tools array, append, PUT it back; the backend re-validates the spec).
+  const enableWrap = section("Enable a tool for an agent");
+  enableWrap.append(desc("Adds a tool to the agent's spec.tools — it takes effect on the agent's next restart. Pick a registered WASM tool below, or type any tool name."));
+  const enRow = el("div", "dash-actions");
+  const agentSel = el("select", "model-input");
+  for (const a of agents) { const o = el("option", null, a.agent_id); o.value = a.agent_id; agentSel.append(o); }
+  const toolInput = el("input", "model-input");
+  toolInput.placeholder = "tool name";
+  const enStatus = el("span", "panel-desc");
+  enRow.append(agentSel, toolInput, button("enable", async () => {
+    const id = agentSel.value;
+    const tool = toolInput.value.trim();
+    if (!id || !tool) { enStatus.textContent = "pick an agent and enter a tool name"; return; }
+    enStatus.textContent = "saving…";
+    try {
+      const cur = await api(`/api/agents/${id}/config?section=tools`);
+      const list = Array.isArray(cur.value) ? cur.value.slice() : [];
+      if (!list.includes(tool)) list.push(tool);
+      await api(`/api/agents/${id}/config`, { method: "PUT", body: JSON.stringify({ section: "tools", value: list }) });
+      enStatus.textContent = `enabled "${tool}" for ${id} — applies on next restart`;
+      toolInput.value = "";
+      renderTools(panel);
+    } catch (e) { enStatus.textContent = String(e); }
+  }), enStatus);
+  enableWrap.append(enRow);
+  panel.append(enableWrap);
 
   // Host-side WASM tool registry, secondary.
   const reg = section("WASM tool registry");
@@ -1130,7 +1159,7 @@ export async function renderEgress(panel, socket) {
 
 export async function renderSkills(panel) {
   const wrap = section("Skills");
-  wrap.append(desc("Reusable procedures agents can load. View one, or define a new skill — it's written to skills/<name>/SKILL.md and becomes available to wire into an agent."));
+  wrap.append(desc("Skills are Markdown procedures (SKILL.md) your agents follow — they live host-side under skills/<name>. They do NOT auto-load into a VM and are NOT the host Codex's skills: deploy one to a running agent (below) to copy it into the guest at /agent/skills, where the agent reads it on its next turn."));
   const detail = el("div", "skill-view");
   const listBox = el("div");
 
@@ -1184,7 +1213,34 @@ export async function renderSkills(panel) {
   }));
   create.append(row, md, createOut);
 
+  // Deploy a skill into a running agent's guest — answers "how do I get a skill
+  // into an agent". Copies the SKILL.md into /agent/skills over SSH (guest IP from
+  // the agent's spec). Composes the CLI `deploy skill` via /api/agents/:id/deploy-skill.
+  const deployCard = section("Deploy a skill to an agent");
+  deployCard.append(desc("Copies a skill into the agent's guest at /agent/skills over SSH — the agent picks it up on its next turn."));
+  const dRow = el("div", "dash-actions");
+  const skillSel = el("select", "model-input");
+  const agentSel2 = el("select", "model-input");
+  const dStatus = el("span", "panel-desc");
+  try {
+    const [sk, ags] = await Promise.all([api("/api/skills").catch(() => []), api("/api/agents").catch(() => [])]);
+    for (const s of sk) { const o = el("option", null, s.name); o.value = s.name; skillSel.append(o); }
+    for (const a of ags) { const o = el("option", null, a.agent_id); o.value = a.agent_id; agentSel2.append(o); }
+    if (!sk.length) dStatus.textContent = "define a skill first";
+  } catch {}
+  dRow.append(skillSel, el("span", "panel-desc", "→"), agentSel2, button("deploy to agent", async () => {
+    const skill = skillSel.value;
+    const agent = agentSel2.value;
+    if (!skill || !agent) { dStatus.textContent = "pick a skill and an agent"; return; }
+    dStatus.textContent = "deploying…";
+    try {
+      const d = await api(`/api/agents/${agent}/deploy-skill`, { method: "POST", body: JSON.stringify({ skill }) });
+      dStatus.textContent = `deployed ${d.deployed} → ${d.agent}:${d.guest_path}`;
+    } catch (e) { dStatus.textContent = String(e); }
+  }), dStatus);
+  deployCard.append(dRow);
+
   await draw();
   wrap.append(listBox);
-  panel.replaceChildren(wrap, create, detail);
+  panel.replaceChildren(wrap, deployCard, create, detail);
 }

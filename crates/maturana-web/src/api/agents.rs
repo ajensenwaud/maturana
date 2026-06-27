@@ -234,6 +234,68 @@ pub async fn restart(State(state): State<AppState>, Path(id): Path<String>) -> R
     }
 }
 
+#[derive(serde::Deserialize)]
+pub struct DeploySkillBody {
+    skill: String,
+}
+
+/// Deploy a host-side skill into a running Firecracker agent's guest: copy the
+/// skill's SKILL.md into /agent/skills over the SSH-pinned channel, via the
+/// CLI's `deploy skill` command. The guest IP is read from the agent's spec, so
+/// the operator only picks the skill — no manual IP/SSH details.
+pub async fn deploy_skill(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<DeploySkillBody>,
+) -> Response {
+    check_id!(id);
+    let skill = body.skill.trim().to_string();
+    if skill.is_empty() || skill.contains('/') || skill.contains('\\') || skill.contains("..") {
+        return err(StatusCode::BAD_REQUEST, "invalid skill name");
+    }
+    let home_root = state.home_root.clone();
+    let spec_path = agent_spec_path(&state, &id);
+    match blocking(move || {
+        let spec = AgentSpec::from_maturana_markdown(&spec_path)?;
+        let fc = spec
+            .vm
+            .firecracker
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("agent has no firecracker guest to deploy into"))?;
+        let guest_ip = fc.guest_ip.clone();
+        // Skills live at <repo root>/skills/<name>; the repo root is the parent of the home dir.
+        let skills_dir = home_root
+            .parent()
+            .unwrap_or(home_root.as_path())
+            .join("skills");
+        let skill_path = skills_dir.join(&skill);
+        if !skill_path.exists() {
+            anyhow::bail!("skill not found at {}", skill_path.display());
+        }
+        let exe = std::env::current_exe()?;
+        let output = std::process::Command::new(exe)
+            .arg("--home")
+            .arg(&home_root)
+            .args(["deploy", "skill"])
+            .arg(&id)
+            .arg(&skill_path)
+            .args(["--ip", &guest_ip])
+            .output()?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "deploy failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(serde_json::json!({ "deployed": skill, "agent": id, "guest_path": "/agent/skills" }))
+    })
+    .await
+    {
+        Ok(data) => ok(data),
+        Err(response) => response,
+    }
+}
+
 pub async fn spec_get(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     check_id!(id);
     let path = agent_spec_path(&state, &id);
