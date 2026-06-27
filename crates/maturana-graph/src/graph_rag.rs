@@ -95,8 +95,16 @@ pub fn local_query(store: &Store, query: &LocalQuery) -> RagResult {
 
     let seeds: Vec<NodeId> = seed_sim.keys().cloned().collect();
 
-    // 2. Expand the neighborhood.
-    let expansion = store.expand(&seeds, query.depth, query.edge_types.as_deref(), query.max_nodes);
+    // 2. Expand the neighborhood. For a keyword-only query (no embedding) keep
+    //    the hop radius tight (depth 1) so a single chunk hit doesn't fan out
+    //    through its Document node to every sibling chunk — the "query returned
+    //    the whole document" bug. Vector/seeded queries may expand further.
+    let depth = if query.query_embedding.is_some() {
+        query.depth
+    } else {
+        query.depth.min(1)
+    };
+    let expansion = store.expand(&seeds, depth, query.edge_types.as_deref(), query.max_nodes);
 
     // 3. Score: seed similarity (or query cosine) discounted by hop distance.
     let mut scored: Vec<ScoredNode> = expansion
@@ -129,7 +137,9 @@ pub fn local_query(store: &Store, query: &LocalQuery) -> RagResult {
             .then_with(|| a.hops.cmp(&b.hops))
     });
 
-    let rendered_context = render(store, &expansion.subgraph, &scored);
+    // Render only the top-scoring nodes, so a query returns a small relevant
+    // snippet rather than every node pulled in by structural expansion.
+    let rendered_context = render(store, &expansion.subgraph, &scored, query.k.max(1));
 
     RagResult {
         seeds,
@@ -141,12 +151,12 @@ pub fn local_query(store: &Store, query: &LocalQuery) -> RagResult {
 
 /// Render the subgraph as compact text for an agent prompt: entities (by score)
 /// then the relationships between them.
-fn render(store: &Store, subgraph: &Subgraph, scored: &[ScoredNode]) -> String {
+fn render(store: &Store, subgraph: &Subgraph, scored: &[ScoredNode], limit: usize) -> String {
     if subgraph.is_empty() {
         return "(no matching knowledge)".to_string();
     }
     let mut out = String::from("Entities:\n");
-    for s in scored {
+    for s in scored.iter().take(limit) {
         if let Some(node) = store.get_node(&s.id) {
             let labels = if node.labels.is_empty() {
                 String::new()

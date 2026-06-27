@@ -48,6 +48,7 @@ pub fn is_terminal(phase: &Phase) -> bool {
     matches!(phase, Phase::Done { .. } | Phase::Failed { .. })
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;

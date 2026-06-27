@@ -1296,6 +1296,59 @@ pub(crate) fn dispatch_slash_command(
     }
 }
 
+/// Apply a [`dispatch_slash_command`] result for the web cockpit. The cockpit has
+/// no interactive TUI loop, so each [`ConsoleCommand`] maps to a concrete effect:
+/// a local `Reply`/`Select` becomes a `web` outbound the cockpit's poller streams
+/// straight back to the browser; a `Prompt` (skill/emerge/onboard) is enqueued as
+/// a real turn so the agent actually answers. Returns the id the cockpit treats as
+/// the "enqueued message id" (an outbound id for local replies, the inbound id for
+/// a real turn). Without this, `/model …` from the web chat would reach the agent
+/// as a literal user message instead of being handled like every other channel.
+pub(crate) fn apply_web_console_command(
+    home: &MaturanaHome,
+    agent_id: &str,
+    session_id: &str,
+    chat_id: i64,
+    cmd: ConsoleCommand,
+) -> anyhow::Result<String> {
+    let paths = session_paths(&home.agent_dir(agent_id), session_id);
+    ensure_session(&paths)?;
+    let reply = |text: String| -> anyhow::Result<String> {
+        let content = serde_json::json!({ "text": text }).to_string();
+        maturana_core::session_db::write_outbound(&paths, None, "chat", "web", "web", None, &content)
+    };
+    match cmd {
+        ConsoleCommand::Reply(text) => reply(text),
+        ConsoleCommand::Prompt(prompt) => enqueue_turn(
+            home,
+            agent_id,
+            session_id,
+            "web",
+            "web",
+            chat_id,
+            None,
+            &prompt,
+            serde_json::json!({}),
+        ),
+        ConsoleCommand::Clear | ConsoleCommand::NewSession => {
+            let _ = reset_channel_context(home, agent_id, chat_id);
+            reply("Conversation reset — starting fresh.".to_string())
+        }
+        ConsoleCommand::Quit => {
+            reply("Close the browser tab to end the session.".to_string())
+        }
+        // No modal picker over the WS yet — surface the choices as text so the
+        // operator can re-issue the command with a value (e.g. `/model <name>`).
+        ConsoleCommand::Select { title, options } => {
+            let labels: Vec<String> = options.into_iter().map(|o| o.label).collect();
+            reply(format!(
+                "{title}\nOptions: {}\n(Re-send the command with a value, e.g. `/model <name>`.)",
+                labels.join(", ")
+            ))
+        }
+    }
+}
+
 /// Per-channel send behavior for the shared [`deliver_outbox`] loop. The loop owns
 /// claiming, dropping unparseable rows, the silence-sentinel filter, transcript
 /// recording, mark-delivered, audit, and release-on-failure (a failed send is
@@ -3002,6 +3055,17 @@ fn spawn_loop_process(
     Ok(())
 }
 
+/// A run id is safe to use as a single path segment under `orchestration/`:
+/// non-empty, no traversal, only `[A-Za-z0-9._-]`. Guards `/loop abort|status`,
+/// which join the operator-supplied id into a filesystem path.
+fn valid_run_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && !s.contains("..")
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 /// `/loop` — start a multi-agent orchestration loop on a goal (it posts progress
 /// + the result back here), or manage one (`status` / `abort`). Available on every
 /// text channel through the shared command handler.
@@ -3025,6 +3089,12 @@ fn handle_loop_command(
             if rest.is_empty() {
                 return "Usage: /loop abort <run_id>".to_string();
             }
+            // run_id becomes a path segment under orchestration/ — reject anything
+            // that could traverse out (a `/loop abort ../../x` would otherwise drop
+            // an `abort` file at an attacker-chosen path).
+            if !valid_run_id(rest) {
+                return "Invalid run id.".to_string();
+            }
             let dir = home.root().join("orchestration").join(rest);
             if !dir.exists() {
                 return format!("No loop `{rest}` found.");
@@ -3039,6 +3109,8 @@ fn handle_loop_command(
         "status" => {
             if rest.is_empty() {
                 loop_list_text(home)
+            } else if !valid_run_id(rest) {
+                "Invalid run id.".to_string()
             } else {
                 loop_status_text(home, rest)
             }
@@ -3960,6 +4032,117 @@ fn send_telegram_document(
     Ok(parsed.result.map(|r| r.message_id))
 }
 
+/// Base URL for the Telegram Bot API. Overridable via `MATURANA_TELEGRAM_API_BASE`
+/// so a test can point the live-progress + dissolve path at a local mock server and
+/// capture the exact HTTP sequence it emits — exercising the real send/edit code
+/// end-to-end without touching real Telegram or a bot token.
+fn tg_api_base() -> String {
+    std::env::var("MATURANA_TELEGRAM_API_BASE")
+        .unwrap_or_else(|_| "https://api.telegram.org".to_string())
+}
+
+/// Hard ceiling on every Telegram HTTP call. ureq has NO default timeout, so
+/// without this a single hung request (a stalled egress proxy, a slow Telegram
+/// edit) blocks the synchronous progress loop indefinitely — which is exactly how
+/// the live "Thinking…" clock froze mid-turn with no error logged. With a ceiling,
+/// a slow call fails fast, the loop logs + retries, and the clock keeps ticking.
+const TG_HTTP_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Flood-safe cadence for the live "Thinking…" edits, and the ceiling we back off
+/// to when Telegram pushes back. Editing the draft ~once/second over a long turn
+/// trips Telegram flood control, which throttles by *slow-responding* — each edit
+/// then blocks this synchronous loop for many seconds and the clock visibly
+/// freezes (the exact bug the user kept hitting). So the loop edits at most every
+/// `LIVE_EDIT_BASE`, doubles the interval up to `LIVE_EDIT_MAX` on a stall/429, and
+/// snaps back to base the instant an edit lands.
+const LIVE_EDIT_BASE: Duration = Duration::from_millis(2500);
+const LIVE_EDIT_MAX: Duration = Duration::from_secs(20);
+
+/// A persistent, tightly-bounded HTTP agent for the high-frequency live-progress
+/// edits. Two reasons it is separate from the one-shot `ureq::post` calls:
+///   1. **Connection reuse.** A fresh `ureq::post` opens a new TLS connection
+///      every tick; reusing one keep-alive connection removes a per-edit
+///      handshake that, under Telegram throttling, was part of the stall.
+///   2. **Hard per-phase bounds.** `ureq`'s request-level `.timeout()` behaves as
+///      a *read* timeout (≈3s connect + 12s read ≈ the ~15s edits we observed in
+///      the journal). Setting connect/read/write explicitly caps the WHOLE call at
+///      a few seconds, so a single stalled edit can never freeze the clock for 15s.
+fn tg_live_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(4))
+            .timeout_read(Duration::from_secs(6))
+            .timeout_write(Duration::from_secs(6))
+            .build()
+    })
+}
+
+/// Outcome of a live-progress edit, so the loop can back off intelligently instead
+/// of hammering a Telegram that is already throttling us.
+enum LiveEditOutcome {
+    /// The edit landed (or there was nothing to change).
+    Ok,
+    /// 429 flood control. `retry_after` is Telegram's requested cooldown in seconds
+    /// (from the `retry-after` header), when it supplied one.
+    Throttled(Option<u64>),
+    /// Timeout / network error / non-2xx — back off and retry next tick.
+    Failed(String),
+}
+
+/// Edit the live message through the bounded, connection-reusing agent. Classifies
+/// 429 (so the caller honors `retry_after`) and treats a benign 400 "message is not
+/// modified" as a no-op success so it never triggers backoff.
+fn edit_telegram_live(
+    token: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+    parse_mode: Option<&str>,
+) -> LiveEditOutcome {
+    let mut body = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+    });
+    if let Some(mode) = parse_mode {
+        body["parse_mode"] = serde_json::json!(mode);
+    }
+    let req = tg_live_agent()
+        .post(&format!("{}/bot{token}/editMessageText", tg_api_base()))
+        .set("content-type", "application/json");
+    match req.send_string(&body.to_string()) {
+        Ok(resp) => match resp.into_json::<TelegramOkResponse>() {
+            Ok(parsed) if parsed.ok => LiveEditOutcome::Ok,
+            Ok(_) => LiveEditOutcome::Failed("editMessageText returned ok=false".to_string()),
+            Err(error) => LiveEditOutcome::Failed(format!("parse: {error}")),
+        },
+        Err(ureq::Error::Status(429, resp)) => {
+            let retry_after = resp
+                .header("retry-after")
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            LiveEditOutcome::Throttled(retry_after)
+        }
+        Err(ureq::Error::Status(400, resp)) => {
+            // "Bad Request: message is not modified" is harmless (we already dedup on
+            // the rendered text); anything else 400 is a real problem worth logging.
+            let desc = resp.into_string().unwrap_or_default();
+            if desc.contains("not modified") {
+                LiveEditOutcome::Ok
+            } else {
+                LiveEditOutcome::Failed(format!("status 400: {}", desc.trim()))
+            }
+        }
+        Err(ureq::Error::Status(code, _)) => LiveEditOutcome::Failed(format!("status {code}")),
+        Err(error) => LiveEditOutcome::Failed(error.to_string()),
+    }
+}
+
+/// HTML variant of [`edit_telegram_live`] for the rich `<pre>`/`<tg-spoiler>` draft.
+fn edit_telegram_live_html(token: &str, chat_id: i64, message_id: i64, html: &str) -> LiveEditOutcome {
+    edit_telegram_live(token, chat_id, message_id, html, Some("HTML"))
+}
+
 fn send_telegram(
     token: &str,
     chat_id: &str,
@@ -4001,7 +4184,8 @@ fn send_telegram_with(
         });
     }
     let response: TelegramSendResponse =
-        ureq::post(&format!("https://api.telegram.org/bot{token}/sendMessage"))
+        ureq::post(&format!("{}/bot{token}/sendMessage", tg_api_base()))
+            .timeout(TG_HTTP_TIMEOUT)
             .set("content-type", "application/json")
             .send_string(&body.to_string())
             .map_err(|error| anyhow::anyhow!("Telegram sendMessage failed: {error}"))
@@ -4129,8 +4313,10 @@ fn send_telegram_chat_action(token: &str, chat_id: &str, action: &str) -> anyhow
         "action": action,
     });
     let response: TelegramOkResponse = ureq::post(&format!(
-        "https://api.telegram.org/bot{token}/sendChatAction"
+        "{}/bot{token}/sendChatAction",
+        tg_api_base()
     ))
+    .timeout(TG_HTTP_TIMEOUT)
     .set("content-type", "application/json")
     .send_string(&body.to_string())
     .map_err(|error| anyhow::anyhow!("Telegram sendChatAction failed: {error}"))
@@ -4334,6 +4520,55 @@ fn finalize_reply(
     }
 }
 
+/// OpenClaw-style finish: rather than snapping the thinking/tool draft straight to
+/// the full answer, "flow" the answer into the SAME live message in a couple of
+/// growing chunks over ~0.4s — the way OpenClaw streams its preview into the reply.
+/// The caller then does the authoritative full edit (`finalize_reply`), so a
+/// dropped intermediate edit (e.g. a transient 429 from the short burst) never
+/// matters. Plain text, no parse mode, so cutting the answer mid-string can't break
+/// HTML, and short answers skip the reveal (one clean edit reads fine).
+fn reveal_answer(token: &str, chat_id: i64, id: i64, answer: &str) {
+    let chars: Vec<char> = answer.chars().collect();
+    let n = chars.len();
+    if n < 48 {
+        return;
+    }
+    for frac in [0.45_f32, 0.75] {
+        let take = ((n as f32 * frac) as usize).min(n);
+        let partial: String = chars[..take].iter().collect();
+        // Bounded agent: this runs right after a turn that may have been throttled,
+        // so a stalled chunk must fail in seconds (not block the real answer ~15s).
+        if !matches!(
+            edit_telegram_live(token, chat_id, id, &format!("{partial} …"), None),
+            LiveEditOutcome::Ok
+        ) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(180));
+    }
+}
+
+/// The "5000 pieces" dissolve: on completion, edit the thinking line into a
+/// Telegram NATIVE spoiler (`<tg-spoiler>`) so the client renders it as the
+/// dotted/particle effect before the answer replaces it. Telegram animates the
+/// dissolve on mobile/iOS; desktop shows static dotted text (a bot can mark a
+/// spoiler but can't force the reveal animation to auto-play — a client limit).
+/// Best-effort: a failed edit just means the answer lands without the flourish.
+fn spoiler_dissolve(token: &str, chat_id: i64, id: i64, elapsed: Duration) {
+    let secs = elapsed.as_secs();
+    let html = format!(
+        "<tg-spoiler>💭 Thinking… {}:{:02}</tg-spoiler>",
+        secs / 60,
+        secs % 60
+    );
+    if matches!(
+        edit_telegram_live_html(token, chat_id, id, &html),
+        LiveEditOutcome::Ok
+    ) {
+        thread::sleep(Duration::from_millis(800));
+    }
+}
+
 /// OpenClaw-style live progress for a turn: post ONE message immediately, tick a
 /// spinner on it while the agent works (showing the tools it runs + streamed
 /// text), then — the instant the reply lands — edit that SAME message in place
@@ -4366,10 +4601,18 @@ fn stream_turn_to_telegram(
     let mut last_render = String::new();
     let mut last_edit_ok = true;
     let started = std::time::Instant::now();
+    // Live-edit cadence: edit at most every `edit_interval` (starts at base), backing
+    // off on stalls/429 so a throttled Telegram doesn't freeze this synchronous loop.
+    // `next_edit_at == started` lets the very first draft go out immediately.
+    let mut edit_interval = LIVE_EDIT_BASE;
+    let mut next_edit_at = started;
     let mut last_typing = started
         .checked_sub(Duration::from_secs(10))
         .unwrap_or(started);
     loop {
+        // Per-iteration timing so a stall (DB lock, hung HTTP) is pinpointed in the
+        // journal instead of silently freezing the clock.
+        let t_list = std::time::Instant::now();
         // Final reply ready? Tolerate a transient DB read so a hiccup never leaves
         // the live spinner orphaned — just keep animating and re-check next tick.
         let final_msg = match list_undelivered(paths) {
@@ -4381,6 +4624,7 @@ fn stream_turn_to_telegram(
                 None
             }
         };
+        let list_ms = t_list.elapsed().as_millis();
         if let Some(final_msg) = final_msg {
             // Lost the claim → the delivery thread owns delivery and will edit the
             // live message (via the marker) into the answer. Just drop our state.
@@ -4411,6 +4655,11 @@ fn stream_turn_to_telegram(
             // — a failed delete must never wedge the turn into an endless retry.
             if reply.trim() == crate::proactive::SILENCE_SENTINEL {
                 if let Some(id) = message_id {
+                    // Nothing worth saying — dissolve the indicator into spoiler
+                    // particles (only if Telegram is responsive), then remove it.
+                    if last_edit_ok {
+                        spoiler_dissolve(token, chat_id, id, started.elapsed());
+                    }
                     let _ = delete_telegram_message(token, chat_id, id);
                 }
                 clear_telegram_status(paths, inbound_id);
@@ -4418,9 +4667,22 @@ fn stream_turn_to_telegram(
                 let _ = clear_progress(paths, inbound_id);
                 return Ok(());
             }
-            // Edit the live message in place into the answer (the progress
-            // disappears, the answer stays — one clean message). finalize_reply
+            // Dissolve the thinking indicator into Telegram's native spoiler
+            // particles (the "5000 pieces" effect), then flow the answer into the
+            // SAME message (OpenClaw-style) so it reads as the reply settling into
+            // place, THEN the authoritative full edit. finalize_reply still
             // guarantees a failed edit never leaves two messages.
+            // Only play the cosmetic dissolve+reveal when Telegram is actually
+            // responsive (the last live edit landed). If we were being throttled,
+            // skip the flourish and go straight to delivering the answer — the
+            // user's reply matters more than the effect, and extra edits would only
+            // deepen the throttle and delay it.
+            if let Some(id) = message_id {
+                if last_edit_ok {
+                    spoiler_dissolve(token, chat_id, id, started.elapsed());
+                    reveal_answer(token, chat_id, id, &reply);
+                }
+            }
             match finalize_reply(token, chat_id, message_id, &reply, reply_to) {
                 Ok(platform_id) => {
                     // Finalize the claim (the row already exists from claim_delivery,
@@ -4458,40 +4720,62 @@ fn stream_turn_to_telegram(
             let _ = send_telegram_chat_action(token, &chat_id.to_string(), "typing");
             last_typing = std::time::Instant::now();
         }
-        // Render the rich tool/thinking draft, plus an always-ticking elapsed clock
-        // so the user is NEVER staring at a frozen message. The clock is bucketed to
-        // 10s, so it (and therefore the draft) visibly updates at least every 10s even
-        // when the agent streams nothing — the per-turn node boot, a long quiet tool
-        // call, or sparse events no longer read as "stalled / dropped". Real progress
-        // still appears the instant it arrives (the content changes immediately).
+        // Render the rich tool/thinking draft, plus an always-advancing elapsed clock
+        // so the user is NEVER staring at a frozen message. The clock value is computed
+        // every iteration but only PUSHED on the flood-safe cadence below (~2.5s), so
+        // it advances in small steps instead of jumping in 10s+ blocks (the old
+        // bucketed bug) or hammering Telegram into throttling us (the freeze).
+        let t_prog = std::time::Instant::now();
         let progress = render_progress_html(&read_progress(paths, inbound_id).unwrap_or_default());
-        let secs = (started.elapsed().as_secs() / 10) * 10;
+        let prog_ms = t_prog.elapsed().as_millis();
+        let secs = started.elapsed().as_secs();
         let clock = format!("{}:{:02}", secs / 60, secs % 60);
         let rendered = if progress.is_empty() {
             if started.elapsed() >= Duration::from_secs(2) {
-                format!("<pre>⏳ Working… {clock}</pre>")
+                format!("<pre>💭 Thinking… {clock}</pre>")
             } else {
                 String::new()
             }
         } else {
             format!("{progress}\n<pre>⏳ {clock}</pre>")
         };
-        // Re-send when the content changed OR the previous update failed. Advance
-        // last_render only on a landed update so a failure can't desync us.
-        if !rendered.is_empty() && (rendered != last_render || !last_edit_ok) {
+        // Push updates on a flood-safe cadence — NOT every loop iteration. We edit
+        // only when due (>= next_edit_at) and the content actually changed (or the
+        // last update failed). On success we reset to the base interval; on a stall
+        // or 429 we back off (honoring `retry_after`) so we stop hammering a Telegram
+        // that is already throttling. The ready-reply check above still runs every
+        // ~900ms, so the answer is never delayed by this cadence. Advance last_render
+        // only on a landed update so a failure can't desync us.
+        let due = std::time::Instant::now() >= next_edit_at;
+        let t_edit = std::time::Instant::now();
+        if !rendered.is_empty() && due && (rendered != last_render || !last_edit_ok) {
             match message_id {
-                Some(id) => match edit_telegram_message_html(token, chat_id, id, &rendered) {
-                    Ok(()) => {
+                Some(id) => match edit_telegram_live_html(token, chat_id, id, &rendered) {
+                    LiveEditOutcome::Ok => {
                         last_render = rendered;
                         last_edit_ok = true;
+                        edit_interval = LIVE_EDIT_BASE;
                     }
-                    Err(error) => {
+                    LiveEditOutcome::Throttled(retry_after) => {
                         if last_edit_ok {
                             eprintln!(
-                                "telegram: live progress update failing, will keep retrying: {error:#}"
+                                "telegram: live progress throttled (429, retry_after={retry_after:?}); backing off"
                             );
                         }
                         last_edit_ok = false;
+                        edit_interval = retry_after
+                            .map(Duration::from_secs)
+                            .unwrap_or(edit_interval * 2)
+                            .clamp(LIVE_EDIT_BASE, LIVE_EDIT_MAX);
+                    }
+                    LiveEditOutcome::Failed(error) => {
+                        if last_edit_ok {
+                            eprintln!(
+                                "telegram: live progress update failing, will keep retrying: {error}"
+                            );
+                        }
+                        last_edit_ok = false;
+                        edit_interval = (edit_interval * 2).min(LIVE_EDIT_MAX);
                     }
                 },
                 None => {
@@ -4502,11 +4786,22 @@ fn stream_turn_to_telegram(
                         set_telegram_status(paths, inbound_id, id);
                         last_render = rendered;
                         last_edit_ok = true;
+                        edit_interval = LIVE_EDIT_BASE;
                     } else {
                         last_edit_ok = false;
+                        edit_interval = (edit_interval * 2).min(LIVE_EDIT_MAX);
                     }
                 }
             }
+            next_edit_at = std::time::Instant::now() + edit_interval;
+        }
+        let edit_ms = t_edit.elapsed().as_millis();
+        // Surface any stall (>1.5s in a step) so a frozen clock is explained in the
+        // journal instead of being invisible.
+        if list_ms > 1500 || prog_ms > 1500 || edit_ms > 1500 {
+            eprintln!(
+                "telegram loop slow @ {clock}: list={list_ms}ms progress={prog_ms}ms edit={edit_ms}ms"
+            );
         }
         if std::time::Instant::now() >= deadline {
             // Gave up waiting; leave the (undelivered) reply to the delivery thread,
@@ -4660,17 +4955,6 @@ fn edit_telegram_message(
     edit_telegram_message_with(token, chat_id, message_id, text, None)
 }
 
-/// Edit a message as HTML (Telegram `parse_mode: "HTML"`) — used to update the
-/// rich live progress draft. Caller must `html_escape` dynamic content.
-fn edit_telegram_message_html(
-    token: &str,
-    chat_id: i64,
-    message_id: i64,
-    html: &str,
-) -> anyhow::Result<()> {
-    edit_telegram_message_with(token, chat_id, message_id, html, Some("HTML"))
-}
-
 fn edit_telegram_message_with(
     token: &str,
     chat_id: i64,
@@ -4687,8 +4971,10 @@ fn edit_telegram_message_with(
         body["parse_mode"] = serde_json::json!(mode);
     }
     let response: TelegramOkResponse = ureq::post(&format!(
-        "https://api.telegram.org/bot{token}/editMessageText"
+        "{}/bot{token}/editMessageText",
+        tg_api_base()
     ))
+    .timeout(TG_HTTP_TIMEOUT)
     .set("content-type", "application/json")
     .send_string(&body.to_string())
     .map_err(|error| anyhow::anyhow!("Telegram editMessageText failed: {error}"))
@@ -4711,8 +4997,10 @@ fn delete_telegram_message(token: &str, chat_id: i64, message_id: i64) -> anyhow
         "message_id": message_id,
     });
     let response: TelegramOkResponse = ureq::post(&format!(
-        "https://api.telegram.org/bot{token}/deleteMessage"
+        "{}/bot{token}/deleteMessage",
+        tg_api_base()
     ))
+    .timeout(TG_HTTP_TIMEOUT)
     .set("content-type", "application/json")
     .send_string(&body.to_string())
     .map_err(|error| anyhow::anyhow!("Telegram deleteMessage failed: {error}"))
@@ -7847,6 +8135,321 @@ mod tests {
         ] {
             assert!(names.contains(&cmd), "catalog missing {cmd}");
         }
+    }
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// A throwaway HTTP server that records each request (first line + body) and
+    /// replies with a generic Telegram-OK so the real send/edit code succeeds.
+    fn spawn_mock_telegram() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let cap = captured.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 2048];
+                loop {
+                    let n = match s.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&buf[..pos]).to_string();
+                        let cl = headers
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        let body_start = pos + 4;
+                        while buf.len() < body_start + cl {
+                            match s.read(&mut tmp) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                            }
+                        }
+                        let first = headers.lines().next().unwrap_or("").to_string();
+                        let body = String::from_utf8_lossy(
+                            &buf[body_start..(body_start + cl).min(buf.len())],
+                        )
+                        .to_string();
+                        cap.lock().unwrap().push(format!("{first}\n{body}"));
+                        break;
+                    }
+                }
+                let body = r#"{"ok":true,"result":{"message_id":4242}}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+                let _ = s.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), captured)
+    }
+
+    /// `MATURANA_TELEGRAM_API_BASE` is process-global, so tests that point the real
+    /// Telegram code at a local mock must not run concurrently — otherwise one test's
+    /// base URL bleeds into another's HTTP call. Serialize them all through this lock.
+    static TG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_tg_base<T>(base: &str, f: impl FnOnce() -> T) -> T {
+        let _guard = TG_ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        std::env::set_var("MATURANA_TELEGRAM_API_BASE", base);
+        let out = f();
+        std::env::remove_var("MATURANA_TELEGRAM_API_BASE");
+        out
+    }
+
+    /// A throwaway HTTP server that replies with a FIXED status line + (optional)
+    /// extra headers + body, so the live-edit classifier can be exercised against
+    /// real 429/400 responses. `extra_headers`, if non-empty, must include its own
+    /// trailing CRLF (e.g. "retry-after: 3\r\n"). Returns the base URL.
+    fn spawn_mock_telegram_status(status_line: &str, extra_headers: &str, body: &str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let status_line = status_line.to_string();
+        let extra_headers = extra_headers.to_string();
+        let body = body.to_string();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 2048];
+                // Read the FULL request (headers + Content-Length body) before replying.
+                // Closing the socket while the client is still writing its body makes
+                // ureq surface a transport error instead of our intended status code.
+                loop {
+                    let n = match s.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&buf[..pos]).to_string();
+                        let cl = headers
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        let body_start = pos + 4;
+                        while buf.len() < body_start + cl {
+                            match s.read(&mut tmp) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                            }
+                        }
+                        break;
+                    }
+                }
+                let resp = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+                let _ = s.flush();
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[test]
+    fn live_edit_classifies_429_with_retry_after() {
+        // A 429 with a retry-after header must surface as Throttled(retry_after) so
+        // the loop honors Telegram's cooldown instead of hammering it (the behaviour
+        // that turned per-second edits into a 15s freeze).
+        let base = spawn_mock_telegram_status(
+            "HTTP/1.1 429 Too Many Requests",
+            "retry-after: 3\r\n",
+            r#"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 3","parameters":{"retry_after":3}}"#,
+        );
+        let outcome = with_tg_base(&base, || edit_telegram_live_html("TESTTOKEN", 1, 2, "<pre>x</pre>"));
+        assert!(
+            matches!(outcome, LiveEditOutcome::Throttled(Some(3))),
+            "429 with retry-after must classify as Throttled(Some(3))"
+        );
+    }
+
+    #[test]
+    fn live_edit_treats_not_modified_400_as_ok() {
+        // Editing with identical content yields 400 "message is not modified" — that
+        // is benign and must NOT trigger backoff (we already dedup on rendered text).
+        let base = spawn_mock_telegram_status(
+            "HTTP/1.1 400 Bad Request",
+            "",
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: message is not modified"}"#,
+        );
+        let outcome = with_tg_base(&base, || edit_telegram_live_html("TESTTOKEN", 1, 2, "<pre>x</pre>"));
+        assert!(
+            matches!(outcome, LiveEditOutcome::Ok),
+            "benign 'message is not modified' 400 must classify as Ok, got a failure"
+        );
+    }
+
+    #[test]
+    fn answer_reveal_emits_clean_http_sequence_against_mock() {
+        // Drive the REAL Telegram send/edit code against a local mock and capture the
+        // exact HTTP for a completing turn: post the "Thinking" draft, flow the answer
+        // in (reveal), then finalize into the full answer. OpenClaw-style — the message
+        // streams into the reply in place, with NO dust/crumble frames.
+        let (base, captured) = spawn_mock_telegram();
+        let answer =
+            "Three biggest stories: one, two, and three — with a short note on each and why it matters.";
+        with_tg_base(&base, || {
+            let id = send_telegram_html("TESTTOKEN", "123", "<pre>💭 Thinking… 0:08</pre>", None)
+                .unwrap()
+                .expect("draft message id");
+            assert_eq!(id, 4242);
+            reveal_answer("TESTTOKEN", 123, id, answer);
+            finalize_reply("TESTTOKEN", 123, Some(id), answer, None).unwrap();
+        });
+
+        let reqs = captured.lock().unwrap().clone();
+        // 1 sendMessage (draft) + 2 editMessageText (reveal chunks) + 1 editMessageText (full answer).
+        assert_eq!(reqs.len(), 4, "unexpected request sequence:\n{}", reqs.join("\n--\n"));
+        assert!(reqs[0].contains("/sendMessage") && reqs[0].contains("Thinking"), "{}", reqs[0]);
+        // No dust ANYWHERE — the cheap crumble is gone for good.
+        assert!(reqs.iter().all(|r| !r.contains('·')), "no dust frames");
+        // The two reveal chunks are growing prefixes of the answer.
+        assert!(reqs[1].contains("/editMessageText") && reqs[2].contains("/editMessageText"));
+        assert!(reqs[1].len() < reqs[2].len(), "reveal should grow 1→2");
+        // The final edit carries the COMPLETE answer.
+        assert!(reqs[3].contains("/editMessageText") && reqs[3].contains("why it matters"), "{}", reqs[3]);
+    }
+
+    #[test]
+    fn spoiler_dissolve_emits_native_tg_spoiler_frame() {
+        // The "5000 pieces" dissolve must edit the live message to a real Telegram
+        // <tg-spoiler> so the client renders the particle effect.
+        let (base, captured) = spawn_mock_telegram();
+        with_tg_base(&base, || {
+            let id = send_telegram_html("TESTTOKEN", "123", "<pre>💭 Thinking… 0:05</pre>", None)
+                .unwrap()
+                .expect("draft id");
+            spoiler_dissolve("TESTTOKEN", 123, id, std::time::Duration::from_secs(5));
+        });
+        let reqs = captured.lock().unwrap().clone();
+        // draft sendMessage + one editMessageText carrying the native spoiler.
+        assert_eq!(reqs.len(), 2, "unexpected sequence:\n{}", reqs.join("\n--\n"));
+        assert!(reqs[1].contains("/editMessageText"), "{}", reqs[1]);
+        assert!(
+            reqs[1].contains("tg-spoiler"),
+            "dissolve frame must use a native <tg-spoiler>: {}",
+            reqs[1]
+        );
+        assert!(reqs[1].contains("Thinking"), "{}", reqs[1]);
+    }
+
+    #[test]
+    fn live_loop_ticks_counter_on_cadence_then_reveals_answer() {
+        // Drive the REAL stream_turn_to_telegram loop against the mock, with a worker
+        // reply that lands after ~8s. Asserts the captured HTTP shows the counter
+        // ADVANCING (≥2 distinct "💭 Thinking… 0:0X" frames — the old 10s-frozen bug
+        // would emit only one) but NOT hammering Telegram (≤6 frames over the ~6s
+        // pre-reply window — the per-second edits that tripped flood control and
+        // caused the 15s freeze would emit far more), the answer revealed at the end,
+        // and NO dust anywhere. This exercises the LIVE behaviour, not just helpers.
+        let (base, captured) = spawn_mock_telegram();
+
+        let tmp = std::env::temp_dir().join(format!("mat-streamloop-{}", std::process::id()));
+        let home = MaturanaHome::new(tmp.clone());
+        let agent = "claude";
+        let session = "telegram-main";
+        let chat_id = 777i64;
+        std::fs::create_dir_all(home.agent_dir(agent)).unwrap();
+        let paths = session_paths(&home.agent_dir(agent), session);
+        ensure_session(&paths).unwrap();
+        let inbound_id = insert_inbound(
+            &paths,
+            "chat",
+            "telegram",
+            &chat_id.to_string(),
+            None,
+            &serde_json::json!({ "text": "hi" }).to_string(),
+        )
+        .unwrap();
+
+        // The worker's reply lands after ~8s so the counter advances across a few
+        // cadence ticks (base 2.5s) before the answer arrives.
+        let answer = "Here is a reasonably long answer that should be revealed in two growing chunks before the final edit lands.";
+        let paths_w = paths.clone();
+        let reply_to = inbound_id.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(8000));
+            let body = serde_json::json!({ "text": answer }).to_string();
+            let _ = maturana_core::session_db::write_outbound(
+                &paths_w,
+                Some(&reply_to),
+                "chat",
+                "telegram",
+                &chat_id.to_string(),
+                None,
+                &body,
+            );
+        });
+
+        let config = TelegramServe {
+            agent_id: agent.to_string(),
+            session_id: session.to_string(),
+            token_source: "x".to_string(),
+            once: false,
+            run_once_provider: None,
+            poll_seconds: 5,
+            timeout_seconds: 600,
+        };
+        with_tg_base(&base, || {
+            stream_turn_to_telegram(
+                &home,
+                "TESTTOKEN",
+                &config,
+                chat_id,
+                &inbound_id,
+                None,
+                &paths,
+                std::time::Duration::from_secs(25),
+            )
+            .unwrap();
+        });
+        worker.join().unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let reqs = captured.lock().unwrap().clone();
+        // Counter ADVANCED but did not HAMMER: between 2 and 6 distinct "Thinking…"
+        // payloads over the ~6s pre-reply window. ≥2 proves the clock isn't frozen
+        // (the old bucketed bug emitted one); ≤6 proves we edit on a flood-safe
+        // cadence (the per-second edits that tripped throttling would emit ~6–8+).
+        let thinking: std::collections::BTreeSet<String> =
+            reqs.iter().filter(|r| r.contains("Thinking")).cloned().collect();
+        assert!(
+            (2..=6).contains(&thinking.len()),
+            "counter should advance on a flood-safe cadence (2..=6 frames), got {}:\n{}",
+            thinking.len(),
+            thinking.into_iter().collect::<Vec<_>>().join("\n--\n")
+        );
+        // No dust anywhere — the dots are gone for good.
+        assert!(reqs.iter().all(|r| !r.contains('·')), "no dust frames");
+        // The full answer was delivered into the live message.
+        assert!(
+            reqs.iter().any(|r| r.contains("before the final edit lands")),
+            "answer not delivered:\n{}",
+            reqs.join("\n--\n")
+        );
     }
 
     #[test]

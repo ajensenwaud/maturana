@@ -48,6 +48,7 @@ export class Console {
     socket.on("turn_started", (msg) => this.onStarted(msg));
     socket.on("turn_delta", (msg) => this.onDelta(msg));
     socket.on("turn_phase", (msg) => this.onPhase(msg));
+    socket.on("turn_item", (msg) => this.onItem(msg));
     socket.on("turn_completed", (msg) => this.onCompleted(msg));
     socket.on("error", (msg) => this.onError(msg));
   }
@@ -194,12 +195,14 @@ export class Console {
     sanitizeInto(promptEl, text);
     const cardsEl = document.createElement("div");
     cardsEl.className = "turn-cards";
+    const itemsEl = document.createElement("div");
+    itemsEl.className = "turn-items";
     const outputEl = document.createElement("div");
     outputEl.className = "turn-output";
     const footerEl = document.createElement("div");
     footerEl.className = "turn-footer label";
     footerEl.textContent = "[ queued ]";
-    el.append(promptEl, cardsEl, outputEl, footerEl);
+    el.append(promptEl, cardsEl, itemsEl, outputEl, footerEl);
     this.timeline.append(el);
     el.scrollIntoView({ block: "end" });
 
@@ -207,6 +210,7 @@ export class Console {
       el,
       outputEl,
       footerEl,
+      itemsEl,
       output: "",
       cards: new PhaseCards(cardsEl),
     });
@@ -296,6 +300,38 @@ export class Console {
   onPhase({ turn_id, span_id, phase }) {
     const turn = this.turn(turn_id);
     if (turn) turn.cards.apply(span_id, phase);
+  }
+
+  // Render a structured turn item (tool call / result / reasoning) as a card —
+  // the rich, interactive view of what the agent is doing, not just its text.
+  onItem({ turn_id, item }) {
+    const turn = this.turn(turn_id);
+    if (!turn || !turn.itemsEl || item == null) return;
+    const card = document.createElement("div");
+    card.className = "tool-card";
+    const label = item.tool || item.name || item.type || item.kind || "event";
+    const head = document.createElement("div");
+    head.className = "tool-card-head label";
+    head.textContent = `⚙ ${label}`;
+    card.append(head);
+    const summary = item.summary || item.text || item.command || item.title;
+    if (summary) {
+      const s = document.createElement("div");
+      s.className = "tool-card-summary";
+      s.textContent = typeof summary === "string" ? summary : JSON.stringify(summary);
+      card.append(s);
+    }
+    const det = document.createElement("details");
+    const sum = document.createElement("summary");
+    sum.className = "label";
+    sum.textContent = "detail";
+    const pre = document.createElement("pre");
+    pre.className = "dash-json";
+    pre.textContent = JSON.stringify(item, null, 2);
+    det.append(sum, pre);
+    card.append(det);
+    turn.itemsEl.append(card);
+    turn.el.scrollIntoView({ block: "end" });
   }
 
   onCompleted({ turn_id, ok, detail }) {

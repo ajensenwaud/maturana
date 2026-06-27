@@ -4,9 +4,41 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
+use axum::Json;
 
 use super::{blocking, err, ok};
 use crate::state::AppState;
+
+#[derive(serde::Deserialize)]
+pub struct SkillBody {
+    name: String,
+    markdown: String,
+}
+
+/// Create (or overwrite) a skill from the UI: write `skills/<name>/SKILL.md`.
+/// Name is a safe slug; the body must be non-empty.
+pub async fn create(State(state): State<AppState>, Json(body): Json<SkillBody>) -> Response {
+    let name = body.name.trim().to_string();
+    if name.is_empty()
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return err(StatusCode::BAD_REQUEST, "invalid skill name (use a-z 0-9 - _)");
+    }
+    if body.markdown.trim().is_empty() {
+        return err(StatusCode::BAD_REQUEST, "skill body is empty");
+    }
+    let dir = skills_dir(&state).join(&name);
+    match blocking(move || {
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("SKILL.md"), body.markdown)?;
+        Ok(serde_json::json!({ "name": name }))
+    })
+    .await
+    {
+        Ok(data) => ok(data),
+        Err(response) => response,
+    }
+}
 
 fn skills_dir(state: &AppState) -> std::path::PathBuf {
     state

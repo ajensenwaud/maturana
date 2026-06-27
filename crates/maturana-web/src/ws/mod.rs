@@ -195,6 +195,18 @@ fn handle_client_msg(
             session_id,
             text,
         } => {
+            // SECURITY: the enqueue closure builds filesystem paths from these ids
+            // (agents/<agent_id>/sessions/<session_id>/…), so validate them with the
+            // SAME guard the REST layer uses — the WS extractor does no path checks,
+            // and an unvalidated `agent_id="../../.."` would write outside the home
+            // tree.
+            if !crate::api::valid_id(&agent_id) || !crate::api::valid_id(&session_id) {
+                return Some(ServerMsg::Error {
+                    code: "session_send_failed".to_string(),
+                    message: "invalid agent or session id".to_string(),
+                    turn_id: None,
+                });
+            }
             // Route through the SHARED channel front door (injected by the CLI),
             // exactly like Telegram/TUI/Discord — so the cockpit turn gets the
             // recent-transcript context (memory), model/reasoning, and routing

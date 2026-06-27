@@ -198,22 +198,47 @@ pub async fn require_session(
     next.run(request).await
 }
 
-/// Origin==Host check for the WebSocket upgrade: cookies ride along on
-/// cross-origin WS upgrades, so the cookie alone is not enough.
+/// DNS-rebinding defense for the WS upgrade. The real auth is the SameSite=Strict
+/// session cookie (a rebinding attacker's page can't carry it), so this is
+/// belt-and-braces: accept a missing Origin (non-browser), a same-hostname Origin
+/// (ignoring a proxy's port rewrite), or a trusted-network Origin (loopback /
+/// private LAN / tailnet / MagicDNS) — the only contexts this cockpit runs in.
+/// Reject only a clearly-external public Origin.
 pub fn origin_matches_host(headers: &HeaderMap) -> bool {
-    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
-        return false;
-    };
     let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
-        // Non-browser clients (websocat, scripts) send no Origin; the cookie
-        // they present can only have been obtained via login.
         return true;
     };
-    let origin_host = origin
+    let origin_authority = origin
         .strip_prefix("http://")
         .or_else(|| origin.strip_prefix("https://"))
         .unwrap_or(origin);
-    origin_host == host
+    let origin_host = origin_authority.split(':').next().unwrap_or(origin_authority);
+    if let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
+        let host_name = host.split(':').next().unwrap_or(host);
+        if origin_host.eq_ignore_ascii_case(host_name) {
+            return true;
+        }
+    }
+    is_trusted_network_host(origin_host)
+}
+
+/// True for hosts the cockpit is meant to be reached on: loopback, private LAN,
+/// the Tailscale CGNAT range (100.64/10), single-label MagicDNS names, and
+/// `*.ts.net` / `*.tailscale.net`.
+fn is_trusted_network_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                let o = v4.octets();
+                v4.is_loopback() || v4.is_private() || (o[0] == 100 && (o[1] & 0xC0) == 0x40)
+            }
+            std::net::IpAddr::V6(v6) => v6.is_loopback(),
+        };
+    }
+    !host.contains('.') || host.ends_with(".ts.net") || host.ends_with(".tailscale.net")
 }
 
 #[cfg(test)]
