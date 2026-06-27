@@ -579,7 +579,22 @@ fn open_ro(path: &Path) -> anyhow::Result<Connection> {
 }
 
 fn tune(db: &Connection) -> anyhow::Result<()> {
-    db.pragma_update(None, "journal_mode", "DELETE")?;
+    // WAL instead of the default rollback journal: under WAL a writer no longer
+    // blocks readers, so the host Telegram progress loop's `list_undelivered`
+    // read on outbound.sqlite stops stalling for seconds behind the worker
+    // writing its reply (observed live as a multi-second "Thinking…" freeze).
+    // Safe here because every accessor of these session DBs is a host-side
+    // process on the same machine — sessiond writes, the channel loops and web
+    // cockpit read; the guest worker never touches the files directly, it posts
+    // over HTTP to sessiond. WAL's shared-memory wal-index therefore coordinates
+    // correctly. Existing DELETE-mode DBs convert to WAL idempotently on first
+    // open (a -wal/-shm sidecar appears); re-opening an already-WAL DB is a near
+    // no-op.
+    db.pragma_update(None, "journal_mode", "WAL")?;
+    // synchronous=NORMAL is the recommended, corruption-safe pairing for WAL: it
+    // only risks losing the last few committed transactions on an OS-level crash
+    // or power loss (never a corrupt database), in exchange for far fewer fsyncs.
+    db.pragma_update(None, "synchronous", "NORMAL")?;
     db.pragma_update(None, "busy_timeout", 5000)?;
     Ok(())
 }
@@ -919,6 +934,38 @@ mod tests {
         let second = claim_pending_inbound_with_policy(&paths, 1, policy).unwrap();
         assert!(second.is_empty(), "in-flight lease must not be re-handed-out");
         assert_eq!(queue_stats(&paths).unwrap().processing, 1);
+    }
+
+    #[test]
+    fn session_dbs_open_in_wal_mode_with_sidecar() {
+        let temp = temp_dir();
+        let paths = session_paths(&temp, "telegram-main");
+        ensure_session(&paths).unwrap();
+        // A real write so the WAL is actually exercised and a sidecar materializes.
+        write_outbound(&paths, Some("in-1"), "chat", "telegram", "chat-1", None, r#"{"text":"hi"}"#)
+            .unwrap();
+
+        // Both stores report WAL on a freshly opened connection — the conversion
+        // is persistent (a property of the file), not per-connection.
+        for db_path in [&paths.inbound_db, &paths.outbound_db] {
+            let db = open_rw(db_path).unwrap();
+            let mode: String = db
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode.to_lowercase(), "wal", "{} not in WAL", db_path.display());
+        }
+
+        // The -wal sidecar exists while a connection is open against outbound.
+        let _held = open_rw(&paths.outbound_db).unwrap();
+        let wal_sidecar = paths.outbound_db.with_extension("sqlite-wal");
+        assert!(
+            wal_sidecar.exists(),
+            "expected WAL sidecar at {}",
+            wal_sidecar.display()
+        );
+
+        // Re-opening an already-WAL DB is idempotent (still WAL, still readable).
+        assert_eq!(list_undelivered(&paths).unwrap().len(), 1);
     }
 
     fn temp_dir() -> PathBuf {
