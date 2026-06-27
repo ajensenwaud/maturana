@@ -4500,16 +4500,15 @@ fn clear_telegram_status(paths: &SessionPaths, inbound_id: &str) {
 /// then send a fresh copy — but if that delete cannot be confirmed, return `Err`
 /// WITHOUT sending, so a failed delete can never leave two messages in the chat.
 /// On `Err` the caller releases the claim and a later pass retries.
-/// Finish a turn the way the user asked for: deliver the answer as its OWN new
-/// message, then delete the live "Thinking…" bubble so Telegram plays its native
-/// particle-dissolve on it — the exact effect of manually deleting a message.
-/// (Editing the bubble into the answer, as we used to, morphs it in place and
-/// never triggers that animation, which is why the dissolve never appeared.)
+/// Finalize a turn into its reply as ONE message: edit the live "Thinking…" bubble
+/// in place into the answer (exactly-once, can never duplicate or orphan). If the
+/// edit fails, delete the stale bubble first and only then send a fresh message —
+/// so a failed edit still can't leave two messages. With no live bubble, just send.
 ///
-/// Order is load-bearing: SEND first and propagate any failure, so the delivery
-/// claim is retried and the answer is never lost; then best-effort delete the
-/// indicator. A failed delete only leaves the (stale) indicator behind — it can
-/// never duplicate or drop the answer.
+/// (The native delete-dissolve was attempted by sending the answer as a separate
+/// message and deleting the bubble, but that destabilized delivery — duplicate
+/// bubble + a counter that kept ticking — so it was reverted to this reliable
+/// in-place finish. See the channel notes / [[maturana-telegram-swoosh]].)
 fn finalize_reply(
     token: &str,
     chat_id: i64,
@@ -4517,12 +4516,20 @@ fn finalize_reply(
     reply: &str,
     reply_to: Option<i64>,
 ) -> anyhow::Result<Option<i64>> {
-    let platform_id = send_telegram(token, &chat_id.to_string(), reply, reply_to)?;
-    if let Some(id) = live_id {
-        // Native dissolve. Best-effort: the answer is already out.
-        let _ = delete_telegram_message(token, chat_id, id);
+    match live_id {
+        Some(id) => match edit_telegram_message(token, chat_id, id, reply) {
+            Ok(()) => Ok(Some(id)),
+            Err(edit_err) => {
+                delete_telegram_message(token, chat_id, id).map_err(|del_err| {
+                    anyhow::anyhow!(
+                        "edit failed ({edit_err}); refusing to send a duplicate because the stale live message could not be removed ({del_err})"
+                    )
+                })?;
+                send_telegram(token, &chat_id.to_string(), reply, reply_to)
+            }
+        },
+        None => send_telegram(token, &chat_id.to_string(), reply, reply_to),
     }
-    Ok(platform_id)
 }
 
 /// OpenClaw-style live progress for a turn: post ONE message immediately, tick a
@@ -8243,12 +8250,10 @@ mod tests {
     }
 
     #[test]
-    fn finalize_sends_answer_then_dissolves_thinking_bubble() {
-        // The finish the user asked for: deliver the answer as its OWN new message,
-        // then DELETE the live "Thinking…" bubble so Telegram plays its native
-        // particle-dissolve on it (identical to manually deleting a message). The
-        // old in-place edit (morph) never triggered that animation — so the answer
-        // must be a fresh sendMessage and the bubble must be deleted, NOT edited.
+    fn finalize_edits_thinking_bubble_into_answer() {
+        // Reliable single-message finish: the live "Thinking…" bubble is EDITED in
+        // place into the answer — exactly one message, no new send, no delete (so it
+        // can never duplicate or orphan a bubble). finalize returns the bubble id.
         let (base, captured) = spawn_mock_telegram();
         let answer = "Three biggest stories: one, two, and three with a short note on each.";
         let returned = with_tg_base(&base, || {
@@ -8259,34 +8264,30 @@ mod tests {
         });
 
         let reqs = captured.lock().unwrap().clone();
-        // sendMessage(draft) + sendMessage(answer) + deleteMessage(draft).
-        assert_eq!(reqs.len(), 3, "unexpected sequence:\n{}", reqs.join("\n--\n"));
+        // sendMessage(draft) + editMessageText(answer). No second send, no delete.
+        assert_eq!(reqs.len(), 2, "unexpected sequence:\n{}", reqs.join("\n--\n"));
         assert!(reqs[0].contains("/sendMessage") && reqs[0].contains("Thinking"), "{}", reqs[0]);
-        // The answer is its OWN new message, not an edit of the thinking bubble.
         assert!(
-            reqs[1].contains("/sendMessage") && reqs[1].contains("short note on each"),
-            "answer must be a fresh sendMessage: {}",
+            reqs[1].contains("/editMessageText") && reqs[1].contains("short note on each"),
+            "answer must edit the bubble in place: {}",
             reqs[1]
         );
-        // The thinking bubble is DELETED (native dissolve) — never edited in place.
-        assert!(reqs[2].contains("/deleteMessage"), "thinking bubble must be deleted: {}", reqs[2]);
         assert!(
-            reqs.iter().all(|r| !r.contains("/editMessageText")),
-            "no in-place edit — the bubble is deleted so Telegram dissolves it"
+            reqs.iter().all(|r| !r.contains("/deleteMessage")),
+            "no delete — the one bubble becomes the answer"
         );
-        // finalize returns the NEW answer message's id.
+        // finalize returns the (reused) bubble id, not a new message id.
         assert_eq!(returned, Some(4242));
     }
 
     #[test]
-    fn live_loop_ticks_counter_then_dissolves_into_answer() {
+    fn live_loop_ticks_counter_then_edits_into_answer() {
         // Drive the REAL stream_turn_to_telegram loop against the mock, with a worker
         // reply that lands after ~8s. Asserts the captured HTTP shows the counter
         // ADVANCING (≥2 distinct "💭 Thinking… 0:0X" frames — the old 10s-frozen bug
         // would emit only one) but NOT hammering Telegram (≤6 frames over the ~6s
-        // pre-reply window), then the FINISH the user asked for: the answer arrives as
-        // its own new sendMessage and the thinking bubble is DELETED (Telegram plays
-        // its native particle-dissolve), never edited in place.
+        // pre-reply window), then a reliable finish: the live bubble is EDITED in
+        // place into the answer (one message, no duplicate, no leftover bubble).
         let (base, captured) = spawn_mock_telegram();
 
         let tmp = std::env::temp_dir().join(format!("mat-streamloop-{}", std::process::id()));
@@ -8309,7 +8310,7 @@ mod tests {
 
         // The worker's reply lands after ~8s so the counter advances across a few
         // cadence ticks (base 2.5s) before the answer arrives.
-        let answer = "Here is a reasonably long answer delivered as its own message while the thinking bubble dissolves.";
+        let answer = "Here is a reasonably long answer that the live bubble is edited into when the turn completes.";
         let paths_w = paths.clone();
         let reply_to = inbound_id.clone();
         let worker = std::thread::spawn(move || {
@@ -8366,17 +8367,16 @@ mod tests {
         );
         // No dust anywhere — the simulated dots/crumble are gone for good.
         assert!(reqs.iter().all(|r| !r.contains('·')), "no dust frames");
-        // The answer was delivered as its OWN new message (sendMessage), not by
-        // editing the thinking bubble.
+        // The answer was delivered by EDITING the live bubble in place (one message),
+        // not a second send and not a delete.
         assert!(
-            reqs.iter().any(|r| r.contains("/sendMessage") && r.contains("its own message while the thinking bubble dissolves")),
-            "answer not delivered as a new message:\n{}",
+            reqs.iter().any(|r| r.contains("/editMessageText") && r.contains("edited into when the turn completes")),
+            "answer not delivered by editing the bubble:\n{}",
             reqs.join("\n--\n")
         );
-        // And the thinking bubble was DELETED so Telegram dissolves it natively.
         assert!(
-            reqs.iter().any(|r| r.contains("/deleteMessage")),
-            "thinking bubble was not deleted (no native dissolve):\n{}",
+            reqs.iter().all(|r| !r.contains("/deleteMessage")),
+            "no delete on a normal answer — the bubble becomes the answer:\n{}",
             reqs.join("\n--\n")
         );
     }
