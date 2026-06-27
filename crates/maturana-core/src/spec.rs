@@ -175,6 +175,13 @@ pub struct Mount {
 pub struct Network {
     #[serde(default)]
     pub egress_allowlist: Vec<String>,
+    /// Open egress: when true the pipelock proxy permits ANY host instead of only
+    /// `egress_allowlist`. Traffic still flows THROUGH the proxy (header injection
+    /// + audit keep working; requests audit as `grant_source=allow_all`) — the
+    /// allowlist is simply not enforced. The deliberate "let this agent reach the
+    /// whole web" opt-in; prefer a scoped `egress_allowlist` when the hosts are known.
+    #[serde(default)]
+    pub egress_allow_all: bool,
     #[serde(default)]
     pub proxy: Option<NetworkProxy>,
 }

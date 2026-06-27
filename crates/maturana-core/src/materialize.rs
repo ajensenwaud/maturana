@@ -226,6 +226,15 @@ fn render_guest_agents(spec: &AgentSpec) -> String {
 
     let egress = &spec.network.egress_allowlist;
     let allows = |needle: &str| egress.iter().any(|h| h.contains(needle));
+    if spec.network.egress_allow_all {
+        recipes.push(
+            "### Open web access\nYour egress allowlist is OFF (allow-all): you can curl/fetch ANY \
+             https host, not just a fixed list. Traffic still routes through the pipelock proxy, \
+             which injects your configured API keys and audits every request — so make normal \
+             HTTPS calls and do NOT add auth headers the proxy already injects."
+                .to_string(),
+        );
+    }
     if allows("brave") || allows("tavily") {
         let mut s = String::from(
             "### Web search\nFor live web facts, curl the allowlisted search API through the proxy \
@@ -242,10 +251,12 @@ fn render_guest_agents(spec: &AgentSpec) -> String {
                  \x20   curl -fsS \"https://html.duckduckgo.com/html/?q=<terms>\"",
             );
         }
-        s.push_str(
-            "\nOnly the hosts on your egress allowlist are reachable — do NOT try google.com, news \
-             sites, or arbitrary pages; they are blocked at the proxy.",
-        );
+        if !spec.network.egress_allow_all {
+            s.push_str(
+                "\nOnly the hosts on your egress allowlist are reachable — do NOT try google.com, news \
+                 sites, or arbitrary pages; they are blocked at the proxy.",
+            );
+        }
         recipes.push(s);
     }
 

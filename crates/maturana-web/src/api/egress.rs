@@ -51,10 +51,16 @@ pub async fn approve(State(state): State<AppState>, Json(body): Json<ApproveBody
 
 fn normalize_host(raw: &str) -> anyhow::Result<String> {
     let host = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    // Reject `*` (and any host containing it): the per-host hot-approve path must
+    // never be able to write an allow-all wildcard. A live `*` in runtime-allow.json
+    // opens egress for EVERY agent (the file is home-level/shared), and `permanent`
+    // would bake it into a spec — both silently, bypassing the loud validation
+    // warning. Allow-all is only reachable through the deliberate, warned paths
+    // (network.egress_allow_all, `pipelock proxy --allow-all`, the cockpit toggle).
     if host.is_empty()
         || host
             .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '@' | '/' | '\\' | ':'))
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '@' | '/' | '\\' | ':' | '*'))
     {
         anyhow::bail!("invalid host");
     }
@@ -102,7 +108,7 @@ fn promote_to_spec(home: &Path, agent_id: &str, host: &str) -> anyhow::Result<()
         .as_ref()
         .map(|p| p.inject_headers.clone())
         .unwrap_or_default();
-    let updated = agents::update_network_block(&markdown, &allowlist, &headers)?;
+    let updated = agents::update_network_block(&markdown, &allowlist, &headers, None)?;
     // Re-validate before writing (same gate as the egress editor).
     let report = {
         let tmp = std::env::temp_dir().join(format!("mweb-egress-{}.md", uuid::Uuid::new_v4()));
@@ -139,5 +145,10 @@ mod tests {
         assert!(normalize_host("bad host").is_err());
         assert!(normalize_host("host:443").is_err());
         assert!(normalize_host("").is_err());
+        // The per-host hot-approve path must never be able to grant a wildcard:
+        // allow-all is reachable only via the deliberate, warned spec/flag/toggle.
+        assert!(normalize_host("*").is_err());
+        assert!(normalize_host("*.example.com").is_err());
+        assert!(normalize_host("ex*ample.com").is_err());
     }
 }
