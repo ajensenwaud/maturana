@@ -644,6 +644,11 @@ enum PipelockSubcommand {
         bind: Option<String>,
         #[arg(long = "allow")]
         allowlist: Vec<String>,
+        /// Permit ANY host (egress governance off). Traffic still flows through the
+        /// proxy — header injection + audit keep working — it is just never denied.
+        /// Equivalent to `network.egress_allow_all: true` in the spec.
+        #[arg(long = "allow-all")]
+        allow_all: bool,
         #[arg(long = "inject-header")]
         inject_headers: Vec<HeaderInjectionArg>,
     },
@@ -1308,6 +1313,7 @@ fn main() -> anyhow::Result<()> {
                     spec,
                     bind,
                     allowlist,
+                    allow_all,
                     inject_headers,
                 } => {
                     // `--agent-id` resolves the spec from `--home` so supervised
@@ -1354,6 +1360,7 @@ fn main() -> anyhow::Result<()> {
                                 ProxyConfig {
                                     home_root: home.root().to_path_buf(),
                                     allowlist: Vec::new(),
+                                    allow_all: false,
                                     injections: Vec::new(),
                                     audit_path,
                                     runtime_allow: Default::default(),
@@ -1362,16 +1369,21 @@ fn main() -> anyhow::Result<()> {
                         }
                     };
                     config.allowlist.extend(allowlist);
+                    config.allow_all = config.allow_all || allow_all;
                     config
                         .injections
                         .extend(inject_headers.into_iter().map(|injection| injection.0));
-                    if config.allowlist.is_empty() {
+                    if config.allowlist.is_empty() && !config.allow_all {
                         anyhow::bail!(
-                            "pipelock proxy requires network.egress_allowlist or at least one --allow host"
+                            "pipelock proxy requires network.egress_allowlist, --allow <host>, or --allow-all"
                         );
                     }
                     println!("pipelock proxy listening on {bind}");
-                    println!("pipelock proxy allowlist: {}", config.allowlist.join(", "));
+                    if config.allow_all {
+                        println!("pipelock proxy allowlist: ALLOW-ALL (egress governance off; still audited)");
+                    } else {
+                        println!("pipelock proxy allowlist: {}", config.allowlist.join(", "));
+                    }
                     println!("pipelock proxy audit: {}", config.audit_path.display());
                     run_proxy(&bind, config)?;
                 }

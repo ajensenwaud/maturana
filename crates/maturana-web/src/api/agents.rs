@@ -77,6 +77,7 @@ pub(crate) fn snapshot(root: &std::path::Path) -> anyhow::Result<serde_json::Val
                     "knowledge_graph": spec.as_ref().map(|s| s.knowledge_graph.enabled).unwrap_or(false),
                     "graph_name": spec.as_ref().filter(|s| s.knowledge_graph.enabled).map(|s| s.knowledge_graph.graph_name(&agent_id)),
                     "egress_allowlist": spec.as_ref().map(|s| s.network.egress_allowlist.clone()).unwrap_or_default(),
+                    "egress_allow_all": spec.as_ref().map(|s| s.network.egress_allow_all).unwrap_or(false),
                     "worker_status": worker_status,
                     "spec_parses": spec.is_some(),
                 }));
@@ -165,6 +166,7 @@ pub async fn detail(State(state): State<AppState>, Path(id): Path<String>) -> Re
             "knowledge_graph": spec.knowledge_graph.enabled,
             "graph_name": spec.knowledge_graph.enabled.then(|| spec.knowledge_graph.graph_name(&id)),
             "egress_allowlist": spec.network.egress_allowlist,
+            "egress_allow_all": spec.network.egress_allow_all,
             "schedules": spec.schedules.len(),
             "worker_status": worker,
         }))
@@ -581,6 +583,7 @@ pub async fn egress_get(State(state): State<AppState>, Path(id): Path<String>) -
         let spec = AgentSpec::from_maturana_markdown(&path)?;
         Ok(serde_json::json!({
             "egress_allowlist": spec.network.egress_allowlist,
+            "egress_allow_all": spec.network.egress_allow_all,
             "inject_headers": spec.network.proxy.as_ref().map(|p| p.inject_headers.clone()).unwrap_or_default(),
         }))
     })
@@ -596,6 +599,10 @@ pub struct EgressBody {
     egress_allowlist: Vec<String>,
     #[serde(default)]
     inject_headers: Vec<maturana_core::spec::NetworkProxyHeader>,
+    /// Open egress toggle. Omitted → preserve the spec's current value; present →
+    /// set `network.egress_allow_all` (removes the allowlist requirement).
+    #[serde(default)]
+    egress_allow_all: Option<bool>,
 }
 
 pub async fn egress_put(
@@ -607,7 +614,12 @@ pub async fn egress_put(
     let path = agent_spec_path(&state, &id);
     match blocking(move || {
         let markdown = std::fs::read_to_string(&path)?;
-        let updated = update_network_block(&markdown, &body.egress_allowlist, &body.inject_headers)?;
+        let updated = update_network_block(
+            &markdown,
+            &body.egress_allowlist,
+            &body.inject_headers,
+            body.egress_allow_all,
+        )?;
         let report = validate_markdown(&updated)?;
         if !report.valid {
             anyhow::bail!("edited spec failed validation: {}", report.errors.join("; "));
@@ -751,6 +763,9 @@ pub fn update_network_block(
     markdown: &str,
     allowlist: &[String],
     headers: &[maturana_core::spec::NetworkProxyHeader],
+    // `Some(v)` sets `network.egress_allow_all`; `None` preserves whatever the spec
+    // already has (so an allowlist edit never silently flips the open-egress flag).
+    allow_all: Option<bool>,
 ) -> anyhow::Result<String> {
     let rest = markdown
         .strip_prefix("---")
@@ -779,6 +794,12 @@ pub fn update_network_block(
             serde_yaml::Value::String("egress_allowlist".to_string()),
             serde_yaml::to_value(allowlist)?,
         );
+        if let Some(open) = allow_all {
+            network_map.insert(
+                serde_yaml::Value::String("egress_allow_all".to_string()),
+                serde_yaml::Value::Bool(open),
+            );
+        }
         let proxy_key = serde_yaml::Value::String("proxy".to_string());
         if headers.is_empty() {
             // Leave an existing proxy block alone but clear its injections.
@@ -845,7 +866,7 @@ body text stays put
             prefix: None,
         }];
         let allowlist = vec!["api.openai.com".to_string(), "api.search.brave.com".to_string()];
-        let updated = update_network_block(SPEC, &allowlist, &headers).unwrap();
+        let updated = update_network_block(SPEC, &allowlist, &headers, None).unwrap();
 
         // Re-parse: the edited model holds, the rest is untouched.
         let tmp = std::env::temp_dir().join(format!("mweb-egress-{}.md", std::process::id()));
@@ -871,13 +892,36 @@ body text stays put
         assert!(updated.contains("body text stays put"));
 
         // Idempotent: applying the same edit again changes nothing.
-        let again = update_network_block(&updated, &allowlist, &headers).unwrap();
+        let again = update_network_block(&updated, &allowlist, &headers, None).unwrap();
         assert_eq!(again, updated);
     }
 
     #[test]
+    fn egress_allow_all_round_trips_through_network_block() {
+        // Setting the flag writes egress_allow_all: true and parses back true; a
+        // later edit with None preserves it (an allowlist edit can't silently
+        // disable open egress).
+        let opened = update_network_block(SPEC, &["api.openai.com".to_string()], &[], Some(true))
+            .unwrap();
+        assert!(opened.contains("egress_allow_all: true"), "{opened}");
+        let tmp = std::env::temp_dir().join(format!("mweb-allowall-{}.md", std::process::id()));
+        std::fs::write(&tmp, &opened).unwrap();
+        let spec = AgentSpec::from_maturana_markdown(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert!(spec.network.egress_allow_all);
+        // None preserves the existing true.
+        let preserved = update_network_block(&opened, &["api.openai.com".to_string()], &[], None)
+            .unwrap();
+        assert!(preserved.contains("egress_allow_all: true"), "{preserved}");
+        // Some(false) turns it back off.
+        let closed = update_network_block(&opened, &["api.openai.com".to_string()], &[], Some(false))
+            .unwrap();
+        assert!(closed.contains("egress_allow_all: false"), "{closed}");
+    }
+
+    #[test]
     fn egress_rewrite_rejects_specs_without_frontmatter() {
-        assert!(update_network_block("# no frontmatter", &[], &[]).is_err());
+        assert!(update_network_block("# no frontmatter", &[], &[], None).is_err());
     }
 
     #[test]

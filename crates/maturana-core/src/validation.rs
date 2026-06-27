@@ -231,15 +231,34 @@ pub fn validate_spec(spec: &AgentSpec) -> ValidationReport {
         }
     }
 
-    if spec.network.egress_allowlist.is_empty() {
+    // Open egress: the explicit flag, or a literal `*` wildcard left in the list.
+    // It satisfies the allowlist requirements below (every host is reachable) but
+    // is a deliberate removal of a zero-trust boundary, so warn loudly.
+    let egress_open = spec.network.egress_allow_all
+        || spec
+            .network
+            .egress_allowlist
+            .iter()
+            .any(|h| h.trim() == "*");
+    if egress_open {
+        warnings.push(
+            "network.egress_allow_all is set: this agent can reach ANY host — egress governance \
+             is OFF (traffic is still proxied and audited as allow_all). Prefer a scoped \
+             network.egress_allowlist when the hosts are known."
+                .to_string(),
+        );
+    } else if spec.network.egress_allowlist.is_empty() {
         warnings.push(
             "network.egress_allowlist is empty; the agent will have no outbound network by default"
                 .to_string(),
         );
     }
     if let Some(proxy) = &spec.network.proxy {
-        if proxy.enabled && spec.network.egress_allowlist.is_empty() {
-            errors.push("network.proxy requires network.egress_allowlist entries".to_string());
+        if proxy.enabled && !egress_open && spec.network.egress_allowlist.is_empty() {
+            errors.push(
+                "network.proxy requires network.egress_allowlist entries (or network.egress_allow_all)"
+                    .to_string(),
+            );
         }
         if proxy.enabled && proxy.bind.trim().is_empty() {
             errors.push("network.proxy.bind must not be empty".to_string());
@@ -257,7 +276,10 @@ pub fn validate_spec(spec: &AgentSpec) -> ValidationReport {
                 );
             }
             let host = injection.host.to_ascii_lowercase();
+            // allow-all covers every host, so the explicit-allowlist requirement
+            // for an injection target only applies when egress is scoped.
             if proxy.enabled
+                && !egress_open
                 && !spec
                     .network
                     .egress_allowlist

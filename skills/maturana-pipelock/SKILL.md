@@ -41,6 +41,13 @@ Codex or Claude OAuth harness state.
   configured for injection.
 - Need browser/guest trust: provide the public MITM CA certificate path; never
   expose the private CA key.
+- Need open ("allow all") egress for an agent: only when the user EXPLICITLY
+  wants the agent to reach arbitrary sites. Set `network.egress_allow_all: true`
+  in that agent's `MATURANA.md` (or run the proxy with `--allow-all`), then
+  relaunch/restart the agent so the proxy re-reads the spec. Allow-all keeps the
+  proxy in path (header injection + audit still apply; requests audit as
+  `grant_source=allow_all`) — it just stops host filtering. Prefer a scoped
+  `egress_allowlist` whenever the hosts are known.
 - Need diagnostics: inspect audit logs and proxy output before changing policy.
 - Need external credential manager: defer it. The MVP is local encrypted vault
   plus MITM proxy only.
@@ -99,6 +106,32 @@ Run it with explicit one-off policy flags:
   --inject-header api.example.test:Authorization=pipelock:api/token
 ```
 
+Open ("allow all") egress for an agent — ONLY when the user explicitly asks for
+unrestricted web access. The durable, per-agent way is the spec flag:
+
+```yaml
+# in the agent's MATURANA.md frontmatter
+network:
+  egress_allow_all: true
+```
+
+Apply it by relaunching the agent (the proxy re-reads the spec on launch):
+
+```powershell
+.\scripts\maturana.ps1 agent launch .maturana\agents\<id>\MATURANA.md --apply
+```
+
+Or flip it from the cockpit: Egress panel → choose the agent → tick "Allow all
+egress" → save (re-validates the spec; applies on the agent's next restart). Or
+run a one-off proxy with open egress for a quick test:
+
+```powershell
+.\scripts\maturana.ps1 pipelock proxy --agent-id <id> --allow-all
+```
+
+Re-scope later by setting `egress_allow_all: false` and listing the specific
+hosts in `egress_allowlist` again.
+
 ## Evidence
 
 Before claiming success, collect:
@@ -110,6 +143,9 @@ Before claiming success, collect:
 - Allowlist enforced: disallowed host is denied; allowed host passes.
 - Header injection: audit shows the allowed target and injected header name,
   not the secret value.
+- Allow-all in effect (when requested): the proxy startup line reads `ALLOW-ALL`,
+  and audited requests carry `grant_source: allow_all` (not `denied`) for hosts
+  that are not on any allowlist.
 
 ## Recovery
 
@@ -128,5 +164,9 @@ Before claiming success, collect:
 - Do not write raw secrets into `MATURANA.md`, `AGENTS.md`, `SOUL.md`, skills,
   docs, audit logs, or committed files.
 - Do not add a queue or external credential manager for the MVP.
-- Do not allow broad wildcard egress when a specific host is known.
+- Prefer a scoped `egress_allowlist`. Enable `egress_allow_all` only when the user
+  explicitly wants open web access — never by default, and never just to clear a
+  single denied host that one allowlist entry would fix. It keeps the proxy in
+  path (audit + injection) but disables host filtering, so treat it as a
+  deliberate, user-approved exception and say so when you set it.
 - Do not expose the MITM private CA key.

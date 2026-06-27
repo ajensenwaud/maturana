@@ -1139,6 +1139,7 @@ mod tests {
             filesystem: Filesystem::default(),
             network: Network {
                 egress_allowlist: vec![],
+                egress_allow_all: false,
                 proxy: Some(NetworkProxy {
                     enabled: true,
                     bind: "172.30.0.1:47833".to_string(),

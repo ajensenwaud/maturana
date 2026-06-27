@@ -971,12 +971,25 @@ export async function renderEgress(panel, socket) {
   const hosts = el("textarea", "spec-editor");
   hosts.placeholder = "one host per line, e.g. api.openai.com";
   hosts.style.minHeight = "120px";
+  // Allow-all toggle: open egress entirely (still proxied + audited as allow_all).
+  const allowAll = el("input");
+  allowAll.type = "checkbox";
+  const allowAllLabel = el("label", "panel-desc");
+  allowAllLabel.style.display = "flex";
+  allowAllLabel.style.alignItems = "center";
+  allowAllLabel.style.gap = "6px";
+  allowAllLabel.append(allowAll, document.createTextNode(
+    "Allow all egress — this agent may reach ANY host (governance off; still proxied + audited). Prefer a scoped list when hosts are known."));
+  const syncHostsState = () => { hosts.disabled = allowAll.checked; hosts.style.opacity = allowAll.checked ? "0.5" : "1"; };
+  allowAll.addEventListener("change", syncHostsState);
   const editorOut = el("div");
   const loadHosts = async () => {
     if (!agentSel.value) return;
     try {
       const data = await api(`/api/agents/${agentSel.value}/egress`);
       hosts.value = (data.egress_allowlist || []).join("\n");
+      allowAll.checked = !!data.egress_allow_all;
+      syncHostsState();
       editorOut.replaceChildren(el("div", "panel-desc",
         `${(data.inject_headers || []).length} header injection(s) configured for this agent (managed in its spec).`));
     } catch (error) { editorOut.replaceChildren(el("div", "status-bad", String(error))); }
@@ -987,12 +1000,15 @@ export async function renderEgress(panel, socket) {
     try {
       await api(`/api/agents/${agentSel.value}/egress`, {
         method: "PUT",
-        body: JSON.stringify({ egress_allowlist: hosts.value.split("\n").map((h) => h.trim()).filter(Boolean) }),
+        body: JSON.stringify({
+          egress_allowlist: hosts.value.split("\n").map((h) => h.trim()).filter(Boolean),
+          egress_allow_all: allowAll.checked,
+        }),
       });
       editorOut.replaceChildren(el("div", "status-ok", "[ saved + validated — applies on next restart ]"));
     } catch (error) { editorOut.replaceChildren(el("div", "status-bad", String(error))); }
   }));
-  editor.append(editorRow, hosts, editorOut);
+  editor.append(editorRow, allowAllLabel, hosts, editorOut);
   await loadHosts();
 
   // 2) Live feed of proxy decisions, with hot-approve for denials.

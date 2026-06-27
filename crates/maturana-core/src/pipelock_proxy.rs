@@ -29,6 +29,11 @@ pub struct ProxyConfig {
     /// Durable allowlist from the spec (+ MCP egress hosts). Never revoked at
     /// runtime.
     pub allowlist: Vec<String>,
+    /// When true, the proxy permits ANY host (egress governance off) — set by the
+    /// spec's `network.egress_allow_all` or the `--allow-all` CLI flag. Traffic
+    /// still flows through the proxy (header injection + audit keep working); it is
+    /// just never denied, and every request audits with `grant_source=allow_all`.
+    pub allow_all: bool,
     pub injections: Vec<HeaderInjection>,
     pub audit_path: PathBuf,
     /// Live, additive grants reloaded from `<home>/pipelock/runtime-allow.json`
@@ -42,6 +47,11 @@ pub struct ProxyConfig {
 pub enum AllowSource {
     Spec,
     Runtime,
+    /// Egress governance is OFF for this agent (the `egress_allow_all` flag or a
+    /// `*` wildcard grant): every host is permitted. Kept distinct from Spec/
+    /// Runtime so each request is audited as `allow_all` and the open boundary is
+    /// never mistaken for a scoped grant.
+    AllowAll,
     Denied,
 }
 
@@ -50,6 +60,7 @@ impl AllowSource {
         match self {
             AllowSource::Spec => "spec",
             AllowSource::Runtime => "runtime",
+            AllowSource::AllowAll => "allow_all",
             AllowSource::Denied => "denied",
         }
     }
@@ -82,6 +93,7 @@ impl ProxyConfig {
         Ok(Self {
             home_root: home_root.into(),
             allowlist,
+            allow_all: spec.network.egress_allow_all,
             injections: proxy
                 .inject_headers
                 .iter()
@@ -102,13 +114,21 @@ impl ProxyConfig {
         self.home_root.join("pipelock").join("runtime-allow.json")
     }
 
-    /// Classify a (already normalized) host against the durable allowlist then
-    /// the live runtime grants.
+    /// Classify a (already normalized) host: allow-all first (the flag or a `*`
+    /// wildcard in either layer), then the durable allowlist, then the live
+    /// runtime grants. Allow-all stays a distinct source so the open boundary is
+    /// always visible in the audit, never masked as a scoped spec/runtime grant.
     fn classify_host(&self, host: &str) -> AllowSource {
+        if self.allow_all || self.allowlist.iter().any(|h| h.trim() == "*") {
+            return AllowSource::AllowAll;
+        }
         if host_allowed(host, &self.allowlist) {
             return AllowSource::Spec;
         }
         let runtime = self.runtime_allow.read().expect("runtime_allow poisoned");
+        if runtime.iter().any(|h| h.trim() == "*") {
+            return AllowSource::AllowAll;
+        }
         if host_allowed(host, &runtime) {
             return AllowSource::Runtime;
         }
@@ -939,6 +959,7 @@ network:
             allowlist: vec!["api.example.test".to_string()],
             injections: vec![],
             audit_path: std::env::temp_dir().join("a.jsonl"),
+            allow_all: false,
             runtime_allow: Default::default(),
         };
         assert_eq!(config.classify_host("api.example.test"), AllowSource::Spec);
@@ -951,6 +972,53 @@ network:
             .push("api.notion.com".to_string());
         assert_eq!(config.classify_host("api.notion.com"), AllowSource::Runtime);
         assert_eq!(config.classify_host("api.example.test"), AllowSource::Spec);
+    }
+
+    #[test]
+    fn allow_all_flag_permits_any_host_as_allow_all_source() {
+        let config = ProxyConfig {
+            home_root: std::env::temp_dir(),
+            allowlist: vec!["api.example.test".to_string()],
+            injections: vec![],
+            audit_path: std::env::temp_dir().join("a.jsonl"),
+            allow_all: true,
+            runtime_allow: Default::default(),
+        };
+        // Any host — on or off the allowlist — is permitted, and classified as
+        // AllowAll (not Spec) so the audit records the open boundary.
+        assert_eq!(
+            config.classify_host("api.example.test"),
+            AllowSource::AllowAll
+        );
+        assert_eq!(config.classify_host("totally.random.example"), AllowSource::AllowAll);
+        assert_eq!(AllowSource::AllowAll.label(), "allow_all");
+    }
+
+    #[test]
+    fn wildcard_grant_in_either_layer_means_allow_all() {
+        // A literal "*" in the durable allowlist opens everything.
+        let spec_star = ProxyConfig {
+            home_root: std::env::temp_dir(),
+            allowlist: vec!["*".to_string()],
+            injections: vec![],
+            audit_path: std::env::temp_dir().join("a.jsonl"),
+            allow_all: false,
+            runtime_allow: Default::default(),
+        };
+        assert_eq!(spec_star.classify_host("anything.example"), AllowSource::AllowAll);
+
+        // A "*" added to the LIVE runtime grants opens everything without a restart.
+        let runtime_star = ProxyConfig {
+            home_root: std::env::temp_dir(),
+            allowlist: vec!["api.example.test".to_string()],
+            injections: vec![],
+            audit_path: std::env::temp_dir().join("a.jsonl"),
+            allow_all: false,
+            runtime_allow: Default::default(),
+        };
+        assert_eq!(runtime_star.classify_host("api.notion.com"), AllowSource::Denied);
+        runtime_star.runtime_allow.write().unwrap().push("*".to_string());
+        assert_eq!(runtime_star.classify_host("api.notion.com"), AllowSource::AllowAll);
     }
 
     #[test]
@@ -1077,6 +1145,7 @@ network:
                 prefix: None,
             }],
             audit_path: audit_path.clone(),
+            allow_all: false,
             runtime_allow: Default::default(),
         };
         let proxy_thread = thread::spawn(move || {
@@ -1115,6 +1184,7 @@ network:
             allowlist: vec!["allowed.example".to_string()],
             injections: vec![],
             audit_path: audit_path.clone(),
+            allow_all: false,
             runtime_allow: Default::default(),
         };
         let proxy_thread = thread::spawn(move || {
@@ -1158,6 +1228,7 @@ network:
             allowlist: vec!["127.0.0.1".to_string()],
             injections: vec![],
             audit_path: audit_path.clone(),
+            allow_all: false,
             runtime_allow: Default::default(),
         };
         let proxy_thread = thread::spawn(move || {
@@ -1248,6 +1319,7 @@ network:
                 prefix: None,
             }],
             audit_path: audit_path.clone(),
+            allow_all: false,
             runtime_allow: Default::default(),
         };
         ensure_mitm_ca_cert(&home).unwrap();

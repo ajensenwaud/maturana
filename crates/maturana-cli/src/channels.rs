@@ -2522,6 +2522,9 @@ fn tools_text(home: &MaturanaHome, agent_id: &str) -> String {
         let egress = &spec.network.egress_allowlist;
         let allows = |needle: &str| egress.iter().any(|h| h.contains(needle));
         let mut caps: Vec<&str> = Vec::new();
+        if spec.network.egress_allow_all {
+            caps.push("open web (allow-all egress)");
+        }
         if allows("brave") || allows("tavily") {
             caps.push("web search");
         }

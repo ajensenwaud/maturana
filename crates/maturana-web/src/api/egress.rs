@@ -102,7 +102,7 @@ fn promote_to_spec(home: &Path, agent_id: &str, host: &str) -> anyhow::Result<()
         .as_ref()
         .map(|p| p.inject_headers.clone())
         .unwrap_or_default();
-    let updated = agents::update_network_block(&markdown, &allowlist, &headers)?;
+    let updated = agents::update_network_block(&markdown, &allowlist, &headers, None)?;
     // Re-validate before writing (same gate as the egress editor).
     let report = {
         let tmp = std::env::temp_dir().join(format!("mweb-egress-{}.md", uuid::Uuid::new_v4()));
