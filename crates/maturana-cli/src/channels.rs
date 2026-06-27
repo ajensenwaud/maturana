@@ -4210,7 +4210,8 @@ fn send_telegram_chat_action(token: &str, chat_id: &str, action: &str) -> anyhow
         "action": action,
     });
     let response: TelegramOkResponse = ureq::post(&format!(
-        "https://api.telegram.org/bot{token}/sendChatAction"
+        "{}/bot{token}/sendChatAction",
+        tg_api_base()
     ))
     .set("content-type", "application/json")
     .send_string(&body.to_string())
@@ -8052,6 +8053,96 @@ mod tests {
         assert!(reqs[1].len() < reqs[2].len(), "reveal should grow 1→2");
         // The final edit carries the COMPLETE answer.
         assert!(reqs[3].contains("/editMessageText") && reqs[3].contains("why it matters"), "{}", reqs[3]);
+    }
+
+    #[test]
+    fn live_loop_ticks_counter_each_second_then_reveals_answer() {
+        // Drive the REAL stream_turn_to_telegram loop against the mock, with a worker
+        // reply that lands after a few seconds. Asserts the captured HTTP shows the
+        // counter ticking each second (distinct "💭 Thinking… 0:0X" frames — the old
+        // 10s-frozen bug would emit only one), the answer revealed at the end, and NO
+        // dust anywhere. This exercises the LIVE behaviour, not just the helpers.
+        let (base, captured) = spawn_mock_telegram();
+        std::env::set_var("MATURANA_TELEGRAM_API_BASE", &base);
+
+        let tmp = std::env::temp_dir().join(format!("mat-streamloop-{}", std::process::id()));
+        let home = MaturanaHome::new(tmp.clone());
+        let agent = "claude";
+        let session = "telegram-main";
+        let chat_id = 777i64;
+        std::fs::create_dir_all(home.agent_dir(agent)).unwrap();
+        let paths = session_paths(&home.agent_dir(agent), session);
+        ensure_session(&paths).unwrap();
+        let inbound_id = insert_inbound(
+            &paths,
+            "chat",
+            "telegram",
+            &chat_id.to_string(),
+            None,
+            &serde_json::json!({ "text": "hi" }).to_string(),
+        )
+        .unwrap();
+
+        // The worker's reply lands after ~4s so the counter visibly ticks first.
+        let answer = "Here is a reasonably long answer that should be revealed in two growing chunks before the final edit lands.";
+        let paths_w = paths.clone();
+        let reply_to = inbound_id.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(4000));
+            let body = serde_json::json!({ "text": answer }).to_string();
+            let _ = maturana_core::session_db::write_outbound(
+                &paths_w,
+                Some(&reply_to),
+                "chat",
+                "telegram",
+                &chat_id.to_string(),
+                None,
+                &body,
+            );
+        });
+
+        let config = TelegramServe {
+            agent_id: agent.to_string(),
+            session_id: session.to_string(),
+            token_source: "x".to_string(),
+            once: false,
+            run_once_provider: None,
+            poll_seconds: 5,
+            timeout_seconds: 600,
+        };
+        stream_turn_to_telegram(
+            &home,
+            "TESTTOKEN",
+            &config,
+            chat_id,
+            &inbound_id,
+            None,
+            &paths,
+            std::time::Duration::from_secs(20),
+        )
+        .unwrap();
+        worker.join().unwrap();
+
+        std::env::remove_var("MATURANA_TELEGRAM_API_BASE");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let reqs = captured.lock().unwrap().clone();
+        // Counter ticked: ≥2 DISTINCT "Thinking…" payloads (the clock changed per second).
+        let thinking: std::collections::BTreeSet<String> =
+            reqs.iter().filter(|r| r.contains("Thinking")).cloned().collect();
+        assert!(
+            thinking.len() >= 2,
+            "counter should tick each second; distinct Thinking frames:\n{}",
+            thinking.into_iter().collect::<Vec<_>>().join("\n--\n")
+        );
+        // No dust anywhere — the dots are gone for good.
+        assert!(reqs.iter().all(|r| !r.contains('·')), "no dust frames");
+        // The full answer was delivered into the live message.
+        assert!(
+            reqs.iter().any(|r| r.contains("before the final edit lands")),
+            "answer not delivered:\n{}",
+            reqs.join("\n--\n")
+        );
     }
 
     #[test]
