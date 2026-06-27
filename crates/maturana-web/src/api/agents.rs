@@ -464,6 +464,17 @@ fn starter_spec(id: &str, name: &str, purpose: &str, harness: &str) -> String {
     // string value — NOT interpolated as new sibling keys. String-formatting these
     // user inputs into YAML let a crafted `purpose` inject e.g. a `harness_auth`
     // block (host arbitrary-file read into the guest) or a `filesystem.mounts`.
+    // Seed the egress allowlist with the harness's model API (+ github) so a new
+    // agent can actually reach its backend, and pair it with the proxy below
+    // (Firecracker egress is proxy-routed; a proxy with no allowlist is rejected,
+    // and an allowlist with no proxy gets ConnectionRefused). The operator widens
+    // the allowlist as needed.
+    let egress: Vec<&str> = match harness {
+        "claude-code" => vec!["api.anthropic.com", "platform.claude.com", "github.com"],
+        "codex" => vec!["api.openai.com", "chatgpt.com", "github.com"],
+        "opencode" => vec!["openrouter.ai", "github.com"],
+        _ => vec!["github.com"],
+    };
     let frontmatter = serde_json::json!({
         "identity": { "id": id, "name": name, "purpose": purpose },
         "runtime": { "harness": harness },
@@ -482,7 +493,14 @@ fn starter_spec(id: &str, name: &str, purpose: &str, harness: &str) -> String {
                 "kernel_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw virtio_mmio.device=4K@0xd0000000:5",
             },
         },
-        "network": { "egress_allowlist": [] },
+        // A Firecracker guest's egress is proxy-routed (the worker bakes
+        // HTTP_PROXY=<host_ip>:47833), so a new agent needs the proxy block from the
+        // start — without it the host launches no proxy and every turn fails with
+        // ConnectionRefused. Bind tracks the (placeholder) host_ip.
+        "network": {
+            "egress_allowlist": egress,
+            "proxy": { "enabled": true, "bind": "172.30.90.1:47833" },
+        },
         "memory": { "wiki_path": ".maturana/wiki" },
         "knowledge_graph": { "enabled": true },
     });
@@ -495,8 +513,9 @@ fn starter_spec(id: &str, name: &str, purpose: &str, harness: &str) -> String {
         "---\n{yaml}---\n\n# {name1}\n\n{purpose1}\n\n\
 You are {name1}, running in an isolated Maturana microVM. Be concise and helpful.\n\n\
 > Before provisioning: give this agent a UNIQUE tap_name / host_ip / guest_ip / guest_mac \
-(the 172.30.90.x placeholders will collide with another agent), point kernel_image / \
-rootfs_image at prepared images, then dry-run -> apply.\n"
+(the 172.30.90.x placeholders will collide with another agent) and set network.proxy.bind \
+to <host_ip>:47833 to match, point kernel_image / rootfs_image at prepared images, then \
+dry-run -> apply.\n"
     )
 }
 
@@ -945,7 +964,8 @@ body text stays put
             let spec = AgentSpec::from_maturana_markdown(&tmp).expect("starter spec must parse");
             let _ = std::fs::remove_file(&tmp);
             assert_eq!(spec.identity.id, "new-bot");
-            assert!(validate_spec(&spec).valid, "starter spec for {harness} must validate");
+            let report = validate_spec(&spec);
+            assert!(report.valid, "starter spec for {harness} must validate: {:?}", report.errors);
         }
     }
 
