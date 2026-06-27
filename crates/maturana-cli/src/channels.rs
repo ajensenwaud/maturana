@@ -4448,6 +4448,24 @@ fn reveal_answer(token: &str, chat_id: i64, id: i64, answer: &str) {
     }
 }
 
+/// The "5000 pieces" dissolve: on completion, edit the thinking line into a
+/// Telegram NATIVE spoiler (`<tg-spoiler>`) so the client renders it as the
+/// dotted/particle effect before the answer replaces it. Telegram animates the
+/// dissolve on mobile/iOS; desktop shows static dotted text (a bot can mark a
+/// spoiler but can't force the reveal animation to auto-play — a client limit).
+/// Best-effort: a failed edit just means the answer lands without the flourish.
+fn spoiler_dissolve(token: &str, chat_id: i64, id: i64, elapsed: Duration) {
+    let secs = elapsed.as_secs();
+    let html = format!(
+        "<tg-spoiler>💭 Thinking… {}:{:02}</tg-spoiler>",
+        secs / 60,
+        secs % 60
+    );
+    if edit_telegram_message_html(token, chat_id, id, &html).is_ok() {
+        thread::sleep(Duration::from_millis(800));
+    }
+}
+
 /// OpenClaw-style live progress for a turn: post ONE message immediately, tick a
 /// spinner on it while the agent works (showing the tools it runs + streamed
 /// text), then — the instant the reply lands — edit that SAME message in place
@@ -4529,7 +4547,9 @@ fn stream_turn_to_telegram(
             // — a failed delete must never wedge the turn into an endless retry.
             if reply.trim() == crate::proactive::SILENCE_SENTINEL {
                 if let Some(id) = message_id {
-                    // Nothing worth saying — just remove the thinking indicator.
+                    // Nothing worth saying — dissolve the indicator into spoiler
+                    // particles, then remove it.
+                    spoiler_dissolve(token, chat_id, id, started.elapsed());
                     let _ = delete_telegram_message(token, chat_id, id);
                 }
                 clear_telegram_status(paths, inbound_id);
@@ -4537,11 +4557,13 @@ fn stream_turn_to_telegram(
                 let _ = clear_progress(paths, inbound_id);
                 return Ok(());
             }
-            // Flow the answer into the live message (OpenClaw-style) so it reads as
-            // the reply streaming into place rather than snapping over, THEN do the
-            // authoritative full edit. finalize_reply still guarantees a failed edit
-            // never leaves two messages.
+            // Dissolve the thinking indicator into Telegram's native spoiler
+            // particles (the "5000 pieces" effect), then flow the answer into the
+            // SAME message (OpenClaw-style) so it reads as the reply settling into
+            // place, THEN the authoritative full edit. finalize_reply still
+            // guarantees a failed edit never leaves two messages.
             if let Some(id) = message_id {
+                spoiler_dissolve(token, chat_id, id, started.elapsed());
                 reveal_answer(token, chat_id, id, &reply);
             }
             match finalize_reply(token, chat_id, message_id, &reply, reply_to) {
@@ -8079,6 +8101,29 @@ mod tests {
         assert!(reqs[1].len() < reqs[2].len(), "reveal should grow 1→2");
         // The final edit carries the COMPLETE answer.
         assert!(reqs[3].contains("/editMessageText") && reqs[3].contains("why it matters"), "{}", reqs[3]);
+    }
+
+    #[test]
+    fn spoiler_dissolve_emits_native_tg_spoiler_frame() {
+        // The "5000 pieces" dissolve must edit the live message to a real Telegram
+        // <tg-spoiler> so the client renders the particle effect.
+        let (base, captured) = spawn_mock_telegram();
+        std::env::set_var("MATURANA_TELEGRAM_API_BASE", &base);
+        let id = send_telegram_html("TESTTOKEN", "123", "<pre>💭 Thinking… 0:05</pre>", None)
+            .unwrap()
+            .expect("draft id");
+        spoiler_dissolve("TESTTOKEN", 123, id, std::time::Duration::from_secs(5));
+        std::env::remove_var("MATURANA_TELEGRAM_API_BASE");
+        let reqs = captured.lock().unwrap().clone();
+        // draft sendMessage + one editMessageText carrying the native spoiler.
+        assert_eq!(reqs.len(), 2, "unexpected sequence:\n{}", reqs.join("\n--\n"));
+        assert!(reqs[1].contains("/editMessageText"), "{}", reqs[1]);
+        assert!(
+            reqs[1].contains("tg-spoiler"),
+            "dissolve frame must use a native <tg-spoiler>: {}",
+            reqs[1]
+        );
+        assert!(reqs[1].contains("Thinking"), "{}", reqs[1]);
     }
 
     #[test]
