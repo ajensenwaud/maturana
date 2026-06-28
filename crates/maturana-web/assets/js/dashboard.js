@@ -903,7 +903,7 @@ export async function renderGraph(panel) {
     fileName,
     button("ingest", async () => {
       const picked = file.files?.[0];
-      if (!picked) return;
+      if (!picked) { toast("Choose a file to ingest first", "bad"); return; }
       out.replaceChildren(el("div", "label", "[ ingesting… ]"));
       try {
         const data = await api("/api/graph/ingest", {
@@ -954,7 +954,7 @@ export async function renderPipelock(panel) {
   value.placeholder = "value (write-only)";
   const addOut = el("div");
   add.append(name, value, button("set", async () => {
-    if (!name.value.trim() || !value.value) return;
+    if (!name.value.trim() || !value.value) { toast("Name and value are both required", "bad"); return; }
     try {
       await api("/api/pipelock/secrets", {
         method: "POST",
@@ -1020,7 +1020,7 @@ export async function renderTools(panel) {
   enRow.append(agentSel, toolInput, button("enable", async () => {
     const id = agentSel.value;
     const tool = toolInput.value.trim();
-    if (!id || !tool) { enStatus.textContent = "pick an agent and enter a tool name"; return; }
+    if (!id || !tool) { toast("Pick an agent and enter a tool name", "bad"); return; }
     enStatus.textContent = "saving…";
     try {
       const cur = await api(`/api/agents/${id}/config?section=tools`);
@@ -1030,7 +1030,7 @@ export async function renderTools(panel) {
       enStatus.textContent = `enabled "${tool}" for ${id} — applies on next restart`;
       toolInput.value = "";
       renderTools(panel);
-    } catch (e) { enStatus.textContent = String(e); }
+    } catch (e) { enStatus.textContent = ""; toast(String(e), "bad"); }
   }), enStatus);
   enableWrap.append(enRow);
   panel.append(enableWrap);
@@ -1234,12 +1234,12 @@ export async function renderSkills(panel) {
   dRow.append(skillSel, el("span", "panel-desc", "→"), agentSel2, button("deploy to agent", async () => {
     const skill = skillSel.value;
     const agent = agentSel2.value;
-    if (!skill || !agent) { dStatus.textContent = "pick a skill and an agent"; return; }
+    if (!skill || !agent) { toast("Pick a skill and an agent", "bad"); return; }
     dStatus.textContent = "deploying…";
     try {
       const d = await api(`/api/agents/${agent}/deploy-skill`, { method: "POST", body: JSON.stringify({ skill }) });
       dStatus.textContent = `deployed ${d.deployed} → ${d.agent}:${d.guest_path}`;
-    } catch (e) { dStatus.textContent = String(e); }
+    } catch (e) { dStatus.textContent = ""; toast(String(e), "bad"); }
   }), dStatus);
   deployCard.append(dRow);
 
@@ -1342,7 +1342,7 @@ export async function renderSchedules(panel) {
   const addStatus = el("span", "panel-desc");
   const addBtn = button("Add schedule", async () => {
     const agent = agentSel.value;
-    if (!agent) { addStatus.textContent = "no agents"; return; }
+    if (!agent) { toast("Pick an agent for the schedule", "bad"); return; }
     addStatus.textContent = "saving…";
     try {
       await api(`/api/schedules/${agent}`, {
@@ -1358,7 +1358,7 @@ export async function renderSchedules(panel) {
       nameIn.value = ""; cronIn.value = ""; promptIn.value = ""; channelIn.value = ""; boardIn.value = "";
       addStatus.textContent = "added";
       draw();
-    } catch (e) { addStatus.textContent = String(e); }
+    } catch (e) { addStatus.textContent = ""; toast(String(e), "bad"); }
   });
   const addRow = el("div", "opt-grid");
   for (const node of [agentSel, nameIn, cronIn, promptIn, channelIn, boardIn]) addRow.append(node);
