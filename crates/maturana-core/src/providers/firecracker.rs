@@ -86,6 +86,11 @@ impl Provider for FirecrackerProvider {
             }
         });
         fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
+        // Firecracker opens the logger + metrics paths from this config at boot
+        // and does NOT create them; a fresh launch otherwise dies with
+        // LoggerUpdateError / Metrics InitializationFailure (NotFound). Pre-create
+        // both so the very first launch on a clean host works.
+        ensure_runtime_files(&log_path, &metrics_path)?;
 
         let metadata = json!({
             "agent_id": spec.identity.id,
@@ -140,6 +145,13 @@ impl Provider for FirecrackerProvider {
         let kernel_image = absolute_path(&firecracker.kernel_image)?;
         let rootfs_image = absolute_path(&firecracker.rootfs_image)?;
         validate_firecracker_prerequisites(&firecracker.tap_name, &kernel_image, &rootfs_image)?;
+        // Firecracker requires the logger + metrics files (named in the config)
+        // to already exist — it opens but never creates them. Ensure them here too
+        // so a launch is robust even if the config was generated elsewhere.
+        ensure_runtime_files(
+            &state_dir.join("firecracker.log"),
+            &state_dir.join("firecracker-metrics.json"),
+        )?;
         start_firecracker_process(
             &firecracker.tap_name,
             &socket,
@@ -425,6 +437,23 @@ fn absolute_without_filesystem(path: &Path) -> PathBuf {
             .map(|cwd| cwd.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
     }
+}
+
+/// Create the Firecracker logger + metrics files if absent. Firecracker opens
+/// the `logger.log_path` and `metrics.metrics_path` from its config at boot and
+/// does NOT create them, so a first launch on a clean host fails with a NotFound
+/// logger/metrics error. Idempotent; existing files (and their contents) are
+/// left untouched.
+fn ensure_runtime_files(log_path: &Path, metrics_path: &Path) -> anyhow::Result<()> {
+    for path in [log_path, metrics_path] {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if !path.exists() {
+            fs::OpenOptions::new().create(true).append(true).open(path)?;
+        }
+    }
+    Ok(())
 }
 
 fn start_firecracker_process(

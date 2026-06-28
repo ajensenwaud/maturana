@@ -3533,9 +3533,22 @@ fn repair_firecracker_harnesses(
             }
             Ok(())
         })();
-        if let Err(err) = result {
-            eprintln!("  {} failed: {err:#}", profile.agent_id);
-            failures.push((profile.agent_id.to_string(), err));
+        match result {
+            Err(err) => {
+                eprintln!("  {} failed: {err:#}", profile.agent_id);
+                failures.push((profile.agent_id.to_string(), err));
+            }
+            Ok(()) => {
+                // When we own the plane (not deferring to `maturana up`), also
+                // start the agent's egress proxy so it can actually reach its
+                // allowlisted hosts — otherwise the guest, routed through the
+                // proxy, gets ECONNREFUSED to its model API. Best-effort.
+                if !repair.skip_services && !repair.skip_launch {
+                    if let Err(err) = start_linux_agent_proxy(home, &profile) {
+                        eprintln!("  {} egress proxy not started: {err:#}", profile.agent_id);
+                    }
+                }
+            }
         }
     }
 
@@ -3597,6 +3610,49 @@ fn ensure_sessiond_token(path: &PathBuf) -> anyhow::Result<String> {
         .collect();
     fs::write(path, format!("{token}\n"))?;
     Ok(token)
+}
+
+/// Start an agent's per-agent egress proxy as a detached child. An agent
+/// provisioned by `setup firecracker-harnesses` (without `maturana up`) routes
+/// its egress through this proxy; if nothing is listening the guest gets
+/// ECONNREFUSED to its model API. Mirrors how `maturana up` supervises proxies.
+/// No-op when the spec has no enabled proxy. Best-effort + detached.
+fn start_linux_agent_proxy(
+    home: &MaturanaHome,
+    profile: &FirecrackerHarnessProfile,
+) -> anyhow::Result<()> {
+    let spec = AgentSpec::from_maturana_markdown(PathBuf::from(&profile.spec_path))?;
+    if !spec.network.proxy.as_ref().is_some_and(|proxy| proxy.enabled) {
+        return Ok(());
+    }
+    // Avoid a duplicate if one is already running for this agent.
+    let _ = ProcessCommand::new("pkill")
+        .arg("-f")
+        .arg(format!("pipelock proxy --agent-id {}", profile.agent_id))
+        .status();
+    let logs_dir = home.root().join("logs");
+    fs::create_dir_all(&logs_dir)?;
+    let stdout = fs::File::create(logs_dir.join(format!("proxy-{}.out.log", profile.agent_id)))?;
+    let stderr = fs::File::create(logs_dir.join(format!("proxy-{}.err.log", profile.agent_id)))?;
+    let child = ProcessCommand::new(std::env::current_exe()?)
+        .arg("--home")
+        .arg(home.root())
+        .arg("pipelock")
+        .arg("proxy")
+        .arg("--agent-id")
+        .arg(&profile.agent_id)
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .context("failed to start agent egress proxy")?;
+    thread::sleep(Duration::from_millis(400));
+    println!(
+        "  egress proxy pid={} for {} (spec allowlist)",
+        child.id(),
+        profile.agent_id
+    );
+    Ok(())
 }
 
 fn start_linux_sessiond(

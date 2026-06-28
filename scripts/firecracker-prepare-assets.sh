@@ -341,6 +341,16 @@ cat > "$asset_manifest_path" <<EOF
 EOF
 echo "manifest: $asset_manifest_path"
 
+# Make the whole output dir owned by the invoking user. The libguestfs /
+# virt-customize steps run via sudo and leave root-owned files here — including
+# maturana-firecracker.id_rsa, which the (non-root) agent launcher must read to
+# SSH into the guest. Without this a fresh host fails with
+# `Load key "...id_rsa": Permission denied` -> guest publickey denied.
 if [[ "$(id -u)" -eq 0 && -n "${SUDO_UID:-}" && -n "${SUDO_GID:-}" ]]; then
+  # Script itself runs as root under sudo: hand ownership to the real user.
   chown -R "$SUDO_UID:$SUDO_GID" "$output_dir"
+elif [[ "$(id -u)" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
+  # Script runs as a normal user that used sudo internally for libguestfs:
+  # reclaim any root-owned artifacts back to the current user.
+  sudo chown -R "$(id -u):$(id -g)" "$output_dir" 2>/dev/null || true
 fi
