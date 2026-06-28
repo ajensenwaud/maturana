@@ -178,19 +178,32 @@ Each successful live push, run, and fetch appends an event to
 **Verified first-run order on a fresh host** (each step is idempotent; do them in
 this order):
 
-1. Fresh login shell (see Preflight — `kvm` group + `~/.local/bin` PATH).
-2. Stage harness auth into `.maturana/host-auth/<harness>/` (e.g.
-   `claude-code/`, `codex/`).
-3. `maturana setup firecracker-harnesses --agent-id <profile>` — builds rootfs +
-   kernel, creates the TAP, boots Firecracker, installs the guest worker. Run
-   **unsandboxed**. Re-runnable: the TAP is recreated fresh each launch, so a
-   repeat never hits "Resource busy".
-4. `maturana up` (or `maturana service install up`) — sessiond + channels +
-   schedules.
-5. Prove a turn: `maturana agent run <profile> --prompt "say hi" --wait`.
-6. (Optional) Pair a channel. **One bot per agent.** Two agents sharing the same
+1. **Host substrate (once):** `bash scripts/install-firecracker-host.sh` —
+   installs the Firecracker binary, enables KVM, installs the libguestfs/qemu
+   image toolchain, makes `/boot/vmlinuz-*` readable for the non-root image build,
+   enables IPv4 forwarding, and grants scoped passwordless sudo for the per-agent
+   TAP. Then install the control plane: `bash scripts/install.sh`. Needs sudo.
+2. Fresh login shell (see Preflight — `kvm` group + `~/.local/bin` PATH).
+3. Stage harness auth into `.maturana/host-auth/<harness>/` (e.g. `claude-code/`,
+   `codex/`). For an **opencode** agent the live-LLM credential is the OpenRouter
+   key — set `openrouter/api-key` in pipelock (plus `host-auth/opencode/`).
+4. `maturana setup firecracker-harnesses --agent-id <profile>` — builds rootfs +
+   kernel, creates the TAP, boots Firecracker, installs the guest worker, and —
+   when it owns the plane (no `--skip-services`) — starts the agent's egress
+   proxy so the guest can reach its allowlisted model API. Run **unsandboxed**.
+   Re-runnable: the TAP is recreated fresh each launch, so a repeat never hits
+   "Resource busy".
+5. `maturana up` (or `maturana service install up`) — sessiond + channels +
+   schedules, and supervises the per-agent egress proxies in steady state.
+6. Prove a turn: `maturana agent run <profile> --prompt "say hi" --wait`.
+7. (Optional) Pair a channel. **One bot per agent.** Two agents sharing the same
    Telegram token collide with a Telegram **409 Conflict** (two pollers, one
    token) and neither answers — give each agent its own bot/token.
+
+A fresh host now needs **no manual workarounds** — the provider pre-creates
+Firecracker's logger/metrics files, the image build hands the SSH key back to the
+invoking user, and `setup` starts the egress proxy. If you still hit one of those
+on an OLD binary, rebuild; do not hand-`touch`/`chown`/start-proxy on the host.
 
 The three ready profiles are `codex-firecracker`, `claude-firecracker`,
 `opencode-firecracker` — each owns a UNIQUE network slot (its own `tap_name`,
