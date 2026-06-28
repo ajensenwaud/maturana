@@ -3568,15 +3568,26 @@ pub(crate) fn orchestrator_spawn_worker(
         "setup orchestration worker TAP",
     )?;
 
-    // 2. Give the VM its own rootfs (copy a baked one — no CoW required of users).
-    //    Keep it under the spawned agent's own dir: the shared images/ dir is
-    //    root-owned (from libguestfs asset prep), but agent dirs are user-owned.
+    // 2. Give the VM its own rootfs. On a copy-on-write filesystem (Btrfs/XFS/
+    //    ZFS-2.2+) this is an instant, space-shared reflink clone; on ext4 it
+    //    falls back to a full byte copy. Keep it under the spawned agent's own
+    //    dir: the shared images/ dir is root-owned (from libguestfs asset prep),
+    //    but agent dirs are user-owned.
     let rootfs_dir = home.agent_dir(new_id);
     fs::create_dir_all(&rootfs_dir)?;
     let new_rootfs = rootfs_dir.join("ubuntu-rootfs.ext4");
-    println!("  spawn {new_id}: copying rootfs (this is a few GB)…");
-    fs::copy(&base_rootfs, &new_rootfs)
-        .with_context(|| format!("failed to copy rootfs for {new_id}"))?;
+    let cow = maturana_core::cow::is_cow(&rootfs_dir);
+    println!(
+        "  spawn {new_id}: provisioning rootfs ({})…",
+        if cow {
+            "copy-on-write clone — instant"
+        } else {
+            "full copy, a few GB"
+        }
+    );
+    let kind = maturana_core::cow::provision_clone(&base_rootfs, &new_rootfs)
+        .with_context(|| format!("failed to provision rootfs for {new_id}"))?;
+    println!("  spawn {new_id}: rootfs ready ({})", kind.label());
 
     // 2b. The guest's static IP is baked into the image's netplan (matched by the
     //     interface MAC), so the copy still carries the base agent's IP. Regenerate
