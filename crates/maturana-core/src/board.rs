@@ -24,31 +24,62 @@ use crate::state::MaturanaHome;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CardStatus {
+    /// Parking column — an idea awaiting `decompose`/`specify` into real cards.
+    Triage,
     Todo,
     Doing,
     Done,
     Blocked,
+    /// Hidden from the active board; recoverable.
+    Archived,
 }
 
 impl CardStatus {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "triage" => Some(Self::Triage),
             "todo" => Some(Self::Todo),
             "doing" | "in_progress" | "in-progress" | "running" => Some(Self::Doing),
             "done" => Some(Self::Done),
             "blocked" => Some(Self::Blocked),
+            "archived" | "archive" => Some(Self::Archived),
             _ => None,
         }
     }
 
     pub fn label(&self) -> &'static str {
         match self {
+            Self::Triage => "triage",
             Self::Todo => "todo",
             Self::Doing => "doing",
             Self::Done => "done",
             Self::Blocked => "blocked",
+            Self::Archived => "archived",
         }
     }
+}
+
+/// A human/agent note on a card (append-only thread, shown to the worker).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Comment {
+    pub at: DateTime<Utc>,
+    #[serde(default)]
+    pub author: String,
+    pub body: String,
+}
+
+/// One execution attempt of a card — the auditable run history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunRecord {
+    pub attempt: u32,
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// "completed" | "blocked" | "crashed" | "timed_out" | "reclaimed" | "gave_up".
+    pub outcome: String,
+    #[serde(default)]
+    pub summary: String,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: DateTime<Utc>,
 }
 
 /// One unit of work on the board.
@@ -64,6 +95,9 @@ pub struct Card {
     #[serde(default)]
     pub assignee: Option<String>,
     pub status: CardStatus,
+    /// Higher runs first when more cards are ready than `max_parallel` allows.
+    #[serde(default)]
+    pub priority: i64,
     /// Card ids that must be `Done` before this one is ready.
     #[serde(default)]
     pub deps: Vec<String>,
@@ -72,6 +106,36 @@ pub struct Card {
     pub result: Option<String>,
     #[serde(default)]
     pub attempts: u32,
+    /// Optional namespace tag (soft filter).
+    #[serde(default)]
+    pub tenant: Option<String>,
+    /// Why a card is Blocked: "dependency"|"needs_input"|"capability"|"transient"|free text.
+    #[serde(default)]
+    pub block_kind: Option<String>,
+    /// Don't dispatch until this time (RFC3339). None = immediately.
+    #[serde(default)]
+    pub scheduled_at: Option<DateTime<Utc>>,
+    /// Auto-retry a failed card up to this many attempts before Blocking. 0/None = no retry.
+    #[serde(default)]
+    pub max_retries: u32,
+    /// Goal mode: re-run the card with an acceptance-criteria judge until it passes.
+    #[serde(default)]
+    pub goal: bool,
+    #[serde(default)]
+    pub goal_max_turns: u32,
+    /// Host-side files delivered into the worker's VM before it runs.
+    #[serde(default)]
+    pub attachments: Vec<String>,
+    /// Append-only note thread (shown to the worker as context).
+    #[serde(default)]
+    pub comments: Vec<Comment>,
+    /// Per-attempt run history.
+    #[serde(default)]
+    pub runs: Vec<RunRecord>,
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 /// A named, persistent board.
@@ -152,17 +216,66 @@ impl Board {
         deps: Vec<String>,
     ) -> String {
         let id = self.next_id();
+        let now = Utc::now();
         self.cards.push(Card {
             id: id.clone(),
             title: title.to_string(),
             detail: detail.to_string(),
             assignee,
             status: CardStatus::Todo,
+            priority: 0,
             deps,
             result: None,
             attempts: 0,
+            tenant: None,
+            block_kind: None,
+            scheduled_at: None,
+            max_retries: 0,
+            goal: false,
+            goal_max_turns: 0,
+            attachments: Vec::new(),
+            comments: Vec::new(),
+            runs: Vec::new(),
+            created_at: Some(now),
+            updated_at: Some(now),
         });
         id
+    }
+
+    /// Record a finished attempt on a card (the auditable run history).
+    pub fn record_run(
+        &mut self,
+        id: &str,
+        agent: Option<String>,
+        outcome: &str,
+        summary: &str,
+        started: DateTime<Utc>,
+    ) {
+        let now = Utc::now();
+        if let Some(c) = self.card_mut(id) {
+            let attempt = c.attempts;
+            c.runs.push(RunRecord {
+                attempt,
+                agent,
+                outcome: outcome.to_string(),
+                summary: summary.chars().take(400).collect(),
+                started_at: started,
+                ended_at: now,
+            });
+            c.updated_at = Some(now);
+        }
+    }
+
+    /// Append a comment to a card's thread.
+    pub fn comment(&mut self, id: &str, author: &str, body: &str) -> bool {
+        let now = Utc::now();
+        if let Some(c) = self.card_mut(id) {
+            c.comments.push(Comment { at: now, author: author.to_string(), body: body.to_string() });
+            c.updated_at = Some(now);
+            true
+        } else {
+            false
+        }
     }
 
     fn next_id(&self) -> String {
@@ -215,23 +328,35 @@ impl Board {
         Ok(())
     }
 
-    /// Cards ready to run now: `Todo` with every dependency `Done`.
+    /// Cards ready to run now: `Todo` with every dependency `Done`, highest
+    /// `priority` first (then by id) so a capped dispatch picks the most
+    /// important ready cards.
     pub fn ready(&self) -> Vec<&Card> {
-        self.cards
+        let now = Utc::now();
+        let mut ready: Vec<&Card> = self
+            .cards
             .iter()
             .filter(|c| {
                 c.status == CardStatus::Todo
+                    && c.scheduled_at.map_or(true, |t| t <= now)
                     && c.deps.iter().all(|d| {
                         self.card(d)
                             .map(|dc| dc.status == CardStatus::Done)
                             .unwrap_or(false)
                     })
             })
-            .collect()
+            .collect();
+        ready.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
+        ready
     }
 
     pub fn is_complete(&self) -> bool {
-        !self.cards.is_empty() && self.cards.iter().all(|c| c.status == CardStatus::Done)
+        let active: Vec<&Card> = self
+            .cards
+            .iter()
+            .filter(|c| c.status != CardStatus::Archived)
+            .collect();
+        !active.is_empty() && active.iter().all(|c| c.status == CardStatus::Done)
     }
 
     /// True if there's outstanding work that a dispatcher run could advance.
@@ -270,7 +395,8 @@ impl Board {
         n
     }
 
-    /// (todo, doing, done, blocked) counts.
+    /// (todo, doing, done, blocked) counts. Triage/archived are tracked
+    /// separately by the UI and not part of the active-work tuple.
     pub fn counts(&self) -> (usize, usize, usize, usize) {
         let mut c = (0, 0, 0, 0);
         for card in &self.cards {
@@ -279,6 +405,7 @@ impl Board {
                 CardStatus::Doing => c.1 += 1,
                 CardStatus::Done => c.2 += 1,
                 CardStatus::Blocked => c.3 += 1,
+                CardStatus::Triage | CardStatus::Archived => {}
             }
         }
         c
@@ -450,6 +577,18 @@ mod tests {
         assert!(b.remove_card("c1"));
         assert!(b.card("c2").unwrap().deps.is_empty());
         assert!(b.validate().is_ok());
+    }
+
+    #[test]
+    fn ready_orders_by_priority_then_id() {
+        let mut b = Board::new("demo");
+        b.add("low", "", None, vec![]);    // c1
+        b.add("high", "", None, vec![]);   // c2
+        b.add("mid", "", None, vec![]);    // c3
+        b.card_mut("c2").unwrap().priority = 10;
+        b.card_mut("c3").unwrap().priority = 5;
+        let order: Vec<_> = b.ready().iter().map(|c| c.id.clone()).collect();
+        assert_eq!(order, vec!["c2", "c3", "c1"]);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 // the shared WebSocket (agents/runtime topics + session_outbound).
 
 import { marked } from "/assets/vendor/marked/marked.esm.js";
+import { formDialog, confirmDialog, toast } from "/assets/js/ui.js";
 
 async function api(path, options = {}) {
   const headers = { ...(options.headers ?? {}) };
@@ -226,7 +227,7 @@ export async function renderSystem(panel, socket) {
   opsWrap.append(desc("Operate the plane: restart/stop/start the supervisor, or snapshot the config to a timestamped backup."));
   const opsOut = el("div");
   const gw = (action, danger) => button(`${action} plane`, async () => {
-    if (action !== "restart" && !confirm(`${action} the supervised plane?`)) return;
+    if (action !== "restart" && !(await confirmDialog({ title: "Gateway", message: `${action} the supervised plane?`, danger: true, confirmLabel: action }))) return;
     opsOut.replaceChildren(el("div", "label", `[ ${action}… ]`));
     try {
       await api(`/api/ops/gateway/${action}`, { method: "POST" });
@@ -535,7 +536,7 @@ async function showAgent(detail, socket, agentId) {
     button("config", () => agentConfig(out, agentId)),
     button("edit spec", () => editSpec(out, agentId)),
     button("restart", async () => {
-      if (!confirm(`Restart ${agentId}? Relaunches its microVM from the baked image.`)) return;
+      if (!(await confirmDialog({ title: "Restart agent", message: `Restart ${agentId}? Relaunches its microVM from the baked image.`, confirmLabel: "Restart" }))) return;
       out.replaceChildren(el("div", "label", "[ restarting… this can take a moment ]"));
       try {
         const r = await api(`/api/agents/${agentId}/restart`, { method: "POST" });
@@ -545,7 +546,7 @@ async function showAgent(detail, socket, agentId) {
       }
     }),
     button("stop", async () => {
-      if (!confirm(`Stop ${agentId}?`)) return;
+      if (!(await confirmDialog({ title: "Stop agent", message: `Stop ${agentId}?`, danger: true, confirmLabel: "Stop" }))) return;
       try {
         await api(`/api/agents/${agentId}/stop`, { method: "POST" });
         out.replaceChildren(el("div", "status-ok", `[ stopped ${agentId} ]`));
@@ -761,7 +762,7 @@ export async function renderSessions(panel, socket) {
     el("span", "label", "days"),
     button("prune", async () => {
       const days = parseInt(pruneDays.value || "30", 10);
-      if (!confirm(`Delete sessions with no activity in ${days} days? This cannot be undone.`)) return;
+      if (!(await confirmDialog({ title: "Prune sessions", message: `Delete sessions with no activity in ${days} days? This cannot be undone.`, danger: true, confirmLabel: "Prune" }))) return;
       try {
         const r = await api("/api/sessions/prune", { method: "POST", body: JSON.stringify({ days }) });
         detail.replaceChildren(el("div", "status-ok", `[ pruned ${r.count} session(s) ]`));
@@ -788,7 +789,7 @@ async function exportSession(agentId, sessionId) {
     a.click();
     URL.revokeObjectURL(url);
   } catch (error) {
-    alert(String(error));
+    toast(String(error), "bad");
   }
 }
 
@@ -800,16 +801,18 @@ async function openSession(detail, socket, s) {
   head.append(
     title,
     button("continue in chat", () => window.cockpitOpenChat(agentId)),
-    button("rename", async () => {
-      const label = prompt("Session label (empty to clear):", s.label || "");
-      if (label === null) return;
-      try {
-        await api(`/api/sessions/${agentId}/${sessionId}/label`, { method: "PUT", body: JSON.stringify({ label }) });
-        s.label = label;
-        title.textContent = `${agentId} / ${label ? label + " · " : ""}${sessionId}`;
-      } catch (error) {
-        detail.append(el("div", "status-bad", String(error)));
-      }
+    button("rename", () => {
+      formDialog({
+        title: "Rename conversation",
+        sub: `${agentId} / ${sessionId}`,
+        fields: [{ name: "label", label: "Label (empty to clear)", type: "text", value: s.label || "" }],
+        submitLabel: "Save",
+        onSubmit: async (v) => {
+          await api(`/api/sessions/${agentId}/${sessionId}/label`, { method: "PUT", body: JSON.stringify({ label: v.label }) });
+          s.label = v.label;
+          title.textContent = `${agentId} / ${v.label ? v.label + " · " : ""}${sessionId}`;
+        },
+      });
     }),
   );
   const log = el("div", "session-log");
@@ -934,7 +937,7 @@ export async function renderPipelock(panel) {
     const rows = data.names.map((name) => [
       name,
       button("delete", async () => {
-        if (!confirm(`Delete secret ${name}?`)) return;
+        if (!(await confirmDialog({ title: "Delete secret", message: `Delete secret ${name}?`, danger: true, confirmLabel: "Delete" }))) return;
         await api(`/api/pipelock/secrets/${encodeURIComponent(name)}`, { method: "DELETE" });
         draw();
       }, true),
@@ -1297,12 +1300,12 @@ export async function renderSchedules(panel) {
     const rows = items.map((s) => {
       const toggle = button(s.enabled ? "disable" : "enable", async () => {
         try { await api(`/api/schedules/${s.agent_id}/${s.id}/toggle`, { method: "POST" }); draw(); }
-        catch (e) { alert(String(e)); }
+        catch (e) { toast(String(e), "bad"); }
       });
       const del = button("delete", async () => {
-        if (!confirm(`Delete schedule “${s.name}”?`)) return;
+        if (!(await confirmDialog({ title: "Delete schedule", message: `Delete schedule “${s.name}”?`, danger: true, confirmLabel: "Delete" }))) return;
         try { await api(`/api/schedules/${s.agent_id}/${s.id}`, { method: "DELETE" }); draw(); }
-        catch (e) { alert(String(e)); }
+        catch (e) { toast(String(e), "bad"); }
       }, true);
       const acts = el("div", "row-actions");
       acts.append(toggle, del);
@@ -1367,223 +1370,446 @@ export async function renderSchedules(panel) {
   panel.replaceChildren(wrap, add);
 }
 
-// ---- orchestrator / board (tasks multiplied) ----
-
-// ---- orchestration: durable, user-defined boards run across agents ----
+// ============================================================
+// Orchestration — durable, user-defined boards run across agents.
+// Board editor + live monitor: drag-drop columns, a full card drawer
+// (edit / comments / run history / attachments / decompose / specify),
+// per-column inline create, filters, multi-board. No native dialogs.
+// ============================================================
 
 const ORCH_ROLES = ["developer", "researcher", "reviewer", "coordinator", "synthesizer"];
+const ORCH_COLUMNS = [
+  ["triage", "Triage"],
+  ["todo", "To do"],
+  ["doing", "Doing"],
+  ["done", "Done"],
+  ["blocked", "Blocked"],
+];
 
 function cardPill(st) {
   if (st === "done") return badge("done", "good");
   if (st === "doing") return badge("doing", "warn");
   if (st === "blocked") return badge("blocked", "bad");
+  if (st === "triage") return badge("triage", "dim");
+  if (st === "archived") return badge("archived", "dim");
   return badge("todo", "dim");
 }
 
-function optionEl(value, label) { const o = el("option", null, label); o.value = value; return o; }
-function disabledOpt(label) { const o = el("option", null, label); o.disabled = true; return o; }
-
-export async function renderOrchestration(panel) {
+export async function renderOrchestration(panel, socket) {
   const wrap = section("Orchestration");
-  wrap.append(desc("Define a board of cards — each a task with an assignee and dependencies — then run it across your agents. Durable: cards persist, an interrupted run is reclaimed, and every card runs in its assignee's own VM over A2A. Cards coordinate only through their results — no shared state. Run it now, on a schedule (Schedules), or by trigger (POST /api/boards/:name/run)."));
-  const bar = el("div", "row-actions");
+  wrap.append(desc("Define a board of cards — each a task with an assignee and dependencies — then run it across your agents. Durable: cards persist, an interrupted run is reclaimed, every card runs in its assignee's own VM over A2A, and cards coordinate only through their results (no shared state). Drag cards between columns; click a card to open it. Run now, on a schedule, or by trigger (POST /api/boards/:name/run)."));
+  const bar = el("div", "orch-bar");
+  const filters = el("div", "orch-filters");
   const body = el("div");
-  wrap.append(bar, body);
+  wrap.append(bar, filters, body);
   panel.replaceChildren(wrap);
 
-  let boards = [];
-  let current = null;
-  let agents = [];
-  let pollTimer = null;
+  const state = {
+    boards: [],
+    current: null,
+    agents: [],
+    detail: null,
+    pollTimer: null,
+    drawer: null, // open card id
+    q: "",
+    assignee: "",
+    archived: false,
+  };
 
-  try { agents = await api("/api/agents"); } catch { agents = []; }
+  try { state.agents = await api("/api/agents"); } catch { state.agents = []; }
 
-  function stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
-  async function loadBoards() { try { boards = await api("/api/boards"); } catch { boards = []; } }
-
-  function assigneeSelect(value) {
-    const sel = el("select", "model-input");
-    sel.append(optionEl("", "(default: developer)"));
-    sel.append(disabledOpt("— roles —"));
-    for (const r of ORCH_ROLES) sel.append(optionEl(r, r));
-    if (agents.length) sel.append(disabledOpt("— agents —"));
-    for (const a of agents) sel.append(optionEl(a.agent_id, a.agent_id));
-    sel.value = value || "";
-    return sel;
+  function assigneeOptions(includeAny) {
+    const opts = [];
+    if (includeAny) opts.push({ value: "", label: "(any assignee)" });
+    else opts.push({ value: "", label: "(default: developer)" });
+    for (const r of ORCH_ROLES) opts.push({ value: r, label: `role: ${r}` });
+    for (const a of state.agents) opts.push({ value: a.agent_id, label: a.agent_id });
+    return opts;
   }
 
+  function stopPoll() { if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; } }
+  async function loadBoards() { try { state.boards = await api("/api/boards"); } catch { state.boards = []; } }
+
+  // ---------- toolbar ----------
   function drawBar() {
     bar.replaceChildren();
-    if (!current && boards.length) current = boards[0].name;
+    if (!state.current && state.boards.length) state.current = state.boards[0].name;
     const sel = el("select", "model-input");
-    if (!boards.length) sel.append(optionEl("", "(no boards yet)"));
-    for (const b of boards) {
-      const o = optionEl(b.name, `${b.name}  (${b.done}/${b.total}${b.running ? " · running" : ""})`);
-      if (b.name === current) o.selected = true;
+    if (!state.boards.length) { const o = el("option", null, "(no boards yet)"); sel.append(o); }
+    for (const b of state.boards) {
+      const o = el("option", null, `${b.name}  (${b.done}/${b.total}${b.running ? " · running" : ""})`);
+      o.value = b.name;
+      if (b.name === state.current) o.selected = true;
       sel.append(o);
     }
-    sel.addEventListener("change", () => { current = sel.value; drawBoard(); });
-    const newBtn = button("＋ New board", async () => {
-      const name = (prompt("New board name (letters, digits, - _):", "") || "").trim();
-      if (!name) return;
-      try { await api("/api/boards", { method: "POST", body: JSON.stringify({ name }) }); current = name; await loadBoards(); drawBar(); drawBoard(); }
-      catch (e) { alert(String(e)); }
-    });
-    bar.append(el("span", "panel-desc", "Board:"), sel, newBtn);
-    if (current) {
-      bar.append(button("Delete board", async () => {
-        if (!confirm(`Delete board "${current}"? Removes all its cards.`)) return;
-        try { await api(`/api/boards/${current}`, { method: "DELETE" }); current = null; await loadBoards(); drawBar(); drawBoard(); }
-        catch (e) { alert(String(e)); }
+    sel.addEventListener("change", () => { state.current = sel.value; state.drawer = null; drawBoard(); });
+    bar.append(el("span", "panel-desc", "Board:"), sel);
+    bar.append(button("＋ New", () => {
+      formDialog({
+        title: "New board",
+        fields: [{ name: "name", label: "Board name", type: "text", placeholder: "letters, digits, - _", required: true }],
+        submitLabel: "Create",
+        onSubmit: async (v) => {
+          await api("/api/boards", { method: "POST", body: JSON.stringify({ name: v.name }) });
+          state.current = v.name; await loadBoards(); drawBar(); drawBoard(); toast("board created", "ok");
+        },
+      });
+    }));
+    if (state.current) {
+      bar.append(button("Rename", () => {
+        formDialog({
+          title: `Rename board "${state.current}"`,
+          fields: [{ name: "name", label: "New name", type: "text", value: state.current, required: true }],
+          submitLabel: "Rename",
+          onSubmit: async (v) => {
+            await api(`/api/boards/${state.current}/rename`, { method: "POST", body: JSON.stringify({ name: v.name }) });
+            state.current = v.name; await loadBoards(); drawBar(); drawBoard(); toast("renamed", "ok");
+          },
+        });
+      }));
+      bar.append(button("Delete", async () => {
+        if (!(await confirmDialog({ title: "Delete board", message: `Delete "${state.current}" and all its cards?`, danger: true, confirmLabel: "Delete" }))) return;
+        try { await api(`/api/boards/${state.current}`, { method: "DELETE" }); state.current = null; await loadBoards(); drawBar(); drawBoard(); toast("deleted", "ok"); }
+        catch (e) { toast(String(e), "bad"); }
       }, true));
     }
   }
 
+  function drawFilters() {
+    filters.replaceChildren();
+    if (!state.current) return;
+    const q = el("input", "model-input orch-search"); q.placeholder = "filter cards…"; q.value = state.q;
+    q.addEventListener("input", () => { state.q = q.value.toLowerCase(); if (state.detail) renderColumns(state.detail); });
+    const asg = el("select", "model-input");
+    for (const o of assigneeOptions(true)) { const opt = el("option", null, o.label); opt.value = o.value; asg.append(opt); }
+    asg.value = state.assignee;
+    asg.addEventListener("change", () => { state.assignee = asg.value; if (state.detail) renderColumns(state.detail); });
+    const arch = el("label", "orch-toggle");
+    const cb = el("input"); cb.type = "checkbox"; cb.checked = state.archived;
+    cb.addEventListener("change", () => { state.archived = cb.checked; if (state.detail) renderColumns(state.detail); });
+    arch.append(cb, document.createTextNode(" show archived"));
+    filters.append(q, asg, arch);
+  }
+
+  // ---------- board ----------
   async function drawBoard() {
     stopPoll();
-    if (!current) { body.replaceChildren(el("div", "panel-desc", "Create a board to get started — then add cards and run them across your agents.")); return; }
+    drawFilters();
+    if (!state.current) {
+      body.replaceChildren(el("div", "panel-desc", "Create a board to get started — then add cards and run them across your agents."));
+      return;
+    }
     let d;
-    try { d = await api(`/api/boards/${current}`); }
+    try { d = await api(`/api/boards/${state.current}`); }
     catch (e) { body.replaceChildren(el("div", "status-bad", String(e))); return; }
-    renderBoardView(d);
+    state.detail = d;
+    renderToolbar2(d);
+    renderColumns(d);
+    if (state.drawer) openDrawer(state.drawer);
     if (d.running) {
-      pollTimer = setInterval(async () => {
+      state.pollTimer = setInterval(async () => {
         if (!panel.contains(body)) { stopPoll(); return; }
-        try { const nd = await api(`/api/boards/${current}`); renderBoardView(nd); if (!nd.running) { stopPoll(); loadBoards().then(drawBar); } }
-        catch { stopPoll(); }
+        try {
+          const nd = await api(`/api/boards/${state.current}`);
+          state.detail = nd; renderToolbar2(nd); renderColumns(nd);
+          if (state.drawer) openDrawer(state.drawer);
+          if (!nd.running) { stopPoll(); loadBoards().then(drawBar); }
+        } catch { stopPoll(); }
       }, 1500);
     }
   }
 
+  let toolbar2 = null;
+  function renderToolbar2(d) {
+    if (!toolbar2) { toolbar2 = el("div", "row-actions"); }
+    toolbar2.replaceChildren();
+    const runBtn = button(d.running ? "running…" : "▶ Run board", async () => {
+      try { await api(`/api/boards/${state.current}/run`, { method: "POST" }); toast("dispatching…", "ok"); drawBoard(); }
+      catch (e) { toast(String(e), "bad"); }
+    });
+    if (d.running) runBtn.disabled = true;
+    toolbar2.append(runBtn);
+    toolbar2.append(button("Reset", async () => {
+      if (!(await confirmDialog({ title: "Reset board", message: "Reset all cards to todo (drops prior results)?" }))) return;
+      try { await api(`/api/boards/${state.current}/reset`, { method: "POST" }); toast("reset", "ok"); drawBoard(); }
+      catch (e) { toast(String(e), "bad"); }
+    }));
+    if (d.running) toolbar2.append(el("span", "chat-responding", "running…"));
+    if (!body.contains(toolbar2)) body.replaceChildren(toolbar2);
+  }
+
+  function passesFilter(c) {
+    if (state.q && !`${c.id} ${c.title} ${c.assignee || ""}`.toLowerCase().includes(state.q)) return false;
+    if (state.assignee && c.assignee !== state.assignee) return false;
+    return true;
+  }
+
+  function renderColumns(d) {
+    // keep toolbar2 (first child), replace the rest
+    const cols = el("div", "board-cols");
+    const columns = state.archived ? [...ORCH_COLUMNS, ["archived", "Archived"]] : ORCH_COLUMNS;
+    for (const [st, label] of columns) {
+      const col = el("div", "board-col");
+      col.dataset.status = st;
+      const cards = (d.cards || []).filter((c) => c.status === st && passesFilter(c));
+      const head = el("div", "board-col-head-row");
+      head.append(el("span", "board-col-head", `${label} · ${cards.length}`));
+      const addBtn = el("button", "board-col-add", "＋");
+      addBtn.title = `Add a card to ${label}`;
+      addBtn.addEventListener("click", () => addCardForm(st === "triage" ? "triage" : "todo"));
+      head.append(addBtn);
+      col.append(head);
+      for (const c of cards) col.append(cardTile(c, d.cards));
+      // drag-drop target
+      col.addEventListener("dragover", (e) => { e.preventDefault(); col.classList.add("drop"); });
+      col.addEventListener("dragleave", () => col.classList.remove("drop"));
+      col.addEventListener("drop", async (e) => {
+        e.preventDefault(); col.classList.remove("drop");
+        const id = e.dataTransfer.getData("text/card");
+        if (!id) return;
+        const card = (state.detail.cards || []).find((x) => x.id === id);
+        if (!card || card.status === st) return;
+        try { await api(`/api/boards/${state.current}/cards/${id}`, { method: "PUT", body: JSON.stringify({ status: st }) }); drawBoard(); }
+        catch (err) { toast(String(err), "bad"); }
+      });
+      cols.append(col);
+    }
+    // rebuild body = toolbar2 + cols
+    body.replaceChildren(toolbar2, cols);
+    if (d.events && d.events.length) body.append(runLog(d.events));
+  }
+
+  function runLog(events) {
+    const log = section("Run log");
+    const lv = el("div", "log-view");
+    for (const e of events.slice(-40)) {
+      const row = el("div", "log-row");
+      row.append(el("span", "log-time", new Date(e.at).toLocaleTimeString()), el("span", "log-msg", `${e.kind}${e.card ? " " + e.card : ""} ${e.text || ""}`.trim()));
+      lv.append(row);
+    }
+    log.append(lv);
+    return log;
+  }
+
   function cardTile(c, allCards) {
-    const tile = el("div", "opt-card");
-    const h = el("div", "panel-card-head");
-    h.append(el("strong", null, `${c.id} · ${c.title}`), cardPill(c.status));
-    tile.append(h);
-    tile.append(el("div", "panel-desc", `@${c.assignee || "(default)"}${c.deps && c.deps.length ? " · after " + c.deps.join(",") : ""}`));
-    if (c.detail) tile.append(el("div", "panel-desc", String(c.detail).slice(0, 140)));
-    if (c.result) { const r = el("div", "log-extra"); r.textContent = String(c.result).slice(0, 300); tile.append(r); }
-    const acts = el("div", "row-actions");
-    acts.append(button("edit", () => editCard(c, allCards)));
-    acts.append(button("delete", async () => {
-      if (!confirm(`Delete ${c.id}?`)) return;
-      try { await api(`/api/boards/${current}/cards/${c.id}`, { method: "DELETE" }); drawBoard(); }
-      catch (e) { alert(String(e)); }
-    }, true));
-    tile.append(acts);
+    const tile = el("div", "board-card");
+    tile.draggable = true;
+    tile.addEventListener("dragstart", (e) => { e.dataTransfer.setData("text/card", c.id); e.dataTransfer.effectAllowed = "move"; });
+    tile.addEventListener("click", () => { state.drawer = c.id; openDrawer(c.id); });
+    const head = el("div", "board-card-head");
+    head.append(el("span", "board-card-id", c.id), el("span", "board-card-title", c.title));
+    tile.append(head);
+    const meta = el("div", "board-card-meta");
+    meta.append(el("span", "board-card-asg", `@${c.assignee || "default"}`));
+    if (c.priority) meta.append(badge(`p${c.priority}`, "dim"));
+    if (c.goal) meta.append(badge("goal", "warn"));
+    if (c.block_kind && c.status === "blocked") meta.append(badge(c.block_kind, "bad"));
+    if (c.deps && c.deps.length) meta.append(el("span", "board-card-dep", `after ${c.deps.join(",")}`));
+    tile.append(meta);
+    const counts = [];
+    if (c.comments && c.comments.length) counts.push(`💬${c.comments.length}`);
+    if (c.runs && c.runs.length) counts.push(`⟳${c.runs.length}`);
+    if (c.attachments && c.attachments.length) counts.push(`📎${c.attachments.length}`);
+    if (counts.length) tile.append(el("div", "board-card-counts", counts.join("  ")));
     return tile;
   }
 
-  function addCardForm(allCards) {
-    const card = section("Add a card");
-    const title = el("input", "model-input"); title.placeholder = "title (what to do)";
-    const detail = el("input", "model-input"); detail.placeholder = "detail / acceptance criteria (optional)";
-    const assignee = assigneeSelect("");
-    const grid = el("div", "opt-grid");
-    grid.append(title, detail, assignee);
-    card.append(grid);
-    const depsBox = el("div", "board-deps");
-    for (const c of allCards || []) {
-      const lab = el("label", "board-dep");
-      const cb = el("input"); cb.type = "checkbox"; cb.value = c.id;
-      lab.append(cb, document.createTextNode(` ${c.id} ${String(c.title).slice(0, 22)}`));
-      depsBox.append(lab);
-    }
-    if ((allCards || []).length) { card.append(el("div", "panel-desc", "Depends on:")); card.append(depsBox); }
-    const status = el("span", "panel-desc");
-    const addBtn = button("Add card", async () => {
-      if (!title.value.trim()) { status.textContent = "title required"; return; }
-      const needs = [...depsBox.querySelectorAll("input:checked")].map((cb) => cb.value);
-      try {
-        await api(`/api/boards/${current}/cards`, { method: "POST", body: JSON.stringify({ title: title.value.trim(), detail: detail.value.trim(), assignee: assignee.value || null, needs }) });
-        drawBoard();
-      } catch (e) { status.textContent = String(e); }
-    });
-    const row = el("div", "row-actions"); row.append(addBtn, status);
-    card.append(row);
-    return card;
+  // ---------- create / edit forms ----------
+  function cardFields(card, allCards) {
+    const depOpts = (allCards || []).filter((x) => !card || x.id !== card.id).map((x) => ({ value: x.id, label: `${x.id} ${x.title.slice(0, 24)}` }));
+    return [
+      { name: "title", label: "Title", type: "text", value: card?.title, placeholder: "what to do", required: true },
+      { name: "detail", label: "Detail / acceptance criteria", type: "textarea", value: card?.detail, rows: 4 },
+      { name: "assignee", label: "Assignee", type: "select", value: card?.assignee || "", options: assigneeOptions(false) },
+      { name: "deps", label: "Depends on", type: "multiselect", value: card?.deps || [], options: depOpts },
+      { name: "priority", label: "Priority (higher runs first)", type: "number", value: card?.priority ?? 0 },
+      { name: "max_retries", label: "Auto-retries on failure", type: "number", value: card?.max_retries ?? 0 },
+      { name: "goal", label: "Goal mode (re-run with an acceptance judge until it passes)", type: "checkbox", value: card?.goal || false },
+      { name: "goal_max_turns", label: "Goal max rounds (0 = default 5)", type: "number", value: card?.goal_max_turns ?? 0 },
+      { name: "tenant", label: "Tenant (optional tag)", type: "text", value: card?.tenant || "" },
+      { name: "scheduled_at", label: "Don't run before (RFC3339, optional)", type: "text", value: card?.scheduled_at || "", placeholder: "2026-07-01T09:00:00Z" },
+    ];
   }
 
-  function editCard(c, allCards) {
-    const overlay = el("div", "pick-overlay");
-    const dlg = el("div", "pick-card");
-    dlg.append(el("div", "pick-title", `Edit ${c.id}`));
-    const title = el("input", "model-input"); title.value = c.title;
-    const detail = el("textarea", "file-edit"); detail.value = c.detail || ""; detail.style.minHeight = "80px";
-    const assignee = assigneeSelect(c.assignee || "");
-    const statusSel = el("select", "model-input");
-    for (const s of ["todo", "doing", "done", "blocked"]) statusSel.append(optionEl(s, s));
-    statusSel.value = c.status;
-    const depsBox = el("div", "board-deps");
-    for (const other of (allCards || []).filter((x) => x.id !== c.id)) {
-      const lab = el("label", "board-dep");
-      const cb = el("input"); cb.type = "checkbox"; cb.value = other.id;
-      if ((c.deps || []).includes(other.id)) cb.checked = true;
-      lab.append(cb, document.createTextNode(` ${other.id} ${String(other.title).slice(0, 22)}`));
-      depsBox.append(lab);
-    }
-    const st = el("span", "panel-desc");
-    const save = button("Save", async () => {
-      const deps = [...depsBox.querySelectorAll("input:checked")].map((cb) => cb.value);
-      try {
-        await api(`/api/boards/${current}/cards/${c.id}`, { method: "PUT", body: JSON.stringify({ title: title.value.trim(), detail: detail.value, assignee: assignee.value || null, deps, status: statusSel.value }) });
-        overlay.remove(); drawBoard();
-      } catch (e) { st.textContent = String(e); }
+  function addCardForm(forceStatus) {
+    formDialog({
+      title: "Add a card",
+      fields: cardFields(null, state.detail?.cards),
+      submitLabel: "Add card",
+      onSubmit: async (v) => {
+        const body = {
+          title: v.title, detail: v.detail, assignee: v.assignee || null, needs: v.deps,
+          priority: Number(v.priority) || 0, max_retries: Number(v.max_retries) || 0,
+          goal: !!v.goal, goal_max_turns: Number(v.goal_max_turns) || 0,
+          tenant: v.tenant || null, scheduled_at: v.scheduled_at || null,
+          triage: forceStatus === "triage",
+        };
+        await api(`/api/boards/${state.current}/cards`, { method: "POST", body: JSON.stringify(body) });
+        drawBoard(); toast("card added", "ok");
+      },
     });
-    const cancel = button("Cancel", () => overlay.remove());
-    dlg.append(
-      el("div", "panel-desc", "Title"), title,
-      el("div", "panel-desc", "Detail"), detail,
-      el("div", "panel-desc", "Assignee"), assignee,
-      el("div", "panel-desc", "Status"), statusSel,
-      el("div", "panel-desc", "Depends on"), depsBox,
-      el("div", "row-actions"),
-    );
-    dlg.lastChild.append(save, cancel, st);
-    overlay.append(dlg);
-    overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
-    document.body.append(overlay);
   }
 
-  function renderBoardView(d) {
-    body.replaceChildren();
-    const tb = el("div", "row-actions");
-    const runBtn = button(d.running ? "running…" : "▶ Run board", async () => {
-      try { await api(`/api/boards/${current}/run`, { method: "POST" }); drawBoard(); }
-      catch (e) { alert(String(e)); }
+  function editCardForm(card) {
+    formDialog({
+      title: `Edit ${card.id}`,
+      fields: [
+        ...cardFields(card, state.detail?.cards),
+        { name: "status", label: "Status", type: "select", value: card.status, options: ["triage", "todo", "doing", "done", "blocked", "archived"].map((s) => ({ value: s, label: s })) },
+      ],
+      submitLabel: "Save",
+      onSubmit: async (v) => {
+        const body = {
+          title: v.title, detail: v.detail, assignee: v.assignee || null, deps: v.deps, status: v.status,
+          priority: Number(v.priority) || 0, max_retries: Number(v.max_retries) || 0,
+          goal: !!v.goal, goal_max_turns: Number(v.goal_max_turns) || 0,
+          tenant: v.tenant || null, scheduled_at: v.scheduled_at,
+        };
+        await api(`/api/boards/${state.current}/cards/${card.id}`, { method: "PUT", body: JSON.stringify(body) });
+        drawBoard(); toast("saved", "ok");
+      },
     });
-    if (d.running) runBtn.disabled = true;
-    tb.append(runBtn);
-    tb.append(button("Reset", async () => {
-      if (!confirm("Reset all cards to todo (drops prior results)?")) return;
-      try { await api(`/api/boards/${current}/reset`, { method: "POST" }); drawBoard(); }
-      catch (e) { alert(String(e)); }
-    }));
-    if (d.running) tb.append(el("span", "chat-responding", "running…"));
-    body.append(tb);
+  }
 
-    const cols = el("div", "board-cols");
-    for (const [stt, label] of [["todo", "To do"], ["doing", "Doing"], ["done", "Done"], ["blocked", "Blocked"]]) {
-      const col = el("div", "board-col");
-      const cards = (d.cards || []).filter((c) => c.status === stt);
-      col.append(el("div", "board-col-head", `${label} · ${cards.length}`));
-      for (const c of cards) col.append(cardTile(c, d.cards));
-      cols.append(col);
+  // ---------- card drawer ----------
+  function openDrawer(cardId) {
+    const c = (state.detail?.cards || []).find((x) => x.id === cardId);
+    if (!c) { closeDrawer(); return; }
+    let overlay = document.querySelector(".board-drawer-overlay");
+    if (!overlay) {
+      overlay = el("div", "board-drawer-overlay");
+      overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) closeDrawer(); });
+      document.body.append(overlay);
     }
-    body.append(cols);
-    body.append(addCardForm(d.cards));
+    const dr = el("div", "board-drawer");
+    // header
+    const hd = el("div", "board-drawer-head");
+    const titleRow = el("div", "board-drawer-titlerow");
+    titleRow.append(el("span", "board-card-id", c.id), cardPill(c.status), el("span", "board-drawer-title", c.title));
+    const x = el("button", "board-drawer-x", "✕");
+    x.addEventListener("click", closeDrawer);
+    hd.append(titleRow, x);
+    dr.append(hd);
+    // meta + edit
+    const meta = el("div", "panel-desc");
+    const bits = [`@${c.assignee || "default"}`];
+    if (c.priority) bits.push(`priority ${c.priority}`);
+    if (c.deps?.length) bits.push(`after ${c.deps.join(",")}`);
+    if (c.tenant) bits.push(`tenant ${c.tenant}`);
+    if (c.max_retries) bits.push(`retries ${c.max_retries}`);
+    if (c.goal) bits.push(`goal (≤${c.goal_max_turns || 5})`);
+    if (c.scheduled_at) bits.push(`scheduled ${c.scheduled_at}`);
+    if (c.block_kind && c.status === "blocked") bits.push(`blocked: ${c.block_kind}`);
+    meta.textContent = bits.join(" · ");
+    dr.append(meta);
+    if (c.detail) { const d = el("div", "board-drawer-detail"); d.innerHTML = renderMd(c.detail); dr.append(d); }
 
-    if (d.events && d.events.length) {
-      const log = section("Run log");
-      const lv = el("div", "log-view");
-      for (const e of d.events.slice(-40)) {
+    // actions
+    const acts = el("div", "row-actions");
+    acts.append(button("Edit", () => editCardForm(c)));
+    if (c.status === "triage") {
+      acts.append(button("⚗ Decompose", async () => {
+        try { await api(`/api/boards/${state.current}/cards/${c.id}/decompose`, { method: "POST" }); toast("decomposing… (refreshes when done)", "ok"); pollOnce(6); }
+        catch (e) { toast(String(e), "bad"); }
+      }));
+      acts.append(button("✨ Specify", async () => {
+        try { await api(`/api/boards/${state.current}/cards/${c.id}/specify`, { method: "POST" }); toast("specifying… (refreshes when done)", "ok"); pollOnce(6); }
+        catch (e) { toast(String(e), "bad"); }
+      }));
+    }
+    if (c.status !== "archived") {
+      acts.append(button("Archive", async () => {
+        try { await api(`/api/boards/${state.current}/cards/${c.id}`, { method: "PUT", body: JSON.stringify({ status: "archived" }) }); drawBoard(); }
+        catch (e) { toast(String(e), "bad"); }
+      }));
+    }
+    acts.append(button("Delete", async () => {
+      if (!(await confirmDialog({ title: "Delete card", message: `Delete ${c.id}?`, danger: true, confirmLabel: "Delete" }))) return;
+      try { await api(`/api/boards/${state.current}/cards/${c.id}`, { method: "DELETE" }); state.drawer = null; closeDrawer(); drawBoard(); }
+      catch (e) { toast(String(e), "bad"); }
+    }, true));
+    dr.append(acts);
+
+    // result
+    if (c.result) {
+      dr.append(el("div", "board-drawer-sub", "Result"));
+      const r = el("div", "board-drawer-result"); r.innerHTML = renderMd(c.result); dr.append(r);
+    }
+
+    // attachments
+    dr.append(el("div", "board-drawer-sub", "Attachments"));
+    const att = el("div", "board-drawer-att");
+    for (const p of c.attachments || []) {
+      const a = document.createElement("a");
+      a.className = "chat-download";
+      a.textContent = `⬇ ${p.split(/[\\/]/).pop()}`;
+      a.href = `/api/boards/${state.current}/attachment?path=${encodeURIComponent(p)}`;
+      a.setAttribute("download", p.split(/[\\/]/).pop());
+      att.append(a);
+    }
+    const fileInput = el("input", "chat-file-hidden"); fileInput.type = "file";
+    fileInput.addEventListener("change", async () => {
+      const f = fileInput.files?.[0]; if (!f) return;
+      try {
+        const res = await fetch(`/api/boards/${state.current}/cards/${c.id}/attach?name=${encodeURIComponent(f.name)}`, { method: "POST", headers: { "x-maturana-web": "1" }, body: f });
+        const j = await res.json(); if (!j.ok) throw new Error(j.error);
+        toast("attached", "ok"); drawBoard();
+      } catch (e) { toast(String(e), "bad"); }
+      fileInput.value = "";
+    });
+    const upBtn = button("📎 Attach file", () => fileInput.click());
+    att.append(upBtn, fileInput);
+    dr.append(att);
+
+    // run history
+    if (c.runs && c.runs.length) {
+      dr.append(el("div", "board-drawer-sub", "Run history"));
+      const rl = el("div", "log-view");
+      for (const r of c.runs) {
         const row = el("div", "log-row");
-        row.append(el("span", "log-time", new Date(e.at).toLocaleTimeString()), el("span", "log-msg", `${e.kind}${e.card ? " " + e.card : ""} ${e.text || ""}`.trim()));
-        lv.append(row);
+        row.append(el("span", "log-time", `#${r.attempt}`), el("span", "log-msg", `${r.outcome} · ${r.agent || "?"} · ${(r.summary || "").slice(0, 80)}`));
+        rl.append(row);
       }
-      log.append(lv);
-      body.append(log);
+      dr.append(rl);
     }
+
+    // comments
+    dr.append(el("div", "board-drawer-sub", "Comments"));
+    const thread = el("div", "board-comments");
+    for (const cm of c.comments || []) {
+      const row = el("div", "board-comment");
+      row.append(el("span", "board-comment-author", cm.author || "note"), el("span", "board-comment-body", cm.body));
+      thread.append(row);
+    }
+    dr.append(thread);
+    const commentRow = el("div", "board-comment-add");
+    const ci = el("input", "model-input"); ci.placeholder = "add a comment (Enter to post)…";
+    const post = async () => {
+      const text = ci.value.trim(); if (!text) return;
+      try { await api(`/api/boards/${state.current}/cards/${c.id}/comment`, { method: "POST", body: JSON.stringify({ body: text }) }); ci.value = ""; drawBoard(); }
+      catch (e) { toast(String(e), "bad"); }
+    };
+    ci.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); post(); } });
+    commentRow.append(ci, button("Post", post));
+    dr.append(commentRow);
+
+    overlay.replaceChildren(dr);
+  }
+
+  function closeDrawer() {
+    state.drawer = null;
+    const o = document.querySelector(".board-drawer-overlay");
+    if (o) o.remove();
+  }
+
+  // a few quick extra polls (for decompose/specify which run detached ~seconds)
+  function pollOnce(times) {
+    let n = 0;
+    const t = setInterval(async () => {
+      n++;
+      if (!panel.contains(body) || n > times) { clearInterval(t); return; }
+      try { const nd = await api(`/api/boards/${state.current}`); state.detail = nd; renderColumns(nd); if (state.drawer) openDrawer(state.drawer); } catch {}
+    }, 2500);
   }
 
   await loadBoards();

@@ -1051,6 +1051,42 @@ button.primary:hover {
 /* dashboard inline action rows (schedules / orchestration cards) */
 .row-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
 
+/* ---- shared modal dialogs + toasts (ui.js) ---- */
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 60; display: flex; align-items: center; justify-content: center;
+  background: color-mix(in srgb, var(--bg) 62%, transparent); padding: 24px;
+}
+.modal-card {
+  background: var(--bg-raised); border: 1px solid var(--border-strong);
+  width: min(560px, 96vw); max-height: 88vh; overflow: auto; padding: 20px 22px;
+}
+.modal-head { margin-bottom: 14px; }
+.modal-title { color: var(--ink-strong); font-weight: 600; font-size: 1.02rem; }
+.modal-sub { color: var(--dim); font-size: 0.86rem; margin-top: 4px; white-space: pre-wrap; }
+.modal-form { display: flex; flex-direction: column; gap: 12px; }
+.modal-field { display: flex; flex-direction: column; gap: 5px; font-size: 0.86rem; }
+.modal-label { color: var(--dim); }
+.modal-input {
+  background: var(--bg-inset); border: 1px solid var(--border); color: var(--ink);
+  padding: 8px 10px; font: inherit; font-size: 0.9rem; width: 100%;
+}
+.modal-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }
+.modal-multi { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.modal-multi-item { font-size: 0.84rem; color: var(--ink); display: inline-flex; align-items: center; gap: 4px; }
+.modal-hint { color: var(--faint); font-size: 0.76rem; }
+.modal-err { color: var(--danger); font-size: 0.82rem; min-height: 1em; }
+.modal-actions { display: flex; gap: 8px; margin-top: 6px; }
+
+.toast-host { position: fixed; bottom: 38px; right: 18px; z-index: 80; display: flex; flex-direction: column; gap: 8px; }
+.toast {
+  background: var(--bg-raised); border: 1px solid var(--border-strong); color: var(--ink);
+  padding: 9px 14px; font-size: 0.86rem; max-width: 360px; border-left: 3px solid var(--accent);
+  transition: opacity 280ms ease, transform 280ms ease;
+}
+.toast.ok { border-left-color: var(--ok); }
+.toast.bad { border-left-color: var(--danger); }
+.toast.out { opacity: 0; transform: translateX(12px); }
+
 /* orchestration board: status columns of cards */
 .board-cols { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 14px; align-items: start; }
 .board-col { background: var(--surface); border: 1px solid var(--border); padding: 10px; display: flex; flex-direction: column; gap: 10px; min-height: 60px; }
@@ -1058,6 +1094,49 @@ button.primary:hover {
 .board-deps { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 6px 0 2px; }
 .board-dep { font-size: 0.82rem; color: var(--ink); display: inline-flex; align-items: center; gap: 4px; }
 @media (max-width: 900px) { .board-cols { grid-template-columns: 1fr 1fr; } }
+
+/* orchestration v2: toolbar, filters, draggable cards, drawer */
+.orch-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+.orch-filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 4px 0 6px; }
+.orch-search { max-width: 240px; }
+.orch-toggle { font-size: 0.82rem; color: var(--dim); display: inline-flex; align-items: center; gap: 5px; }
+.board-col-head-row { display: flex; align-items: center; justify-content: space-between; }
+.board-col-add { background: none; border: 1px solid var(--border); color: var(--dim); cursor: pointer; padding: 0 7px; line-height: 1.4; }
+.board-col-add:hover { color: var(--accent); border-color: var(--accent); }
+.board-col.drop { border-color: var(--accent); background: var(--accent-bg); }
+.board-card {
+  background: var(--bg-raised); border: 1px solid var(--border); padding: 9px 10px;
+  cursor: pointer; display: flex; flex-direction: column; gap: 5px;
+}
+.board-card:hover { border-color: var(--border-strong); }
+.board-card[draggable="true"]:active { opacity: 0.6; }
+.board-card-head { display: flex; gap: 7px; align-items: baseline; }
+.board-card-id { font-family: var(--mono); font-size: 0.72rem; color: var(--faint); }
+.board-card-title { color: var(--ink-strong); font-size: 0.9rem; font-weight: 500; }
+.board-card-meta { display: flex; flex-wrap: wrap; gap: 5px 8px; align-items: center; font-size: 0.78rem; color: var(--dim); }
+.board-card-asg { font-family: var(--mono); }
+.board-card-dep { color: var(--faint); }
+.board-card-counts { font-size: 0.78rem; color: var(--faint); }
+
+.board-drawer-overlay { position: fixed; inset: 0; z-index: 55; background: color-mix(in srgb, var(--bg) 45%, transparent); display: flex; justify-content: flex-end; }
+.board-drawer {
+  width: min(560px, 96vw); height: 100%; overflow: auto; background: var(--bg-raised);
+  border-left: 1px solid var(--border-strong); padding: 18px 20px; display: flex; flex-direction: column; gap: 12px;
+}
+.board-drawer-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.board-drawer-titlerow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.board-drawer-title { color: var(--ink-strong); font-weight: 600; font-size: 1.02rem; }
+.board-drawer-x { background: none; border: none; color: var(--dim); font-size: 1.1rem; cursor: pointer; }
+.board-drawer-x:hover { color: var(--ink); }
+.board-drawer-detail, .board-drawer-result { font-size: 0.9rem; color: var(--ink); }
+.board-drawer-sub { color: var(--dim); font-family: var(--mono); font-size: 0.74rem; letter-spacing: 0.08em; text-transform: uppercase; margin-top: 6px; }
+.board-drawer-att { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.board-comments { display: flex; flex-direction: column; gap: 6px; }
+.board-comment { font-size: 0.86rem; }
+.board-comment-author { color: var(--accent); font-family: var(--mono); font-size: 0.76rem; margin-right: 6px; }
+.board-comment-body { color: var(--ink); }
+.board-comment-add { display: flex; gap: 6px; margin-top: 4px; }
+.board-comment-add .model-input { flex: 1; }
 
 /* ============================================================
    FLAT LOOK (goal): no rounded corners, no shadows/glows — the

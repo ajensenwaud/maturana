@@ -6,6 +6,7 @@
 // so it gets the agent's memory + model — and replies stream back over the WS.
 
 import { marked } from "/assets/vendor/marked/marked.esm.js";
+import { formDialog, toast } from "/assets/js/ui.js";
 
 async function api(path, options = {}) {
   const headers = { ...(options.headers ?? {}) };
@@ -351,7 +352,7 @@ export class Chat {
           this.open(inMem || convo);
         }
       } catch (e) {
-        alert(`Rename failed: ${e}`);
+        toast(`Rename failed: ${e}`, "bad");
       }
     });
   }
@@ -580,14 +581,20 @@ export class Chat {
   // Create a new host-side document (e.g. SOUL.md) — opens the editor empty; the
   // file is written on first Save (the backend confirms it's a safe doc path).
   newFile(agentId) {
-    const name = (prompt("New document filename (e.g. SOUL.md):", "SOUL.md") || "").trim();
-    if (!name) return;
-    if (/[\\/]/.test(name)) { alert("Use a plain filename (no folders)."); return; }
-    if (!/\.(md|txt|json|yaml|yml|toml|csv|log)$/i.test(name)) {
-      alert("Use a .md / .txt / .json / .yaml / .toml / .csv / .log filename.");
-      return;
-    }
-    this.viewFile(agentId, name, { create: true });
+    formDialog({
+      title: "New document",
+      sub: "A host-side doc for this agent (e.g. SOUL.md). Written on first Save.",
+      fields: [{ name: "name", label: "Filename", type: "text", value: "SOUL.md", required: true }],
+      submitLabel: "Create",
+      onSubmit: (v) => {
+        const name = v.name.trim();
+        if (/[\\/]/.test(name)) throw new Error("Use a plain filename (no folders).");
+        if (!/\.(md|txt|json|yaml|yml|toml|csv|log)$/i.test(name)) {
+          throw new Error("Use a .md / .txt / .json / .yaml / .toml / .csv / .log filename.");
+        }
+        this.viewFile(agentId, name, { create: true });
+      },
+    });
   }
 
   sendCommand(cmd) { this.input.value = cmd; this.send(); }

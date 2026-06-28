@@ -1992,6 +1992,26 @@ pub enum BoardSubcommand {
         /// Card ids this one depends on, comma-separated (e.g. c1,c2).
         #[arg(long, value_delimiter = ',')]
         needs: Vec<String>,
+        /// Higher runs first when more cards are ready than max_parallel.
+        #[arg(long)]
+        priority: Option<i64>,
+        /// Optional namespace tag.
+        #[arg(long)]
+        tenant: Option<String>,
+        /// Don't dispatch until this RFC3339 time.
+        #[arg(long)]
+        scheduled_at: Option<String>,
+        /// Auto-retry a failed card up to N times before blocking.
+        #[arg(long)]
+        max_retries: Option<u32>,
+        /// Goal mode: re-run with an acceptance judge until it passes.
+        #[arg(long)]
+        goal: bool,
+        #[arg(long)]
+        goal_max_turns: Option<u32>,
+        /// Park in triage (awaiting decompose/specify) instead of todo.
+        #[arg(long)]
+        triage: bool,
         #[arg(long, default_value = "default")]
         board: String,
     },
@@ -2000,12 +2020,49 @@ pub enum BoardSubcommand {
         #[arg(long, default_value = "default")]
         board: String,
     },
-    /// Move a card to a status: todo | doing | done | blocked.
+    /// Show one card in full (detail, deps, result, comments, run history).
+    Show {
+        card: String,
+        #[arg(long, default_value = "default")]
+        board: String,
+    },
+    /// Move a card to a status: triage | todo | doing | done | blocked | archived.
     Move {
         card: String,
         status: String,
         #[arg(long, default_value = "default")]
         board: String,
+    },
+    /// Append a comment to a card's thread.
+    Comment {
+        card: String,
+        text: String,
+        #[arg(long, default_value = "human")]
+        author: String,
+        #[arg(long, default_value = "default")]
+        board: String,
+    },
+    /// Archive a card (hide from the active board).
+    Archive {
+        card: String,
+        #[arg(long, default_value = "default")]
+        board: String,
+    },
+    /// Decompose a card into child cards via the coordinator agent (LLM).
+    Decompose {
+        card: String,
+        #[arg(long, default_value = "default")]
+        board: String,
+        #[arg(long)]
+        agents: Option<String>,
+    },
+    /// Flesh out a terse card into a detailed title + body via an agent (LLM).
+    Specify {
+        card: String,
+        #[arg(long, default_value = "default")]
+        board: String,
+        #[arg(long)]
+        agents: Option<String>,
     },
     /// Reset every finished/failed card back to todo for a clean re-run.
     Reset {
@@ -2057,6 +2114,13 @@ pub fn handle_board(command: BoardCommand, home: &MaturanaHome) -> anyhow::Resul
             detail,
             assignee,
             needs,
+            priority,
+            tenant,
+            scheduled_at,
+            max_retries,
+            goal,
+            goal_max_turns,
+            triage,
             board,
         } => {
             let mut b = Board::load(home, &board)?;
@@ -2070,7 +2134,28 @@ pub fn handle_board(command: BoardCommand, home: &MaturanaHome) -> anyhow::Resul
                     anyhow::bail!("card depends on unknown card '{dep}' (add it first)");
                 }
             }
+            let scheduled = match scheduled_at {
+                Some(s) => Some(
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .map_err(|e| anyhow::anyhow!("invalid --scheduled-at: {e}"))?
+                        .with_timezone(&chrono::Utc),
+                ),
+                None => None,
+            };
             let id = b.add(&title, detail.as_deref().unwrap_or(""), assignee, deps);
+            if let Some(c) = b.card_mut(&id) {
+                if let Some(p) = priority {
+                    c.priority = p;
+                }
+                c.tenant = tenant;
+                c.scheduled_at = scheduled;
+                c.max_retries = max_retries.unwrap_or(0);
+                c.goal = goal;
+                c.goal_max_turns = goal_max_turns.unwrap_or(0);
+                if triage {
+                    c.status = CardStatus::Triage;
+                }
+            }
             b.validate().map_err(|e| anyhow::anyhow!(e))?;
             b.save(home)?;
             println!("added {id}: {title}");
@@ -2080,9 +2165,44 @@ pub fn handle_board(command: BoardCommand, home: &MaturanaHome) -> anyhow::Resul
             print_board(&Board::load(home, &board)?);
             Ok(())
         }
+        BoardSubcommand::Show { card, board } => {
+            let b = Board::load(home, &board)?;
+            let c = b.card(&card).ok_or_else(|| anyhow::anyhow!("no card '{card}'"))?;
+            println!("{} [{}] {}", c.id, c.status.label(), c.title);
+            if !c.detail.is_empty() {
+                println!("\n{}", c.detail);
+            }
+            println!("\nassignee: {}", c.assignee.as_deref().unwrap_or("(default)"));
+            if !c.deps.is_empty() {
+                println!("deps: {}", c.deps.join(", "));
+            }
+            if c.priority != 0 {
+                println!("priority: {}", c.priority);
+            }
+            if let Some(k) = &c.block_kind {
+                println!("block kind: {k}");
+            }
+            if let Some(r) = &c.result {
+                println!("\nresult:\n{r}");
+            }
+            if !c.comments.is_empty() {
+                println!("\ncomments:");
+                for cm in &c.comments {
+                    println!("  [{}] {}", cm.author, cm.body);
+                }
+            }
+            if !c.runs.is_empty() {
+                println!("\nruns:");
+                for r in &c.runs {
+                    println!("  #{} {} ({})", r.attempt, r.outcome, r.agent.as_deref().unwrap_or("?"));
+                }
+            }
+            Ok(())
+        }
         BoardSubcommand::Move { card, status, board } => {
-            let st = CardStatus::parse(&status)
-                .ok_or_else(|| anyhow::anyhow!("unknown status '{status}' (todo|doing|done|blocked)"))?;
+            let st = CardStatus::parse(&status).ok_or_else(|| {
+                anyhow::anyhow!("unknown status '{status}' (triage|todo|doing|done|blocked|archived)")
+            })?;
             let mut b = Board::load(home, &board)?;
             b.card_mut(&card)
                 .ok_or_else(|| anyhow::anyhow!("no card '{card}' on board {board}"))?
@@ -2090,6 +2210,30 @@ pub fn handle_board(command: BoardCommand, home: &MaturanaHome) -> anyhow::Resul
             b.save(home)?;
             println!("{card} -> {}", st.label());
             Ok(())
+        }
+        BoardSubcommand::Comment { card, text, author, board } => {
+            let mut b = Board::load(home, &board)?;
+            if !b.comment(&card, &author, &text) {
+                anyhow::bail!("no card '{card}' on board {board}");
+            }
+            b.save(home)?;
+            println!("commented on {card}");
+            Ok(())
+        }
+        BoardSubcommand::Archive { card, board } => {
+            let mut b = Board::load(home, &board)?;
+            b.card_mut(&card)
+                .ok_or_else(|| anyhow::anyhow!("no card '{card}'"))?
+                .status = CardStatus::Archived;
+            b.save(home)?;
+            println!("archived {card}");
+            Ok(())
+        }
+        BoardSubcommand::Decompose { card, board, agents } => {
+            decompose_card(home, &board, &card, agents)
+        }
+        BoardSubcommand::Specify { card, board, agents } => {
+            specify_card(home, &board, &card, agents)
         }
         BoardSubcommand::Reset { board } => {
             let mut b = Board::load(home, &board)?;
@@ -2149,10 +2293,12 @@ fn print_board(b: &maturana_core::board::Board) {
     use maturana_core::board::CardStatus;
     println!("board {} ({} cards)", b.name, b.cards.len());
     for status in [
+        CardStatus::Triage,
         CardStatus::Todo,
         CardStatus::Doing,
         CardStatus::Blocked,
         CardStatus::Done,
+        CardStatus::Archived,
     ] {
         let cards: Vec<_> = b.cards.iter().filter(|c| c.status == status).collect();
         if cards.is_empty() {
@@ -2258,6 +2404,9 @@ fn run_board_inner(
     let mut budget = RunBudget::new(caps.clone());
     let started = Instant::now();
     let wall = Duration::from_secs(caps.max_wall_seconds);
+    // Goal-mode re-queue counter per card (how many revise rounds it has had).
+    let mut goal_turns: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let has_reviewer = registry.get("reviewer").is_some();
 
     loop {
         if budget.tick().is_err() {
@@ -2289,6 +2438,8 @@ fn run_board_inner(
         // the budget stays single-threaded; the A2A I/O then fans out.
         let mut batch: Vec<(String, Worker, String)> = Vec::new();
         let mut agent_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut claimed_at: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> =
+            std::collections::HashMap::new();
         for card in ready.iter().take(caps.max_parallel.max(1) as usize) {
             if budget.spend_turn().is_err() {
                 break;
@@ -2296,6 +2447,7 @@ fn run_board_inner(
             let worker = resolve_assignee(pool, registry, card.assignee.as_deref())?;
             let task = build_card_task(registry, board, card, &card_out_dir(run_id, &card.id));
             agent_of.insert(card.id.clone(), worker.agent_id.clone());
+            claimed_at.insert(card.id.clone(), chrono::Utc::now());
             if let Some(c) = board.card_mut(&card.id) {
                 c.status = CardStatus::Doing;
                 c.attempts += 1;
@@ -2311,30 +2463,91 @@ fn run_board_inner(
         board.save(home)?;
 
         for (id, res) in parallel_dispatch(a2a, run_id, batch) {
+            let agent = agent_of.get(&id).cloned();
+            let started_at = claimed_at.get(&id).copied().unwrap_or_else(chrono::Utc::now);
             match res {
                 Ok(reply) => {
                     let mut note = reply.replace(marker::DONE, "").trim().to_string();
-                    if let Some(agent) = agent_of.get(&id) {
-                        let got =
-                            collect_step_artifacts(home, agent, &card_out_dir(run_id, &id), staging_dir);
+                    if let Some(a) = &agent {
+                        let got = collect_step_artifacts(home, a, &card_out_dir(run_id, &id), staging_dir);
                         if got > 0 {
                             note.push_str(&format!("\n[+{got} file(s) collected]"));
                         }
                     }
-                    if let Some(c) = board.card_mut(&id) {
-                        c.result = Some(note);
-                        c.status = CardStatus::Done;
+                    // GOAL MODE: judge the result; if it doesn't meet the goal and
+                    // there's turn budget + goal rounds left, re-queue the card to
+                    // Todo with the judge's feedback as a comment (the worker reads
+                    // its comments on the next run) — a board-native acceptance loop.
+                    let (is_goal, goal_max) = board
+                        .card(&id)
+                        .map(|c| (c.goal, if c.goal_max_turns == 0 { 5 } else { c.goal_max_turns }))
+                        .unwrap_or((false, 5));
+                    if is_goal {
+                        let used = *goal_turns.get(&id).unwrap_or(&0);
+                        if used < goal_max && budget.spend_turn().is_ok() {
+                            let judge = if has_reviewer {
+                                resolve_assignee(pool, registry, Some("reviewer"))
+                            } else {
+                                resolve_assignee(pool, registry, agent.as_deref())
+                            };
+                            let (title, detail) = board
+                                .card(&id)
+                                .map(|c| (c.title.clone(), c.detail.clone()))
+                                .unwrap_or_default();
+                            if let Ok(jw) = judge {
+                                let (pass, feedback) = judge_card(a2a, run_id, &jw, &title, &detail, &note);
+                                if !pass {
+                                    goal_turns.insert(id.clone(), used + 1);
+                                    board.comment(
+                                        &id,
+                                        "goal-judge",
+                                        &format!("Not yet ({}/{goal_max}). {feedback}", used + 1),
+                                    );
+                                    if let Some(c) = board.card_mut(&id) {
+                                        c.status = CardStatus::Todo;
+                                        c.result = Some(note.clone());
+                                    }
+                                    board.record_run(&id, agent.clone(), "revise", &feedback, started_at);
+                                    println!("  <- card {id} goal: revise ({}/{goal_max})", used + 1);
+                                    log_event(home, &board_name, "goal_revise", Some(&id), &feedback);
+                                    continue;
+                                }
+                            }
+                        }
                     }
+                    if let Some(c) = board.card_mut(&id) {
+                        c.result = Some(note.clone());
+                        c.status = CardStatus::Done;
+                        c.block_kind = None;
+                    }
+                    board.record_run(&id, agent.clone(), "completed", &note, started_at);
                     println!("  <- card {id} done");
                     log_event(home, &board_name, "done", Some(&id), "");
                 }
                 Err(error) => {
-                    if let Some(c) = board.card_mut(&id) {
-                        c.status = CardStatus::Blocked;
-                        c.result = Some(format!("failed: {error:#}"));
+                    // AUTO-RETRY: a failed card goes back to Todo until it has used
+                    // up max_retries, then it's Blocked (gave_up).
+                    let attempts = board.card(&id).map(|c| c.attempts).unwrap_or(0);
+                    let max_retries = board.card(&id).map(|c| c.max_retries).unwrap_or(0);
+                    if attempts <= max_retries {
+                        if let Some(c) = board.card_mut(&id) {
+                            c.status = CardStatus::Todo;
+                            c.block_kind = Some("transient".to_string());
+                            c.result = Some(format!("attempt {attempts} failed: {error:#}"));
+                        }
+                        board.record_run(&id, agent.clone(), "crashed", &format!("{error:#}"), started_at);
+                        eprintln!("  <- card {id} failed (attempt {attempts}/{}), retrying", max_retries + 1);
+                        log_event(home, &board_name, "retry", Some(&id), &format!("{error:#}"));
+                    } else {
+                        if let Some(c) = board.card_mut(&id) {
+                            c.status = CardStatus::Blocked;
+                            c.block_kind = Some("transient".to_string());
+                            c.result = Some(format!("failed: {error:#}"));
+                        }
+                        board.record_run(&id, agent.clone(), "gave_up", &format!("{error:#}"), started_at);
+                        eprintln!("  <- card {id} blocked: {error:#}");
+                        log_event(home, &board_name, "blocked", Some(&id), &format!("{error:#}"));
                     }
-                    eprintln!("  <- card {id} blocked: {error:#}");
-                    log_event(home, &board_name, "blocked", Some(&id), &format!("{error:#}"));
                 }
             }
         }
@@ -2343,8 +2556,169 @@ fn run_board_inner(
     Ok(())
 }
 
+/// Goal-mode acceptance check: ask a judge worker whether `result` meets the
+/// goal. Returns (pass, feedback). A judge dispatch error accepts (never blocks
+/// a finished card on a judge hiccup).
+fn judge_card(
+    a2a: &A2aWire,
+    run_id: &str,
+    worker: &Worker,
+    title: &str,
+    detail: &str,
+    result: &str,
+) -> (bool, String) {
+    let prompt = format!(
+        "Acceptance check. The goal was:\n\n{title}\n{detail}\n\nThe worker produced this result:\n\n{result}\n\n\
+         Reply with EXACTLY `PASS` on the first line if the result fully meets the goal. \
+         Otherwise reply `REVISE` on the first line, then say specifically what to fix."
+    );
+    match a2a_send(a2a, &worker.agent_id, worker.model.as_deref(), run_id, &prompt) {
+        Ok(reply) => {
+            let t = reply.trim();
+            if t.to_ascii_uppercase().starts_with("PASS") {
+                (true, String::new())
+            } else {
+                let fb = t
+                    .trim_start_matches(|c: char| c.is_alphabetic())
+                    .trim_start_matches([':', '-', ' ', '\n'])
+                    .trim()
+                    .to_string();
+                (false, if fb.is_empty() { "revise".to_string() } else { fb })
+            }
+        }
+        Err(_) => (true, String::new()),
+    }
+}
+
 fn card_out_dir(run_id: &str, card_id: &str) -> String {
     format!("{}-{}", remote_out_dir(run_id), card_id)
+}
+
+/// Stand up the A2A wire + role registry for a one-off board LLM action.
+fn board_llm_setup(
+    home: &MaturanaHome,
+    agents: Option<String>,
+) -> anyhow::Result<(A2aWire, RoleRegistry)> {
+    let placement = PlacementChoice { roles_file: None, agents, base_spec: None };
+    let registry = resolve_registry(home, &placement)?;
+    let token = std::fs::read_to_string(home.root().join("sessiond/token"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if token.is_empty() {
+        anyhow::bail!(
+            "the A2A wire needs the sessiond token at {}/sessiond/token",
+            home.root().display()
+        );
+    }
+    let a2a = A2aWire { base: crate::a2a::start_local_a2a_server(home, &token)?, token };
+    Ok((a2a, registry))
+}
+
+/// Decompose a card into child cards via the coordinator agent (LLM). Reuses the
+/// orchestrator's plan format + parser; each step becomes a card (deps wired).
+fn decompose_card(
+    home: &MaturanaHome,
+    board_name: &str,
+    card_id: &str,
+    agents: Option<String>,
+) -> anyhow::Result<()> {
+    use maturana_core::board::{Board, CardStatus};
+    let mut board = Board::load(home, board_name)?;
+    let card = board.card(card_id).ok_or_else(|| anyhow::anyhow!("no card '{card_id}'"))?.clone();
+    let (a2a, registry) = board_llm_setup(home, agents)?;
+    let run_id = format!("board-decompose-{}", chrono::Utc::now().timestamp());
+    let mut pool = WorkerPool::new(home, &registry, run_id.clone(), String::new(), 1);
+    let worker = if registry.get("coordinator").is_some() {
+        pool.resolve("coordinator")?
+    } else {
+        resolve_assignee(&mut pool, &registry, None)?
+    };
+    let prompt = format!(
+        "Break this task into a small list (2-6) of concrete subtasks for a team of agents.\n\nTask:\n{}\n{}\n\n\
+         Reply ONLY with JSON: {{\"steps\": [{{\"id\": \"s1\", \"role\": \"developer\", \"task\": \"...\", \"deps\": []}}]}}. \
+         role is one of developer|researcher|reviewer|synthesizer; deps reference earlier step ids. No prose.",
+        card.title, card.detail
+    );
+    let reply = a2a_send(&a2a, &worker.agent_id, worker.model.as_deref(), &run_id, &prompt);
+    pool.teardown();
+    let reply = reply?;
+    let plan = parse_plan(&card.title, &reply, &registry)
+        .map_err(|e| anyhow::anyhow!("decompose failed: {e}\n{reply}"))?;
+    if plan.steps.is_empty() {
+        anyhow::bail!("decompose produced no subtasks");
+    }
+    let mut step_to_card: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut new_ids = Vec::new();
+    for step in &plan.steps {
+        let deps: Vec<String> = step.deps.iter().filter_map(|d| step_to_card.get(d).cloned()).collect();
+        let id = board.add(&step.task, "", Some(step.role.clone()), deps);
+        step_to_card.insert(step.id.clone(), id.clone());
+        new_ids.push(id);
+    }
+    if let Some(c) = board.card_mut(card_id) {
+        c.status = CardStatus::Done;
+        c.result = Some(format!("decomposed into {}", new_ids.join(", ")));
+    }
+    board.validate().map_err(|e| anyhow::anyhow!(e))?;
+    board.save(home)?;
+    maturana_core::board::log_event(
+        home,
+        board_name,
+        "decompose",
+        Some(card_id),
+        &format!("-> {}", new_ids.join(", ")),
+    );
+    println!("decomposed {card_id} into {}", new_ids.join(", "));
+    Ok(())
+}
+
+/// Flesh out a terse card into a clear title + detail via an agent (LLM).
+fn specify_card(
+    home: &MaturanaHome,
+    board_name: &str,
+    card_id: &str,
+    agents: Option<String>,
+) -> anyhow::Result<()> {
+    use maturana_core::board::{Board, CardStatus};
+    let mut board = Board::load(home, board_name)?;
+    let card = board.card(card_id).ok_or_else(|| anyhow::anyhow!("no card '{card_id}'"))?.clone();
+    let (a2a, registry) = board_llm_setup(home, agents)?;
+    let run_id = format!("board-specify-{}", chrono::Utc::now().timestamp());
+    let mut pool = WorkerPool::new(home, &registry, run_id.clone(), String::new(), 1);
+    let worker = resolve_assignee(&mut pool, &registry, card.assignee.as_deref().or(Some("developer")))?;
+    let prompt = format!(
+        "Rewrite this rough task into a clear, actionable spec.\n\nTask:\n{}\n{}\n\n\
+         Reply ONLY with JSON: {{\"title\": \"concise imperative title\", \"detail\": \"what to do, plus acceptance criteria\"}}. No prose.",
+        card.title, card.detail
+    );
+    let reply = a2a_send(&a2a, &worker.agent_id, worker.model.as_deref(), &run_id, &prompt);
+    pool.teardown();
+    let reply = reply?;
+    let json = extract_json_object(&reply)
+        .ok_or_else(|| anyhow::anyhow!("specify reply had no JSON:\n{reply}"))?;
+    #[derive(serde::Deserialize)]
+    struct Spec {
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        detail: String,
+    }
+    let spec: Spec = serde_json::from_str(json)
+        .map_err(|e| anyhow::anyhow!("bad specify JSON: {e}\n{json}"))?;
+    if let Some(c) = board.card_mut(card_id) {
+        if !spec.title.trim().is_empty() {
+            c.title = spec.title.trim().to_string();
+        }
+        if !spec.detail.trim().is_empty() {
+            c.detail = spec.detail.trim().to_string();
+        }
+        if c.status == CardStatus::Triage {
+            c.status = CardStatus::Todo;
+        }
+    }
+    board.save(home)?;
+    println!("specified {card_id}");
+    Ok(())
 }
 
 /// Resolve a card's assignee to a worker: a known role goes through the pool
@@ -2378,6 +2752,33 @@ fn build_card_task(
     let ctx = board.dependency_context(card);
     if !ctx.trim().is_empty() {
         body.push_str(&format!("\n--- INPUTS FROM EARLIER CARDS ---{ctx}\n"));
+    }
+    // Card notes (comments) — including any goal-mode revise feedback — so the
+    // worker sees the running thread on this card.
+    if !card.comments.is_empty() {
+        body.push_str("\n--- NOTES ON THIS CARD ---\n");
+        for cm in &card.comments {
+            let who = if cm.author.is_empty() { "note" } else { &cm.author };
+            body.push_str(&format!("[{who}] {}\n", cm.body));
+        }
+    }
+    // Attachments — inline small text files so the worker can read them; larger
+    // or binary ones are named with their host path.
+    if !card.attachments.is_empty() {
+        body.push_str("\n--- ATTACHMENTS ---\n");
+        for path in &card.attachments {
+            let name = std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone());
+            match std::fs::metadata(path) {
+                Ok(meta) if meta.len() <= 64 * 1024 => match std::fs::read_to_string(path) {
+                    Ok(text) => body.push_str(&format!("\n## {name}\n{text}\n")),
+                    Err(_) => body.push_str(&format!("- {name} (binary, at {path})\n")),
+                },
+                _ => body.push_str(&format!("- {name} (at {path})\n")),
+            }
+        }
     }
     body.push_str(&format!(
         "\n--- PRODUCING FILES ---\nIf this task creates any files (code, a page, a script, data), \

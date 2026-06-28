@@ -92,8 +92,17 @@ pub fn router() -> Router<AppState> {
         .route("/api/boards/:name", get(boards::detail).delete(boards::delete))
         .route("/api/boards/:name/run", post(boards::run))
         .route("/api/boards/:name/reset", post(boards::reset))
+        .route("/api/boards/:name/rename", post(boards::rename_board))
+        .route("/api/boards/:name/attachment", get(boards::download_attachment))
         .route("/api/boards/:name/cards", post(boards::add_card))
         .route("/api/boards/:name/cards/:id", put(boards::edit_card).delete(boards::delete_card))
+        .route("/api/boards/:name/cards/:id/comment", post(boards::comment_card))
+        .route("/api/boards/:name/cards/:id/decompose", post(boards::decompose))
+        .route("/api/boards/:name/cards/:id/specify", post(boards::specify))
+        .route(
+            "/api/boards/:name/cards/:id/attach",
+            post(boards::upload_attachment).layer(DefaultBodyLimit::max(25 * 1024 * 1024)),
+        )
         // Channels overview (configured + live per agent).
         .route("/api/channels", get(channels::overview))
         // PUT routes share the same mutating-CSRF gate as POST/DELETE.
