@@ -2996,6 +2996,58 @@ fn resolve_transfer_ip(home: &MaturanaHome, agent_id: &str) -> anyhow::Result<St
     resolve_guest_ip(home, agent_id, None)
 }
 
+/// Push a host image into the agent's guest workspace (`/workspace/inbox/<file>`)
+/// so a vision-capable harness can open and view it on its next turn. Returns the
+/// guest path. Channel-agnostic — every channel that can receive an image
+/// (Telegram, Discord, web, …) delivers it the same way. Best-effort: errors if
+/// the guest is unreachable so the caller can fall back (e.g. OCR into the graph).
+/// The bytes go straight host→guest over scp; they never transit the model API or
+/// the browser.
+pub(crate) fn deliver_image_to_guest(
+    home: &MaturanaHome,
+    agent_id: &str,
+    local_path: &Path,
+) -> anyhow::Result<String> {
+    let ip = resolve_transfer_ip(home, agent_id)?;
+    let key = crate::orchestrate::guest_ssh_key(home, agent_id);
+    if !key.exists() {
+        anyhow::bail!("no guest SSH key for {agent_id}");
+    }
+    let host_key = GuestHostKey::resolve(home, agent_id, &ip)?;
+    let file_name = local_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("image");
+    let remote = format!("/workspace/inbox/{file_name}");
+    let roots = agent_transfer_roots(home, agent_id, true)
+        .unwrap_or_else(|_| vec!["/workspace".to_string()]);
+    push_live_path(
+        &ip,
+        "ubuntu",
+        &key,
+        &host_key,
+        &local_path.to_path_buf(),
+        &remote,
+        &roots,
+        false,
+    )?;
+    Ok(remote)
+}
+
+/// Build the prompt text for an inbound image turn: any caption plus an explicit
+/// pointer to the image's guest path, instructing the (vision-capable) harness to
+/// open and view it. Shared by every channel so behavior is identical everywhere.
+pub(crate) fn vision_prompt_text(caption: Option<&str>, guest_path: &str) -> String {
+    match caption.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(caption) => format!(
+            "{caption}\n\n[The user attached an image, saved in your workspace at {guest_path}. Open and view it to answer.]"
+        ),
+        None => format!(
+            "[The user sent an image, saved in your workspace at {guest_path}. Open and view it, then describe it or act on it.]"
+        ),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct FirecrackerHarnessRepair {
     agent_ids: Vec<String>,

@@ -1384,7 +1384,7 @@ fn out_basename(remote: &str) -> String {
 
 /// The private key for SSHing into a worker's guest, by provider. Firecracker
 /// guests use the baked image key; anything else the default agent key.
-fn guest_ssh_key(home: &MaturanaHome, agent_id: &str) -> PathBuf {
+pub(crate) fn guest_ssh_key(home: &MaturanaHome, agent_id: &str) -> PathBuf {
     let provider = maturana_core::AgentSpec::from_maturana_markdown(
         home.agent_dir(agent_id).join("MATURANA.md"),
     )

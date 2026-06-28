@@ -1769,21 +1769,6 @@ fn handle_telegram_photo(
     caption: Option<&str>,
     reply_to_message_id: Option<i64>,
 ) -> anyhow::Result<()> {
-    let knowledge_graph = agent_knowledge_graph(home, &config.agent_id);
-    let graph_token = maturana_core::worker::read_graph_token(home.root());
-    let (graph_token, graph_name) = match (graph_token, knowledge_graph.enabled) {
-        (Some(value), true) => (value, crate::graph::agent_graph_name(&config.agent_id)),
-        _ => {
-            send_telegram(
-                token,
-                &chat_id.to_string(),
-                "I received the image, but my knowledge graph is not enabled, so I cannot store it. Enable `knowledge_graph` in MATURANA.md and set up the graph service.",
-                reply_to_message_id,
-            )?;
-            return Ok(());
-        }
-    };
-
     send_telegram_chat_action(token, &chat_id.to_string(), "typing")?;
     let inbox = home.agent_dir(&config.agent_id).join("inbox");
     fs::create_dir_all(&inbox)?;
@@ -1798,6 +1783,48 @@ fn handle_telegram_photo(
         )?;
         return Ok(());
     }
+
+    // VISION (primary): push the image into the guest workspace and run it as a
+    // normal prompt turn that points the harness at the file. A vision-capable
+    // harness (Claude Code / codex / opencode) opens and *sees* the image, then
+    // replies through the same memory + reply + TTS pipeline as a typed message.
+    match crate::deliver_image_to_guest(home, &config.agent_id, &image_dest) {
+        Ok(guest_path) => {
+            audit_channel_event(
+                home,
+                &config.agent_id,
+                "channel.telegram.image",
+                &format!("delivered image to guest ({guest_path}); running vision turn"),
+            )?;
+            let prompt = crate::vision_prompt_text(caption, &guest_path);
+            return run_channel_prompt(home, token, config, chat_id, &prompt, reply_to_message_id);
+        }
+        Err(error) => {
+            audit_channel_event(
+                home,
+                &config.agent_id,
+                "channel.telegram.image_fallback",
+                &format!("guest image delivery failed ({error:#}); falling back to OCR"),
+            )?;
+        }
+    }
+
+    // FALLBACK: the guest is unreachable — OCR the image into the knowledge graph
+    // so it is at least retained, if the graph is enabled.
+    let knowledge_graph = agent_knowledge_graph(home, &config.agent_id);
+    let graph_token = maturana_core::worker::read_graph_token(home.root());
+    let (graph_token, graph_name) = match (graph_token, knowledge_graph.enabled) {
+        (Some(value), true) => (value, crate::graph::agent_graph_name(&config.agent_id)),
+        _ => {
+            send_telegram(
+                token,
+                &chat_id.to_string(),
+                "I received your image but couldn't reach my VM to view it, and my knowledge graph is off, so I can't store it either. Try again, or enable `knowledge_graph`.",
+                reply_to_message_id,
+            )?;
+            return Ok(());
+        }
+    };
 
     let text = match ocr_image_text(&image_dest) {
         Ok(text) if !text.trim().is_empty() => text,
@@ -6644,6 +6671,52 @@ fn handle_discord_attachments(
         if let Err(error) = discord_download_attachment(url, &dest, MAX_DISCORD_UPLOAD_BYTES) {
             lines.push(format!("• `{file_name}` — download failed: {error}"));
             continue;
+        }
+        // VISION: an image attachment is delivered into the guest workspace and
+        // run as a turn so the vision-capable harness opens and *sees* it (parity
+        // with Telegram). Falls through to graph/inbox if the guest is unreachable.
+        let ext = file_name
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let is_image = matches!(
+            ext.as_str(),
+            "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "heic" | "heif" | "tif" | "tiff"
+        );
+        if is_image {
+            match crate::deliver_image_to_guest(home, &config.agent_id, &dest) {
+                Ok(guest_path) => {
+                    let cap = (!caption.trim().is_empty()).then_some(caption);
+                    let prompt = crate::vision_prompt_text(cap, &guest_path);
+                    let _ = enqueue_turn(
+                        home,
+                        &config.agent_id,
+                        &config.session_id,
+                        "discord",
+                        channel_id,
+                        stable_chat_key(channel_id),
+                        None,
+                        &prompt,
+                        serde_json::json!({ "image": guest_path }),
+                    );
+                    let _ = audit_channel_event(
+                        home,
+                        &config.agent_id,
+                        "channel.discord.image",
+                        &format!("delivered image to guest ({guest_path}); running vision turn"),
+                    );
+                    lines.push(format!("• `{file_name}` — 👁️ viewing it now"));
+                    continue;
+                }
+                Err(error) => {
+                    let _ = audit_channel_event(
+                        home,
+                        &config.agent_id,
+                        "channel.discord.image_fallback",
+                        &format!("guest image delivery failed ({error:#}); falling back"),
+                    );
+                }
+            }
         }
         let supported = file_name
             .rsplit_once('.')
