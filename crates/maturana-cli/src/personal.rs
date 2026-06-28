@@ -629,6 +629,16 @@ fn enqueue_schedule(
     // A board schedule RUNS an orchestration board: spawn `maturana board run`
     // detached (the real dispatcher) rather than enqueueing a turn. The cron is
     // the trigger; the board is the work.
+    crate::channels::fire_agent_hooks(
+        home,
+        maturana_core::hooks::HookContext::new(
+            maturana_core::hooks::HookEvent::ScheduleFired,
+            agent_id,
+        )
+        .text(schedule.prompt.as_str())
+        .field("schedule.id", schedule.id.as_str())
+        .field("schedule.name", schedule.name.as_str()),
+    );
     if let Some(board) = schedule.board.as_deref().filter(|b| !b.is_empty()) {
         spawn_board_run(home, board)?;
         append_event(
