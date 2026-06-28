@@ -11,7 +11,10 @@ use std::collections::BTreeMap;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::spec::{AgentSpec, Hook, HookAction, HookEvent};
+use crate::spec::AgentSpec;
+// Re-export the spec-defined hook types so callers can use the ergonomic
+// `maturana_core::hooks::{Hook, HookAction, HookEvent}` path.
+pub use crate::spec::{Hook, HookAction, HookEvent};
 
 /// The context for a fired event, surfaced to commands (as `MATURANA_HOOK_*`
 /// env vars) and webhooks (as a JSON body).

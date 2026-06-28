@@ -6801,7 +6801,56 @@ pub(crate) fn enqueue_turn(
         }
     }
     let id = insert_inbound(&paths, "chat", channel, platform_id, thread_id, &content.to_string())?;
+    fire_agent_hooks(
+        home,
+        maturana_core::hooks::HookContext::new(
+            maturana_core::hooks::HookEvent::MessageIn,
+            agent_id,
+        )
+        .channel(channel)
+        .text(text),
+    );
     Ok(id)
+}
+
+/// Fire an agent's lifecycle hooks for `ctx`, off the hot path. Loads the
+/// agent's spec; if it declares no hooks this is a cheap no-op. Command/webhook
+/// actions run on the host (never the guest). The `enqueue-turn` action is routed
+/// through [`enqueue_outreach_turn`] (system-initiated) so it can NEVER recurse
+/// back into the `message-in` hook fired above.
+pub(crate) fn fire_agent_hooks(home: &MaturanaHome, ctx: maturana_core::hooks::HookContext) {
+    let spec_path = home.agent_dir(&ctx.agent_id).join("MATURANA.md");
+    let spec = match maturana_core::AgentSpec::from_maturana_markdown(&spec_path) {
+        Ok(spec) => spec,
+        Err(_) => return,
+    };
+    if spec.hooks.on.is_empty() {
+        return;
+    }
+    let home = home.clone();
+    std::thread::spawn(move || {
+        let enqueue = |target: &str, prompt: &str| -> anyhow::Result<()> {
+            let session = format!("{target}-main");
+            match current_paired_telegram_chat_id(&home, target) {
+                Some(chat_id) => {
+                    enqueue_outreach_turn(
+                        &home,
+                        target,
+                        &session,
+                        chat_id,
+                        prompt,
+                        "hook",
+                        serde_json::json!({}),
+                    )?;
+                    Ok(())
+                }
+                None => anyhow::bail!(
+                    "agent '{target}' has no paired channel to receive a hook-enqueued turn"
+                ),
+            }
+        };
+        maturana_core::hooks::fire(&spec, &ctx, Some(&enqueue));
+    });
 }
 
 /// Enqueue a SYSTEM-initiated turn (proactivity, scheduler) tagged for the
