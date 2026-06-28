@@ -431,6 +431,7 @@ mod tests {
             schedules: vec![],
             channels: Channels::default(),
             snapshots: SnapshotPolicy::default(),
+            hooks: Default::default(),
         };
 
         let report = validate_spec(&spec);

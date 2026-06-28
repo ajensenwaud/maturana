@@ -55,6 +55,96 @@ pub struct AgentSpec {
     pub channels: Channels,
     #[serde(default)]
     pub snapshots: SnapshotPolicy,
+    /// Lifecycle event hooks: when an agent event fires (a message arrives, a
+    /// turn finishes, a schedule runs, …) run a host command, POST a webhook, or
+    /// enqueue a follow-up turn. Host-side, best-effort, and audited — they never
+    /// run inside the guest, so a hook can react to an agent without weakening the
+    /// VM boundary.
+    #[serde(default)]
+    pub hooks: Hooks,
+}
+
+/// A set of lifecycle event hooks for one agent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hooks {
+    #[serde(default)]
+    pub on: Vec<Hook>,
+}
+
+/// One hook: an action to run when a specific lifecycle event fires.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hook {
+    /// Optional human label (shown in the cockpit + logs).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The lifecycle event that triggers this hook.
+    pub event: HookEvent,
+    /// Only run when the event's text contains this substring (case-insensitive).
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// What to do when the event fires.
+    pub action: HookAction,
+    /// Set false to keep the hook defined but inert.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// Host-observable points in an agent's lifecycle that a hook can react to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HookEvent {
+    /// An inbound message was accepted onto an agent's queue.
+    MessageIn,
+    /// A reply was delivered back to a channel.
+    MessageOut,
+    /// An agent turn started processing.
+    TurnStart,
+    /// An agent turn finished (success or failure).
+    TurnEnd,
+    /// A scheduled job fired for the agent.
+    ScheduleFired,
+    /// The agent's VM was (re)launched.
+    AgentLaunch,
+    /// A turn ended in an error.
+    Error,
+}
+
+impl HookEvent {
+    /// The kebab-case wire name (matches the serde rename).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HookEvent::MessageIn => "message-in",
+            HookEvent::MessageOut => "message-out",
+            HookEvent::TurnStart => "turn-start",
+            HookEvent::TurnEnd => "turn-end",
+            HookEvent::ScheduleFired => "schedule-fired",
+            HookEvent::AgentLaunch => "agent-launch",
+            HookEvent::Error => "error",
+        }
+    }
+}
+
+/// What a hook does when it fires. Tagged by `kind` in YAML.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HookAction {
+    /// Run a host shell command. The event context is passed as `MATURANA_HOOK_*`
+    /// environment variables (EVENT, AGENT, CHANNEL, TEXT, plus event-specific
+    /// fields). Runs on the host, never in the guest.
+    Command { command: String },
+    /// POST a JSON event payload to a URL (host-side; the body carries the full
+    /// event context). Use for Slack/webhook notifications or external automation.
+    Webhook { url: String },
+    /// Enqueue a follow-up turn — by default to this same agent, or to another
+    /// agent by id. Lets an event drive the agent (e.g. a nightly schedule asks
+    /// the agent to summarize, or an error asks it to self-diagnose).
+    EnqueueTurn {
+        prompt: String,
+        #[serde(default)]
+        agent: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -3,6 +3,7 @@ pub mod animation;
 pub mod audit;
 pub mod board;
 pub mod claude_refresh;
+pub mod hooks;
 pub mod improvement;
 pub mod materialize;
 pub mod mcp;

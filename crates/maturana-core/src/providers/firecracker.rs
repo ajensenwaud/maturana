@@ -1159,6 +1159,7 @@ mod tests {
                 on_launch: true,
                 retain: 5,
             },
+            hooks: Default::default(),
         }
     }
 }
