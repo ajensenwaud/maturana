@@ -92,10 +92,14 @@ pub enum ScheduleSubcommand {
         name: String,
         #[arg(long)]
         cron: String,
-        #[arg(long)]
+        /// The turn text to enqueue (omit when --board is set).
+        #[arg(long, default_value = "")]
         prompt: String,
         #[arg(long)]
         channel: Option<String>,
+        /// Run an orchestration board (`maturana board run <board>`) instead of a prompt.
+        #[arg(long)]
+        board: Option<String>,
     },
     List {
         agent_id: String,
@@ -202,6 +206,12 @@ struct ScheduleRecord {
     cron: String,
     prompt: String,
     channel: Option<String>,
+    /// When set, this schedule RUNS AN ORCHESTRATION BOARD (`maturana board run
+    /// <board>`) instead of enqueueing `prompt` as a turn. The cron is the
+    /// trigger; the board is the work. `#[serde(default)]` so pre-existing
+    /// prompt schedules still deserialize.
+    #[serde(default)]
+    board: Option<String>,
     enabled: bool,
     created_at: DateTime<Utc>,
 }
@@ -251,7 +261,8 @@ pub fn handle_schedule(command: ScheduleCommand, home: &MaturanaHome) -> anyhow:
             cron,
             prompt,
             channel,
-        } => add_schedule(home, &agent_id, &name, &cron, &prompt, channel),
+            board,
+        } => add_schedule(home, &agent_id, &name, &cron, &prompt, channel, board),
         ScheduleSubcommand::List { agent_id } => list_schedules(home, &agent_id),
         ScheduleSubcommand::RunDue {
             agent_id,
@@ -509,6 +520,7 @@ fn read_heartbeat(home: &MaturanaHome, agent_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_schedule(
     home: &MaturanaHome,
     agent_id: &str,
@@ -516,7 +528,15 @@ fn add_schedule(
     cron: &str,
     prompt: &str,
     channel: Option<String>,
+    board: Option<String>,
 ) -> anyhow::Result<()> {
+    let board = board.and_then(|b| {
+        let b = b.trim().to_string();
+        if b.is_empty() { None } else { Some(b) }
+    });
+    if board.is_none() && prompt.trim().is_empty() {
+        anyhow::bail!("a schedule needs a --prompt (or a --board to run)");
+    }
     let path = schedules_path(home, agent_id);
     let mut schedules = read_schedules(&path)?;
     let id = slugify(name);
@@ -528,6 +548,7 @@ fn add_schedule(
         cron: cron.to_string(),
         prompt: prompt.to_string(),
         channel,
+        board,
         enabled: true,
         created_at: Utc::now(),
     });
@@ -605,6 +626,22 @@ fn enqueue_schedule(
     schedule: &ScheduleRecord,
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
+    // A board schedule RUNS an orchestration board: spawn `maturana board run`
+    // detached (the real dispatcher) rather than enqueueing a turn. The cron is
+    // the trigger; the board is the work.
+    if let Some(board) = schedule.board.as_deref().filter(|b| !b.is_empty()) {
+        spawn_board_run(home, board)?;
+        append_event(
+            home.audit_dir().join(format!("{agent_id}.jsonl")),
+            &AuditEvent {
+                at: now,
+                agent_id: agent_id.to_string(),
+                action: "schedule.fired".to_string(),
+                message: format!("{} ran board '{board}'", schedule.id),
+            },
+        )?;
+        return Ok(());
+    }
     let channel = schedule.channel.as_deref().unwrap_or("schedule");
     // A telegram schedule is a reminder TO the user. Route it through the shared
     // outreach front door so the reply is tagged for the REAL chat (telegram +
@@ -652,6 +689,33 @@ fn enqueue_schedule(
             message: format!("{} enqueued as {id}", schedule.id),
         },
     )?;
+    Ok(())
+}
+
+/// Spawn `maturana board run <board>` detached (the real dispatcher), logging to
+/// board/<board>.run.log. Reused by cron-fired board schedules; the child
+/// outlives this call and is reaped off-thread so it never zombies.
+fn spawn_board_run(home: &MaturanaHome, board: &str) -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("locate the maturana binary")?;
+    let log_path = home.root().join("board").join(format!("{board}.run.log"));
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let log = fs::File::create(&log_path)?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--home")
+        .arg(home.root())
+        .arg("board")
+        .arg("run")
+        .arg("--board")
+        .arg(board)
+        .stdin(std::process::Stdio::null())
+        .stderr(log.try_clone()?)
+        .stdout(log);
+    let mut child = cmd.spawn().context("spawn board run")?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(())
 }
 
@@ -1089,6 +1153,7 @@ mod tests {
             "0 9 * * *",
             "Brief me",
             Some("telegram".to_string()),
+            None,
         )
         .unwrap();
         add_schedule(
@@ -1098,6 +1163,7 @@ mod tests {
             "30 9 * * *",
             "Brief me later",
             Some("discord".to_string()),
+            None,
         )
         .unwrap();
 
@@ -1111,7 +1177,7 @@ mod tests {
     #[test]
     fn schedule_run_due_enqueues_once_per_minute() {
         let home = test_home("schedule-run-due");
-        add_schedule(&home, "demo", "Every Minute", "* * * * *", "ping", None).unwrap();
+        add_schedule(&home, "demo", "Every Minute", "* * * * *", "ping", None, None).unwrap();
         run_due_schedules(&home, "demo", "main", Some("2026-06-08T12:34:00Z")).unwrap();
         run_due_schedules(&home, "demo", "main", Some("2026-06-08T12:34:30Z")).unwrap();
         let paths = session_paths(&home.agent_dir("demo"), "main");

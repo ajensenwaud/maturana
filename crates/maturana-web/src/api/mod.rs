@@ -4,6 +4,7 @@
 //! operator.
 
 pub mod agents;
+pub mod boards;
 pub mod channels;
 pub mod egress;
 pub mod graph;
@@ -82,10 +83,17 @@ pub fn router() -> Router<AppState> {
         .route("/api/schedules/:agent", post(schedules::add))
         .route("/api/schedules/:agent/:id/toggle", post(schedules::toggle))
         .route("/api/schedules/:agent/:id", axum::routing::delete(schedules::delete))
-        // Orchestrator / board (durable multi-agent runs).
+        // Orchestrator loop runs (LLM-decomposed one-shot goals; read-only viewer).
         .route("/api/orchestrator/runs", get(orchestrator::list_runs))
         .route("/api/orchestrator/runs/:run_id", get(orchestrator::run_detail))
         .route("/api/orchestrator/runs/:run_id/abort", post(orchestrator::abort_run))
+        // Durable orchestration boards (user-defined cards, run across agents).
+        .route("/api/boards", get(boards::list).post(boards::create))
+        .route("/api/boards/:name", get(boards::detail).delete(boards::delete))
+        .route("/api/boards/:name/run", post(boards::run))
+        .route("/api/boards/:name/reset", post(boards::reset))
+        .route("/api/boards/:name/cards", post(boards::add_card))
+        .route("/api/boards/:name/cards/:id", put(boards::edit_card).delete(boards::delete_card))
         // Channels overview (configured + live per agent).
         .route("/api/channels", get(channels::overview))
         // PUT routes share the same mutating-CSRF gate as POST/DELETE.

@@ -79,7 +79,7 @@ const views = {
   sessions: dashboard.renderSessions,
   channels: dashboard.renderChannels,
   schedules: dashboard.renderSchedules,
-  orchestrator: dashboard.renderOrchestrator,
+  orchestration: dashboard.renderOrchestration,
   graph: dashboard.renderGraph,
   pipelock: dashboard.renderPipelock,
   egress: dashboard.renderEgress,

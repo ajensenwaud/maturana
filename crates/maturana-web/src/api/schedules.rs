@@ -87,9 +87,13 @@ pub async fn list(State(state): State<AppState>) -> Response {
 pub struct AddBody {
     name: String,
     cron: String,
+    #[serde(default)]
     prompt: String,
     #[serde(default)]
     channel: Option<String>,
+    /// When set, the schedule RUNS this orchestration board instead of a prompt.
+    #[serde(default)]
+    board: Option<String>,
 }
 
 /// Add (or replace by name-slug) a schedule for an agent — mirrors `schedule add`.
@@ -106,8 +110,12 @@ pub async fn add(
         let name = body.name.trim();
         let cron = body.cron.trim();
         let prompt = body.prompt.trim();
-        if name.is_empty() || cron.is_empty() || prompt.is_empty() {
-            anyhow::bail!("name, cron and prompt are all required");
+        let board = body.board.as_deref().map(str::trim).filter(|b| !b.is_empty());
+        if name.is_empty() || cron.is_empty() {
+            anyhow::bail!("name and cron are required");
+        }
+        if board.is_none() && prompt.is_empty() {
+            anyhow::bail!("a schedule needs a prompt (or a board to run)");
         }
         if cron.split_whitespace().count() != 5 {
             anyhow::bail!("cron must have 5 fields (min hour dom month dow)");
@@ -123,6 +131,7 @@ pub async fn add(
             "cron": cron,
             "prompt": prompt,
             "channel": body.channel,
+            "board": board,
             "enabled": true,
             "created_at": chrono::Utc::now().to_rfc3339(),
         }));

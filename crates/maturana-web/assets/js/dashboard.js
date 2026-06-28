@@ -1307,17 +1307,18 @@ export async function renderSchedules(panel) {
       const acts = el("div", "row-actions");
       acts.append(toggle, del);
       const lastRun = typeof s.last_run === "string" ? s.last_run : (s.last_run ? JSON.stringify(s.last_run) : "—");
+      const action = s.board ? `▶ board: ${s.board}` : (s.prompt || "").slice(0, 60);
       return [
         s.agent_id,
         s.name,
         el("code", null, s.cron),
         s.channel || "—",
         s.enabled ? badge("on", "good") : badge("off", "dim"),
-        (s.prompt || "").slice(0, 60),
+        action,
         acts,
       ];
     });
-    listBox.replaceChildren(table(["agent", "name", "cron", "channel", "enabled", "prompt", "actions"], rows));
+    listBox.replaceChildren(table(["agent", "name", "cron", "channel", "enabled", "prompt / board", "actions"], rows));
   }
 
   // ---- add card ----
@@ -1334,6 +1335,7 @@ export async function renderSchedules(panel) {
   const cronIn = el("input", "model-input"); cronIn.placeholder = "cron: 0 8 * * 1-5";
   const promptIn = el("input", "model-input"); promptIn.placeholder = "prompt the agent runs";
   const channelIn = el("input", "model-input"); channelIn.placeholder = "channel (optional, e.g. telegram)";
+  const boardIn = el("input", "model-input"); boardIn.placeholder = "or run a board (optional, board name)";
   const addStatus = el("span", "panel-desc");
   const addBtn = button("Add schedule", async () => {
     const agent = agentSel.value;
@@ -1347,15 +1349,16 @@ export async function renderSchedules(panel) {
           cron: cronIn.value.trim(),
           prompt: promptIn.value.trim(),
           channel: channelIn.value.trim() || null,
+          board: boardIn.value.trim() || null,
         }),
       });
-      nameIn.value = ""; cronIn.value = ""; promptIn.value = ""; channelIn.value = "";
+      nameIn.value = ""; cronIn.value = ""; promptIn.value = ""; channelIn.value = ""; boardIn.value = "";
       addStatus.textContent = "added";
       draw();
     } catch (e) { addStatus.textContent = String(e); }
   });
   const addRow = el("div", "opt-grid");
-  for (const node of [agentSel, nameIn, cronIn, promptIn, channelIn]) addRow.append(node);
+  for (const node of [agentSel, nameIn, cronIn, promptIn, channelIn, boardIn]) addRow.append(node);
   add.append(addRow, el("div", "row-actions"));
   add.lastChild.append(addBtn, addStatus);
 
@@ -1366,76 +1369,224 @@ export async function renderSchedules(panel) {
 
 // ---- orchestrator / board (tasks multiplied) ----
 
-function orchStatePill(st) {
+// ---- orchestration: durable, user-defined boards run across agents ----
+
+const ORCH_ROLES = ["developer", "researcher", "reviewer", "coordinator", "synthesizer"];
+
+function cardPill(st) {
   if (st === "done") return badge("done", "good");
-  if (st === "failed") return badge("failed", "bad");
-  if (st === "running") return badge("running", "good");
-  return badge(st || "waiting", "dim");
+  if (st === "doing") return badge("doing", "warn");
+  if (st === "blocked") return badge("blocked", "bad");
+  return badge("todo", "dim");
 }
 
-export async function renderOrchestrator(panel) {
-  const wrap = section("Orchestrator");
-  wrap.append(desc("Durable multi-agent runs — each goal split into steps dispatched across isolated agents. A run's steps are its board cards."));
-  const box = el("div");
+function optionEl(value, label) { const o = el("option", null, label); o.value = value; return o; }
+function disabledOpt(label) { const o = el("option", null, label); o.disabled = true; return o; }
 
-  async function openRun(runId, host, btn) {
-    host.replaceChildren(el("div", "panel-desc", "loading board…"));
+export async function renderOrchestration(panel) {
+  const wrap = section("Orchestration");
+  wrap.append(desc("Define a board of cards — each a task with an assignee and dependencies — then run it across your agents. Durable: cards persist, an interrupted run is reclaimed, and every card runs in its assignee's own VM over A2A. Cards coordinate only through their results — no shared state. Run it now, on a schedule (Schedules), or by trigger (POST /api/boards/:name/run)."));
+  const bar = el("div", "row-actions");
+  const body = el("div");
+  wrap.append(bar, body);
+  panel.replaceChildren(wrap);
+
+  let boards = [];
+  let current = null;
+  let agents = [];
+  let pollTimer = null;
+
+  try { agents = await api("/api/agents"); } catch { agents = []; }
+
+  function stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+  async function loadBoards() { try { boards = await api("/api/boards"); } catch { boards = []; } }
+
+  function assigneeSelect(value) {
+    const sel = el("select", "model-input");
+    sel.append(optionEl("", "(default: developer)"));
+    sel.append(disabledOpt("— roles —"));
+    for (const r of ORCH_ROLES) sel.append(optionEl(r, r));
+    if (agents.length) sel.append(disabledOpt("— agents —"));
+    for (const a of agents) sel.append(optionEl(a.agent_id, a.agent_id));
+    sel.value = value || "";
+    return sel;
+  }
+
+  function drawBar() {
+    bar.replaceChildren();
+    if (!current && boards.length) current = boards[0].name;
+    const sel = el("select", "model-input");
+    if (!boards.length) sel.append(optionEl("", "(no boards yet)"));
+    for (const b of boards) {
+      const o = optionEl(b.name, `${b.name}  (${b.done}/${b.total}${b.running ? " · running" : ""})`);
+      if (b.name === current) o.selected = true;
+      sel.append(o);
+    }
+    sel.addEventListener("change", () => { current = sel.value; drawBoard(); });
+    const newBtn = button("＋ New board", async () => {
+      const name = (prompt("New board name (letters, digits, - _):", "") || "").trim();
+      if (!name) return;
+      try { await api("/api/boards", { method: "POST", body: JSON.stringify({ name }) }); current = name; await loadBoards(); drawBar(); drawBoard(); }
+      catch (e) { alert(String(e)); }
+    });
+    bar.append(el("span", "panel-desc", "Board:"), sel, newBtn);
+    if (current) {
+      bar.append(button("Delete board", async () => {
+        if (!confirm(`Delete board "${current}"? Removes all its cards.`)) return;
+        try { await api(`/api/boards/${current}`, { method: "DELETE" }); current = null; await loadBoards(); drawBar(); drawBoard(); }
+        catch (e) { alert(String(e)); }
+      }, true));
+    }
+  }
+
+  async function drawBoard() {
+    stopPoll();
+    if (!current) { body.replaceChildren(el("div", "panel-desc", "Create a board to get started — then add cards and run them across your agents.")); return; }
     let d;
-    try { d = await api(`/api/orchestrator/runs/${runId}`); }
-    catch (e) { host.replaceChildren(el("div", "status-bad", String(e))); return; }
+    try { d = await api(`/api/boards/${current}`); }
+    catch (e) { body.replaceChildren(el("div", "status-bad", String(e))); return; }
+    renderBoardView(d);
+    if (d.running) {
+      pollTimer = setInterval(async () => {
+        if (!panel.contains(body)) { stopPoll(); return; }
+        try { const nd = await api(`/api/boards/${current}`); renderBoardView(nd); if (!nd.running) { stopPoll(); loadBoards().then(drawBar); } }
+        catch { stopPoll(); }
+      }, 1500);
+    }
+  }
+
+  function cardTile(c, allCards) {
+    const tile = el("div", "opt-card");
+    const h = el("div", "panel-card-head");
+    h.append(el("strong", null, `${c.id} · ${c.title}`), cardPill(c.status));
+    tile.append(h);
+    tile.append(el("div", "panel-desc", `@${c.assignee || "(default)"}${c.deps && c.deps.length ? " · after " + c.deps.join(",") : ""}`));
+    if (c.detail) tile.append(el("div", "panel-desc", String(c.detail).slice(0, 140)));
+    if (c.result) { const r = el("div", "log-extra"); r.textContent = String(c.result).slice(0, 300); tile.append(r); }
+    const acts = el("div", "row-actions");
+    acts.append(button("edit", () => editCard(c, allCards)));
+    acts.append(button("delete", async () => {
+      if (!confirm(`Delete ${c.id}?`)) return;
+      try { await api(`/api/boards/${current}/cards/${c.id}`, { method: "DELETE" }); drawBoard(); }
+      catch (e) { alert(String(e)); }
+    }, true));
+    tile.append(acts);
+    return tile;
+  }
+
+  function addCardForm(allCards) {
+    const card = section("Add a card");
+    const title = el("input", "model-input"); title.placeholder = "title (what to do)";
+    const detail = el("input", "model-input"); detail.placeholder = "detail / acceptance criteria (optional)";
+    const assignee = assigneeSelect("");
     const grid = el("div", "opt-grid");
-    for (const s of d.steps || []) {
-      const c = el("div", "opt-card");
-      const h = el("div", "panel-card-head");
-      h.append(el("strong", null, `${s.id} · ${s.role}`), orchStatePill(s.status));
-      c.append(h, el("div", "panel-desc", s.task || ""));
-      if (s.deps && s.deps.length) c.append(el("div", "panel-desc", `deps: ${s.deps.join(", ")}`));
-      if (s.result) { const r = el("div", "log-extra"); r.textContent = String(s.result).slice(0, 400); c.append(r); }
-      grid.append(c);
+    grid.append(title, detail, assignee);
+    card.append(grid);
+    const depsBox = el("div", "board-deps");
+    for (const c of allCards || []) {
+      const lab = el("label", "board-dep");
+      const cb = el("input"); cb.type = "checkbox"; cb.value = c.id;
+      lab.append(cb, document.createTextNode(` ${c.id} ${String(c.title).slice(0, 22)}`));
+      depsBox.append(lab);
     }
-    const parts = [grid];
-    if (d.files && d.files.length) parts.push(el("div", "panel-desc", `files: ${d.files.join(", ")}`));
-    host.replaceChildren(...parts);
-    if (btn) btn.textContent = "hide board";
+    if ((allCards || []).length) { card.append(el("div", "panel-desc", "Depends on:")); card.append(depsBox); }
+    const status = el("span", "panel-desc");
+    const addBtn = button("Add card", async () => {
+      if (!title.value.trim()) { status.textContent = "title required"; return; }
+      const needs = [...depsBox.querySelectorAll("input:checked")].map((cb) => cb.value);
+      try {
+        await api(`/api/boards/${current}/cards`, { method: "POST", body: JSON.stringify({ title: title.value.trim(), detail: detail.value.trim(), assignee: assignee.value || null, needs }) });
+        drawBoard();
+      } catch (e) { status.textContent = String(e); }
+    });
+    const row = el("div", "row-actions"); row.append(addBtn, status);
+    card.append(row);
+    return card;
   }
 
-  async function draw() {
-    box.replaceChildren(el("div", "panel-desc", "loading…"));
-    let runs = [];
-    try { runs = await api("/api/orchestrator/runs"); }
-    catch (e) { box.replaceChildren(el("div", "status-bad", String(e))); return; }
-    if (!runs.length) {
-      box.replaceChildren(el("div", "panel-desc", "No orchestration runs yet — start one with /loop <goal> or `maturana orchestrator loop`."));
-      return;
+  function editCard(c, allCards) {
+    const overlay = el("div", "pick-overlay");
+    const dlg = el("div", "pick-card");
+    dlg.append(el("div", "pick-title", `Edit ${c.id}`));
+    const title = el("input", "model-input"); title.value = c.title;
+    const detail = el("textarea", "file-edit"); detail.value = c.detail || ""; detail.style.minHeight = "80px";
+    const assignee = assigneeSelect(c.assignee || "");
+    const statusSel = el("select", "model-input");
+    for (const s of ["todo", "doing", "done", "blocked"]) statusSel.append(optionEl(s, s));
+    statusSel.value = c.status;
+    const depsBox = el("div", "board-deps");
+    for (const other of (allCards || []).filter((x) => x.id !== c.id)) {
+      const lab = el("label", "board-dep");
+      const cb = el("input"); cb.type = "checkbox"; cb.value = other.id;
+      if ((c.deps || []).includes(other.id)) cb.checked = true;
+      lab.append(cb, document.createTextNode(` ${other.id} ${String(other.title).slice(0, 22)}`));
+      depsBox.append(lab);
     }
-    box.replaceChildren();
-    for (const r of runs) {
-      const t = r.tally || {};
-      const card = el("div", "panel-card");
-      const head = el("div", "panel-card-head");
-      head.append(el("div", "panel-card-title", r.goal || r.run_id), orchStatePill(t.state));
-      card.append(head, el("div", "panel-desc", `${r.run_id} · ${t.done || 0}/${t.total || 0} steps${r.has_output ? " · has output" : ""}`));
-      const boardHost = el("div");
-      const acts = el("div", "row-actions");
-      let open = false;
-      const viewBtn = button("view board", async () => {
-        open = !open;
-        if (open) { await openRun(r.run_id, boardHost, viewBtn); }
-        else { boardHost.replaceChildren(); viewBtn.textContent = "view board"; }
-      });
-      acts.append(viewBtn);
-      if (t.state === "running") {
-        acts.append(button("abort", async () => {
-          if (!confirm(`Abort run ${r.run_id}?`)) return;
-          try { await api(`/api/orchestrator/runs/${r.run_id}/abort`, { method: "POST" }); draw(); }
-          catch (e) { alert(String(e)); }
-        }, true));
+    const st = el("span", "panel-desc");
+    const save = button("Save", async () => {
+      const deps = [...depsBox.querySelectorAll("input:checked")].map((cb) => cb.value);
+      try {
+        await api(`/api/boards/${current}/cards/${c.id}`, { method: "PUT", body: JSON.stringify({ title: title.value.trim(), detail: detail.value, assignee: assignee.value || null, deps, status: statusSel.value }) });
+        overlay.remove(); drawBoard();
+      } catch (e) { st.textContent = String(e); }
+    });
+    const cancel = button("Cancel", () => overlay.remove());
+    dlg.append(
+      el("div", "panel-desc", "Title"), title,
+      el("div", "panel-desc", "Detail"), detail,
+      el("div", "panel-desc", "Assignee"), assignee,
+      el("div", "panel-desc", "Status"), statusSel,
+      el("div", "panel-desc", "Depends on"), depsBox,
+      el("div", "row-actions"),
+    );
+    dlg.lastChild.append(save, cancel, st);
+    overlay.append(dlg);
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
+    document.body.append(overlay);
+  }
+
+  function renderBoardView(d) {
+    body.replaceChildren();
+    const tb = el("div", "row-actions");
+    const runBtn = button(d.running ? "running…" : "▶ Run board", async () => {
+      try { await api(`/api/boards/${current}/run`, { method: "POST" }); drawBoard(); }
+      catch (e) { alert(String(e)); }
+    });
+    if (d.running) runBtn.disabled = true;
+    tb.append(runBtn);
+    tb.append(button("Reset", async () => {
+      if (!confirm("Reset all cards to todo (drops prior results)?")) return;
+      try { await api(`/api/boards/${current}/reset`, { method: "POST" }); drawBoard(); }
+      catch (e) { alert(String(e)); }
+    }));
+    if (d.running) tb.append(el("span", "chat-responding", "running…"));
+    body.append(tb);
+
+    const cols = el("div", "board-cols");
+    for (const [stt, label] of [["todo", "To do"], ["doing", "Doing"], ["done", "Done"], ["blocked", "Blocked"]]) {
+      const col = el("div", "board-col");
+      const cards = (d.cards || []).filter((c) => c.status === stt);
+      col.append(el("div", "board-col-head", `${label} · ${cards.length}`));
+      for (const c of cards) col.append(cardTile(c, d.cards));
+      cols.append(col);
+    }
+    body.append(cols);
+    body.append(addCardForm(d.cards));
+
+    if (d.events && d.events.length) {
+      const log = section("Run log");
+      const lv = el("div", "log-view");
+      for (const e of d.events.slice(-40)) {
+        const row = el("div", "log-row");
+        row.append(el("span", "log-time", new Date(e.at).toLocaleTimeString()), el("span", "log-msg", `${e.kind}${e.card ? " " + e.card : ""} ${e.text || ""}`.trim()));
+        lv.append(row);
       }
-      card.append(acts, boardHost);
-      box.append(card);
+      log.append(lv);
+      body.append(log);
     }
   }
 
-  await draw();
-  panel.replaceChildren(wrap, box);
+  await loadBoards();
+  drawBar();
+  drawBoard();
 }

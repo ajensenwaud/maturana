@@ -1048,8 +1048,16 @@ button.primary:hover {
 }
 .chat-download:hover { border-color: var(--accent); background: var(--accent-bg); }
 
-/* dashboard inline action rows (schedules / orchestrator cards) */
+/* dashboard inline action rows (schedules / orchestration cards) */
 .row-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+
+/* orchestration board: status columns of cards */
+.board-cols { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 14px; align-items: start; }
+.board-col { background: var(--surface); border: 1px solid var(--border); padding: 10px; display: flex; flex-direction: column; gap: 10px; min-height: 60px; }
+.board-col-head { font-family: var(--mono); font-size: 0.76rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--dim); }
+.board-deps { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 6px 0 2px; }
+.board-dep { font-size: 0.82rem; color: var(--ink); display: inline-flex; align-items: center; gap: 4px; }
+@media (max-width: 900px) { .board-cols { grid-template-columns: 1fr 1fr; } }
 
 /* ============================================================
    FLAT LOOK (goal): no rounded corners, no shadows/glows — the
