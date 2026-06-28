@@ -106,6 +106,20 @@ pub enum ServerMsg {
         session_id: String,
         message: serde_json::Value,
     },
+    /// Live, pre-final progress for an in-flight chat turn — the same side-lane
+    /// Telegram reads ("Thinking…" + tool lines + cumulative answer text). `kind`
+    /// is "tool" | "thinking" | "text" | "status"; for "text" the payload is the
+    /// WHOLE answer-so-far (cumulative, not a delta), so the client replaces. A
+    /// `status` of "done"/"error" marks the turn terminal; the authoritative final
+    /// reply still arrives as `SessionOutbound`.
+    SessionProgress {
+        agent_id: String,
+        session_id: String,
+        message_id: String,
+        seq: u64,
+        kind: String,
+        text: String,
+    },
     Error {
         code: String,
         message: String,
@@ -233,6 +247,14 @@ mod tests {
             agent_id: "a".into(),
             session_id: "s".into(),
             message: serde_json::json!({"text": "reply"}),
+        });
+        round_trip_server(&ServerMsg::SessionProgress {
+            agent_id: "a".into(),
+            session_id: "s".into(),
+            message_id: "m1".into(),
+            seq: 3,
+            kind: "text".into(),
+            text: "partial answer".into(),
         });
         round_trip_server(&ServerMsg::Error {
             code: "not_implemented".into(),

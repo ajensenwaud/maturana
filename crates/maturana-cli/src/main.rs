@@ -1504,7 +1504,43 @@ fn main() -> anyhow::Result<()> {
                         )
                     },
                 );
-                maturana_web::run_web(home.root().to_path_buf(), &bind, enqueue)?
+                // Inject the knowledge-graph ingest hook so a file uploaded in
+                // the chat window becomes retrievable by the (VM-isolated) agent
+                // — exactly the path a Telegram document upload takes.
+                let ingest: maturana_web::IngestFileFn = std::sync::Arc::new(
+                    |home_root: &std::path::Path, agent_id: &str, file_path: &std::path::Path| {
+                        let home = MaturanaHome::new(home_root.to_path_buf());
+                        let kg = crate::channels::agent_knowledge_graph(&home, agent_id);
+                        if !kg.enabled {
+                            anyhow::bail!("knowledge graph is not enabled for this agent");
+                        }
+                        let token = maturana_core::worker::read_graph_token(home.root())
+                            .ok_or_else(|| anyhow::anyhow!("graph service token is missing"))?;
+                        let supported = file_path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .map(|e| {
+                                crate::graph::SUPPORTED_EXTS
+                                    .contains(&e.to_ascii_lowercase().as_str())
+                            })
+                            .unwrap_or(false);
+                        if !supported {
+                            anyhow::bail!(
+                                "unsupported file type for graph ingest (supported: {})",
+                                crate::graph::SUPPORTED_EXTS.join(", ")
+                            );
+                        }
+                        let name = crate::graph::agent_graph_name(agent_id);
+                        crate::graph::ingest_file_into_service(
+                            crate::graph::DEFAULT_LOCAL_URL,
+                            &token,
+                            &name,
+                            file_path,
+                            1800,
+                        )
+                    },
+                );
+                maturana_web::run_web(home.root().to_path_buf(), &bind, enqueue, Some(ingest))?
             }
         },
         Command::Search(command) => run_search(&home, command)?,

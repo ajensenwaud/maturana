@@ -28,9 +28,10 @@
     Arial, sans-serif;
   --mono: "JetBrains Mono", "Cascadia Code", ui-monospace, "SF Mono",
     Menlo, Consolas, monospace;
-  --radius: 12px;
-  --radius-sm: 9px;
-  --radius-lg: 16px;
+  /* Squared, flat look (no rounding) — matches the Hermes density preference. */
+  --radius: 0px;
+  --radius-sm: 0px;
+  --radius-lg: 0px;
 
   /* ============================================================
      DERIVED — computed from the base; themes never set these.
@@ -65,9 +66,10 @@
   --halo-1: color-mix(in srgb, var(--accent) 7%, transparent);
   --halo-2: color-mix(in srgb, var(--ok) 6%, transparent);
 
-  /* shadows */
-  --shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
-  --shadow-soft: 0 6px 22px rgba(0, 0, 0, 0.28);
+  /* shadows — dropped (flat). Kept as tokens (set to none) so any rule using them
+     simply renders flat instead of needing per-rule edits. */
+  --shadow: none;
+  --shadow-soft: none;
 
   /* eyebrow-label tracking */
   --track-spacing-wide: 0.18em;

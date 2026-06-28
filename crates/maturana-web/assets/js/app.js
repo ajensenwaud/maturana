@@ -10,9 +10,9 @@ import { mountThemeSwitcher } from "/assets/js/themes.js";
 mountThemeSwitcher(document.getElementById("theme-switch"));
 
 const socket = new CockpitSocket();
-const linkStatus = document.getElementById("link-status");
 
-const sbLink = document.getElementById("sb-link");
+// Link status lives in ONE place: the bottom status bar (#sb-link). The old
+// header indicator was a duplicate and has been removed.
 function setSbDot(itemId, kind, label) {
   const node = document.getElementById(itemId);
   if (!node) return;
@@ -24,20 +24,12 @@ function setSbDot(itemId, kind, label) {
 
 socket.onStatus((status) => {
   if (status === "open") {
-    linkStatus.textContent = "[link ok]";
-    linkStatus.className = "status-ok";
     setSbDot("sb-link", "ok", "link ok");
   } else if (status === "connecting") {
-    linkStatus.textContent = "[link ..]";
-    linkStatus.className = "status-dim";
     setSbDot("sb-link", "dim", "link…");
   } else if (status === "version-mismatch") {
-    linkStatus.textContent = "[link v!]";
-    linkStatus.className = "status-bad";
     setSbDot("sb-link", "bad", "version!");
   } else {
-    linkStatus.textContent = "[link --]";
-    linkStatus.className = "status-bad";
     setSbDot("sb-link", "bad", "link down");
   }
 });
@@ -85,6 +77,9 @@ const views = {
   agents: dashboard.renderAgents,
   system: dashboard.renderSystem,
   sessions: dashboard.renderSessions,
+  channels: dashboard.renderChannels,
+  schedules: dashboard.renderSchedules,
+  orchestrator: dashboard.renderOrchestrator,
   graph: dashboard.renderGraph,
   pipelock: dashboard.renderPipelock,
   egress: dashboard.renderEgress,

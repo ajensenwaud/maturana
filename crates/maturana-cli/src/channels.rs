@@ -2087,7 +2087,10 @@ fn sanitize_document_name(name: Option<&str>) -> String {
 
 /// The agent's `knowledge_graph` opt-in, read from its materialized spec.
 /// Missing/unparseable spec means disabled (the default).
-fn agent_knowledge_graph(home: &MaturanaHome, agent_id: &str) -> maturana_core::spec::KnowledgeGraph {
+pub(crate) fn agent_knowledge_graph(
+    home: &MaturanaHome,
+    agent_id: &str,
+) -> maturana_core::spec::KnowledgeGraph {
     maturana_core::spec::AgentSpec::from_maturana_markdown(
         &home.agent_dir(agent_id).join("MATURANA.md"),
     )

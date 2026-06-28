@@ -566,6 +566,18 @@ button.primary:hover {
   0%, 70%, 100% { transform: translateY(0); opacity: 0.35; }
   35% { transform: translateY(-5px); opacity: 1; }
 }
+/* live tool/activity line shown in the in-flight bubble before answer text
+   starts streaming (e.g. "bash ls -la", "web_search …"). */
+.chat-activity {
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  color: var(--dim);
+  display: flex; align-items: center; gap: 7px;
+}
+.chat-activity::before {
+  content: "⚙"; color: var(--accent); font-size: 0.9em;
+  animation: pulse-dot 1.4s infinite ease-in-out;
+}
 /* a soft "responding" label that breathes, shown under the active convo */
 .chat-responding {
   display: flex; align-items: center; gap: 8px;
@@ -1010,3 +1022,46 @@ button.primary:hover {
 .log-msg { color: var(--ink); }
 .log-extra { color: var(--dim); font-family: var(--mono); font-size: 0.74rem; margin-left: auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45%; }
 .log-plain { font-family: var(--mono); color: var(--dim); white-space: pre-wrap; word-break: break-word; }
+
+/* ---- chat file attachments: composer attach button, upload chips, download links ---- */
+.chat-attach {
+  background: none; border: 1px solid var(--border); color: var(--dim);
+  cursor: pointer; padding: 0 11px; font-size: 1rem; align-self: stretch;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+.chat-attach:hover { color: var(--accent); border-color: var(--accent); }
+.chat-file-hidden { display: none; }
+.chat-attach-strip { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 6px 0; }
+.attach-chip {
+  display: inline-flex; align-items: center; gap: 7px; padding: 3px 6px 3px 10px;
+  border: 1px solid var(--border); background: var(--surface); color: var(--ink); font-size: 0.8rem;
+}
+.attach-chip.uploading { color: var(--dim); }
+.attach-chip.error { border-color: var(--danger); color: var(--danger); }
+.attach-x { background: none; border: none; color: inherit; cursor: pointer; font-size: 1.05rem; line-height: 1; padding: 0 2px; }
+.attach-x:hover { color: var(--danger); }
+.chat-downloads { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.chat-download {
+  display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px;
+  border: 1px solid var(--border); background: var(--surface); color: var(--accent);
+  text-decoration: none; font-size: 0.82rem; font-family: var(--mono);
+}
+.chat-download:hover { border-color: var(--accent); background: var(--accent-bg); }
+
+/* dashboard inline action rows (schedules / orchestrator cards) */
+.row-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+
+/* ============================================================
+   FLAT LOOK (goal): no rounded corners, no shadows/glows — the
+   chrome shouldn't steal space or attention from content. We strip
+   it all, then restore only the FUNCTIONAL non-decorative bits:
+   round status/typing dots, the active-item accent bar, and a real
+   focus outline (accessibility) in place of the old glow ring.
+   ============================================================ */
+* { border-radius: 0 !important; box-shadow: none !important; }
+.sb-dot, .chat-typing-dot, .status-dot { border-radius: 999px !important; }
+nav.side button.active { box-shadow: inset 2px 0 0 var(--accent) !important; }
+.chat-convo.active { box-shadow: inset 2px 0 0 var(--accent) !important; }
+.opt-card.sel { box-shadow: inset 0 0 0 1px var(--accent) !important; }
+input:focus, textarea:focus, select:focus, .model-input:focus, .chat-input:focus,
+.spec-editor:focus, .file-edit:focus { outline: 2px solid var(--accent); outline-offset: -1px; }

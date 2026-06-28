@@ -1244,3 +1244,198 @@ export async function renderSkills(panel) {
   wrap.append(listBox);
   panel.replaceChildren(wrap, deployCard, create, detail);
 }
+
+// ---- channels (lives everywhere) ----
+
+export async function renderChannels(panel) {
+  const wrap = section("Channels");
+  wrap.append(desc("Every chat surface each agent exposes — one agent, one memory, every surface. “live” means the supervisor is running that bridge right now."));
+  let rows = [];
+  try {
+    rows = await api("/api/channels");
+  } catch (e) {
+    wrap.append(el("div", "status-bad", String(e)));
+    panel.replaceChildren(wrap);
+    return;
+  }
+  const order = ["web", "tui", "telegram", "discord", "slack", "agentmail"];
+  const cell = (ch) => {
+    if (!ch || !ch.configured) return el("span", "panel-desc", "—");
+    const b = ch.live ? badge("live", "good") : badge("down", "warn");
+    if (ch.detail) b.title = ch.detail;
+    return b;
+  };
+  const trows = rows.map((r) => {
+    const byName = Object.fromEntries((r.channels || []).map((c) => [c.name, c]));
+    return [el("strong", null, r.agent_id), ...order.map((n) => cell(byName[n]))];
+  });
+  if (!trows.length) wrap.append(el("div", "panel-desc", "No agents."));
+  else wrap.append(table(["agent", ...order], trows));
+  panel.replaceChildren(wrap);
+}
+
+// ---- schedules (focused automation) ----
+
+export async function renderSchedules(panel) {
+  const wrap = section("Schedules");
+  wrap.append(desc("Recurring agent tasks the plane fires unattended — reports, backups, briefings. Same store as `maturana schedule`; cron is 5-field (min hour dom month dow)."));
+  const listBox = el("div");
+
+  async function draw() {
+    listBox.replaceChildren(el("div", "panel-desc", "loading…"));
+    let items = [];
+    try {
+      items = await api("/api/schedules");
+    } catch (e) {
+      listBox.replaceChildren(el("div", "status-bad", String(e)));
+      return;
+    }
+    if (!items.length) {
+      listBox.replaceChildren(el("div", "panel-desc", "No schedules yet — add one below."));
+      return;
+    }
+    const rows = items.map((s) => {
+      const toggle = button(s.enabled ? "disable" : "enable", async () => {
+        try { await api(`/api/schedules/${s.agent_id}/${s.id}/toggle`, { method: "POST" }); draw(); }
+        catch (e) { alert(String(e)); }
+      });
+      const del = button("delete", async () => {
+        if (!confirm(`Delete schedule “${s.name}”?`)) return;
+        try { await api(`/api/schedules/${s.agent_id}/${s.id}`, { method: "DELETE" }); draw(); }
+        catch (e) { alert(String(e)); }
+      }, true);
+      const acts = el("div", "row-actions");
+      acts.append(toggle, del);
+      const lastRun = typeof s.last_run === "string" ? s.last_run : (s.last_run ? JSON.stringify(s.last_run) : "—");
+      return [
+        s.agent_id,
+        s.name,
+        el("code", null, s.cron),
+        s.channel || "—",
+        s.enabled ? badge("on", "good") : badge("off", "dim"),
+        (s.prompt || "").slice(0, 60),
+        acts,
+      ];
+    });
+    listBox.replaceChildren(table(["agent", "name", "cron", "channel", "enabled", "prompt", "actions"], rows));
+  }
+
+  // ---- add card ----
+  const add = section("Add a schedule");
+  let agents = [];
+  try { agents = await api("/api/agents"); } catch { agents = []; }
+  const agentSel = el("select", "model-input");
+  for (const a of agents) {
+    const o = el("option", null, a.agent_id);
+    o.value = a.agent_id;
+    agentSel.append(o);
+  }
+  const nameIn = el("input", "model-input"); nameIn.placeholder = "name (e.g. morning-brief)";
+  const cronIn = el("input", "model-input"); cronIn.placeholder = "cron: 0 8 * * 1-5";
+  const promptIn = el("input", "model-input"); promptIn.placeholder = "prompt the agent runs";
+  const channelIn = el("input", "model-input"); channelIn.placeholder = "channel (optional, e.g. telegram)";
+  const addStatus = el("span", "panel-desc");
+  const addBtn = button("Add schedule", async () => {
+    const agent = agentSel.value;
+    if (!agent) { addStatus.textContent = "no agents"; return; }
+    addStatus.textContent = "saving…";
+    try {
+      await api(`/api/schedules/${agent}`, {
+        method: "POST",
+        body: JSON.stringify({
+          name: nameIn.value.trim(),
+          cron: cronIn.value.trim(),
+          prompt: promptIn.value.trim(),
+          channel: channelIn.value.trim() || null,
+        }),
+      });
+      nameIn.value = ""; cronIn.value = ""; promptIn.value = ""; channelIn.value = "";
+      addStatus.textContent = "added";
+      draw();
+    } catch (e) { addStatus.textContent = String(e); }
+  });
+  const addRow = el("div", "opt-grid");
+  for (const node of [agentSel, nameIn, cronIn, promptIn, channelIn]) addRow.append(node);
+  add.append(addRow, el("div", "row-actions"));
+  add.lastChild.append(addBtn, addStatus);
+
+  await draw();
+  wrap.append(listBox);
+  panel.replaceChildren(wrap, add);
+}
+
+// ---- orchestrator / board (tasks multiplied) ----
+
+function orchStatePill(st) {
+  if (st === "done") return badge("done", "good");
+  if (st === "failed") return badge("failed", "bad");
+  if (st === "running") return badge("running", "good");
+  return badge(st || "waiting", "dim");
+}
+
+export async function renderOrchestrator(panel) {
+  const wrap = section("Orchestrator");
+  wrap.append(desc("Durable multi-agent runs — each goal split into steps dispatched across isolated agents. A run's steps are its board cards."));
+  const box = el("div");
+
+  async function openRun(runId, host, btn) {
+    host.replaceChildren(el("div", "panel-desc", "loading board…"));
+    let d;
+    try { d = await api(`/api/orchestrator/runs/${runId}`); }
+    catch (e) { host.replaceChildren(el("div", "status-bad", String(e))); return; }
+    const grid = el("div", "opt-grid");
+    for (const s of d.steps || []) {
+      const c = el("div", "opt-card");
+      const h = el("div", "panel-card-head");
+      h.append(el("strong", null, `${s.id} · ${s.role}`), orchStatePill(s.status));
+      c.append(h, el("div", "panel-desc", s.task || ""));
+      if (s.deps && s.deps.length) c.append(el("div", "panel-desc", `deps: ${s.deps.join(", ")}`));
+      if (s.result) { const r = el("div", "log-extra"); r.textContent = String(s.result).slice(0, 400); c.append(r); }
+      grid.append(c);
+    }
+    const parts = [grid];
+    if (d.files && d.files.length) parts.push(el("div", "panel-desc", `files: ${d.files.join(", ")}`));
+    host.replaceChildren(...parts);
+    if (btn) btn.textContent = "hide board";
+  }
+
+  async function draw() {
+    box.replaceChildren(el("div", "panel-desc", "loading…"));
+    let runs = [];
+    try { runs = await api("/api/orchestrator/runs"); }
+    catch (e) { box.replaceChildren(el("div", "status-bad", String(e))); return; }
+    if (!runs.length) {
+      box.replaceChildren(el("div", "panel-desc", "No orchestration runs yet — start one with /loop <goal> or `maturana orchestrator loop`."));
+      return;
+    }
+    box.replaceChildren();
+    for (const r of runs) {
+      const t = r.tally || {};
+      const card = el("div", "panel-card");
+      const head = el("div", "panel-card-head");
+      head.append(el("div", "panel-card-title", r.goal || r.run_id), orchStatePill(t.state));
+      card.append(head, el("div", "panel-desc", `${r.run_id} · ${t.done || 0}/${t.total || 0} steps${r.has_output ? " · has output" : ""}`));
+      const boardHost = el("div");
+      const acts = el("div", "row-actions");
+      let open = false;
+      const viewBtn = button("view board", async () => {
+        open = !open;
+        if (open) { await openRun(r.run_id, boardHost, viewBtn); }
+        else { boardHost.replaceChildren(); viewBtn.textContent = "view board"; }
+      });
+      acts.append(viewBtn);
+      if (t.state === "running") {
+        acts.append(button("abort", async () => {
+          if (!confirm(`Abort run ${r.run_id}?`)) return;
+          try { await api(`/api/orchestrator/runs/${r.run_id}/abort`, { method: "POST" }); draw(); }
+          catch (e) { alert(String(e)); }
+        }, true));
+      }
+      card.append(acts, boardHost);
+      box.append(card);
+    }
+  }
+
+  await draw();
+  panel.replaceChildren(wrap, box);
+}

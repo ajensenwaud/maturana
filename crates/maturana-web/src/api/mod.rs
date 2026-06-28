@@ -4,11 +4,14 @@
 //! operator.
 
 pub mod agents;
+pub mod channels;
 pub mod egress;
 pub mod graph;
 pub mod ops;
+pub mod orchestrator;
 pub mod pipelock;
 pub mod runtime;
+pub mod schedules;
 pub mod search;
 pub mod sessions;
 pub mod skills;
@@ -16,6 +19,7 @@ pub mod system;
 pub mod tools;
 pub mod voice;
 
+use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post, put};
@@ -35,6 +39,12 @@ pub fn router() -> Router<AppState> {
         .route("/api/agents/:id/files", get(agents::files))
         .route("/api/agents/:id/files/read", get(agents::file_read))
         .route("/api/agents/:id/files/write", post(agents::file_write))
+        .route("/api/agents/:id/chat/download", get(agents::chat_download))
+        // Chat attachment upload: raw body, generous limit (default is ~2 MB).
+        .route(
+            "/api/agents/:id/chat/upload",
+            post(agents::chat_upload).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
         .route("/api/agents/:id/spec", get(agents::spec_get).put(agents::spec_put))
         .route("/api/agents/:id/spec/validate", post(agents::spec_validate))
         .route("/api/agents/:id/apply", post(agents::apply))
@@ -67,6 +77,17 @@ pub fn router() -> Router<AppState> {
         .route("/api/tools", get(tools::list))
         .route("/api/skills", get(skills::list).post(skills::create))
         .route("/api/skills/:name", get(skills::detail))
+        // Schedules (per-agent cron store; mirrors `maturana schedule …`).
+        .route("/api/schedules", get(schedules::list))
+        .route("/api/schedules/:agent", post(schedules::add))
+        .route("/api/schedules/:agent/:id/toggle", post(schedules::toggle))
+        .route("/api/schedules/:agent/:id", axum::routing::delete(schedules::delete))
+        // Orchestrator / board (durable multi-agent runs).
+        .route("/api/orchestrator/runs", get(orchestrator::list_runs))
+        .route("/api/orchestrator/runs/:run_id", get(orchestrator::run_detail))
+        .route("/api/orchestrator/runs/:run_id/abort", post(orchestrator::abort_run))
+        // Channels overview (configured + live per agent).
+        .route("/api/channels", get(channels::overview))
         // PUT routes share the same mutating-CSRF gate as POST/DELETE.
         .route("/api/_csrf_probe", put(|| async { ok(serde_json::json!({})) }))
 }

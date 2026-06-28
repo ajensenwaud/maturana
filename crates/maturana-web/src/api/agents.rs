@@ -4,9 +4,10 @@
 
 use std::path::PathBuf;
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::Response;
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use maturana_core::spec::AgentSpec;
 use maturana_core::state::MaturanaHome;
@@ -523,6 +524,140 @@ pub async fn file_write(
         }
         std::fs::write(&target, text.as_bytes())?;
         Ok(serde_json::json!({ "path": rel, "written": true, "size": text.len() }))
+    })
+    .await
+    {
+        Ok(data) => ok(data),
+        Err(response) => response,
+    }
+}
+
+/// Download any (non-secret) file under the agent's host directory as a binary
+/// attachment — used for files an agent attaches to a chat reply (the
+/// `{"text":…,"files":[…]}` outbound convention). Accepts an absolute host path
+/// (how outbound files are recorded) OR a path relative to the agent dir; both
+/// must canonicalize INSIDE the agent dir, and secret dirs/names are refused even
+/// for an explicit download. Unlike the previewer, any extension is allowed.
+pub async fn chat_download(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<FileQuery>,
+) -> Response {
+    check_id!(id);
+    let dir = home(&state).agent_dir(&id);
+    let req = q.path.clone();
+    let result = blocking(move || {
+        if req.is_empty() || req.contains("..") {
+            anyhow::bail!("invalid path");
+        }
+        let p = std::path::Path::new(&req);
+        let target = if p.is_absolute() { p.to_path_buf() } else { dir.join(&req) };
+        let canon = target.canonicalize()?;
+        let base = dir.canonicalize()?;
+        if !canon.starts_with(&base) {
+            anyhow::bail!("path escapes the agent directory");
+        }
+        // Default-deny secrets even for an explicit download.
+        let rel = canon
+            .strip_prefix(&base)
+            .unwrap_or(&canon)
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        if rel.split('/').any(|c| SKIP_DIRS.contains(&c)) {
+            anyhow::bail!("not a downloadable file");
+        }
+        let name = canon
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        if SECRET_HINTS.iter().any(|h| name.to_ascii_lowercase().contains(h)) {
+            anyhow::bail!("not a downloadable file");
+        }
+        let meta = std::fs::metadata(&canon)?;
+        if meta.is_dir() {
+            anyhow::bail!("that is a directory");
+        }
+        if meta.len() > 50 * 1024 * 1024 {
+            anyhow::bail!("file is too large to download ({} bytes)", meta.len());
+        }
+        let bytes = std::fs::read(&canon)?;
+        Ok((name, bytes))
+    })
+    .await;
+    match result {
+        Ok((name, bytes)) => {
+            let disp = format!("attachment; filename=\"{}\"", name.replace(['"', '\n', '\r'], ""));
+            (
+                [
+                    (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                    (header::CONTENT_DISPOSITION, disp),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(response) => response,
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct UploadQuery {
+    name: String,
+}
+
+/// Receive a file attached in the chat composer (raw request body, filename in
+/// `?name=`), store it under `<agent>/inbox/<stamp>-<name>`, then best-effort
+/// ingest it into the agent's knowledge graph via the injected hook — the SAME
+/// path a Telegram document upload takes, so the VM-isolated agent can retrieve
+/// it. Returns the stored name + chunk count (or the ingest error, surfaced to
+/// the operator rather than swallowed).
+pub async fn chat_upload(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<UploadQuery>,
+    body: Bytes,
+) -> Response {
+    check_id!(id);
+    let dir = home(&state).agent_dir(&id);
+    let ingest = state.ingest.clone();
+    let home_root = state.home_root.clone();
+    let agent_id = id.clone();
+    let raw_name = q.name.clone();
+    match blocking(move || {
+        if body.is_empty() {
+            anyhow::bail!("empty upload");
+        }
+        if body.len() > 32 * 1024 * 1024 {
+            anyhow::bail!("file is too large to upload ({} bytes)", body.len());
+        }
+        let base_name = raw_name.rsplit(['/', '\\']).next().unwrap_or("file");
+        let safe: String = base_name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+            .collect();
+        let safe = if safe.trim_matches('.').is_empty() { "upload.bin".to_string() } else { safe };
+        let inbox = dir.join("inbox");
+        std::fs::create_dir_all(&inbox)?;
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+        let stored = format!("{stamp}-{safe}");
+        let dest = inbox.join(&stored);
+        std::fs::write(&dest, &body)?;
+        let (ingested, ingest_error) = match &ingest {
+            Some(f) => match f(&home_root, &agent_id, &dest) {
+                Ok(chunks) => (Some(chunks), None),
+                Err(error) => (None, Some(format!("{error:#}"))),
+            },
+            None => (None, Some("graph ingest is not available".to_string())),
+        };
+        Ok(serde_json::json!({
+            "name": safe,
+            "stored": stored,
+            "size": body.len(),
+            "ingested_chunks": ingested,
+            "ingest_error": ingest_error,
+        }))
     })
     .await
     {
