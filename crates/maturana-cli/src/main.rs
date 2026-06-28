@@ -2955,6 +2955,47 @@ fn resolve_guest_ip(
     })
 }
 
+/// Resolve a guest's IP for *file transfer* without the strict whole-plan
+/// validation that `inspect_agent` runs. The guest IP is recorded in the spec
+/// and the launch metadata, so unrelated provisioning drift — e.g. a spec
+/// `network.proxy` toggle the running VM's metadata predates — must not silently
+/// disable deliverable collection (it did: `inspect` rejects the mismatch, the
+/// IP never resolves, and the scp is skipped without a word). For Firecracker we
+/// read the static IP straight from the spec, then the metadata; everything else
+/// falls back to the strict live resolver (Hyper-V has no static guest IP).
+fn resolve_transfer_ip(home: &MaturanaHome, agent_id: &str) -> anyhow::Result<String> {
+    let spec_path = home.agent_dir(agent_id).join("MATURANA.md");
+    if let Ok(spec) = AgentSpec::from_maturana_markdown(&spec_path) {
+        if spec.vm.provider == maturana_core::HostProvider::Firecracker {
+            if let Some(ip) = spec
+                .vm
+                .firecracker
+                .as_ref()
+                .map(|fc| fc.guest_ip.trim().to_string())
+                .filter(|ip| !ip.is_empty())
+            {
+                return Ok(ip);
+            }
+            let metadata_path = home
+                .agent_dir(agent_id)
+                .join("state/firecracker-metadata.json");
+            if let Ok(raw) = fs::read_to_string(&metadata_path) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if let Some(ip) = value
+                        .get("guest_ip")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|ip| !ip.is_empty())
+                    {
+                        return Ok(ip.to_string());
+                    }
+                }
+            }
+        }
+    }
+    resolve_guest_ip(home, agent_id, None)
+}
+
 #[derive(Debug, Clone)]
 struct FirecrackerHarnessRepair {
     agent_ids: Vec<String>,

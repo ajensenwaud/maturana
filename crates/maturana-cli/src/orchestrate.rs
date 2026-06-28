@@ -1407,23 +1407,42 @@ fn collect_step_artifacts(
     remote_dir: &str,
     staging_dir: &std::path::Path,
 ) -> usize {
-    let ip = match crate::resolve_guest_ip(home, agent_id, None) {
+    // Resolve the IP without the strict whole-plan validation `inspect` runs:
+    // a file-producing card must not lose its deliverable to unrelated config
+    // drift. Infra failures below are surfaced loudly; only a genuinely empty
+    // output dir (the worker wrote nothing) stays quiet — that is normal for an
+    // analysis card.
+    let ip = match crate::resolve_transfer_ip(home, agent_id) {
         Ok(ip) => ip,
-        Err(_) => return 0,
+        Err(error) => {
+            eprintln!("  (could not resolve {agent_id} guest IP to collect files: {error})");
+            return 0;
+        }
     };
     let key = guest_ssh_key(home, agent_id);
     if !key.exists() {
+        eprintln!(
+            "  (no guest SSH key for {agent_id} at {}; cannot collect files)",
+            key.display()
+        );
         return 0;
     }
     let host_key = match crate::GuestHostKey::resolve(home, agent_id, &ip) {
         Ok(host_key) => host_key,
-        Err(_) => return 0,
+        Err(error) => {
+            eprintln!("  (could not prepare host key for {agent_id}: {error})");
+            return 0;
+        }
     };
     // Skip the copy entirely if the worker produced nothing.
     let probe = format!("ls -A {remote_dir} 2>/dev/null | head -1");
     match crate::run_ssh_with_stdin(&ip, "ubuntu", &key, &host_key, &probe, None) {
         Ok(listing) if !listing.trim().is_empty() => {}
-        _ => return 0,
+        Ok(_) => return 0, // worker wrote nothing — normal, stay quiet
+        Err(error) => {
+            eprintln!("  (could not reach {agent_id} guest to collect files: {error})");
+            return 0;
+        }
     }
     if std::fs::create_dir_all(staging_dir).is_err() {
         return 0;
