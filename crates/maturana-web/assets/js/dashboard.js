@@ -1474,7 +1474,7 @@ export async function renderOrchestration(panel, socket) {
     return opts;
   }
 
-  function stopPoll() { if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; } }
+  function stopPoll() { if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; } removeRunIndicator(); }
   async function loadBoards() { try { state.boards = await api("/api/boards"); } catch { state.boards = []; } }
 
   // ---------- toolbar ----------
@@ -1556,19 +1556,60 @@ export async function renderOrchestration(panel, socket) {
     state.detail = d;
     renderToolbar2(d);
     renderColumns(d);
+    updateRunIndicator(d);
     if (state.drawer) openDrawer(state.drawer);
-    if (d.running) {
-      state.pollTimer = setInterval(async () => {
-        if (!panel.contains(body)) { stopPoll(); return; }
-        try {
-          const nd = await api(`/api/boards/${state.current}`);
-          state.detail = nd; renderToolbar2(nd); renderColumns(nd);
+    // Poll continuously while this board is on screen (NOT gated on d.running):
+    // a freshly-dispatched run isn't "running" yet — no Doing card or event —
+    // so gating missed the card transitioning to Doing, leaving it visually
+    // stuck in To-do. Re-render only when the board actually changed, to avoid
+    // disrupting scroll/drag/typing.
+    state.sig = boardSig(d);
+    state.wasRunning = !!d.running;
+    state.pollTimer = setInterval(async () => {
+      if (!panel.contains(body)) { stopPoll(); return; }
+      try {
+        const nd = await api(`/api/boards/${state.current}`);
+        const sig = boardSig(nd);
+        if (sig !== state.sig) {
+          state.sig = sig; state.detail = nd;
+          renderToolbar2(nd); renderColumns(nd);
           if (state.drawer) openDrawer(state.drawer);
-          if (!nd.running) { stopPoll(); loadBoards().then(drawBar); }
-        } catch { stopPoll(); }
-      }, 1500);
-    }
+        }
+        updateRunIndicator(nd);
+        if (state.wasRunning && !nd.running) loadBoards().then(drawBar); // refresh counts when a run ends
+        state.wasRunning = !!nd.running;
+      } catch { /* transient — keep polling */ }
+    }, 2000);
   }
+
+  // A cheap fingerprint of the board's live state — drives change-detection so the
+  // poll only re-renders columns when something actually moved.
+  function boardSig(d) {
+    return `${d.running}|` + (d.cards || [])
+      .map((c) => `${c.id}:${c.status}:${(c.result || "").length}:${(c.runs || []).length}`)
+      .join(",");
+  }
+
+  // A fixed bottom-right "board is executing" indicator (global, animated). Shown
+  // whenever the current board is running; named which card(s) are executing.
+  function updateRunIndicator(d) {
+    const all = document.querySelectorAll(".orch-run-indicator");
+    if (!d || !d.running) { all.forEach((e) => e.remove()); return; }
+    // Singleton: keep the first, drop any strays (guards against double-append).
+    all.forEach((e, i) => { if (i > 0) e.remove(); });
+    const cards = (d.cards || []).filter((c) => c.status !== "archived");
+    const done = cards.filter((c) => c.status === "done").length;
+    const doing = cards.filter((c) => c.status === "doing").map((c) => c.id);
+    let ind = all[0];
+    if (!ind) { ind = el("div", "orch-run-indicator"); document.body.append(ind); }
+    ind.replaceChildren(
+      el("span", "orch-run-spin", "⟳"),
+      el("span", "orch-run-text",
+        `Board "${state.current}" running · ${done}/${cards.length} done` +
+        (doing.length ? ` · ${doing.join(", ")} executing` : " · dispatching…")),
+    );
+  }
+  function removeRunIndicator() { document.querySelectorAll(".orch-run-indicator").forEach((e) => e.remove()); }
 
   let toolbar2 = null;
   function renderToolbar2(d) {
@@ -1692,6 +1733,7 @@ export async function renderOrchestration(panel, socket) {
 
   function cardTile(c, allCards) {
     const tile = el("div", "board-card");
+    if (c.status === "doing") tile.classList.add("doing"); // executing → highlighted border
     tile.draggable = true;
     tile.addEventListener("dragstart", (e) => { e.dataTransfer.setData("text/card", c.id); e.dataTransfer.effectAllowed = "move"; });
     tile.addEventListener("click", () => { state.drawer = c.id; openDrawer(c.id); });
