@@ -506,6 +506,17 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
 }
 
 fn draw(f: &mut Frame, app: &App) {
+    // The agent-selector HUD (opened at startup with no agent, or via Ctrl+P) is
+    // a full-screen takeover: draw ONLY the banner + selector. Rendering the chat
+    // layout underneath would also paint the transcript's own logo (when empty),
+    // so the banner logo and the transcript logo both show — the "logo twice"
+    // bug — and on a non-empty transcript the banner overpaints the messages.
+    if let Some(sel) = app.selector {
+        let body = draw_banner(f, f.area());
+        draw_agent_selector(f, body, app, sel);
+        return;
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -523,12 +534,6 @@ fn draw(f: &mut Frame, app: &App) {
 
     if app.show_slash {
         draw_slash_popup(f, chunks[2], app);
-    }
-    if let Some(sel) = app.selector {
-        // Show the gradient logo above the selector when there's room; the
-        // selector then centers in the space below it.
-        let body = draw_banner(f, f.area());
-        draw_agent_selector(f, body, app, sel);
     }
     if let Some(p) = &app.picker {
         draw_picker(f, f.area(), p);
