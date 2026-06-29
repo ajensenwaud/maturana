@@ -807,7 +807,14 @@ impl ChatTargetArgs {
 /// running delivery thread sends it. Best-effort — a failed post never stops the
 /// run, and a plain CLI run (chat = None) is a no-op.
 fn post_chat(home: &MaturanaHome, chat: Option<&ChatTarget>, text: &str) {
-    let Some(c) = chat else { return };
+    let _ = post_chat_result(home, chat, text);
+}
+
+/// Like [`post_chat`] but surfaces whether the outbox write actually succeeded, so
+/// a caller that reports delivery (card result delivery) doesn't claim success when
+/// the write silently failed. `Ok(false)` = no chat target (nothing to do).
+fn post_chat_result(home: &MaturanaHome, chat: Option<&ChatTarget>, text: &str) -> anyhow::Result<bool> {
+    let Some(c) = chat else { return Ok(false) };
     let paths = maturana_core::session_db::session_paths(&home.agent_dir(&c.agent_id), &c.session_id);
     // write_outbound opens the db with create, but won't make its parent dir — a
     // real chat's session dir already exists, but ensure it so a status post is
@@ -816,7 +823,7 @@ fn post_chat(home: &MaturanaHome, chat: Option<&ChatTarget>, text: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
     let body = serde_json::json!({ "text": text }).to_string();
-    let _ = maturana_core::session_db::write_outbound(
+    maturana_core::session_db::write_outbound(
         &paths,
         None,
         "chat",
@@ -824,7 +831,8 @@ fn post_chat(home: &MaturanaHome, chat: Option<&ChatTarget>, text: &str) {
         &c.platform_id,
         c.thread_id.as_deref(),
         &body,
-    );
+    )?;
+    Ok(true)
 }
 
 /// Where a finished card's result should be delivered. Resolved to a concrete
@@ -924,6 +932,13 @@ fn resolve_channel_delivery(
 /// and any future channel go through one path. Failures are logged loudly and
 /// never fail the run; the result is always on the board regardless.
 fn deliver_card_result(home: &MaturanaHome, worker_agent: &str, deliver: &str, text: &str) {
+    // The worker produced nothing worth sending (empty, or the silence sentinel a
+    // self-check emits) — never queue an empty/sentinel "result" as if it were one.
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == crate::proactive::SILENCE_SENTINEL {
+        eprintln!("  deliver: card produced no deliverable content — nothing sent");
+        return;
+    }
     match resolve_channel_delivery(home, deliver, Some(worker_agent)) {
         Ok(target) => {
             let chat = ChatTarget {
@@ -933,11 +948,19 @@ fn deliver_card_result(home: &MaturanaHome, worker_agent: &str, deliver: &str, t
                 agent_id: target.agent_id.clone(),
                 session_id: target.session_id.clone(),
             };
-            post_chat(home, Some(&chat), text);
-            println!(
-                "  -> delivered card result via {} to {} ({})",
-                target.channel, target.agent_id, target.platform_id
-            );
+            // Honest reporting: only claim the result reached the bridge if the
+            // outbox write actually succeeded. The bridge then performs the send.
+            match post_chat_result(home, Some(&chat), text) {
+                Ok(true) => println!(
+                    "  -> queued result for delivery via {} to {} ({}); the bridge will send it",
+                    target.channel, target.agent_id, target.platform_id
+                ),
+                Ok(false) => eprintln!("  deliver: no chat target resolved — result kept on the board only"),
+                Err(error) => eprintln!(
+                    "  deliver: FAILED to write result to {}'s outbox ({error:#}) — result kept on the board only",
+                    target.agent_id
+                ),
+            }
         }
         Err(reason) => {
             eprintln!("  deliver: {reason} — result kept on the board only");
