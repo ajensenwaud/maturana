@@ -1424,11 +1424,24 @@ function cardPill(st) {
 
 export async function renderOrchestration(panel, socket) {
   const wrap = section("Orchestration");
-  wrap.append(desc("Define a board of cards — each a task with an assignee and dependencies — then run it across your agents. Durable: cards persist, an interrupted run is reclaimed, every card runs in its assignee's own VM over A2A, and cards coordinate only through their results (no shared state). Drag cards between columns; click a card to open it. Run now, on a schedule, or by trigger (POST /api/boards/:name/run)."));
+  wrap.append(desc("Break a job into cards — each a task for one agent — give them assignees and dependencies, then Run. Cards run in parallel across your agents as soon as their dependencies finish; click a card to edit it or read its result."));
+  // Legend: what the columns mean. This is the single biggest source of
+  // confusion — you author cards in Triage/To do; the runner owns Doing/Done/
+  // Blocked while a Run is in progress (so dragging there is rarely what you want).
+  const legend = el("div", "orch-legend");
+  const lg = (label, rest) => { const s = el("span"); s.append(el("b", null, label), document.createTextNode(" " + rest)); return s; };
+  legend.append(
+    lg("Triage", "rough ideas — use ⚗ Decompose / ✨ Specify to flesh out"),
+    lg("To do", "ready to run"),
+    lg("Doing · Done · Blocked", "set by the runner during a Run"),
+  );
+  const keys = el("span", "orch-legend-keys");
+  keys.textContent = "card badges:  p# priority · after deps · goal judge-loop · ⟳ runs · 📎 files";
+  legend.append(keys);
   const bar = el("div", "orch-bar");
   const filters = el("div", "orch-filters");
   const body = el("div");
-  wrap.append(bar, filters, body);
+  wrap.append(legend, bar, filters, body);
   panel.replaceChildren(wrap);
 
   const state = {
@@ -1548,20 +1561,33 @@ export async function renderOrchestration(panel, socket) {
 
   let toolbar2 = null;
   function renderToolbar2(d) {
-    if (!toolbar2) { toolbar2 = el("div", "row-actions"); }
+    if (!toolbar2) { toolbar2 = el("div", "row-actions orch-runbar"); }
     toolbar2.replaceChildren();
-    const runBtn = button(d.running ? "running…" : "▶ Run board", async () => {
+    const cards = (d.cards || []).filter((c) => c.status !== "archived");
+    const total = cards.length;
+    const done = cards.filter((c) => c.status === "done").length;
+    const doing = cards.filter((c) => c.status === "doing");
+    const runBtn = button(d.running ? `running · ${done}/${total}` : "▶ Run board", async () => {
       try { await api(`/api/boards/${state.current}/run`, { method: "POST" }); toast("dispatching…", "ok"); drawBoard(); }
       catch (e) { toast(String(e), "bad"); }
     });
     if (d.running) runBtn.disabled = true;
     toolbar2.append(runBtn);
-    toolbar2.append(button("Reset", async () => {
-      if (!(await confirmDialog({ title: "Reset board", message: "Reset all cards to todo (drops prior results)?" }))) return;
+    // Live progress: which cards are running, or a static done/total when idle.
+    if (d.running && doing.length) {
+      toolbar2.append(el("span", "orch-running", `▷ ${doing.map((c) => `${c.id} @${c.assignee || "default"}`).join(", ")}`));
+    } else if (d.running) {
+      toolbar2.append(el("span", "orch-running", "dispatching…"));
+    } else if (total) {
+      toolbar2.append(el("span", "panel-desc", `${done}/${total} done`));
+    }
+    // Reset is destructive (wipes results) — pushed to the far right, away from Run.
+    toolbar2.append(el("span", "orch-spacer"));
+    toolbar2.append(button("↺ Reset (drops results)", async () => {
+      if (!(await confirmDialog({ title: "Reset board", message: "Set every card back to 'to do' and drop all prior results? This can't be undone.", danger: true, confirmLabel: "Reset" }))) return;
       try { await api(`/api/boards/${state.current}/reset`, { method: "POST" }); toast("reset", "ok"); drawBoard(); }
       catch (e) { toast(String(e), "bad"); }
-    }));
-    if (d.running) toolbar2.append(el("span", "chat-responding", "running…"));
+    }, true));
     if (!body.contains(toolbar2)) body.replaceChildren(toolbar2);
   }
 
@@ -1645,16 +1671,16 @@ export async function renderOrchestration(panel, socket) {
   function cardFields(card, allCards) {
     const depOpts = (allCards || []).filter((x) => !card || x.id !== card.id).map((x) => ({ value: x.id, label: `${x.id} ${x.title.slice(0, 24)}` }));
     return [
-      { name: "title", label: "Title", type: "text", value: card?.title, placeholder: "what to do", required: true },
-      { name: "detail", label: "Detail / acceptance criteria", type: "textarea", value: card?.detail, rows: 4 },
+      { name: "title", label: "Title", type: "text", value: card?.title, placeholder: "what the agent should do", required: true },
+      { name: "detail", label: "Detail / acceptance criteria", type: "textarea", value: card?.detail, rows: 4, hint: "the full instructions + how to tell it's done (markdown)" },
       { name: "assignee", label: "Assignee", type: "select", value: card?.assignee || "", options: assigneeOptions(false) },
-      { name: "deps", label: "Depends on", type: "multiselect", value: card?.deps || [], options: depOpts },
-      { name: "priority", label: "Priority (higher runs first)", type: "number", value: card?.priority ?? 0 },
-      { name: "max_retries", label: "Auto-retries on failure", type: "number", value: card?.max_retries ?? 0 },
-      { name: "goal", label: "Goal mode (re-run with an acceptance judge until it passes)", type: "checkbox", value: card?.goal || false },
-      { name: "goal_max_turns", label: "Goal max rounds (0 = default 5)", type: "number", value: card?.goal_max_turns ?? 0 },
-      { name: "tenant", label: "Tenant (optional tag)", type: "text", value: card?.tenant || "" },
-      { name: "scheduled_at", label: "Don't run before (RFC3339, optional)", type: "text", value: card?.scheduled_at || "", placeholder: "2026-07-01T09:00:00Z" },
+      { name: "deps", label: "Depends on", type: "multiselect", value: card?.deps || [], options: depOpts, hint: "this card waits until these finish; their results are fed in" },
+      { name: "priority", label: "Priority (higher runs first)", type: "number", value: card?.priority ?? 0, advanced: true },
+      { name: "max_retries", label: "Auto-retries on failure", type: "number", value: card?.max_retries ?? 0, advanced: true },
+      { name: "goal", label: "Goal mode (re-run with an acceptance judge until it passes)", type: "checkbox", value: card?.goal || false, advanced: true },
+      { name: "goal_max_turns", label: "Goal max rounds (0 = default 5)", type: "number", value: card?.goal_max_turns ?? 0, advanced: true },
+      { name: "tenant", label: "Tenant (optional tag)", type: "text", value: card?.tenant || "", advanced: true },
+      { name: "scheduled_at", label: "Don't run before (RFC3339, optional)", type: "text", value: card?.scheduled_at || "", placeholder: "2026-07-01T09:00:00Z", advanced: true },
     ];
   }
 
@@ -1729,7 +1755,9 @@ export async function renderOrchestration(panel, socket) {
     if (c.block_kind && c.status === "blocked") bits.push(`blocked: ${c.block_kind}`);
     meta.textContent = bits.join(" · ");
     dr.append(meta);
+    dr.append(el("div", "board-drawer-sub", "Task"));
     if (c.detail) { const d = el("div", "board-drawer-detail"); d.innerHTML = renderMd(c.detail); dr.append(d); }
+    else dr.append(el("div", "panel-desc", "No detail yet — “Edit” to describe what to do and how to tell it's done."));
 
     // actions
     const acts = el("div", "row-actions");

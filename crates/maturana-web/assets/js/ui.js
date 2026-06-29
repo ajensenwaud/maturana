@@ -30,6 +30,7 @@ export function formDialog({ title, sub, fields = [], submitLabel = "Save", onSu
 
   const form = el("form", "modal-form");
   const inputs = {};
+  const advancedRows = [];
   for (const f of fields) {
     const row = el("label", "modal-field");
     if (f.type !== "checkbox") row.append(el("span", "modal-label", f.label));
@@ -68,7 +69,17 @@ export function formDialog({ title, sub, fields = [], submitLabel = "Save", onSu
     inputs[f.name] = { input, type: f.type, required: f.required };
     if (f.type !== "checkbox") row.append(input);
     if (f.hint) row.append(el("span", "modal-hint", f.hint));
-    form.append(row);
+    if (f.advanced) advancedRows.push(row); else form.append(row);
+  }
+
+  // Optional fields flagged `advanced: true` fold into a collapsed section so the
+  // form leads with the essentials instead of a wall of power-user knobs.
+  if (advancedRows.length) {
+    const det = el("details", "modal-advanced");
+    const sum = document.createElement("summary");
+    sum.textContent = `Advanced (${advancedRows.length})`;
+    det.append(sum, ...advancedRows);
+    form.append(det);
   }
 
   const errLine = el("div", "modal-err");
