@@ -827,6 +827,35 @@ fn post_chat(home: &MaturanaHome, chat: Option<&ChatTarget>, text: &str) {
     );
 }
 
+/// Best-effort host-side delivery of a finished card's result to a channel, via
+/// the assignee agent's already-configured bridge. The agent never sends it
+/// itself (no bot token in the task VM); the host posts the result to the
+/// agent's paired chat. Failures are logged and never fail the run — the result
+/// is always collected on the board regardless.
+fn deliver_card_result(home: &MaturanaHome, agent_id: &str, channel: &str, text: &str) {
+    let target = match channel.trim().to_ascii_lowercase().as_str() {
+        "telegram" => match crate::channels::current_paired_telegram_chat_id(home, agent_id) {
+            Some(chat_id) => ChatTarget {
+                channel: "telegram".to_string(),
+                platform_id: chat_id.to_string(),
+                thread_id: None,
+                agent_id: agent_id.to_string(),
+                session_id: format!("{agent_id}-main"),
+            },
+            None => {
+                eprintln!("  deliver: {agent_id} has no paired Telegram chat — result kept on the board only");
+                return;
+            }
+        },
+        other => {
+            eprintln!("  deliver: channel '{other}' not supported yet — result kept on the board only");
+            return;
+        }
+    };
+    post_chat(home, Some(&target), text);
+    println!("  -> delivered card result to {agent_id} via {channel}");
+}
+
 /// Like [`post_chat`], but attaches host-side files; the channel's delivery sink
 /// uploads them where supported (Telegram sendDocument) and otherwise names them.
 /// Non-existent paths are dropped; if none remain it degrades to a text post.
@@ -2542,6 +2571,12 @@ fn run_board_inner(
                     board.record_run(&id, agent.clone(), "completed", &note, started_at);
                     println!("  <- card {id} done");
                     log_event(home, &board_name, "done", Some(&id), "");
+                    // Optional host-side delivery of the result to a channel.
+                    if let (Some(channel), Some(a)) =
+                        (board.card(&id).and_then(|c| c.deliver.clone()), agent.as_deref())
+                    {
+                        deliver_card_result(home, a, &channel, &note);
+                    }
                 }
                 Err(error) => {
                     // AUTO-RETRY: a failed card goes back to Todo until it has used
@@ -2767,6 +2802,11 @@ fn build_card_task(
     let mut body = format!("Task: {}\n", card.title);
     if !card.detail.is_empty() {
         body.push_str(&format!("\n{}\n", card.detail));
+    }
+    if card.deliver.is_some() {
+        body.push_str(
+            "\n[Delivery is handled for you: produce the finished result as your reply and the host will deliver it to the requested channel. Do NOT attempt to send it yourself.]\n",
+        );
     }
     let ctx = board.dependency_context(card);
     if !ctx.trim().is_empty() {

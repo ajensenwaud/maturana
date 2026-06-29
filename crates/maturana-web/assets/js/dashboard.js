@@ -1702,6 +1702,7 @@ export async function renderOrchestration(panel, socket) {
     meta.append(el("span", "board-card-asg", `@${c.assignee || "default"}`));
     if (c.priority) meta.append(badge(`p${c.priority}`, "dim"));
     if (c.goal) meta.append(badge("goal", "warn"));
+    if (c.deliver) meta.append(badge(`→${c.deliver}`, "good"));
     if (c.block_kind && c.status === "blocked") meta.append(badge(c.block_kind, "bad"));
     if (c.deps && c.deps.length) meta.append(el("span", "board-card-dep", `after ${c.deps.join(",")}`));
     tile.append(meta);
@@ -1727,6 +1728,9 @@ export async function renderOrchestration(panel, socket) {
       { name: "goal_max_turns", label: "Goal max rounds (0 = default 5)", type: "number", value: card?.goal_max_turns ?? 0, advanced: true },
       { name: "tenant", label: "Tenant (optional tag)", type: "text", value: card?.tenant || "", advanced: true },
       { name: "scheduled_at", label: "Don't run before (optional)", type: "datetime", value: card?.scheduled_at || "", advanced: true },
+      { name: "deliver", label: "Deliver result to", type: "select", value: card?.deliver || "", advanced: true,
+        options: [{ value: "", label: "(don't deliver — collect on the board)" }, { value: "telegram", label: "Telegram (the agent's chat)" }],
+        hint: "when the card finishes, the host posts its result to the agent's paired chat" },
     ];
   }
 
@@ -1741,6 +1745,7 @@ export async function renderOrchestration(panel, socket) {
           priority: Number(v.priority) || 0, max_retries: Number(v.max_retries) || 0,
           goal: !!v.goal, goal_max_turns: Number(v.goal_max_turns) || 0,
           tenant: v.tenant || null, scheduled_at: v.scheduled_at || null,
+          deliver: v.deliver || null,
           triage: forceStatus === "triage",
         };
         await api(`/api/boards/${state.current}/cards`, { method: "POST", body: JSON.stringify(body) });
@@ -1763,6 +1768,7 @@ export async function renderOrchestration(panel, socket) {
           priority: Number(v.priority) || 0, max_retries: Number(v.max_retries) || 0,
           goal: !!v.goal, goal_max_turns: Number(v.goal_max_turns) || 0,
           tenant: v.tenant || null, scheduled_at: v.scheduled_at || null,
+          deliver: v.deliver || "",
         };
         await api(`/api/boards/${state.current}/cards/${card.id}`, { method: "PUT", body: JSON.stringify(body) });
         drawBoard(); toast("saved", "ok");
@@ -1797,6 +1803,7 @@ export async function renderOrchestration(panel, socket) {
     if (c.tenant) bits.push(`tenant ${c.tenant}`);
     if (c.max_retries) bits.push(`retries ${c.max_retries}`);
     if (c.goal) bits.push(`goal (≤${c.goal_max_turns || 5})`);
+    if (c.deliver) bits.push(`delivers result → ${c.deliver}`);
     if (c.scheduled_at) bits.push(`scheduled ${c.scheduled_at}`);
     if (c.block_kind && c.status === "blocked") bits.push(`blocked: ${c.block_kind}`);
     meta.textContent = bits.join(" · ");

@@ -7019,6 +7019,36 @@ pub(crate) struct DispatchHandle {
 ///     orchestrator loop on the host and can NEVER leak into a user's chat.
 /// The orchestrator loop charges the turn budget before calling this, so every
 /// turn is paid for before it is sent.
+/// Prepend the agent's identity + memory to a dispatched task. Without this a
+/// board card (or any A2A task) is a context-free turn: it doesn't know who it
+/// is, what it can do, or who its operator is — which is why a card asked to
+/// "send this to Anders" couldn't tell who Anders was. Bounded, best-effort
+/// reads of the same files the channel prompt uses.
+fn build_dispatch_prompt(home: &MaturanaHome, agent_id: &str, task: &str) -> String {
+    let agent_dir = home.agent_dir(agent_id);
+    let head = |rel: &str, cap: usize| -> String {
+        std::fs::read_to_string(agent_dir.join(rel))
+            .map(|s| s.chars().take(cap).collect::<String>())
+            .unwrap_or_default()
+    };
+    let identity = head("AGENTS.md", 4000);
+    let memory = head("memory/MEMORY.md", 4000);
+    let mut out = String::new();
+    if !identity.trim().is_empty() {
+        out.push_str("--- WHO YOU ARE ---\n");
+        out.push_str(identity.trim());
+        out.push_str("\n\n");
+    }
+    if !memory.trim().is_empty() {
+        out.push_str("--- YOUR MEMORY (operator, contacts, context) ---\n");
+        out.push_str(memory.trim());
+        out.push_str("\n\n");
+    }
+    out.push_str("--- TASK ---\n");
+    out.push_str(task);
+    out
+}
+
 pub(crate) fn enqueue_dispatch_turn(
     home: &MaturanaHome,
     agent_id: &str,
@@ -7031,7 +7061,7 @@ pub(crate) fn enqueue_dispatch_turn(
     ensure_session(&paths)?;
     let content = serde_json::json!({
         "text": framed_task,
-        "prompt": framed_task,
+        "prompt": build_dispatch_prompt(home, agent_id, framed_task),
         "model": model,
         "reasoning": serde_json::Value::Null,
     });
