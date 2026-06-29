@@ -3,6 +3,7 @@
 // the shared WebSocket (agents/runtime topics + session_outbound).
 
 import { marked } from "/assets/vendor/marked/marked.esm.js";
+import { formDialog, confirmDialog, toast } from "/assets/js/ui.js";
 
 async function api(path, options = {}) {
   const headers = { ...(options.headers ?? {}) };
@@ -27,7 +28,7 @@ function el(tag, className, text) {
 
 function section(title) {
   const wrap = el("div", "dash-section");
-  wrap.append(el("div", "label dash-title", title));
+  wrap.append(el("div", "dash-title", title));
   return wrap;
 }
 
@@ -131,8 +132,8 @@ export async function renderOverview(panel) {
       ? Math.round(100 * (1 - host.mem_available_bytes / host.mem_total_bytes)) : null;
     cards.replaceChildren(
       card("agents", c.agents ?? 0),
-      card("running", c.running ?? 0, (c.running ? "good" : "")),
-      card("idle", c.idle ?? 0),
+      card("up", c.up ?? 0, ((c.up ?? 0) > 0 ? "good" : "bad")),
+      card("busy", c.busy ?? 0),
       card("with graph", c.graphs ?? 0),
       card("plane", o.plane?.up ? "up" : "down", o.plane?.up ? "good" : "bad"),
       card("load", (host.loadavg?.[0] ?? 0).toFixed(2)),
@@ -141,12 +142,12 @@ export async function renderOverview(panel) {
 
     const agents = (o.agents || []);
     const rows = agents.map((a) => {
-      const st = a.worker_status?.status || "unknown";
+      const st = a.status || a.worker_status?.status || "unknown";
       const doing = a.worker_status?.message || WORKER_TEXT[st] || "—";
       return [
         el("strong", null, a.agent_id),
         a.harness || "—",
-        statusPill(st),
+        statusPill(st, a.live),
         doing,
         a.knowledge_graph ? `graph:${a.graph_name}` : "—",
       ];
@@ -167,11 +168,19 @@ export async function renderOverview(panel) {
   }, 5000);
 }
 
-function statusPill(status) {
-  const kind = status === "running" ? "good"
-    : status === "error" ? "bad"
-    : status === "idle" ? "dim" : "";
-  return badge(status, kind);
+// Liveness pill. `live` (fresh heartbeat) is what decides up vs offline; the
+// raw status only distinguishes busy (a turn in flight) from idle. The guest
+// worker never writes "running", so we synthesize the human labels here:
+//   error → "error" (red) · stale/no heartbeat → "offline" (dim)
+//   claimed → "busy" (green) · idle+fresh → "up" (green).
+// `live` is optional so legacy callers (Agents view) that pass only a status
+// still get a sensible pill.
+function statusPill(status, live) {
+  if (status === "error") return badge("error", "bad");
+  if (live === false) return badge(status ? `offline (${status})` : "offline", "dim");
+  if (status === "claimed") return badge("busy", "good");
+  if (status === "idle" || live === true) return badge("up", "good");
+  return badge(status || "—", "dim");
 }
 
 // ---- system (observability) ----
@@ -218,7 +227,7 @@ export async function renderSystem(panel, socket) {
   opsWrap.append(desc("Operate the plane: restart/stop/start the supervisor, or snapshot the config to a timestamped backup."));
   const opsOut = el("div");
   const gw = (action, danger) => button(`${action} plane`, async () => {
-    if (action !== "restart" && !confirm(`${action} the supervised plane?`)) return;
+    if (action !== "restart" && !(await confirmDialog({ title: "Gateway", message: `${action} the supervised plane?`, danger: true, confirmLabel: action }))) return;
     opsOut.replaceChildren(el("div", "label", `[ ${action}… ]`));
     try {
       await api(`/api/ops/gateway/${action}`, { method: "POST" });
@@ -283,23 +292,58 @@ export async function renderSystem(panel, socket) {
 
   // Logs (source dropdown + optional auto-tail).
   const logWrap = section("Logs");
-  logWrap.append(desc("Tail the plane/web/fleet units or any agent's egress audit log. Toggle auto-tail to follow live."));
+  logWrap.append(desc("Tail the plane/web/fleet units or any agent's egress audit log. JSON lines render as readable rows — time, action, message; toggle Raw for the verbatim text, auto-tail to follow live."));
   const controls = el("div", "dash-actions");
   const sourceSel = el("select", "model-input");
   const linesInput = el("input", "model-input");
   linesInput.type = "number";
   linesInput.value = "200";
   linesInput.style.width = "90px";
+  const logView = el("div", "log-view");
   const logPre = el("pre", "dash-json");
-  logPre.style.maxHeight = "42vh";
-  logPre.style.overflow = "auto";
+  logPre.style.display = "none";
+  // Parse each line as JSON → a readable row; non-JSON (journalctl) passes through.
+  const renderLogLines = (text) => {
+    logView.replaceChildren();
+    const lines = (text || "").split("\n").filter((l) => l.trim());
+    if (!lines.length) { logView.append(el("div", "panel-desc", "(empty)")); return; }
+    for (const line of lines) {
+      let obj = null;
+      try { obj = JSON.parse(line); } catch {}
+      if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+        const row = el("div", "log-row");
+        const ts = obj.at || obj.timestamp || obj.time || "";
+        const tstr = typeof ts === "string" && ts.length >= 19 ? ts.slice(11, 19) : String(ts).slice(0, 8);
+        row.append(el("span", "log-time", tstr));
+        const action = obj.action || obj.level || obj.kind || "";
+        const bad = /deny|denied|error|fail|block|warn/i.test(`${action} ${obj.reason || ""}`);
+        if (action) row.append(badge(String(action), bad ? "bad" : "good"));
+        const msg = obj.message || obj.msg || [obj.method, obj.host, obj.target].filter(Boolean).join(" ") || "";
+        row.append(el("span", "log-msg", msg));
+        const skip = new Set(["at", "timestamp", "time", "action", "level", "kind", "message", "msg", "method", "host", "target"]);
+        const extra = Object.entries(obj)
+          .filter(([k, v]) => !skip.has(k) && v != null && v !== "" && typeof v !== "object")
+          .map(([k, v]) => `${k}=${v}`)
+          .join("  ");
+        if (extra) row.append(el("span", "log-extra", extra));
+        logView.append(row);
+      } else {
+        logView.append(el("div", "log-row log-plain", line));
+      }
+    }
+    logView.scrollTop = logView.scrollHeight;
+  };
+  let rawOn = false;
+  let lastText = "";
   const loadLog = async () => {
     try {
       const d = await api(`/api/system/logs?source=${encodeURIComponent(sourceSel.value)}&lines=${encodeURIComponent(linesInput.value || 200)}`);
-      logPre.textContent = d.text || "(empty)";
+      lastText = d.text || "";
+      renderLogLines(lastText);
+      logPre.textContent = lastText || "(empty)";
       logPre.scrollTop = logPre.scrollHeight;
     } catch (error) {
-      logPre.textContent = String(error);
+      logView.replaceChildren(el("div", "status-bad", String(error)));
     }
   };
   try {
@@ -315,12 +359,21 @@ export async function renderSystem(panel, socket) {
     sourceSel.append(o);
   }
   sourceSel.addEventListener("change", loadLog);
+  const rawChk = el("input");
+  rawChk.type = "checkbox";
+  const rawLabel = el("label", "label");
+  rawLabel.append(rawChk, document.createTextNode(" raw"));
+  rawChk.addEventListener("change", () => {
+    rawOn = rawChk.checked;
+    logPre.style.display = rawOn ? "" : "none";
+    logView.style.display = rawOn ? "none" : "";
+  });
   const tailChk = el("input");
   tailChk.type = "checkbox";
   const tailLabel = el("label", "label");
   tailLabel.append(tailChk, document.createTextNode(" auto-tail"));
-  controls.append(sourceSel, linesInput, button("refresh", loadLog), tailLabel);
-  logWrap.append(controls, logPre);
+  controls.append(sourceSel, linesInput, button("refresh", loadLog), rawLabel, tailLabel);
+  logWrap.append(controls, logView, logPre);
   await loadLog();
   const logTimer = setInterval(() => {
     if (!panel.contains(logWrap)) { clearInterval(logTimer); return; }
@@ -483,7 +536,7 @@ async function showAgent(detail, socket, agentId) {
     button("config", () => agentConfig(out, agentId)),
     button("edit spec", () => editSpec(out, agentId)),
     button("restart", async () => {
-      if (!confirm(`Restart ${agentId}? Relaunches its microVM from the baked image.`)) return;
+      if (!(await confirmDialog({ title: "Restart agent", message: `Restart ${agentId}? Relaunches its microVM from the baked image.`, confirmLabel: "Restart" }))) return;
       out.replaceChildren(el("div", "label", "[ restarting… this can take a moment ]"));
       try {
         const r = await api(`/api/agents/${agentId}/restart`, { method: "POST" });
@@ -493,7 +546,7 @@ async function showAgent(detail, socket, agentId) {
       }
     }),
     button("stop", async () => {
-      if (!confirm(`Stop ${agentId}?`)) return;
+      if (!(await confirmDialog({ title: "Stop agent", message: `Stop ${agentId}?`, danger: true, confirmLabel: "Stop" }))) return;
       try {
         await api(`/api/agents/${agentId}/stop`, { method: "POST" });
         out.replaceChildren(el("div", "status-ok", `[ stopped ${agentId} ]`));
@@ -709,7 +762,7 @@ export async function renderSessions(panel, socket) {
     el("span", "label", "days"),
     button("prune", async () => {
       const days = parseInt(pruneDays.value || "30", 10);
-      if (!confirm(`Delete sessions with no activity in ${days} days? This cannot be undone.`)) return;
+      if (!(await confirmDialog({ title: "Prune sessions", message: `Delete sessions with no activity in ${days} days? This cannot be undone.`, danger: true, confirmLabel: "Prune" }))) return;
       try {
         const r = await api("/api/sessions/prune", { method: "POST", body: JSON.stringify({ days }) });
         detail.replaceChildren(el("div", "status-ok", `[ pruned ${r.count} session(s) ]`));
@@ -736,7 +789,7 @@ async function exportSession(agentId, sessionId) {
     a.click();
     URL.revokeObjectURL(url);
   } catch (error) {
-    alert(String(error));
+    toast(String(error), "bad");
   }
 }
 
@@ -748,16 +801,18 @@ async function openSession(detail, socket, s) {
   head.append(
     title,
     button("continue in chat", () => window.cockpitOpenChat(agentId)),
-    button("rename", async () => {
-      const label = prompt("Session label (empty to clear):", s.label || "");
-      if (label === null) return;
-      try {
-        await api(`/api/sessions/${agentId}/${sessionId}/label`, { method: "PUT", body: JSON.stringify({ label }) });
-        s.label = label;
-        title.textContent = `${agentId} / ${label ? label + " · " : ""}${sessionId}`;
-      } catch (error) {
-        detail.append(el("div", "status-bad", String(error)));
-      }
+    button("rename", () => {
+      formDialog({
+        title: "Rename conversation",
+        sub: `${agentId} / ${sessionId}`,
+        fields: [{ name: "label", label: "Label (empty to clear)", type: "text", value: s.label || "" }],
+        submitLabel: "Save",
+        onSubmit: async (v) => {
+          await api(`/api/sessions/${agentId}/${sessionId}/label`, { method: "PUT", body: JSON.stringify({ label: v.label }) });
+          s.label = v.label;
+          title.textContent = `${agentId} / ${v.label ? v.label + " · " : ""}${sessionId}`;
+        },
+      });
     }),
   );
   const log = el("div", "session-log");
@@ -835,13 +890,20 @@ export async function renderGraph(panel) {
   queryRow.append(terms, button("query", runQuery));
 
   const uploadRow = el("div", "dash-actions");
-  const file = el("input");
+  const file = el("input", "file-input");
   file.type = "file";
+  file.id = "graph-file";
+  const pickLabel = el("label", "file-pick", "Choose file");
+  pickLabel.htmlFor = "graph-file";
+  const fileName = el("span", "file-name", "no file selected");
+  file.addEventListener("change", () => { fileName.textContent = file.files?.[0]?.name || "no file selected"; });
   uploadRow.append(
+    pickLabel,
     file,
+    fileName,
     button("ingest", async () => {
       const picked = file.files?.[0];
-      if (!picked) return;
+      if (!picked) { toast("Choose a file to ingest first", "bad"); return; }
       out.replaceChildren(el("div", "label", "[ ingesting… ]"));
       try {
         const data = await api("/api/graph/ingest", {
@@ -875,7 +937,7 @@ export async function renderPipelock(panel) {
     const rows = data.names.map((name) => [
       name,
       button("delete", async () => {
-        if (!confirm(`Delete secret ${name}?`)) return;
+        if (!(await confirmDialog({ title: "Delete secret", message: `Delete secret ${name}?`, danger: true, confirmLabel: "Delete" }))) return;
         await api(`/api/pipelock/secrets/${encodeURIComponent(name)}`, { method: "DELETE" });
         draw();
       }, true),
@@ -892,7 +954,7 @@ export async function renderPipelock(panel) {
   value.placeholder = "value (write-only)";
   const addOut = el("div");
   add.append(name, value, button("set", async () => {
-    if (!name.value.trim() || !value.value) return;
+    if (!name.value.trim() || !value.value) { toast("Name and value are both required", "bad"); return; }
     try {
       await api("/api/pipelock/secrets", {
         method: "POST",
@@ -917,45 +979,129 @@ export async function renderPipelock(panel) {
 // ---- tools / skills ----
 
 export async function renderTools(panel) {
+  // Tools = host-registered WASM modules an agent can call (sandboxed, no
+  // ambient authority). This page is about THOSE tools — the catalog, defining
+  // new ones, and wiring them to agents. Skills, MCP servers and capabilities
+  // have their own pages / live under Agents → config.
   const wrap = section("Tools");
-  wrap.append(desc("What each agent can actually do — its tools, skills, MCP servers, and opt-in capabilities, read from each agent's spec. Edit these per agent under Agents → config."));
-  const body = el("div", "label", "[ loading… ]");
+  wrap.append(desc("Host-registered WASM tools — sandboxed modules an agent can call over a stdin/stdout JSON contract. Define a tool below, then wire it to an agent."));
+  const body = el("div");
+  body.append(el("div", "panel-desc", "loading…"));
   wrap.append(body);
   panel.replaceChildren(wrap);
+
+  // 1) The catalog: what tools exist on this host.
+  let tools = [];
   try {
-    const agents = await api("/api/agents");
-    const details = await Promise.all(
-      agents.map((a) => api(`/api/agents/${a.agent_id}/detail`).catch(() => null)),
-    );
-    const rows = details.filter(Boolean).map((d) => [
-      el("strong", null, d.agent_id),
-      chipsOf(d.tools),
-      chipsOf(d.skills),
-      chipsOf(d.mcp_servers),
-      chipsOf(Object.entries(d.capabilities || {}).filter(([, v]) => v === true).map(([k]) => k)),
+    tools = (await api("/api/tools")) || [];
+    const rows = tools.map((t) => [
+      el("strong", null, t.name),
+      t.version,
+      t.description || "—",
+      capSummary(t.capabilities),
     ]);
     body.replaceChildren(
       rows.length
-        ? table(["agent", "tools", "skills", "MCP servers", "capabilities"], rows)
-        : el("div", "panel-desc", "no agents deployed"),
+        ? table(["tool", "version", "description", "capabilities"], rows)
+        : el("div", "panel-desc", "No tools registered yet — use “Define a tool” below."),
     );
   } catch (error) {
     body.replaceChildren(el("div", "status-bad", String(error)));
   }
 
-  // Host-side WASM tool registry, secondary.
-  const reg = section("WASM tool registry");
-  reg.append(desc("Host-registered WASM tools available to wire into an agent (maturana tool register)."));
+  // 2) Define a tool: upload a compiled .wasm + manifest → host registry.
+  const defWrap = section("Define a tool");
+  defWrap.append(desc("Register a compiled WebAssembly module as a tool. Declared capabilities are the ONLY authority it gets (none = pure compute); network is enforced by the egress proxy. Mirrors `maturana tool register`."));
+  defWrap.append(button("Define a tool…", () => openDefineTool(panel)));
+  panel.append(defWrap);
+
+  // 3) Wire a tool to an agent (adds it to spec.tools; effective on restart).
+  const enableWrap = section("Wire a tool to an agent");
+  enableWrap.append(desc("Adds a tool to the agent's spec.tools so the agent may call it. Takes effect on the agent's next restart."));
+  let agents = [];
+  try { agents = (await api("/api/agents")) || []; } catch {}
+  const enRow = el("div", "dash-actions");
+  const agentSel = el("select", "model-input");
+  for (const a of agents) { const o = el("option", null, a.agent_id); o.value = a.agent_id; agentSel.append(o); }
+  const toolSel = el("select", "model-input");
+  { const o = el("option", null, "— pick a registered tool —"); o.value = ""; toolSel.append(o); }
+  for (const t of tools) { const o = el("option", null, `${t.name} (v${t.version})`); o.value = t.name; toolSel.append(o); }
+  const toolInput = el("input", "model-input");
+  toolInput.placeholder = "or type a tool name";
+  toolSel.addEventListener("change", () => { if (toolSel.value) toolInput.value = toolSel.value; });
+  const enStatus = el("span", "panel-desc");
+  enRow.append(agentSel, toolSel, toolInput, button("wire", async () => {
+    const id = agentSel.value;
+    const tool = (toolInput.value || toolSel.value).trim();
+    if (!id || !tool) { toast("Pick an agent and a tool", "bad"); return; }
+    enStatus.textContent = "saving…";
+    try {
+      const cur = await api(`/api/agents/${id}/config?section=tools`);
+      const list = Array.isArray(cur.value) ? cur.value.slice() : [];
+      if (!list.includes(tool)) list.push(tool);
+      await api(`/api/agents/${id}/config`, { method: "PUT", body: JSON.stringify({ section: "tools", value: list }) });
+      enStatus.textContent = `wired "${tool}" to ${id} — applies on next restart`;
+      toolInput.value = "";
+      renderTools(panel);
+    } catch (e) { enStatus.textContent = ""; toast(String(e), "bad"); }
+  }), enStatus);
+  enableWrap.append(enRow);
+
+  // Which tools each agent currently has wired (tools only — not skills).
   try {
-    const tools = await api("/api/tools");
-    const rows = (tools ?? []).map((t) => [t.name, t.version, t.description]);
-    reg.append(rows.length
-      ? table(["name", "version", "description"], rows)
-      : el("div", "panel-desc", "none registered"));
-  } catch (error) {
-    reg.append(el("div", "status-bad", String(error)));
-  }
-  panel.append(reg);
+    const details = await Promise.all(agents.map((a) => api(`/api/agents/${a.agent_id}/detail`).catch(() => null)));
+    const rows = details.filter(Boolean).map((d) => [el("strong", null, d.agent_id), chipsOf(d.tools)]);
+    if (rows.length) enableWrap.append(table(["agent", "wired tools"], rows));
+  } catch {}
+  panel.append(enableWrap);
+}
+
+// One-line capabilities summary for a tool manifest.
+function capSummary(c) {
+  if (!c) return "pure compute";
+  const parts = [];
+  if (c.net && c.net.length) parts.push(`net: ${c.net.join(", ")}`);
+  if (c.fs_read && c.fs_read.length) parts.push(`read: ${c.fs_read.join(", ")}`);
+  if (c.fs_write && c.fs_write.length) parts.push(`write: ${c.fs_write.join(", ")}`);
+  if (c.env && c.env.length) parts.push(`env: ${c.env.join(", ")}`);
+  return parts.length ? parts.join(" · ") : "pure compute";
+}
+
+// Modal: define (register) a tool by uploading a compiled .wasm + manifest.
+function openDefineTool(panel) {
+  formDialog({
+    title: "Define a tool",
+    sub: "Upload a compiled WebAssembly module and declare what it may touch.",
+    fields: [
+      { name: "name", label: "Name", required: true, placeholder: "lowercase-dashes", hint: "lowercase letters, digits, dashes" },
+      { name: "version", label: "Version", value: "0.1.0" },
+      { name: "description", label: "Description", type: "textarea", rows: 2 },
+      { name: "wasm", label: "WASM module (.wasm)", type: "file", accept: ".wasm,application/wasm", required: true },
+      { name: "net", label: "Network hosts", placeholder: "api.example.com, other.com", hint: "comma-separated; enforced by the egress proxy" },
+      { name: "env", label: "Env var names", placeholder: "API_KEY", hint: "comma-separated; values passed through at call time" },
+      { name: "fs_read", label: "Readable dirs", placeholder: "/data", hint: "comma-separated host dirs" },
+      { name: "fs_write", label: "Writable dirs", placeholder: "/tmp/out", hint: "comma-separated host dirs" },
+    ],
+    submitLabel: "Register",
+    onSubmit: async (v) => {
+      if (!v.wasm) throw new Error("a .wasm module is required");
+      const params = new URLSearchParams();
+      params.set("name", v.name);
+      if (v.version) params.set("version", v.version);
+      if (v.description) params.set("description", v.description);
+      for (const k of ["net", "env", "fs_read", "fs_write"]) if (v[k]) params.set(k, v[k]);
+      const bytes = await v.wasm.arrayBuffer();
+      const res = await fetch(`/api/tools?${params.toString()}`, {
+        method: "POST",
+        headers: { "x-maturana-web": "1", "content-type": "application/wasm" },
+        body: bytes,
+      });
+      const payload = await res.json().catch(() => ({ ok: false, error: "bad json" }));
+      if (!payload.ok) throw new Error(payload.error || `http ${res.status}`);
+      toast(`Registered tool "${payload.data.name}" v${payload.data.version}`, "ok");
+      renderTools(panel);
+    },
+  });
 }
 
 // ---- egress (live governance) ----
@@ -1070,7 +1216,7 @@ export async function renderEgress(panel, socket) {
 
 export async function renderSkills(panel) {
   const wrap = section("Skills");
-  wrap.append(desc("Reusable procedures agents can load. View one, or define a new skill — it's written to skills/<name>/SKILL.md and becomes available to wire into an agent."));
+  wrap.append(desc("Skills are Markdown procedures (SKILL.md) the host's Codex console follows — operator-level playbooks for running Maturana, under skills/<name>. They are NOT pushed into agent VMs; an agent gets its own skills from its spec at launch."));
   const detail = el("div", "skill-view");
   const listBox = el("div");
 
@@ -1127,4 +1273,573 @@ export async function renderSkills(panel) {
   await draw();
   wrap.append(listBox);
   panel.replaceChildren(wrap, create, detail);
+}
+
+// ---- channels (lives everywhere) ----
+
+export async function renderChannels(panel) {
+  const wrap = section("Channels");
+  wrap.append(desc("Every chat surface each agent exposes — one agent, one memory, every surface. “live” means the supervisor is running that bridge right now."));
+  let rows = [];
+  try {
+    rows = await api("/api/channels");
+  } catch (e) {
+    wrap.append(el("div", "status-bad", String(e)));
+    panel.replaceChildren(wrap);
+    return;
+  }
+  const order = ["web", "tui", "telegram", "discord", "slack", "agentmail"];
+  const cell = (ch) => {
+    if (!ch || !ch.configured) return el("span", "panel-desc", "—");
+    const b = ch.live ? badge("live", "good") : badge("down", "warn");
+    if (ch.detail) b.title = ch.detail;
+    return b;
+  };
+  const trows = rows.map((r) => {
+    const byName = Object.fromEntries((r.channels || []).map((c) => [c.name, c]));
+    return [el("strong", null, r.agent_id), ...order.map((n) => cell(byName[n]))];
+  });
+  if (!trows.length) wrap.append(el("div", "panel-desc", "No agents."));
+  else wrap.append(table(["agent", ...order], trows));
+  panel.replaceChildren(wrap);
+}
+
+// ---- schedules (focused automation) ----
+
+export async function renderSchedules(panel) {
+  const wrap = section("Schedules");
+  wrap.append(desc("Recurring agent tasks the plane fires unattended — reports, backups, briefings. Same store as `maturana schedule`; cron is 5-field (min hour dom month dow)."));
+  const listBox = el("div");
+
+  async function draw() {
+    listBox.replaceChildren(el("div", "panel-desc", "loading…"));
+    let items = [];
+    try {
+      items = await api("/api/schedules");
+    } catch (e) {
+      listBox.replaceChildren(el("div", "status-bad", String(e)));
+      return;
+    }
+    if (!items.length) {
+      listBox.replaceChildren(el("div", "panel-desc", "No schedules yet — add one below."));
+      return;
+    }
+    const rows = items.map((s) => {
+      const toggle = button(s.enabled ? "disable" : "enable", async () => {
+        try { await api(`/api/schedules/${s.agent_id}/${s.id}/toggle`, { method: "POST" }); draw(); }
+        catch (e) { toast(String(e), "bad"); }
+      });
+      const del = button("delete", async () => {
+        if (!(await confirmDialog({ title: "Delete schedule", message: `Delete schedule “${s.name}”?`, danger: true, confirmLabel: "Delete" }))) return;
+        try { await api(`/api/schedules/${s.agent_id}/${s.id}`, { method: "DELETE" }); draw(); }
+        catch (e) { toast(String(e), "bad"); }
+      }, true);
+      const acts = el("div", "row-actions");
+      acts.append(toggle, del);
+      const lastRun = typeof s.last_run === "string" ? s.last_run : (s.last_run ? JSON.stringify(s.last_run) : "—");
+      const action = s.board ? `▶ board: ${s.board}` : (s.prompt || "").slice(0, 60);
+      return [
+        s.agent_id,
+        s.name,
+        el("code", null, s.cron),
+        s.channel || "—",
+        s.enabled ? badge("on", "good") : badge("off", "dim"),
+        action,
+        acts,
+      ];
+    });
+    listBox.replaceChildren(table(["agent", "name", "cron", "channel", "enabled", "prompt / board", "actions"], rows));
+  }
+
+  // ---- add card ----
+  const add = section("Add a schedule");
+  let agents = [];
+  try { agents = await api("/api/agents"); } catch { agents = []; }
+  const agentSel = el("select", "model-input");
+  for (const a of agents) {
+    const o = el("option", null, a.agent_id);
+    o.value = a.agent_id;
+    agentSel.append(o);
+  }
+  const nameIn = el("input", "model-input"); nameIn.placeholder = "name (e.g. morning-brief)";
+  const cronIn = el("input", "model-input"); cronIn.placeholder = "cron: 0 8 * * 1-5";
+  const promptIn = el("input", "model-input"); promptIn.placeholder = "prompt the agent runs";
+  const channelIn = el("input", "model-input"); channelIn.placeholder = "channel (optional, e.g. telegram)";
+  const boardIn = el("input", "model-input"); boardIn.placeholder = "or run a board (optional, board name)";
+  const addStatus = el("span", "panel-desc");
+  const addBtn = button("Add schedule", async () => {
+    const agent = agentSel.value;
+    if (!agent) { toast("Pick an agent for the schedule", "bad"); return; }
+    addStatus.textContent = "saving…";
+    try {
+      await api(`/api/schedules/${agent}`, {
+        method: "POST",
+        body: JSON.stringify({
+          name: nameIn.value.trim(),
+          cron: cronIn.value.trim(),
+          prompt: promptIn.value.trim(),
+          channel: channelIn.value.trim() || null,
+          board: boardIn.value.trim() || null,
+        }),
+      });
+      nameIn.value = ""; cronIn.value = ""; promptIn.value = ""; channelIn.value = ""; boardIn.value = "";
+      addStatus.textContent = "added";
+      draw();
+    } catch (e) { addStatus.textContent = ""; toast(String(e), "bad"); }
+  });
+  const addRow = el("div", "opt-grid");
+  for (const node of [agentSel, nameIn, cronIn, promptIn, channelIn, boardIn]) addRow.append(node);
+  add.append(addRow, el("div", "row-actions"));
+  add.lastChild.append(addBtn, addStatus);
+
+  await draw();
+  wrap.append(listBox);
+  panel.replaceChildren(wrap, add);
+}
+
+// ============================================================
+// Orchestration — durable, user-defined boards run across agents.
+// Board editor + live monitor: drag-drop columns, a full card drawer
+// (edit / comments / run history / attachments / decompose / specify),
+// per-column inline create, filters, multi-board. No native dialogs.
+// ============================================================
+
+const ORCH_ROLES = ["developer", "researcher", "reviewer", "coordinator", "synthesizer"];
+const ORCH_COLUMNS = [
+  ["triage", "Triage"],
+  ["todo", "To do"],
+  ["doing", "Doing"],
+  ["done", "Done"],
+  ["blocked", "Blocked"],
+];
+
+function cardPill(st) {
+  if (st === "done") return badge("done", "good");
+  if (st === "doing") return badge("doing", "warn");
+  if (st === "blocked") return badge("blocked", "bad");
+  if (st === "triage") return badge("triage", "dim");
+  if (st === "archived") return badge("archived", "dim");
+  return badge("todo", "dim");
+}
+
+export async function renderOrchestration(panel, socket) {
+  const wrap = section("Orchestration");
+  wrap.append(desc("Define a board of cards — each a task with an assignee and dependencies — then run it across your agents. Durable: cards persist, an interrupted run is reclaimed, every card runs in its assignee's own VM over A2A, and cards coordinate only through their results (no shared state). Drag cards between columns; click a card to open it. Run now, on a schedule, or by trigger (POST /api/boards/:name/run)."));
+  const bar = el("div", "orch-bar");
+  const filters = el("div", "orch-filters");
+  const body = el("div");
+  wrap.append(bar, filters, body);
+  panel.replaceChildren(wrap);
+
+  const state = {
+    boards: [],
+    current: null,
+    agents: [],
+    detail: null,
+    pollTimer: null,
+    drawer: null, // open card id
+    q: "",
+    assignee: "",
+    archived: false,
+  };
+
+  try { state.agents = await api("/api/agents"); } catch { state.agents = []; }
+
+  function assigneeOptions(includeAny) {
+    const opts = [];
+    if (includeAny) opts.push({ value: "", label: "(any assignee)" });
+    else opts.push({ value: "", label: "(default: developer)" });
+    for (const r of ORCH_ROLES) opts.push({ value: r, label: `role: ${r}` });
+    for (const a of state.agents) opts.push({ value: a.agent_id, label: a.agent_id });
+    return opts;
+  }
+
+  function stopPoll() { if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; } }
+  async function loadBoards() { try { state.boards = await api("/api/boards"); } catch { state.boards = []; } }
+
+  // ---------- toolbar ----------
+  function drawBar() {
+    bar.replaceChildren();
+    if (!state.current && state.boards.length) state.current = state.boards[0].name;
+    const sel = el("select", "model-input");
+    if (!state.boards.length) { const o = el("option", null, "(no boards yet)"); sel.append(o); }
+    for (const b of state.boards) {
+      const o = el("option", null, `${b.name}  (${b.done}/${b.total}${b.running ? " · running" : ""})`);
+      o.value = b.name;
+      if (b.name === state.current) o.selected = true;
+      sel.append(o);
+    }
+    sel.addEventListener("change", () => { state.current = sel.value; state.drawer = null; drawBoard(); });
+    bar.append(el("span", "panel-desc", "Board:"), sel);
+    bar.append(button("＋ New", () => {
+      formDialog({
+        title: "New board",
+        fields: [{ name: "name", label: "Board name", type: "text", placeholder: "letters, digits, - _", required: true }],
+        submitLabel: "Create",
+        onSubmit: async (v) => {
+          await api("/api/boards", { method: "POST", body: JSON.stringify({ name: v.name }) });
+          state.current = v.name; await loadBoards(); drawBar(); drawBoard(); toast("board created", "ok");
+        },
+      });
+    }));
+    if (state.current) {
+      bar.append(button("Rename", () => {
+        formDialog({
+          title: `Rename board "${state.current}"`,
+          fields: [{ name: "name", label: "New name", type: "text", value: state.current, required: true }],
+          submitLabel: "Rename",
+          onSubmit: async (v) => {
+            await api(`/api/boards/${state.current}/rename`, { method: "POST", body: JSON.stringify({ name: v.name }) });
+            state.current = v.name; await loadBoards(); drawBar(); drawBoard(); toast("renamed", "ok");
+          },
+        });
+      }));
+      bar.append(button("Delete", async () => {
+        if (!(await confirmDialog({ title: "Delete board", message: `Delete "${state.current}" and all its cards?`, danger: true, confirmLabel: "Delete" }))) return;
+        try { await api(`/api/boards/${state.current}`, { method: "DELETE" }); state.current = null; await loadBoards(); drawBar(); drawBoard(); toast("deleted", "ok"); }
+        catch (e) { toast(String(e), "bad"); }
+      }, true));
+    }
+  }
+
+  function drawFilters() {
+    filters.replaceChildren();
+    if (!state.current) return;
+    const q = el("input", "model-input orch-search"); q.placeholder = "filter cards…"; q.value = state.q;
+    q.addEventListener("input", () => { state.q = q.value.toLowerCase(); if (state.detail) renderColumns(state.detail); });
+    const asg = el("select", "model-input");
+    for (const o of assigneeOptions(true)) { const opt = el("option", null, o.label); opt.value = o.value; asg.append(opt); }
+    asg.value = state.assignee;
+    asg.addEventListener("change", () => { state.assignee = asg.value; if (state.detail) renderColumns(state.detail); });
+    const arch = el("label", "orch-toggle");
+    const cb = el("input"); cb.type = "checkbox"; cb.checked = state.archived;
+    cb.addEventListener("change", () => { state.archived = cb.checked; if (state.detail) renderColumns(state.detail); });
+    arch.append(cb, document.createTextNode(" show archived"));
+    filters.append(q, asg, arch);
+  }
+
+  // ---------- board ----------
+  async function drawBoard() {
+    stopPoll();
+    drawFilters();
+    if (!state.current) {
+      body.replaceChildren(el("div", "panel-desc", "Create a board to get started — then add cards and run them across your agents."));
+      return;
+    }
+    let d;
+    try { d = await api(`/api/boards/${state.current}`); }
+    catch (e) { body.replaceChildren(el("div", "status-bad", String(e))); return; }
+    state.detail = d;
+    renderToolbar2(d);
+    renderColumns(d);
+    if (state.drawer) openDrawer(state.drawer);
+    if (d.running) {
+      state.pollTimer = setInterval(async () => {
+        if (!panel.contains(body)) { stopPoll(); return; }
+        try {
+          const nd = await api(`/api/boards/${state.current}`);
+          state.detail = nd; renderToolbar2(nd); renderColumns(nd);
+          if (state.drawer) openDrawer(state.drawer);
+          if (!nd.running) { stopPoll(); loadBoards().then(drawBar); }
+        } catch { stopPoll(); }
+      }, 1500);
+    }
+  }
+
+  let toolbar2 = null;
+  function renderToolbar2(d) {
+    if (!toolbar2) { toolbar2 = el("div", "row-actions"); }
+    toolbar2.replaceChildren();
+    const runBtn = button(d.running ? "running…" : "▶ Run board", async () => {
+      try { await api(`/api/boards/${state.current}/run`, { method: "POST" }); toast("dispatching…", "ok"); drawBoard(); }
+      catch (e) { toast(String(e), "bad"); }
+    });
+    if (d.running) runBtn.disabled = true;
+    toolbar2.append(runBtn);
+    toolbar2.append(button("Reset", async () => {
+      if (!(await confirmDialog({ title: "Reset board", message: "Reset all cards to todo (drops prior results)?" }))) return;
+      try { await api(`/api/boards/${state.current}/reset`, { method: "POST" }); toast("reset", "ok"); drawBoard(); }
+      catch (e) { toast(String(e), "bad"); }
+    }));
+    if (d.running) toolbar2.append(el("span", "chat-responding", "running…"));
+    if (!body.contains(toolbar2)) body.replaceChildren(toolbar2);
+  }
+
+  function passesFilter(c) {
+    if (state.q && !`${c.id} ${c.title} ${c.assignee || ""}`.toLowerCase().includes(state.q)) return false;
+    if (state.assignee && c.assignee !== state.assignee) return false;
+    return true;
+  }
+
+  function renderColumns(d) {
+    // keep toolbar2 (first child), replace the rest
+    const cols = el("div", "board-cols");
+    const columns = state.archived ? [...ORCH_COLUMNS, ["archived", "Archived"]] : ORCH_COLUMNS;
+    for (const [st, label] of columns) {
+      const col = el("div", "board-col");
+      col.dataset.status = st;
+      const cards = (d.cards || []).filter((c) => c.status === st && passesFilter(c));
+      const head = el("div", "board-col-head-row");
+      head.append(el("span", "board-col-head", `${label} · ${cards.length}`));
+      const addBtn = el("button", "board-col-add", "＋");
+      addBtn.title = `Add a card to ${label}`;
+      addBtn.addEventListener("click", () => addCardForm(st === "triage" ? "triage" : "todo"));
+      head.append(addBtn);
+      col.append(head);
+      for (const c of cards) col.append(cardTile(c, d.cards));
+      // drag-drop target
+      col.addEventListener("dragover", (e) => { e.preventDefault(); col.classList.add("drop"); });
+      col.addEventListener("dragleave", () => col.classList.remove("drop"));
+      col.addEventListener("drop", async (e) => {
+        e.preventDefault(); col.classList.remove("drop");
+        const id = e.dataTransfer.getData("text/card");
+        if (!id) return;
+        const card = (state.detail.cards || []).find((x) => x.id === id);
+        if (!card || card.status === st) return;
+        try { await api(`/api/boards/${state.current}/cards/${id}`, { method: "PUT", body: JSON.stringify({ status: st }) }); drawBoard(); }
+        catch (err) { toast(String(err), "bad"); }
+      });
+      cols.append(col);
+    }
+    // rebuild body = toolbar2 + cols
+    body.replaceChildren(toolbar2, cols);
+    if (d.events && d.events.length) body.append(runLog(d.events));
+  }
+
+  function runLog(events) {
+    const log = section("Run log");
+    const lv = el("div", "log-view");
+    for (const e of events.slice(-40)) {
+      const row = el("div", "log-row");
+      row.append(el("span", "log-time", new Date(e.at).toLocaleTimeString()), el("span", "log-msg", `${e.kind}${e.card ? " " + e.card : ""} ${e.text || ""}`.trim()));
+      lv.append(row);
+    }
+    log.append(lv);
+    return log;
+  }
+
+  function cardTile(c, allCards) {
+    const tile = el("div", "board-card");
+    tile.draggable = true;
+    tile.addEventListener("dragstart", (e) => { e.dataTransfer.setData("text/card", c.id); e.dataTransfer.effectAllowed = "move"; });
+    tile.addEventListener("click", () => { state.drawer = c.id; openDrawer(c.id); });
+    const head = el("div", "board-card-head");
+    head.append(el("span", "board-card-id", c.id), el("span", "board-card-title", c.title));
+    tile.append(head);
+    const meta = el("div", "board-card-meta");
+    meta.append(el("span", "board-card-asg", `@${c.assignee || "default"}`));
+    if (c.priority) meta.append(badge(`p${c.priority}`, "dim"));
+    if (c.goal) meta.append(badge("goal", "warn"));
+    if (c.block_kind && c.status === "blocked") meta.append(badge(c.block_kind, "bad"));
+    if (c.deps && c.deps.length) meta.append(el("span", "board-card-dep", `after ${c.deps.join(",")}`));
+    tile.append(meta);
+    const counts = [];
+    if (c.comments && c.comments.length) counts.push(`💬${c.comments.length}`);
+    if (c.runs && c.runs.length) counts.push(`⟳${c.runs.length}`);
+    if (c.attachments && c.attachments.length) counts.push(`📎${c.attachments.length}`);
+    if (counts.length) tile.append(el("div", "board-card-counts", counts.join("  ")));
+    return tile;
+  }
+
+  // ---------- create / edit forms ----------
+  function cardFields(card, allCards) {
+    const depOpts = (allCards || []).filter((x) => !card || x.id !== card.id).map((x) => ({ value: x.id, label: `${x.id} ${x.title.slice(0, 24)}` }));
+    return [
+      { name: "title", label: "Title", type: "text", value: card?.title, placeholder: "what to do", required: true },
+      { name: "detail", label: "Detail / acceptance criteria", type: "textarea", value: card?.detail, rows: 4 },
+      { name: "assignee", label: "Assignee", type: "select", value: card?.assignee || "", options: assigneeOptions(false) },
+      { name: "deps", label: "Depends on", type: "multiselect", value: card?.deps || [], options: depOpts },
+      { name: "priority", label: "Priority (higher runs first)", type: "number", value: card?.priority ?? 0 },
+      { name: "max_retries", label: "Auto-retries on failure", type: "number", value: card?.max_retries ?? 0 },
+      { name: "goal", label: "Goal mode (re-run with an acceptance judge until it passes)", type: "checkbox", value: card?.goal || false },
+      { name: "goal_max_turns", label: "Goal max rounds (0 = default 5)", type: "number", value: card?.goal_max_turns ?? 0 },
+      { name: "tenant", label: "Tenant (optional tag)", type: "text", value: card?.tenant || "" },
+      { name: "scheduled_at", label: "Don't run before (RFC3339, optional)", type: "text", value: card?.scheduled_at || "", placeholder: "2026-07-01T09:00:00Z" },
+    ];
+  }
+
+  function addCardForm(forceStatus) {
+    formDialog({
+      title: "Add a card",
+      fields: cardFields(null, state.detail?.cards),
+      submitLabel: "Add card",
+      onSubmit: async (v) => {
+        const body = {
+          title: v.title, detail: v.detail, assignee: v.assignee || null, needs: v.deps,
+          priority: Number(v.priority) || 0, max_retries: Number(v.max_retries) || 0,
+          goal: !!v.goal, goal_max_turns: Number(v.goal_max_turns) || 0,
+          tenant: v.tenant || null, scheduled_at: v.scheduled_at || null,
+          triage: forceStatus === "triage",
+        };
+        await api(`/api/boards/${state.current}/cards`, { method: "POST", body: JSON.stringify(body) });
+        drawBoard(); toast("card added", "ok");
+      },
+    });
+  }
+
+  function editCardForm(card) {
+    formDialog({
+      title: `Edit ${card.id}`,
+      fields: [
+        ...cardFields(card, state.detail?.cards),
+        { name: "status", label: "Status", type: "select", value: card.status, options: ["triage", "todo", "doing", "done", "blocked", "archived"].map((s) => ({ value: s, label: s })) },
+      ],
+      submitLabel: "Save",
+      onSubmit: async (v) => {
+        const body = {
+          title: v.title, detail: v.detail, assignee: v.assignee || null, deps: v.deps, status: v.status,
+          priority: Number(v.priority) || 0, max_retries: Number(v.max_retries) || 0,
+          goal: !!v.goal, goal_max_turns: Number(v.goal_max_turns) || 0,
+          tenant: v.tenant || null, scheduled_at: v.scheduled_at,
+        };
+        await api(`/api/boards/${state.current}/cards/${card.id}`, { method: "PUT", body: JSON.stringify(body) });
+        drawBoard(); toast("saved", "ok");
+      },
+    });
+  }
+
+  // ---------- card drawer ----------
+  function openDrawer(cardId) {
+    const c = (state.detail?.cards || []).find((x) => x.id === cardId);
+    if (!c) { closeDrawer(); return; }
+    let overlay = document.querySelector(".board-drawer-overlay");
+    if (!overlay) {
+      overlay = el("div", "board-drawer-overlay");
+      overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) closeDrawer(); });
+      document.body.append(overlay);
+    }
+    const dr = el("div", "board-drawer");
+    // header
+    const hd = el("div", "board-drawer-head");
+    const titleRow = el("div", "board-drawer-titlerow");
+    titleRow.append(el("span", "board-card-id", c.id), cardPill(c.status), el("span", "board-drawer-title", c.title));
+    const x = el("button", "board-drawer-x", "✕");
+    x.addEventListener("click", closeDrawer);
+    hd.append(titleRow, x);
+    dr.append(hd);
+    // meta + edit
+    const meta = el("div", "panel-desc");
+    const bits = [`@${c.assignee || "default"}`];
+    if (c.priority) bits.push(`priority ${c.priority}`);
+    if (c.deps?.length) bits.push(`after ${c.deps.join(",")}`);
+    if (c.tenant) bits.push(`tenant ${c.tenant}`);
+    if (c.max_retries) bits.push(`retries ${c.max_retries}`);
+    if (c.goal) bits.push(`goal (≤${c.goal_max_turns || 5})`);
+    if (c.scheduled_at) bits.push(`scheduled ${c.scheduled_at}`);
+    if (c.block_kind && c.status === "blocked") bits.push(`blocked: ${c.block_kind}`);
+    meta.textContent = bits.join(" · ");
+    dr.append(meta);
+    if (c.detail) { const d = el("div", "board-drawer-detail"); d.innerHTML = renderMd(c.detail); dr.append(d); }
+
+    // actions
+    const acts = el("div", "row-actions");
+    acts.append(button("Edit", () => editCardForm(c)));
+    if (c.status === "triage") {
+      acts.append(button("⚗ Decompose", async () => {
+        try { await api(`/api/boards/${state.current}/cards/${c.id}/decompose`, { method: "POST" }); toast("decomposing… (refreshes when done)", "ok"); pollOnce(6); }
+        catch (e) { toast(String(e), "bad"); }
+      }));
+      acts.append(button("✨ Specify", async () => {
+        try { await api(`/api/boards/${state.current}/cards/${c.id}/specify`, { method: "POST" }); toast("specifying… (refreshes when done)", "ok"); pollOnce(6); }
+        catch (e) { toast(String(e), "bad"); }
+      }));
+    }
+    if (c.status !== "archived") {
+      acts.append(button("Archive", async () => {
+        try { await api(`/api/boards/${state.current}/cards/${c.id}`, { method: "PUT", body: JSON.stringify({ status: "archived" }) }); drawBoard(); }
+        catch (e) { toast(String(e), "bad"); }
+      }));
+    }
+    acts.append(button("Delete", async () => {
+      if (!(await confirmDialog({ title: "Delete card", message: `Delete ${c.id}?`, danger: true, confirmLabel: "Delete" }))) return;
+      try { await api(`/api/boards/${state.current}/cards/${c.id}`, { method: "DELETE" }); state.drawer = null; closeDrawer(); drawBoard(); }
+      catch (e) { toast(String(e), "bad"); }
+    }, true));
+    dr.append(acts);
+
+    // result
+    if (c.result) {
+      dr.append(el("div", "board-drawer-sub", "Result"));
+      const r = el("div", "board-drawer-result"); r.innerHTML = renderMd(c.result); dr.append(r);
+    }
+
+    // attachments
+    dr.append(el("div", "board-drawer-sub", "Attachments"));
+    const att = el("div", "board-drawer-att");
+    for (const p of c.attachments || []) {
+      const a = document.createElement("a");
+      a.className = "chat-download";
+      a.textContent = `⬇ ${p.split(/[\\/]/).pop()}`;
+      a.href = `/api/boards/${state.current}/attachment?path=${encodeURIComponent(p)}`;
+      a.setAttribute("download", p.split(/[\\/]/).pop());
+      att.append(a);
+    }
+    const fileInput = el("input", "chat-file-hidden"); fileInput.type = "file";
+    fileInput.addEventListener("change", async () => {
+      const f = fileInput.files?.[0]; if (!f) return;
+      try {
+        const res = await fetch(`/api/boards/${state.current}/cards/${c.id}/attach?name=${encodeURIComponent(f.name)}`, { method: "POST", headers: { "x-maturana-web": "1" }, body: f });
+        const j = await res.json(); if (!j.ok) throw new Error(j.error);
+        toast("attached", "ok"); drawBoard();
+      } catch (e) { toast(String(e), "bad"); }
+      fileInput.value = "";
+    });
+    const upBtn = button("📎 Attach file", () => fileInput.click());
+    att.append(upBtn, fileInput);
+    dr.append(att);
+
+    // run history
+    if (c.runs && c.runs.length) {
+      dr.append(el("div", "board-drawer-sub", "Run history"));
+      const rl = el("div", "log-view");
+      for (const r of c.runs) {
+        const row = el("div", "log-row");
+        row.append(el("span", "log-time", `#${r.attempt}`), el("span", "log-msg", `${r.outcome} · ${r.agent || "?"} · ${(r.summary || "").slice(0, 80)}`));
+        rl.append(row);
+      }
+      dr.append(rl);
+    }
+
+    // comments
+    dr.append(el("div", "board-drawer-sub", "Comments"));
+    const thread = el("div", "board-comments");
+    for (const cm of c.comments || []) {
+      const row = el("div", "board-comment");
+      row.append(el("span", "board-comment-author", cm.author || "note"), el("span", "board-comment-body", cm.body));
+      thread.append(row);
+    }
+    dr.append(thread);
+    const commentRow = el("div", "board-comment-add");
+    const ci = el("input", "model-input"); ci.placeholder = "add a comment (Enter to post)…";
+    const post = async () => {
+      const text = ci.value.trim(); if (!text) return;
+      try { await api(`/api/boards/${state.current}/cards/${c.id}/comment`, { method: "POST", body: JSON.stringify({ body: text }) }); ci.value = ""; drawBoard(); }
+      catch (e) { toast(String(e), "bad"); }
+    };
+    ci.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); post(); } });
+    commentRow.append(ci, button("Post", post));
+    dr.append(commentRow);
+
+    overlay.replaceChildren(dr);
+  }
+
+  function closeDrawer() {
+    state.drawer = null;
+    const o = document.querySelector(".board-drawer-overlay");
+    if (o) o.remove();
+  }
+
+  // a few quick extra polls (for decompose/specify which run detached ~seconds)
+  function pollOnce(times) {
+    let n = 0;
+    const t = setInterval(async () => {
+      n++;
+      if (!panel.contains(body) || n > times) { clearInterval(t); return; }
+      try { const nd = await api(`/api/boards/${state.current}`); state.detail = nd; renderColumns(nd); if (state.drawer) openDrawer(state.drawer); } catch {}
+    }, 2500);
+  }
+
+  await loadBoards();
+  drawBar();
+  drawBoard();
 }

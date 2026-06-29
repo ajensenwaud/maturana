@@ -72,6 +72,9 @@ enum Command {
     Agent(AgentCommand),
     /// List, take, or restore agent VM snapshots.
     Snapshot(SnapshotCommand),
+    /// Copy-on-write VM storage: clone/snapshot/rewind a rootfs via filesystem
+    /// reflink — instant + space-shared on Btrfs/XFS/ZFS-2.2+, full copy on ext4.
+    Vm(VmCommand),
     /// Show an agent's governed audit-log events.
     Audit(AuditCommand),
     /// Windows SYSTEM daemon for Hyper-V VM lifecycle (machine-managed).
@@ -94,6 +97,8 @@ enum Command {
     Proactive(proactive::ProactiveCommand),
     /// Run a goal across multiple worker agents in a bounded loop.
     Orchestrator(orchestrate::OrchestratorCommand),
+    /// Durable orchestration board: define cards, then run them across agents.
+    Board(orchestrate::BoardCommand),
     /// Serve Agent2Agent (A2A) endpoints for agent-to-agent calls.
     #[command(hide = true)]
     A2a(a2a::A2aCommand),
@@ -164,6 +169,40 @@ struct TuiCommand {
     /// Seconds to wait for each reply before showing a timeout.
     #[arg(long, default_value_t = 180)]
     timeout_seconds: u64,
+}
+
+/// Copy-on-write VM storage operations.
+#[derive(Debug, Args)]
+struct VmCommand {
+    #[command(subcommand)]
+    command: VmSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum VmSubcommand {
+    /// Report a path's filesystem and whether it supports reflink (CoW) clones.
+    Fstype {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Copy-on-write clone a file: an instant, space-shared reflink on
+    /// Btrfs/XFS/ZFS-2.2+, a full byte copy elsewhere. This is the primitive
+    /// agent provisioning uses to clone a golden rootfs.
+    Clone { src: PathBuf, dest: PathBuf },
+    /// Snapshot a (stopped) agent's rootfs via CoW, under its snapshots dir.
+    Snapshot {
+        agent_id: String,
+        #[arg(long, default_value = "snap")]
+        name: String,
+    },
+    /// Roll a (stopped) agent's rootfs back to a previously taken snapshot.
+    Rollback {
+        agent_id: String,
+        #[arg(long, default_value = "snap")]
+        name: String,
+    },
+    /// List an agent's CoW rootfs snapshots.
+    Snapshots { agent_id: String },
 }
 
 /// Self-improvement flywheel: capture agent trajectories, attach reward
@@ -1126,6 +1165,7 @@ fn main() -> anyhow::Result<()> {
                 );
             }
         },
+        Command::Vm(command) => handle_vm(command, &home)?,
         Command::Snapshot(command) => match command.command {
             SnapshotSubcommand::List { agent_id, live } => {
                 let snapshots = match list_snapshots(&home, &agent_id, live) {
@@ -1438,6 +1478,7 @@ fn main() -> anyhow::Result<()> {
         Command::Schedule(command) => handle_schedule(command, &home)?,
         Command::Proactive(command) => proactive::handle_proactive(command, &home)?,
         Command::Orchestrator(command) => orchestrate::handle_orchestrator(command, &home)?,
+        Command::Board(command) => orchestrate::handle_board(command, &home)?,
         Command::A2a(command) => a2a::handle_a2a(command, &home)?,
         Command::Deploy(command) => handle_deploy(command, &home)?,
         Command::Develop(command) => handle_develop(command)?,
@@ -1504,7 +1545,43 @@ fn main() -> anyhow::Result<()> {
                         )
                     },
                 );
-                maturana_web::run_web(home.root().to_path_buf(), &bind, enqueue)?
+                // Inject the knowledge-graph ingest hook so a file uploaded in
+                // the chat window becomes retrievable by the (VM-isolated) agent
+                // — exactly the path a Telegram document upload takes.
+                let ingest: maturana_web::IngestFileFn = std::sync::Arc::new(
+                    |home_root: &std::path::Path, agent_id: &str, file_path: &std::path::Path| {
+                        let home = MaturanaHome::new(home_root.to_path_buf());
+                        let kg = crate::channels::agent_knowledge_graph(&home, agent_id);
+                        if !kg.enabled {
+                            anyhow::bail!("knowledge graph is not enabled for this agent");
+                        }
+                        let token = maturana_core::worker::read_graph_token(home.root())
+                            .ok_or_else(|| anyhow::anyhow!("graph service token is missing"))?;
+                        let supported = file_path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .map(|e| {
+                                crate::graph::SUPPORTED_EXTS
+                                    .contains(&e.to_ascii_lowercase().as_str())
+                            })
+                            .unwrap_or(false);
+                        if !supported {
+                            anyhow::bail!(
+                                "unsupported file type for graph ingest (supported: {})",
+                                crate::graph::SUPPORTED_EXTS.join(", ")
+                            );
+                        }
+                        let name = crate::graph::agent_graph_name(agent_id);
+                        crate::graph::ingest_file_into_service(
+                            crate::graph::DEFAULT_LOCAL_URL,
+                            &token,
+                            &name,
+                            file_path,
+                            1800,
+                        )
+                    },
+                );
+                maturana_web::run_web(home.root().to_path_buf(), &bind, enqueue, Some(ingest))?
             }
         },
         Command::Search(command) => run_search(&home, command)?,
@@ -2916,6 +2993,200 @@ fn resolve_guest_ip(
     })
 }
 
+/// Resolve a guest's IP for *file transfer* without the strict whole-plan
+/// validation that `inspect_agent` runs. The guest IP is recorded in the spec
+/// and the launch metadata, so unrelated provisioning drift — e.g. a spec
+/// `network.proxy` toggle the running VM's metadata predates — must not silently
+/// disable deliverable collection (it did: `inspect` rejects the mismatch, the
+/// IP never resolves, and the scp is skipped without a word). For Firecracker we
+/// read the static IP straight from the spec, then the metadata; everything else
+/// falls back to the strict live resolver (Hyper-V has no static guest IP).
+fn resolve_transfer_ip(home: &MaturanaHome, agent_id: &str) -> anyhow::Result<String> {
+    let spec_path = home.agent_dir(agent_id).join("MATURANA.md");
+    if let Ok(spec) = AgentSpec::from_maturana_markdown(&spec_path) {
+        if spec.vm.provider == maturana_core::HostProvider::Firecracker {
+            if let Some(ip) = spec
+                .vm
+                .firecracker
+                .as_ref()
+                .map(|fc| fc.guest_ip.trim().to_string())
+                .filter(|ip| !ip.is_empty())
+            {
+                return Ok(ip);
+            }
+            let metadata_path = home
+                .agent_dir(agent_id)
+                .join("state/firecracker-metadata.json");
+            if let Ok(raw) = fs::read_to_string(&metadata_path) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if let Some(ip) = value
+                        .get("guest_ip")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|ip| !ip.is_empty())
+                    {
+                        return Ok(ip.to_string());
+                    }
+                }
+            }
+        }
+    }
+    resolve_guest_ip(home, agent_id, None)
+}
+
+/// Push a host image into the agent's guest workspace (`/workspace/inbox/<file>`)
+/// so a vision-capable harness can open and view it on its next turn. Returns the
+/// guest path. Channel-agnostic — every channel that can receive an image
+/// (Telegram, Discord, web, …) delivers it the same way. Best-effort: errors if
+/// the guest is unreachable so the caller can fall back (e.g. OCR into the graph).
+/// The bytes go straight host→guest over scp; they never transit the model API or
+/// the browser.
+pub(crate) fn deliver_image_to_guest(
+    home: &MaturanaHome,
+    agent_id: &str,
+    local_path: &Path,
+) -> anyhow::Result<String> {
+    let ip = resolve_transfer_ip(home, agent_id)?;
+    let key = crate::orchestrate::guest_ssh_key(home, agent_id);
+    if !key.exists() {
+        anyhow::bail!("no guest SSH key for {agent_id}");
+    }
+    let host_key = GuestHostKey::resolve(home, agent_id, &ip)?;
+    let file_name = local_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("image");
+    let remote = format!("/workspace/inbox/{file_name}");
+    let roots = agent_transfer_roots(home, agent_id, true)
+        .unwrap_or_else(|_| vec!["/workspace".to_string()]);
+    push_live_path(
+        &ip,
+        "ubuntu",
+        &key,
+        &host_key,
+        &local_path.to_path_buf(),
+        &remote,
+        &roots,
+        false,
+    )?;
+    Ok(remote)
+}
+
+/// Build the prompt text for an inbound image turn: any caption plus an explicit
+/// pointer to the image's guest path, instructing the (vision-capable) harness to
+/// open and view it. Shared by every channel so behavior is identical everywhere.
+pub(crate) fn vision_prompt_text(caption: Option<&str>, guest_path: &str) -> String {
+    match caption.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(caption) => format!(
+            "{caption}\n\n[The user attached an image, saved in your workspace at {guest_path}. Open and view it to answer.]"
+        ),
+        None => format!(
+            "[The user sent an image, saved in your workspace at {guest_path}. Open and view it, then describe it or act on it.]"
+        ),
+    }
+}
+
+/// Resolve an agent's live Firecracker rootfs image file (the thing CoW
+/// snapshots/rewinds operate on). Spec rootfs paths are stored relative to the
+/// repo root (the parent of the `.maturana` home dir).
+fn agent_rootfs_path(home: &MaturanaHome, agent_id: &str) -> anyhow::Result<PathBuf> {
+    let spec = maturana_core::AgentSpec::from_maturana_markdown(
+        home.agent_dir(agent_id).join("MATURANA.md"),
+    )?;
+    let firecracker = spec.vm.firecracker.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{agent_id} is not a Firecracker agent — CoW rootfs snapshots apply to Firecracker"
+        )
+    })?;
+    let raw = PathBuf::from(&firecracker.rootfs_image);
+    if raw.is_absolute() {
+        Ok(raw)
+    } else {
+        let base = home.root().parent().unwrap_or_else(|| home.root());
+        Ok(base.join(raw))
+    }
+}
+
+fn handle_vm(command: VmCommand, home: &MaturanaHome) -> anyhow::Result<()> {
+    use maturana_core::cow;
+    match command.command {
+        VmSubcommand::Fstype { path } => {
+            match cow::detect_fstype(&path) {
+                Some(fs) => {
+                    let cap = if cow::fstype_supports_reflink(&fs) {
+                        "copy-on-write: reflink supported (instant, space-shared clones)"
+                    } else {
+                        "no reflink — clones are full byte copies"
+                    };
+                    println!("{}: {fs} — {cap}", path.display());
+                }
+                None => println!(
+                    "{}: filesystem could not be detected — clones will be full copies",
+                    path.display()
+                ),
+            }
+            Ok(())
+        }
+        VmSubcommand::Clone { src, dest } => {
+            let kind = cow::provision_clone(&src, &dest)?;
+            println!(
+                "cloned {} -> {} [{}]",
+                src.display(),
+                dest.display(),
+                kind.label()
+            );
+            Ok(())
+        }
+        VmSubcommand::Snapshot { agent_id, name } => {
+            let rootfs = agent_rootfs_path(home, &agent_id)?;
+            let dir = home.agent_dir(&agent_id).join("cow-snapshots");
+            std::fs::create_dir_all(&dir)?;
+            let snap = dir.join(format!("{name}.ext4"));
+            let kind = cow::snapshot(&rootfs, &snap)?;
+            println!(
+                "snapshot '{name}' of {agent_id} [{}] -> {}",
+                kind.label(),
+                snap.display()
+            );
+            Ok(())
+        }
+        VmSubcommand::Rollback { agent_id, name } => {
+            let rootfs = agent_rootfs_path(home, &agent_id)?;
+            let snap = home
+                .agent_dir(&agent_id)
+                .join("cow-snapshots")
+                .join(format!("{name}.ext4"));
+            let kind = cow::rollback(&snap, &rootfs)?;
+            println!(
+                "rolled {agent_id} back to '{name}' [{}] — restart the agent to boot the restored rootfs",
+                kind.label()
+            );
+            Ok(())
+        }
+        VmSubcommand::Snapshots { agent_id } => {
+            let dir = home.agent_dir(&agent_id).join("cow-snapshots");
+            match std::fs::read_dir(&dir) {
+                Ok(entries) => {
+                    let mut names: Vec<String> = entries
+                        .flatten()
+                        .filter_map(|e| e.file_name().into_string().ok())
+                        .collect();
+                    names.sort();
+                    if names.is_empty() {
+                        println!("no CoW snapshots for {agent_id}");
+                    } else {
+                        for name in names {
+                            println!("{name}");
+                        }
+                    }
+                }
+                Err(_) => println!("no CoW snapshots for {agent_id}"),
+            }
+            Ok(())
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct FirecrackerHarnessRepair {
     agent_ids: Vec<String>,
@@ -3262,9 +3533,22 @@ fn repair_firecracker_harnesses(
             }
             Ok(())
         })();
-        if let Err(err) = result {
-            eprintln!("  {} failed: {err:#}", profile.agent_id);
-            failures.push((profile.agent_id.to_string(), err));
+        match result {
+            Err(err) => {
+                eprintln!("  {} failed: {err:#}", profile.agent_id);
+                failures.push((profile.agent_id.to_string(), err));
+            }
+            Ok(()) => {
+                // When we own the plane (not deferring to `maturana up`), also
+                // start the agent's egress proxy so it can actually reach its
+                // allowlisted hosts — otherwise the guest, routed through the
+                // proxy, gets ECONNREFUSED to its model API. Best-effort.
+                if !repair.skip_services && !repair.skip_launch {
+                    if let Err(err) = start_linux_agent_proxy(home, &profile) {
+                        eprintln!("  {} egress proxy not started: {err:#}", profile.agent_id);
+                    }
+                }
+            }
         }
     }
 
@@ -3326,6 +3610,49 @@ fn ensure_sessiond_token(path: &PathBuf) -> anyhow::Result<String> {
         .collect();
     fs::write(path, format!("{token}\n"))?;
     Ok(token)
+}
+
+/// Start an agent's per-agent egress proxy as a detached child. An agent
+/// provisioned by `setup firecracker-harnesses` (without `maturana up`) routes
+/// its egress through this proxy; if nothing is listening the guest gets
+/// ECONNREFUSED to its model API. Mirrors how `maturana up` supervises proxies.
+/// No-op when the spec has no enabled proxy. Best-effort + detached.
+fn start_linux_agent_proxy(
+    home: &MaturanaHome,
+    profile: &FirecrackerHarnessProfile,
+) -> anyhow::Result<()> {
+    let spec = AgentSpec::from_maturana_markdown(PathBuf::from(&profile.spec_path))?;
+    if !spec.network.proxy.as_ref().is_some_and(|proxy| proxy.enabled) {
+        return Ok(());
+    }
+    // Avoid a duplicate if one is already running for this agent.
+    let _ = ProcessCommand::new("pkill")
+        .arg("-f")
+        .arg(format!("pipelock proxy --agent-id {}", profile.agent_id))
+        .status();
+    let logs_dir = home.root().join("logs");
+    fs::create_dir_all(&logs_dir)?;
+    let stdout = fs::File::create(logs_dir.join(format!("proxy-{}.out.log", profile.agent_id)))?;
+    let stderr = fs::File::create(logs_dir.join(format!("proxy-{}.err.log", profile.agent_id)))?;
+    let child = ProcessCommand::new(std::env::current_exe()?)
+        .arg("--home")
+        .arg(home.root())
+        .arg("pipelock")
+        .arg("proxy")
+        .arg("--agent-id")
+        .arg(&profile.agent_id)
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .context("failed to start agent egress proxy")?;
+    thread::sleep(Duration::from_millis(400));
+    println!(
+        "  egress proxy pid={} for {} (spec allowlist)",
+        child.id(),
+        profile.agent_id
+    );
+    Ok(())
 }
 
 fn start_linux_sessiond(
@@ -3488,15 +3815,26 @@ pub(crate) fn orchestrator_spawn_worker(
         "setup orchestration worker TAP",
     )?;
 
-    // 2. Give the VM its own rootfs (copy a baked one — no CoW required of users).
-    //    Keep it under the spawned agent's own dir: the shared images/ dir is
-    //    root-owned (from libguestfs asset prep), but agent dirs are user-owned.
+    // 2. Give the VM its own rootfs. On a copy-on-write filesystem (Btrfs/XFS/
+    //    ZFS-2.2+) this is an instant, space-shared reflink clone; on ext4 it
+    //    falls back to a full byte copy. Keep it under the spawned agent's own
+    //    dir: the shared images/ dir is root-owned (from libguestfs asset prep),
+    //    but agent dirs are user-owned.
     let rootfs_dir = home.agent_dir(new_id);
     fs::create_dir_all(&rootfs_dir)?;
     let new_rootfs = rootfs_dir.join("ubuntu-rootfs.ext4");
-    println!("  spawn {new_id}: copying rootfs (this is a few GB)…");
-    fs::copy(&base_rootfs, &new_rootfs)
-        .with_context(|| format!("failed to copy rootfs for {new_id}"))?;
+    let cow = maturana_core::cow::is_cow(&rootfs_dir);
+    println!(
+        "  spawn {new_id}: provisioning rootfs ({})…",
+        if cow {
+            "copy-on-write clone — instant"
+        } else {
+            "full copy, a few GB"
+        }
+    );
+    let kind = maturana_core::cow::provision_clone(&base_rootfs, &new_rootfs)
+        .with_context(|| format!("failed to provision rootfs for {new_id}"))?;
+    println!("  spawn {new_id}: rootfs ready ({})", kind.label());
 
     // 2b. The guest's static IP is baked into the image's netplan (matched by the
     //     interface MAC), so the copy still carries the base agent's IP. Regenerate
@@ -3978,7 +4316,15 @@ fn wait_for_guest_ssh(
     // (host-key mismatch / auth / connection reset) instead of a black box.
     let mut last_err: Option<String> = None;
     while Instant::now() < deadline {
-        match run_ssh_with_stdin(guest_ip, ssh_user, ssh_key, host_key, "echo ok", None) {
+        match run_ssh_with_stdin(
+            guest_ip,
+            ssh_user,
+            ssh_key,
+            host_key,
+            "echo ok",
+            None,
+            SSH_TIMEOUT_QUICK,
+        ) {
             Ok(_) => return Ok(()),
             Err(error) => last_err = Some(format!("{error:#}")),
         }
@@ -4291,7 +4637,7 @@ fn guest_has_live_harness_creds(
     // `test -s` (present + non-empty) → "LIVE"; otherwise "ABSENT". The `|| echo`
     // keeps the remote exit status 0 so SSH itself never errors on a missing file.
     let cmd = format!("test -s {} && echo LIVE || echo ABSENT", shell_quote(&path));
-    match run_ssh_with_stdin(ip, ssh_user, ssh_key, host_key, &cmd, None) {
+    match run_ssh_with_stdin(ip, ssh_user, ssh_key, host_key, &cmd, None, SSH_TIMEOUT_QUICK) {
         Ok(out) => out.trim() == "LIVE",
         // Unreachable/edge: env + runner copies already proved SSH works by this
         // point, so treat a probe failure as "can't confirm live" → allow the
@@ -4414,6 +4760,7 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
             &host_key,
             &render_harness_install(&install.harness, false),
             None,
+            SSH_TIMEOUT_PROVISION,
         )?;
     }
     if auth_push_path.is_some() {
@@ -4428,6 +4775,7 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
                 &install.harness_auth_guest_path,
             ),
             None,
+            SSH_TIMEOUT_PROVISION,
         )?;
     }
     // MCP config: render the harness-native file (secrets resolved host-side)
@@ -4475,6 +4823,7 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
                         user = shell_quote(&install.ssh_user),
                     ),
                     None,
+                    SSH_TIMEOUT_QUICK,
                 )?;
                 println!("installed MCP config ({} servers) at {guest_path}", spec.mcp_servers.len());
             }
@@ -4497,6 +4846,7 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
                     &host_key,
                     &format!("sudo npm install -g {quoted}"),
                     None,
+                    SSH_TIMEOUT_PROVISION,
                 ) {
                     Ok(_) => println!(
                         "pre-installed {} resident MCP server(s): {}",
@@ -4523,6 +4873,7 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
             user = shell_quote(&install.ssh_user)
         ),
         None,
+        SSH_TIMEOUT_PROVISION,
     )?;
     println!(
         "refreshed {} worker at {}",
@@ -5507,7 +5858,7 @@ fn print_live_guest_state(
     headless_chrome: bool,
 ) -> anyhow::Result<()> {
     let remote = render_live_guest_state_script(headless_chrome);
-    let output = run_ssh_with_stdin(ip, ssh_user, ssh_key, host_key, &remote, None)?;
+    let output = run_ssh_with_stdin(ip, ssh_user, ssh_key, host_key, &remote, None, SSH_TIMEOUT_QUICK)?;
     print!("{output}");
     Ok(())
 }
@@ -5741,7 +6092,7 @@ fn read_live_log(
     } else {
         format!("test -f {path} && tail -n {} {path} || true", lines.max(1))
     };
-    run_ssh_with_stdin(ip, ssh_user, ssh_key, host_key, &command, None)
+    run_ssh_with_stdin(ip, ssh_user, ssh_key, host_key, &command, None, SSH_TIMEOUT_QUICK)
 }
 
 impl LogKind {
@@ -5832,7 +6183,7 @@ fn push_live_path(
 
     if let Some(parent) = remote_parent(remote_path) {
         let mkdir = format!("mkdir -p {}", shell_quote(&parent));
-        run_ssh_with_stdin(ip, ssh_user, ssh_key, host_key, &mkdir, None)?;
+        run_ssh_with_stdin(ip, ssh_user, ssh_key, host_key, &mkdir, None, SSH_TIMEOUT_QUICK)?;
     }
 
     let mut command = ProcessCommand::new("scp");
@@ -5944,6 +6295,18 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+/// SSH command time budgets. QUICK bounds readiness/probe/log commands — they
+/// return in well under a second once the guest is up, so the cap only ever
+/// fires on a stalled attempt (and `wait_for_guest_ssh`'s own outer loop retries
+/// within its larger budget). PROVISION covers first-boot installs — `npm
+/// install -g <harness>`, auth seeding, the worker unit restart — which on a
+/// modest 2-vCPU guest contending with cloud-init can legitimately take minutes.
+/// The old flat 30s cap killed those on slower hosts (e.g. a fresh 7GB / 2-core
+/// box), surfacing as "ssh timed out after 30 seconds" and a stale-pid relaunch
+/// loop, even though the guest itself was healthy.
+pub(crate) const SSH_TIMEOUT_QUICK: Duration = Duration::from_secs(30);
+pub(crate) const SSH_TIMEOUT_PROVISION: Duration = Duration::from_secs(600);
+
 fn run_ssh_with_stdin(
     ip: &str,
     ssh_user: &str,
@@ -5951,12 +6314,20 @@ fn run_ssh_with_stdin(
     host_key: &GuestHostKey,
     remote_command: &str,
     stdin_text: Option<&str>,
+    timeout: Duration,
 ) -> anyhow::Result<String> {
     let mut command = ProcessCommand::new("ssh");
     command
         .args(host_key.options())
         .arg("-o")
         .arg("ConnectTimeout=10")
+        // Key-based only, never interactive: a not-yet-ready or auth-rejecting
+        // guest must fail fast instead of stalling on a password/passphrase
+        // prompt with no TTY (which would burn the whole command budget).
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("PreferredAuthentications=publickey")
         .arg("-i")
         .arg(ssh_key)
         .arg(format!("{ssh_user}@{ip}"))
@@ -5976,7 +6347,7 @@ fn run_ssh_with_stdin(
         stdin.write_all(stdin_text.as_bytes())?;
     }
 
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + timeout;
     loop {
         if child.try_wait()?.is_some() {
             break;
@@ -5984,7 +6355,7 @@ fn run_ssh_with_stdin(
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            anyhow::bail!("ssh timed out after 30 seconds");
+            anyhow::bail!("ssh timed out after {} seconds", timeout.as_secs());
         }
         thread::sleep(Duration::from_millis(100));
     }

@@ -9,24 +9,71 @@ import { mountThemeSwitcher } from "/assets/js/themes.js";
 
 mountThemeSwitcher(document.getElementById("theme-switch"));
 
+// ---- logout: drop the server session + cookie, return to the login page ----
+document.getElementById("logout-btn")?.addEventListener("click", async () => {
+  try {
+    await fetch("/logout", { method: "POST", headers: { "x-maturana-web": "1" } });
+  } catch {}
+  window.location.href = "/login";
+});
+
 const socket = new CockpitSocket();
-const linkStatus = document.getElementById("link-status");
+
+// Link status lives in ONE place: the bottom status bar (#sb-link). The old
+// header indicator was a duplicate and has been removed.
+function setSbDot(itemId, kind, label) {
+  const node = document.getElementById(itemId);
+  if (!node) return;
+  node.innerHTML = "";
+  const dot = document.createElement("span");
+  dot.className = `sb-dot ${kind}`;
+  node.append(dot, document.createTextNode(label));
+}
 
 socket.onStatus((status) => {
   if (status === "open") {
-    linkStatus.textContent = "[link ok]";
-    linkStatus.className = "status-ok";
+    setSbDot("sb-link", "ok", "link ok");
   } else if (status === "connecting") {
-    linkStatus.textContent = "[link ..]";
-    linkStatus.className = "status-dim";
+    setSbDot("sb-link", "dim", "link…");
   } else if (status === "version-mismatch") {
-    linkStatus.textContent = "[link v!]";
-    linkStatus.className = "status-bad";
+    setSbDot("sb-link", "bad", "version!");
   } else {
-    linkStatus.textContent = "[link --]";
-    linkStatus.className = "status-bad";
+    setSbDot("sb-link", "bad", "link down");
   }
 });
+
+// ---- collapsible sidebar (persisted, pre-paint friendly) ----
+const navToggle = document.getElementById("nav-toggle");
+const NAV_KEY = "maturana.nav.collapsed";
+function setNavCollapsed(collapsed) {
+  document.documentElement.dataset.navCollapsed = collapsed ? "1" : "";
+  navToggle.setAttribute("aria-expanded", String(!collapsed));
+  navToggle.setAttribute("aria-label", collapsed ? "Expand sidebar" : "Collapse sidebar");
+  try { localStorage.setItem(NAV_KEY, collapsed ? "1" : "0"); } catch {}
+}
+let navCollapsed = false;
+try { navCollapsed = localStorage.getItem(NAV_KEY) === "1"; } catch {}
+setNavCollapsed(navCollapsed);
+navToggle?.addEventListener("click", () => { navCollapsed = !navCollapsed; setNavCollapsed(navCollapsed); });
+
+// ---- bottom status bar (plane / agents / host), polled lightly ----
+async function refreshStatusBar() {
+  try {
+    const res = await fetch("/api/overview", { headers: {} });
+    const payload = await res.json().catch(() => null);
+    const o = payload && payload.ok ? payload.data : null;
+    if (!o) return;
+    const c = o.counts || {};
+    const host = o.host || {};
+    setSbDot("sb-plane", o.plane?.up ? "ok" : "bad", o.plane?.up ? "plane up" : "plane down");
+    const up = c.up ?? 0, total = c.agents ?? 0;
+    setSbDot("sb-agents", up > 0 ? "ok" : (total ? "warn" : "dim"), `${up}/${total} agents`);
+    const hostEl = document.getElementById("sb-host");
+    if (hostEl) hostEl.textContent = host.hostname ? `${host.hostname} · ${host.cores ?? "?"} cores` : "";
+  } catch {}
+}
+refreshStatusBar();
+setInterval(refreshStatusBar, 5000);
 
 const panel = document.getElementById("panel");
 const nav = document.getElementById("nav");
@@ -38,6 +85,9 @@ const views = {
   agents: dashboard.renderAgents,
   system: dashboard.renderSystem,
   sessions: dashboard.renderSessions,
+  channels: dashboard.renderChannels,
+  schedules: dashboard.renderSchedules,
+  orchestration: dashboard.renderOrchestration,
   graph: dashboard.renderGraph,
   pipelock: dashboard.renderPipelock,
   egress: dashboard.renderEgress,

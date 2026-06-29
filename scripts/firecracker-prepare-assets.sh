@@ -341,6 +341,23 @@ cat > "$asset_manifest_path" <<EOF
 EOF
 echo "manifest: $asset_manifest_path"
 
+# Hand ownership of every artifact this script produced to the invoking user.
+# `maturana setup` runs this script under `sudo`, so files land root-owned — and
+# the (non-root) agent launcher must read the SSH PRIVATE KEY to reach the guest.
+# The key lives in the SHARED parent dir (`$ssh_key_path`, one level ABOVE
+# `$output_dir`, reused across agents), so it is NOT covered by chowning
+# `$output_dir` alone — chown it (and its .pub) explicitly. Without this a fresh
+# host fails with `Load key "...id_rsa": Permission denied` -> publickey denied.
+chown_targets=("$output_dir" "$ssh_key_path" "$ssh_key_path.pub")
 if [[ "$(id -u)" -eq 0 && -n "${SUDO_UID:-}" && -n "${SUDO_GID:-}" ]]; then
-  chown -R "$SUDO_UID:$SUDO_GID" "$output_dir"
+  # Script itself runs as root under sudo: hand ownership to the real user.
+  for t in "${chown_targets[@]}"; do
+    [ -e "$t" ] && chown -R "$SUDO_UID:$SUDO_GID" "$t" || true
+  done
+elif [[ "$(id -u)" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
+  # Script runs as a normal user that used sudo internally for libguestfs:
+  # reclaim any root-owned artifacts back to the current user.
+  for t in "${chown_targets[@]}"; do
+    [ -e "$t" ] && sudo chown -R "$(id -u):$(id -g)" "$t" 2>/dev/null || true
+  done
 fi

@@ -227,13 +227,14 @@ pub async fn overview(State(state): State<AppState>) -> Response {
         let agents = crate::api::agents::snapshot(&root).unwrap_or_else(|_| serde_json::json!([]));
         let arr = agents.as_array().cloned().unwrap_or_default();
         let count = arr.len();
-        let idle = arr
+        // "up" = a fresh heartbeat (computed in agents::snapshot as `live`), not
+        // the literal status "running" the worker never writes. "busy" = a turn
+        // actually in flight (status "claimed"). This is what fixes the Overview
+        // showing 0 agents while a healthy idle fleet is live.
+        let up = arr.iter().filter(|a| a["live"] == true).count();
+        let busy = arr
             .iter()
-            .filter(|a| a["worker_status"]["status"].as_str() == Some("idle"))
-            .count();
-        let running = arr
-            .iter()
-            .filter(|a| a["worker_status"]["status"].as_str() == Some("running"))
+            .filter(|a| a["status"].as_str() == Some("claimed"))
             .count();
         let graphs = arr.iter().filter(|a| a["knowledge_graph"] == true).count();
         let plane = std::fs::read_to_string(root.join("up").join("state.json"))
@@ -241,7 +242,7 @@ pub async fn overview(State(state): State<AppState>) -> Response {
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
         Ok(serde_json::json!({
             "agents": agents,
-            "counts": { "agents": count, "idle": idle, "running": running, "graphs": graphs },
+            "counts": { "agents": count, "up": up, "busy": busy, "graphs": graphs },
             "plane": { "up": plane.is_some(), "state": plane },
             "host": host_stats(),
         }))

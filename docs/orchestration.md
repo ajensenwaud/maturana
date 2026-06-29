@@ -81,3 +81,79 @@ operator rather than disappearing.
 3. `maturana up --dry-run` and confirm the guest session id matches the
    worker's `MATURANA_SESSION_ID`.
 4. `maturana up` and verify with `maturana doctor`.
+
+## Durable orchestration boards
+
+Two front doors sit over one engine (A2A dispatch + roles + host-enforced
+budgets, every card/step running in an agent's own VM):
+
+- **`orchestrator loop` (`/loop`)** — give it a goal; an LLM coordinator
+  decomposes it into steps and runs them once. Ephemeral: goal → plan → done.
+- **orchestration boards (`maturana board`)** — *you* author the work as a
+  durable, editable board of cards. Use this for an ongoing, multi-step,
+  multi-owner pipeline you re-run, schedule, or trigger.
+
+### Model
+
+A **board** is a named JSON file at `<home>/board/<name>.json` — the single
+source of truth. A **card** is one unit of work:
+
+| Field | Meaning |
+| --- | --- |
+| `title` / `detail` | what to do (+ acceptance criteria) |
+| `assignee` | a **role** (`developer`/`researcher`/`reviewer`/`coordinator`/`synthesizer`) or a concrete agent id; empty ⇒ `developer` |
+| `deps` | card ids that must be `done` before this one is `ready` |
+| `status` | `todo` → `doing` → `done` (or `blocked` on failure) |
+| `result` | the worker's reply, stored back on the board |
+
+**Coordinate through the board, not shared memory.** A card's only view of its
+upstreams is their stored `result` (folded into its prompt as "inputs from
+earlier cards"). Agents never share process state or talk directly — exactly the
+"state on the board" model.
+
+### Running it — the dispatcher
+
+`maturana board run <name>` claims every **ready** card (todo + all deps done),
+marks it `doing`, and dispatches it to its assignee **over A2A — in that agent's
+own VM**, never a local/Docker shortcut. Ready cards run in **parallel** up to
+`max_parallel`; as cards finish they unblock dependents, and the loop drains the
+board. Same host-enforced caps as the loop (turns / wall-clock / parallel /
+concurrent-VMs — tighten-only, never raisable by an agent) and the same
+real-artifact collection (files a card writes to its out-dir are scp'd off the VM
+into the run's output).
+
+### Durable
+
+- **Atomic store** — each save writes a temp file + fsync + rename, so a crash
+  mid-write can never corrupt the board.
+- **Reclaim** — a run interrupted by a crash/restart leaves cards in `doing`; the
+  next `board run` resets those back to `todo` and resumes (a dead task is
+  reclaimed, not stuck). `attempts` is preserved.
+- **Run log** — every claim / done / blocked / reclaim is appended to
+  `<home>/board/<name>.events.jsonl` for audit and the cockpit's live activity feed.
+
+### Three ways to fire a board
+
+1. **Manually** — the cockpit **Orchestration** view's *Run* button, or
+   `maturana board run <name>`.
+2. **On a schedule (cron)** — a schedule with a board target runs it unattended:
+   `maturana schedule add <agent> nightly --cron "0 2 * * *" --board <name>`
+   (or set the *board* field when adding a schedule in the cockpit). The cron is
+   the trigger; the board is the work.
+3. **By trigger** — `POST /api/boards/<name>/run` (cockpit-authenticated) lets any
+   external event start a board.
+
+### Cockpit
+
+The **Orchestration** view is a board editor + live monitor: create/delete
+boards, add/edit/delete cards (title, detail, assignee dropdown of roles +
+agents, dependency picker), then *Run* and watch the To-do / Doing / Done /
+Blocked columns and the run log update live. *Reset* clears results for a clean
+re-run.
+
+### Boundaries (zero-trust)
+
+A card always runs in its assignee's VM over A2A — there is no weaker execution
+substrate. Caps are host-enforced and unraiseable from inside a card. A board is
+a task list for agents, not a way to reconfigure the fleet; don't give a card
+work that rewrites another agent's identity files.

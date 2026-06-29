@@ -4,9 +4,10 @@
 
 use std::path::PathBuf;
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::Response;
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use maturana_core::spec::AgentSpec;
 use maturana_core::state::MaturanaHome;
@@ -63,11 +64,31 @@ pub(crate) fn snapshot(root: &std::path::Path) -> anyhow::Result<serde_json::Val
                 }
                 let agent_id = entry.file_name().to_string_lossy().to_string();
                 let spec = AgentSpec::from_maturana_markdown(&spec_path).ok();
-                let worker_status: Option<serde_json::Value> = std::fs::read_to_string(
-                    dir.join("worker-status.json"),
-                )
-                .ok()
-                .and_then(|raw| serde_json::from_str(&raw).ok());
+                let status_path = dir.join("worker-status.json");
+                let worker_status: Option<serde_json::Value> =
+                    std::fs::read_to_string(&status_path)
+                        .ok()
+                        .and_then(|raw| serde_json::from_str(&raw).ok());
+                // Liveness by heartbeat FRESHNESS, not the literal status string.
+                // The guest worker rewrites worker-status.json every ~1s while
+                // idle and only ever writes idle/claimed/completed/error — it
+                // never writes "running", so the Overview's old status=="running"
+                // count was always 0 for a healthy idle fleet. An agent is "up"
+                // when its heartbeat is fresh and not in an error state; "busy"
+                // means a turn is actually in flight (status "claimed").
+                let worker_age_s: Option<u64> = std::fs::metadata(&status_path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|d| d.as_secs());
+                let status_str = worker_status
+                    .as_ref()
+                    .and_then(|w| w.get("status"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let live = worker_age_s.map(|age| age <= 90).unwrap_or(false)
+                    && status_str != "error";
                 agents.push(serde_json::json!({
                     "agent_id": agent_id,
                     "name": spec.as_ref().map(|s| s.identity.name.clone()),
@@ -79,6 +100,9 @@ pub(crate) fn snapshot(root: &std::path::Path) -> anyhow::Result<serde_json::Val
                     "egress_allowlist": spec.as_ref().map(|s| s.network.egress_allowlist.clone()).unwrap_or_default(),
                     "egress_allow_all": spec.as_ref().map(|s| s.network.egress_allow_all).unwrap_or(false),
                     "worker_status": worker_status,
+                    "status": status_str,
+                    "live": live,
+                    "worker_age_s": worker_age_s,
                     "spec_parses": spec.is_some(),
                 }));
             }
@@ -203,6 +227,68 @@ pub async fn restart(State(state): State<AppState>, Path(id): Path<String>) -> R
             anyhow::bail!("restart failed: {}", err.trim());
         }
         Ok(serde_json::json!({ "restarted": id, "output": tail }))
+    })
+    .await
+    {
+        Ok(data) => ok(data),
+        Err(response) => response,
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct DeploySkillBody {
+    skill: String,
+}
+
+/// Deploy a host-side skill into a running Firecracker agent's guest: copy the
+/// skill's SKILL.md into /agent/skills over the SSH-pinned channel, via the
+/// CLI's `deploy skill` command. The guest IP is read from the agent's spec, so
+/// the operator only picks the skill — no manual IP/SSH details.
+pub async fn deploy_skill(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<DeploySkillBody>,
+) -> Response {
+    check_id!(id);
+    let skill = body.skill.trim().to_string();
+    if skill.is_empty() || skill.contains('/') || skill.contains('\\') || skill.contains("..") {
+        return err(StatusCode::BAD_REQUEST, "invalid skill name");
+    }
+    let home_root = state.home_root.clone();
+    let spec_path = agent_spec_path(&state, &id);
+    match blocking(move || {
+        let spec = AgentSpec::from_maturana_markdown(&spec_path)?;
+        let fc = spec
+            .vm
+            .firecracker
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("agent has no firecracker guest to deploy into"))?;
+        let guest_ip = fc.guest_ip.clone();
+        // Skills live at <repo root>/skills/<name>; the repo root is the parent of the home dir.
+        let skills_dir = home_root
+            .parent()
+            .unwrap_or(home_root.as_path())
+            .join("skills");
+        let skill_path = skills_dir.join(&skill);
+        if !skill_path.exists() {
+            anyhow::bail!("skill not found at {}", skill_path.display());
+        }
+        let exe = std::env::current_exe()?;
+        let output = std::process::Command::new(exe)
+            .arg("--home")
+            .arg(&home_root)
+            .args(["deploy", "skill"])
+            .arg(&id)
+            .arg(&skill_path)
+            .args(["--ip", &guest_ip])
+            .output()?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "deploy failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(serde_json::json!({ "deployed": skill, "agent": id, "guest_path": "/agent/skills" }))
     })
     .await
     {
@@ -438,6 +524,140 @@ pub async fn file_write(
         }
         std::fs::write(&target, text.as_bytes())?;
         Ok(serde_json::json!({ "path": rel, "written": true, "size": text.len() }))
+    })
+    .await
+    {
+        Ok(data) => ok(data),
+        Err(response) => response,
+    }
+}
+
+/// Download any (non-secret) file under the agent's host directory as a binary
+/// attachment — used for files an agent attaches to a chat reply (the
+/// `{"text":…,"files":[…]}` outbound convention). Accepts an absolute host path
+/// (how outbound files are recorded) OR a path relative to the agent dir; both
+/// must canonicalize INSIDE the agent dir, and secret dirs/names are refused even
+/// for an explicit download. Unlike the previewer, any extension is allowed.
+pub async fn chat_download(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<FileQuery>,
+) -> Response {
+    check_id!(id);
+    let dir = home(&state).agent_dir(&id);
+    let req = q.path.clone();
+    let result = blocking(move || {
+        if req.is_empty() || req.contains("..") {
+            anyhow::bail!("invalid path");
+        }
+        let p = std::path::Path::new(&req);
+        let target = if p.is_absolute() { p.to_path_buf() } else { dir.join(&req) };
+        let canon = target.canonicalize()?;
+        let base = dir.canonicalize()?;
+        if !canon.starts_with(&base) {
+            anyhow::bail!("path escapes the agent directory");
+        }
+        // Default-deny secrets even for an explicit download.
+        let rel = canon
+            .strip_prefix(&base)
+            .unwrap_or(&canon)
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        if rel.split('/').any(|c| SKIP_DIRS.contains(&c)) {
+            anyhow::bail!("not a downloadable file");
+        }
+        let name = canon
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        if SECRET_HINTS.iter().any(|h| name.to_ascii_lowercase().contains(h)) {
+            anyhow::bail!("not a downloadable file");
+        }
+        let meta = std::fs::metadata(&canon)?;
+        if meta.is_dir() {
+            anyhow::bail!("that is a directory");
+        }
+        if meta.len() > 50 * 1024 * 1024 {
+            anyhow::bail!("file is too large to download ({} bytes)", meta.len());
+        }
+        let bytes = std::fs::read(&canon)?;
+        Ok((name, bytes))
+    })
+    .await;
+    match result {
+        Ok((name, bytes)) => {
+            let disp = format!("attachment; filename=\"{}\"", name.replace(['"', '\n', '\r'], ""));
+            (
+                [
+                    (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                    (header::CONTENT_DISPOSITION, disp),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(response) => response,
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct UploadQuery {
+    name: String,
+}
+
+/// Receive a file attached in the chat composer (raw request body, filename in
+/// `?name=`), store it under `<agent>/inbox/<stamp>-<name>`, then best-effort
+/// ingest it into the agent's knowledge graph via the injected hook — the SAME
+/// path a Telegram document upload takes, so the VM-isolated agent can retrieve
+/// it. Returns the stored name + chunk count (or the ingest error, surfaced to
+/// the operator rather than swallowed).
+pub async fn chat_upload(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<UploadQuery>,
+    body: Bytes,
+) -> Response {
+    check_id!(id);
+    let dir = home(&state).agent_dir(&id);
+    let ingest = state.ingest.clone();
+    let home_root = state.home_root.clone();
+    let agent_id = id.clone();
+    let raw_name = q.name.clone();
+    match blocking(move || {
+        if body.is_empty() {
+            anyhow::bail!("empty upload");
+        }
+        if body.len() > 32 * 1024 * 1024 {
+            anyhow::bail!("file is too large to upload ({} bytes)", body.len());
+        }
+        let base_name = raw_name.rsplit(['/', '\\']).next().unwrap_or("file");
+        let safe: String = base_name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+            .collect();
+        let safe = if safe.trim_matches('.').is_empty() { "upload.bin".to_string() } else { safe };
+        let inbox = dir.join("inbox");
+        std::fs::create_dir_all(&inbox)?;
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+        let stored = format!("{stamp}-{safe}");
+        let dest = inbox.join(&stored);
+        std::fs::write(&dest, &body)?;
+        let (ingested, ingest_error) = match &ingest {
+            Some(f) => match f(&home_root, &agent_id, &dest) {
+                Ok(chunks) => (Some(chunks), None),
+                Err(error) => (None, Some(format!("{error:#}"))),
+            },
+            None => (None, Some("graph ingest is not available".to_string())),
+        };
+        Ok(serde_json::json!({
+            "name": safe,
+            "stored": stored,
+            "size": body.len(),
+            "ingested_chunks": ingested,
+            "ingest_error": ingest_error,
+        }))
     })
     .await
     {

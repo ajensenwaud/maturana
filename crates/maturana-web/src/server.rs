@@ -11,11 +11,16 @@ use axum::middleware;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 
-use crate::state::{AppState, Broadcast, EnqueueTurnFn};
+use crate::state::{AppState, Broadcast, EnqueueTurnFn, IngestFileFn};
 use crate::ws::protocol::{ServerMsg, Topic};
 use crate::{api, assets, auth, ws};
 
-pub async fn serve(home_root: PathBuf, bind: &str, enqueue: EnqueueTurnFn) -> anyhow::Result<()> {
+pub async fn serve(
+    home_root: PathBuf,
+    bind: &str,
+    enqueue: EnqueueTurnFn,
+    ingest: Option<IngestFileFn>,
+) -> anyhow::Result<()> {
     let login_token = auth::ensure_web_token(&home_root)?;
     // Providers resolve several conventional paths (.maturana/keys, images,
     // host-auth, hostd token) relative to the repo root. Under a service the
@@ -33,10 +38,11 @@ pub async fn serve(home_root: PathBuf, bind: &str, enqueue: EnqueueTurnFn) -> an
         }
     }
     let token_for_banner = login_token.clone();
-    let state = AppState::new(home_root, login_token, enqueue);
+    let state = AppState::new(home_root, login_token, enqueue).with_ingest(ingest);
 
     tokio::spawn(dashboard_poller(state.clone()));
     tokio::spawn(web_outbound_poller(state.clone()));
+    tokio::spawn(web_progress_poller(state.clone()));
     tokio::spawn(egress_poller(state.clone()));
 
     let app = Router::new()
@@ -125,6 +131,122 @@ async fn web_outbound_poller(state: AppState) {
             }
         }
     }
+}
+
+/// Stream the live progress side-lane for in-flight web chat turns (the same
+/// JSONL Telegram reads: tool lines, thinking, and cumulative answer text) so
+/// replies appear as they're generated instead of all at once on completion.
+/// Turns are registered by the `SessionSend` handler and removed here once they
+/// go terminal (status done/error) or age out (worker died mid-turn).
+async fn web_progress_poller(state: AppState) {
+    loop {
+        // Faster than the outbound poll (2s) — this is the live-typing feed.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        if state.dash_tx.receiver_count() == 0 {
+            continue;
+        }
+        // Snapshot the watch list (key + how far we've streamed each).
+        let watching: Vec<((String, String, String), Option<u64>)> = {
+            let Ok(guard) = state.active_turns.lock() else {
+                continue;
+            };
+            guard
+                .iter()
+                .map(|(key, watch)| (key.clone(), watch.last_seq))
+                .collect()
+        };
+        if watching.is_empty() {
+            continue;
+        }
+        let root = state.home_root.clone();
+        let progress = tokio::task::spawn_blocking(move || read_new_progress(&root, watching))
+            .await
+            .unwrap_or_default();
+        let mut terminal: Vec<(String, String, String)> = Vec::new();
+        for (key, events, is_terminal) in progress {
+            let mut max_seq: Option<u64> = None;
+            for event in events {
+                max_seq = Some(max_seq.map_or(event.seq, |m: u64| m.max(event.seq)));
+                let _ = state.dash_tx.send(Broadcast::Session(ServerMsg::SessionProgress {
+                    agent_id: key.0.clone(),
+                    session_id: key.1.clone(),
+                    message_id: key.2.clone(),
+                    seq: event.seq,
+                    kind: event.kind,
+                    text: event.text,
+                }));
+            }
+            if let (Some(max), Ok(mut guard)) = (max_seq, state.active_turns.lock()) {
+                if let Some(watch) = guard.get_mut(&key) {
+                    watch.last_seq = Some(watch.last_seq.map_or(max, |prev| prev.max(max)));
+                }
+            }
+            if is_terminal {
+                terminal.push(key);
+            }
+        }
+        // Drop finished turns + age out any whose worker died without a terminal
+        // status (15 min), so the map never grows unbounded.
+        let mut to_clear = terminal.clone();
+        if let Ok(mut guard) = state.active_turns.lock() {
+            for key in &terminal {
+                guard.remove(key);
+            }
+            let now = std::time::Instant::now();
+            guard.retain(|key, watch| {
+                let fresh = now.duration_since(watch.started) < Duration::from_secs(900);
+                if !fresh {
+                    to_clear.push(key.clone());
+                }
+                fresh
+            });
+        }
+        // Remove the now-finished side-lane files (mirrors Telegram's cleanup).
+        for key in to_clear {
+            let root = state.home_root.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let paths = maturana_core::session_db::session_paths(
+                    &root.join("agents").join(&key.0),
+                    &key.1,
+                );
+                maturana_core::session_db::clear_progress(&paths, &key.2)
+            })
+            .await;
+        }
+    }
+}
+
+/// For each watched turn, read its progress side-lane and return only the events
+/// newer than `last_seq`, plus whether the turn reached a terminal status. A
+/// missing file yields no events (the worker hasn't written one yet).
+#[allow(clippy::type_complexity)]
+fn read_new_progress(
+    root: &std::path::Path,
+    watching: Vec<((String, String, String), Option<u64>)>,
+) -> Vec<(
+    (String, String, String),
+    Vec<maturana_core::session_db::ProgressEvent>,
+    bool,
+)> {
+    let mut out = Vec::new();
+    for (key, last_seq) in watching {
+        let paths = maturana_core::session_db::session_paths(
+            &root.join("agents").join(&key.0),
+            &key.1,
+        );
+        let all = maturana_core::session_db::read_progress(&paths, &key.2).unwrap_or_default();
+        let terminal = all
+            .iter()
+            .any(|e| e.kind == "status" && (e.text == "done" || e.text == "error"));
+        let fresh: Vec<_> = all
+            .into_iter()
+            .filter(|e| last_seq.map_or(true, |seen| e.seq > seen))
+            .collect();
+        if !fresh.is_empty() || terminal {
+            out.push((key, fresh, terminal));
+        }
+    }
+    out
 }
 
 /// Tail the pipelock proxy audit JSONL files and stream new lines to

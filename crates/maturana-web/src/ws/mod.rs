@@ -214,11 +214,25 @@ fn handle_client_msg(
             // back over WS.
             let result = (state.enqueue)(&state.home_root, &agent_id, &session_id, &text);
             match result {
-                Ok(message_id) => Some(ServerMsg::SessionOutbound {
-                    agent_id,
-                    session_id,
-                    message: serde_json::json!({ "queued": message_id }),
-                }),
+                Ok(message_id) => {
+                    // Register the turn so the progress poller streams its
+                    // side-lane (tool/thinking/answer-text) back to the chat
+                    // until it goes terminal.
+                    if let Ok(mut active) = state.active_turns.lock() {
+                        active.insert(
+                            (agent_id.clone(), session_id.clone(), message_id.clone()),
+                            crate::state::TurnWatch {
+                                last_seq: None,
+                                started: std::time::Instant::now(),
+                            },
+                        );
+                    }
+                    Some(ServerMsg::SessionOutbound {
+                        agent_id,
+                        session_id,
+                        message: serde_json::json!({ "queued": message_id }),
+                    })
+                }
                 Err(error) => Some(ServerMsg::Error {
                     code: "session_send_failed".to_string(),
                     message: format!("{error:#}"),

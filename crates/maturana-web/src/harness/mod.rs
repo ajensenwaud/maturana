@@ -77,6 +77,48 @@ pub fn adapter_for(kind: &HarnessKind) -> Box<dyn HarnessAdapter> {
     }
 }
 
+/// Resolve a harness CLI (`codex`, `opencode`, …) to an absolute path on Unix.
+/// A `systemd --user` service runs with a minimal PATH (no `~/.npm-global/bin`,
+/// `~/.local/bin`, nvm, …), so a bare program name fails with `No such file or
+/// directory (os error 2)` even though the operator's login shell can run it —
+/// which is exactly why the cockpit Console showed `turn_spawn_failed`. Scan
+/// `$PATH`, then the common npm/local install dirs, and fall back to the bare
+/// name (so a normal PATH still works and the Windows shim logic is untouched).
+/// Cross-platform-compilable (only invoked on the Unix spawn path at runtime).
+pub(crate) fn resolve_program(name: &str) -> String {
+    use std::path::Path;
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in path.split(':').filter(|d| !d.is_empty()) {
+            let cand = Path::new(dir).join(name);
+            if cand.is_file() {
+                return cand.display().to_string();
+            }
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        for rel in [
+            ".npm-global/bin",
+            ".local/bin",
+            ".local/share/npm/bin",
+            ".volta/bin",
+            ".bun/bin",
+            ".nvm/current/bin",
+        ] {
+            let cand = Path::new(&home).join(rel).join(name);
+            if cand.is_file() {
+                return cand.display().to_string();
+            }
+        }
+    }
+    for dir in ["/usr/local/bin", "/usr/bin", "/opt/homebrew/bin"] {
+        let cand = Path::new(dir).join(name);
+        if cand.is_file() {
+            return cand.display().to_string();
+        }
+    }
+    name.to_string()
+}
+
 /// Spawn `command`, stream stdout lines through `map_line`, forward stderr
 /// tails into the completion detail on failure, and emit a synthetic
 /// completion if the parser never produced one. Shared by both adapters.
@@ -105,15 +147,28 @@ pub(crate) fn spawn_streaming(
         let mut err_lines = BufReader::new(stderr).lines();
         let mut stderr_tail: Vec<String> = Vec::new();
         let mut completed = false;
+        // Only an EXPLICIT cancel should kill the turn. The kill Sender lives in
+        // the TurnHandle, which the WS layer drops the instant a turn completes
+        // (the handle is removed from the per-socket map). A dropped Sender
+        // resolves this receiver as `Err` — if we treated that the same as a
+        // real cancel we'd race the natural stdout EOF and spuriously report
+        // "cancelled" on a turn that actually succeeded.
+        let mut cancellable = true;
         loop {
             tokio::select! {
-                _ = &mut kill_rx => {
-                    let _ = child.kill().await;
-                    let _ = tx.send(TurnEvent::Completed {
-                        ok: false,
-                        detail: Some("cancelled".to_string()),
-                    }).await;
-                    return;
+                res = &mut kill_rx, if cancellable => {
+                    if res.is_ok() {
+                        let _ = child.kill().await;
+                        let _ = tx.send(TurnEvent::Completed {
+                            ok: false,
+                            detail: Some("cancelled".to_string()),
+                        }).await;
+                        return;
+                    }
+                    // Sender dropped: the turn already finished and its handle
+                    // was released. Stop watching for cancel and let stdout
+                    // drain to its natural EOF.
+                    cancellable = false;
                 }
                 line = lines.next_line() => {
                     match line {

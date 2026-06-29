@@ -44,7 +44,13 @@ impl HarnessAdapter for OpencodeAdapter {
             )
         })?;
         // Same Windows shim consideration as codex: spawn the .cmd by name.
-        let program = if cfg!(windows) { "opencode.cmd" } else { "opencode" };
+        // On Unix resolve the absolute path so a minimal systemd --user PATH
+        // doesn't ENOENT (same fix as codex_program).
+        let program = if cfg!(windows) {
+            "opencode.cmd".to_string()
+        } else {
+            crate::harness::resolve_program("opencode")
+        };
         let mut command = Command::new(program);
         command
             .args(Self::args(&request))

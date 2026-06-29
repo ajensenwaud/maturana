@@ -1,6 +1,9 @@
 # maturana-snapshot
 
-Use this skill when a user wants to take, list, or restore Maturana snapshots.
+Use this skill when a user wants to take, list, or restore Maturana snapshots —
+either full VM **memory** snapshots (`maturana snapshot`, pause/restore a live
+VM) or fast **copy-on-write disk** snapshots of a Firecracker rootfs
+(`maturana vm`, instant reflink clone/snapshot/rewind on Btrfs/XFS/ZFS).
 
 Snapshots are provider-aware safety operations. Treat them as a workflow with
 preflight and evidence, not as a bare command wrapper.
@@ -63,6 +66,18 @@ Use `--live` for restorable VM snapshots:
 .\scripts\maturana.ps1 snapshot take <agent-id> <snapshot-name> --live
 .\scripts\maturana.ps1 snapshot list <agent-id> --live
 .\scripts\maturana.ps1 snapshot restore <agent-id> <snapshot-name> --live
+```
+
+Copy-on-write **disk** snapshots of a Firecracker rootfs (Linux; instant +
+space-shared on Btrfs/XFS/ZFS-2.2+, full copy on ext4). Stop the agent first —
+these operate on the rootfs file:
+
+```bash
+maturana vm fstype <path>                       # report reflink capability of a filesystem
+maturana vm clone <src> <dest>                  # reflink clone a rootfs image (prints reflink vs full-copy)
+maturana vm snapshot <agent-id> --name <name>   # CoW snapshot the (stopped) agent rootfs
+maturana vm snapshots <agent-id>                # list CoW rootfs snapshots
+maturana vm rollback <agent-id> --name <name>   # rewind rootfs to a snapshot, then relaunch
 ```
 
 ## Evidence

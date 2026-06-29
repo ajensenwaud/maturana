@@ -1769,21 +1769,6 @@ fn handle_telegram_photo(
     caption: Option<&str>,
     reply_to_message_id: Option<i64>,
 ) -> anyhow::Result<()> {
-    let knowledge_graph = agent_knowledge_graph(home, &config.agent_id);
-    let graph_token = maturana_core::worker::read_graph_token(home.root());
-    let (graph_token, graph_name) = match (graph_token, knowledge_graph.enabled) {
-        (Some(value), true) => (value, crate::graph::agent_graph_name(&config.agent_id)),
-        _ => {
-            send_telegram(
-                token,
-                &chat_id.to_string(),
-                "I received the image, but my knowledge graph is not enabled, so I cannot store it. Enable `knowledge_graph` in MATURANA.md and set up the graph service.",
-                reply_to_message_id,
-            )?;
-            return Ok(());
-        }
-    };
-
     send_telegram_chat_action(token, &chat_id.to_string(), "typing")?;
     let inbox = home.agent_dir(&config.agent_id).join("inbox");
     fs::create_dir_all(&inbox)?;
@@ -1798,6 +1783,48 @@ fn handle_telegram_photo(
         )?;
         return Ok(());
     }
+
+    // VISION (primary): push the image into the guest workspace and run it as a
+    // normal prompt turn that points the harness at the file. A vision-capable
+    // harness (Claude Code / codex / opencode) opens and *sees* the image, then
+    // replies through the same memory + reply + TTS pipeline as a typed message.
+    match crate::deliver_image_to_guest(home, &config.agent_id, &image_dest) {
+        Ok(guest_path) => {
+            audit_channel_event(
+                home,
+                &config.agent_id,
+                "channel.telegram.image",
+                &format!("delivered image to guest ({guest_path}); running vision turn"),
+            )?;
+            let prompt = crate::vision_prompt_text(caption, &guest_path);
+            return run_channel_prompt(home, token, config, chat_id, &prompt, reply_to_message_id);
+        }
+        Err(error) => {
+            audit_channel_event(
+                home,
+                &config.agent_id,
+                "channel.telegram.image_fallback",
+                &format!("guest image delivery failed ({error:#}); falling back to OCR"),
+            )?;
+        }
+    }
+
+    // FALLBACK: the guest is unreachable — OCR the image into the knowledge graph
+    // so it is at least retained, if the graph is enabled.
+    let knowledge_graph = agent_knowledge_graph(home, &config.agent_id);
+    let graph_token = maturana_core::worker::read_graph_token(home.root());
+    let (graph_token, graph_name) = match (graph_token, knowledge_graph.enabled) {
+        (Some(value), true) => (value, crate::graph::agent_graph_name(&config.agent_id)),
+        _ => {
+            send_telegram(
+                token,
+                &chat_id.to_string(),
+                "I received your image but couldn't reach my VM to view it, and my knowledge graph is off, so I can't store it either. Try again, or enable `knowledge_graph`.",
+                reply_to_message_id,
+            )?;
+            return Ok(());
+        }
+    };
 
     let text = match ocr_image_text(&image_dest) {
         Ok(text) if !text.trim().is_empty() => text,
@@ -2087,7 +2114,10 @@ fn sanitize_document_name(name: Option<&str>) -> String {
 
 /// The agent's `knowledge_graph` opt-in, read from its materialized spec.
 /// Missing/unparseable spec means disabled (the default).
-fn agent_knowledge_graph(home: &MaturanaHome, agent_id: &str) -> maturana_core::spec::KnowledgeGraph {
+pub(crate) fn agent_knowledge_graph(
+    home: &MaturanaHome,
+    agent_id: &str,
+) -> maturana_core::spec::KnowledgeGraph {
     maturana_core::spec::AgentSpec::from_maturana_markdown(
         &home.agent_dir(agent_id).join("MATURANA.md"),
     )
@@ -6642,6 +6672,52 @@ fn handle_discord_attachments(
             lines.push(format!("• `{file_name}` — download failed: {error}"));
             continue;
         }
+        // VISION: an image attachment is delivered into the guest workspace and
+        // run as a turn so the vision-capable harness opens and *sees* it (parity
+        // with Telegram). Falls through to graph/inbox if the guest is unreachable.
+        let ext = file_name
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let is_image = matches!(
+            ext.as_str(),
+            "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "heic" | "heif" | "tif" | "tiff"
+        );
+        if is_image {
+            match crate::deliver_image_to_guest(home, &config.agent_id, &dest) {
+                Ok(guest_path) => {
+                    let cap = (!caption.trim().is_empty()).then_some(caption);
+                    let prompt = crate::vision_prompt_text(cap, &guest_path);
+                    let _ = enqueue_turn(
+                        home,
+                        &config.agent_id,
+                        &config.session_id,
+                        "discord",
+                        channel_id,
+                        stable_chat_key(channel_id),
+                        None,
+                        &prompt,
+                        serde_json::json!({ "image": guest_path }),
+                    );
+                    let _ = audit_channel_event(
+                        home,
+                        &config.agent_id,
+                        "channel.discord.image",
+                        &format!("delivered image to guest ({guest_path}); running vision turn"),
+                    );
+                    lines.push(format!("• `{file_name}` — 👁️ viewing it now"));
+                    continue;
+                }
+                Err(error) => {
+                    let _ = audit_channel_event(
+                        home,
+                        &config.agent_id,
+                        "channel.discord.image_fallback",
+                        &format!("guest image delivery failed ({error:#}); falling back"),
+                    );
+                }
+            }
+        }
         let supported = file_name
             .rsplit_once('.')
             .map(|(_, ext)| {
@@ -6798,7 +6874,56 @@ pub(crate) fn enqueue_turn(
         }
     }
     let id = insert_inbound(&paths, "chat", channel, platform_id, thread_id, &content.to_string())?;
+    fire_agent_hooks(
+        home,
+        maturana_core::hooks::HookContext::new(
+            maturana_core::hooks::HookEvent::MessageIn,
+            agent_id,
+        )
+        .channel(channel)
+        .text(text),
+    );
     Ok(id)
+}
+
+/// Fire an agent's lifecycle hooks for `ctx`, off the hot path. Loads the
+/// agent's spec; if it declares no hooks this is a cheap no-op. Command/webhook
+/// actions run on the host (never the guest). The `enqueue-turn` action is routed
+/// through [`enqueue_outreach_turn`] (system-initiated) so it can NEVER recurse
+/// back into the `message-in` hook fired above.
+pub(crate) fn fire_agent_hooks(home: &MaturanaHome, ctx: maturana_core::hooks::HookContext) {
+    let spec_path = home.agent_dir(&ctx.agent_id).join("MATURANA.md");
+    let spec = match maturana_core::AgentSpec::from_maturana_markdown(&spec_path) {
+        Ok(spec) => spec,
+        Err(_) => return,
+    };
+    if spec.hooks.on.is_empty() {
+        return;
+    }
+    let home = home.clone();
+    std::thread::spawn(move || {
+        let enqueue = |target: &str, prompt: &str| -> anyhow::Result<()> {
+            let session = format!("{target}-main");
+            match current_paired_telegram_chat_id(&home, target) {
+                Some(chat_id) => {
+                    enqueue_outreach_turn(
+                        &home,
+                        target,
+                        &session,
+                        chat_id,
+                        prompt,
+                        "hook",
+                        serde_json::json!({}),
+                    )?;
+                    Ok(())
+                }
+                None => anyhow::bail!(
+                    "agent '{target}' has no paired channel to receive a hook-enqueued turn"
+                ),
+            }
+        };
+        maturana_core::hooks::fire(&spec, &ctx, Some(&enqueue));
+    });
 }
 
 /// Enqueue a SYSTEM-initiated turn (proactivity, scheduler) tagged for the

@@ -39,7 +39,15 @@ pub fn resolve_secret_source_with_home(
 
     if let Some(name) = source.strip_prefix("pipelock:") {
         let vault = PipelockVault::new(home_root.join("pipelock"));
-        return Ok(SecretValue(vault.get(name)?));
+        let stored = vault.get(name)?;
+        // A pipelock entry may hold a Bitwarden REFERENCE rather than a literal
+        // (`bitwarden://<id>` or `bw://<id>/<field>`). Resolve it host-side, at
+        // injection time, so Bitwarden can be the source of truth without the
+        // value ever being stored in the clear or reaching a guest.
+        if crate::bitwarden::is_reference(&stored) {
+            return Ok(SecretValue(crate::bitwarden::resolve(&stored, &vault)?));
+        }
+        return Ok(SecretValue(stored));
     }
 
     anyhow::bail!("unsupported secret source; expected env:, file:, or pipelock:")

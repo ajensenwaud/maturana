@@ -1,9 +1,38 @@
 # Web UI: Maturana cockpit vs Hermes Agent dashboard
 
 A side-by-side of the **web interfaces** (not the orchestration engines — that's
-`multi-agent-orchestration.md`). Maturana side is from the `maturana-web` crate
-(currently disabled; bringing it back is the trigger for this comparison). Hermes
-side is from Nous Research's official dashboard docs (June 2026).
+`multi-agent-orchestration.md`). Maturana side is from the `maturana-web` crate.
+Hermes side is from Nous Research's official dashboard docs (June 2026).
+
+## Status update — June 2026 (cockpit revival + Hermes-coverage pass)
+
+The cockpit is back (`:47836`) and this pass closed the biggest coverage gaps so
+the cockpit covers the features Hermes advertises, mapped onto Maturana's
+zero-trust, VM-per-agent model. New since the table below was first written:
+
+- **Chat streaming** — replies now stream token-by-token as generated (the worker's
+  progress side-lane — tool lines + thinking + cumulative answer text — surfaced
+  over the chat WS by a `web_progress_poller`, the same feed Telegram reads). Fixed
+  the typing indicator that flashed-and-vanished (the `{queued}` echo used to clear it).
+- **Chat file upload/download (like Telegram)** — 📎 attach uploads to the agent's
+  inbox and ingests into its knowledge graph (the exact Telegram-document path, via
+  an injected `IngestFileFn`), so a VM-isolated agent can retrieve it; agent replies
+  that carry `files` render as guarded download links.
+- **Schedules view** — list/add/enable-disable/delete the per-agent cron store
+  (`maturana schedule` parity). Closes Hermes "FOCUSED AUTOMATION / cron".
+- **Channels overview** — per-agent matrix of configured vs live chat surfaces
+  (web/tui/telegram/discord/slack/agentmail). Closes Hermes "LIVES EVERYWHERE".
+- **Orchestrator / board view** — durable multi-agent runs surfaced as a status
+  board (steps = cards with deps/status/result); view-board + abort. Closes Hermes
+  "TASKS MULTIPLIED".
+- **Flat, squared look** — dropped all rounded corners + decorative shadows/glows
+  (kept focus outlines + the active-item accent bar); de-duplicated link status to
+  the single bottom status bar.
+
+**Still open (deliberately deferred):** the embedded interactive PTY TUI (Hermes's
+biggest UX delta — ours is a streaming console), usage/cost analytics, a dedicated
+MCP-servers panel, multi-user OIDC/OAuth, and plugin themes. The rows below predate
+this pass; treat the Status update as authoritative where they conflict.
 
 Sources: Hermes [web-dashboard docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/web-dashboard),
 [repo](https://github.com/NousResearch/hermes-agent).

@@ -4,11 +4,15 @@
 //! operator.
 
 pub mod agents;
+pub mod boards;
+pub mod channels;
 pub mod egress;
 pub mod graph;
 pub mod ops;
+pub mod orchestrator;
 pub mod pipelock;
 pub mod runtime;
+pub mod schedules;
 pub mod search;
 pub mod sessions;
 pub mod skills;
@@ -16,6 +20,7 @@ pub mod system;
 pub mod tools;
 pub mod voice;
 
+use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post, put};
@@ -31,9 +36,16 @@ pub fn router() -> Router<AppState> {
         .route("/api/agents/:id/detail", get(agents::detail))
         .route("/api/agents/:id/stop", post(agents::stop))
         .route("/api/agents/:id/restart", post(agents::restart))
+        .route("/api/agents/:id/deploy-skill", post(agents::deploy_skill))
         .route("/api/agents/:id/files", get(agents::files))
         .route("/api/agents/:id/files/read", get(agents::file_read))
         .route("/api/agents/:id/files/write", post(agents::file_write))
+        .route("/api/agents/:id/chat/download", get(agents::chat_download))
+        // Chat attachment upload: raw body, generous limit (default is ~2 MB).
+        .route(
+            "/api/agents/:id/chat/upload",
+            post(agents::chat_upload).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
         .route("/api/agents/:id/spec", get(agents::spec_get).put(agents::spec_put))
         .route("/api/agents/:id/spec/validate", post(agents::spec_validate))
         .route("/api/agents/:id/apply", post(agents::apply))
@@ -63,9 +75,39 @@ pub fn router() -> Router<AppState> {
         .route("/api/search", post(search::search))
         .route("/api/voice/tts", post(voice::tts))
         .route("/api/voice/stt", post(voice::stt))
-        .route("/api/tools", get(tools::list))
+        .route(
+            "/api/tools",
+            get(tools::list).post(tools::register).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
         .route("/api/skills", get(skills::list).post(skills::create))
         .route("/api/skills/:name", get(skills::detail))
+        // Schedules (per-agent cron store; mirrors `maturana schedule …`).
+        .route("/api/schedules", get(schedules::list))
+        .route("/api/schedules/:agent", post(schedules::add))
+        .route("/api/schedules/:agent/:id/toggle", post(schedules::toggle))
+        .route("/api/schedules/:agent/:id", axum::routing::delete(schedules::delete))
+        // Orchestrator loop runs (LLM-decomposed one-shot goals; read-only viewer).
+        .route("/api/orchestrator/runs", get(orchestrator::list_runs))
+        .route("/api/orchestrator/runs/:run_id", get(orchestrator::run_detail))
+        .route("/api/orchestrator/runs/:run_id/abort", post(orchestrator::abort_run))
+        // Durable orchestration boards (user-defined cards, run across agents).
+        .route("/api/boards", get(boards::list).post(boards::create))
+        .route("/api/boards/:name", get(boards::detail).delete(boards::delete))
+        .route("/api/boards/:name/run", post(boards::run))
+        .route("/api/boards/:name/reset", post(boards::reset))
+        .route("/api/boards/:name/rename", post(boards::rename_board))
+        .route("/api/boards/:name/attachment", get(boards::download_attachment))
+        .route("/api/boards/:name/cards", post(boards::add_card))
+        .route("/api/boards/:name/cards/:id", put(boards::edit_card).delete(boards::delete_card))
+        .route("/api/boards/:name/cards/:id/comment", post(boards::comment_card))
+        .route("/api/boards/:name/cards/:id/decompose", post(boards::decompose))
+        .route("/api/boards/:name/cards/:id/specify", post(boards::specify))
+        .route(
+            "/api/boards/:name/cards/:id/attach",
+            post(boards::upload_attachment).layer(DefaultBodyLimit::max(25 * 1024 * 1024)),
+        )
+        // Channels overview (configured + live per agent).
+        .route("/api/channels", get(channels::overview))
         // PUT routes share the same mutating-CSRF gate as POST/DELETE.
         .route("/api/_csrf_probe", put(|| async { ok(serde_json::json!({})) }))
 }
