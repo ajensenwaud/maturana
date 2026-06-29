@@ -1196,6 +1196,15 @@ button.primary:hover {
 .board-drawer-detail, .board-drawer-result { font-size: 0.9rem; color: var(--ink); }
 .board-drawer-sub { color: var(--dim); font-family: var(--mono); font-size: 0.74rem; letter-spacing: 0.08em; text-transform: uppercase; margin-top: 6px; }
 .board-drawer-att { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+/* Run history: each attempt shows its FULL outcome text, not a truncated line. */
+.board-runs { display: flex; flex-direction: column; gap: 8px; max-height: 46vh; overflow: auto; }
+.board-run { border-left: 2px solid var(--line); padding: 2px 0 4px 9px; }
+.board-run-head { display: flex; align-items: center; gap: 7px; margin-bottom: 3px; }
+.board-run-attempt { font-family: var(--mono); font-size: 0.76rem; color: var(--dim); }
+.board-run-agent { font-family: var(--mono); font-size: 0.76rem; color: var(--accent); }
+.board-run-summary { font-size: 0.86rem; color: var(--ink); white-space: pre-wrap; word-break: break-word; }
+.board-run-summary > :first-child { margin-top: 0; }
+.board-run-summary > :last-child { margin-bottom: 0; }
 .board-comments { display: flex; flex-direction: column; gap: 6px; }
 .board-comment { font-size: 0.86rem; }
 .board-comment-author { color: var(--accent); font-family: var(--mono); font-size: 0.76rem; margin-right: 6px; }

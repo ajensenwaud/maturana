@@ -1438,12 +1438,12 @@ export async function renderOrchestration(panel, socket) {
   const legend = el("div", "orch-legend");
   const lg = (label, rest) => { const s = el("span"); s.append(el("b", null, label), document.createTextNode(" " + rest)); return s; };
   legend.append(
-    lg("Triage", "rough ideas — use ⚗ Decompose / ✨ Specify to flesh out"),
+    lg("Triage", "ideas you haven't committed to running — open a card to Specify the detail or Decompose it into sub-tasks, then move it to To do"),
     lg("To do", "ready to run"),
     lg("Doing · Done · Blocked", "set by the runner during a Run"),
   );
   const keys = el("span", "orch-legend-keys");
-  keys.textContent = "card badges:  p# priority · after deps · goal judge-loop · ⟳ runs · 📎 files";
+  keys.textContent = "card badges:  p# priority · after deps · goal judge-loop · runs · files";
   legend.append(keys);
   const bar = el("div", "orch-bar");
   const filters = el("div", "orch-filters");
@@ -1749,10 +1749,11 @@ export async function renderOrchestration(panel, socket) {
     if (c.deps && c.deps.length) meta.append(el("span", "board-card-dep", `after ${c.deps.join(",")}`));
     tile.append(meta);
     const counts = [];
-    if (c.comments && c.comments.length) counts.push(`💬${c.comments.length}`);
-    if (c.runs && c.runs.length) counts.push(`⟳${c.runs.length}`);
-    if (c.attachments && c.attachments.length) counts.push(`📎${c.attachments.length}`);
-    if (counts.length) tile.append(el("div", "board-card-counts", counts.join("  ")));
+    const plural = (n, w) => `${n} ${w}${n > 1 ? "s" : ""}`;
+    if (c.comments && c.comments.length) counts.push(plural(c.comments.length, "comment"));
+    if (c.runs && c.runs.length) counts.push(plural(c.runs.length, "run"));
+    if (c.attachments && c.attachments.length) counts.push(plural(c.attachments.length, "file"));
+    if (counts.length) tile.append(el("div", "board-card-counts", counts.join(" · ")));
     return tile;
   }
 
@@ -1858,11 +1859,11 @@ export async function renderOrchestration(panel, socket) {
     const acts = el("div", "row-actions");
     acts.append(button("Edit", () => editCardForm(c)));
     if (c.status === "triage") {
-      acts.append(button("⚗ Decompose", async () => {
+      acts.append(button("Decompose", async () => {
         try { await api(`/api/boards/${state.current}/cards/${c.id}/decompose`, { method: "POST" }); toast("decomposing… (refreshes when done)", "ok"); pollOnce(6); }
         catch (e) { toast(String(e), "bad"); }
       }));
-      acts.append(button("✨ Specify", async () => {
+      acts.append(button("Specify", async () => {
         try { await api(`/api/boards/${state.current}/cards/${c.id}/specify`, { method: "POST" }); toast("specifying… (refreshes when done)", "ok"); pollOnce(6); }
         catch (e) { toast(String(e), "bad"); }
       }));
@@ -1892,7 +1893,7 @@ export async function renderOrchestration(panel, socket) {
     for (const p of c.attachments || []) {
       const a = document.createElement("a");
       a.className = "chat-download";
-      a.textContent = `⬇ ${p.split(/[\\/]/).pop()}`;
+      a.textContent = p.split(/[\\/]/).pop();
       a.href = `/api/boards/${state.current}/attachment?path=${encodeURIComponent(p)}`;
       a.setAttribute("download", p.split(/[\\/]/).pop());
       att.append(a);
@@ -1907,17 +1908,25 @@ export async function renderOrchestration(panel, socket) {
       } catch (e) { toast(String(e), "bad"); }
       fileInput.value = "";
     });
-    const upBtn = button("📎 Attach file", () => fileInput.click());
+    const upBtn = button("Attach file", () => fileInput.click());
     att.append(upBtn, fileInput);
     dr.append(att);
 
-    // run history
+    // run history — show the FULL outcome text per attempt (was truncated to 80
+    // chars, which cut the status message mid-sentence).
     if (c.runs && c.runs.length) {
       dr.append(el("div", "board-drawer-sub", "Run history"));
-      const rl = el("div", "log-view");
+      const rl = el("div", "board-runs");
       for (const r of c.runs) {
-        const row = el("div", "log-row");
-        row.append(el("span", "log-time", `#${r.attempt}`), el("span", "log-msg", `${r.outcome} · ${r.agent || "?"} · ${(r.summary || "").slice(0, 80)}`));
+        const row = el("div", "board-run");
+        const head = el("div", "board-run-head");
+        head.append(
+          el("span", "board-run-attempt", `#${r.attempt}`),
+          badge(r.outcome || "?", r.outcome === "completed" ? "good" : r.outcome === "failed" ? "bad" : "dim"),
+          el("span", "board-run-agent", r.agent || "?"),
+        );
+        row.append(head);
+        if (r.summary) { const b = el("div", "board-run-summary"); b.innerHTML = renderMd(r.summary); row.append(b); }
         rl.append(row);
       }
       dr.append(rl);
