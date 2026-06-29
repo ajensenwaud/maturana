@@ -7083,18 +7083,23 @@ fn build_dispatch_prompt(home: &MaturanaHome, agent_id: &str, task: &str) -> Str
     };
     let identity = head("AGENTS.md", 4000);
     let memory = head("memory/MEMORY.md", 4000);
+    // Section headers must NOT start with "-" : a harness CLI (codex exec, claude
+    // -p, …) is clap-based and treats a positional PROMPT that begins with "--" as
+    // an unknown option, printing usage and failing the whole turn. The old
+    // "--- WHO YOU ARE ---" prefix broke every dispatched (board/A2A) turn that
+    // carried an identity block. "===" is visually equivalent and parser-safe.
     let mut out = String::new();
     if !identity.trim().is_empty() {
-        out.push_str("--- WHO YOU ARE ---\n");
+        out.push_str("=== WHO YOU ARE ===\n");
         out.push_str(identity.trim());
         out.push_str("\n\n");
     }
     if !memory.trim().is_empty() {
-        out.push_str("--- YOUR MEMORY (operator, contacts, context) ---\n");
+        out.push_str("=== YOUR MEMORY (operator, contacts, context) ===\n");
         out.push_str(memory.trim());
         out.push_str("\n\n");
     }
-    out.push_str("--- TASK ---\n");
+    out.push_str("=== TASK ===\n");
     out.push_str(task);
     out
 }
@@ -7645,6 +7650,27 @@ mod tests {
     fn pair_command_accepts_bot_suffix() {
         assert!(is_pair_command("/pair@LuhmannSystemsBot ABC123", "ABC123"));
         assert!(!is_pair_command("/pair@LuhmannSystemsBot WRONG", "ABC123"));
+    }
+
+    #[test]
+    fn dispatch_prompt_never_starts_with_a_dash() {
+        // Regression: a leading "--" makes a clap-based harness CLI (codex exec,
+        // claude -p) treat the whole PROMPT as an unknown option and fail the turn.
+        let temp = temp_dir("dispatch-prompt-dash");
+        let home = MaturanaHome::new(temp.path().join(".maturana"));
+        let agent_dir = home.agent_dir("agent");
+        fs::create_dir_all(agent_dir.join("memory")).unwrap();
+        fs::write(agent_dir.join("AGENTS.md"), "# Agent\nidentity\n").unwrap();
+        fs::write(agent_dir.join("memory/MEMORY.md"), "operator: Anders\n").unwrap();
+
+        // With identity + memory present.
+        let p = build_dispatch_prompt(&home, "agent", "do the thing");
+        assert!(!p.starts_with('-'), "prompt must not start with '-': {:?}", &p[..20.min(p.len())]);
+        assert!(p.contains("WHO YOU ARE") && p.contains("operator: Anders") && p.contains("do the thing"));
+
+        // With no identity/memory files (bare task) — still safe.
+        let bare = build_dispatch_prompt(&home, "missing-agent", "do the thing");
+        assert!(!bare.starts_with('-'));
     }
 
     #[test]
