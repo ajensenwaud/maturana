@@ -1436,7 +1436,7 @@ fn collect_step_artifacts(
     };
     // Skip the copy entirely if the worker produced nothing.
     let probe = format!("ls -A {remote_dir} 2>/dev/null | head -1");
-    match crate::run_ssh_with_stdin(&ip, "ubuntu", &key, &host_key, &probe, None) {
+    match crate::run_ssh_with_stdin(&ip, "ubuntu", &key, &host_key, &probe, None, crate::SSH_TIMEOUT_QUICK) {
         Ok(listing) if !listing.trim().is_empty() => {}
         Ok(_) => return 0, // worker wrote nothing — normal, stay quiet
         Err(error) => {

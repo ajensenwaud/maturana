@@ -4316,7 +4316,15 @@ fn wait_for_guest_ssh(
     // (host-key mismatch / auth / connection reset) instead of a black box.
     let mut last_err: Option<String> = None;
     while Instant::now() < deadline {
-        match run_ssh_with_stdin(guest_ip, ssh_user, ssh_key, host_key, "echo ok", None) {
+        match run_ssh_with_stdin(
+            guest_ip,
+            ssh_user,
+            ssh_key,
+            host_key,
+            "echo ok",
+            None,
+            SSH_TIMEOUT_QUICK,
+        ) {
             Ok(_) => return Ok(()),
             Err(error) => last_err = Some(format!("{error:#}")),
         }
@@ -4629,7 +4637,7 @@ fn guest_has_live_harness_creds(
     // `test -s` (present + non-empty) → "LIVE"; otherwise "ABSENT". The `|| echo`
     // keeps the remote exit status 0 so SSH itself never errors on a missing file.
     let cmd = format!("test -s {} && echo LIVE || echo ABSENT", shell_quote(&path));
-    match run_ssh_with_stdin(ip, ssh_user, ssh_key, host_key, &cmd, None) {
+    match run_ssh_with_stdin(ip, ssh_user, ssh_key, host_key, &cmd, None, SSH_TIMEOUT_QUICK) {
         Ok(out) => out.trim() == "LIVE",
         // Unreachable/edge: env + runner copies already proved SSH works by this
         // point, so treat a probe failure as "can't confirm live" → allow the
@@ -4752,6 +4760,7 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
             &host_key,
             &render_harness_install(&install.harness, false),
             None,
+            SSH_TIMEOUT_PROVISION,
         )?;
     }
     if auth_push_path.is_some() {
@@ -4766,6 +4775,7 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
                 &install.harness_auth_guest_path,
             ),
             None,
+            SSH_TIMEOUT_PROVISION,
         )?;
     }
     // MCP config: render the harness-native file (secrets resolved host-side)
@@ -4813,6 +4823,7 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
                         user = shell_quote(&install.ssh_user),
                     ),
                     None,
+                    SSH_TIMEOUT_QUICK,
                 )?;
                 println!("installed MCP config ({} servers) at {guest_path}", spec.mcp_servers.len());
             }
@@ -4835,6 +4846,7 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
                     &host_key,
                     &format!("sudo npm install -g {quoted}"),
                     None,
+                    SSH_TIMEOUT_PROVISION,
                 ) {
                     Ok(_) => println!(
                         "pre-installed {} resident MCP server(s): {}",
@@ -4861,6 +4873,7 @@ fn install_guest_worker(home: &MaturanaHome, install: GuestWorkerInstall) -> any
             user = shell_quote(&install.ssh_user)
         ),
         None,
+        SSH_TIMEOUT_PROVISION,
     )?;
     println!(
         "refreshed {} worker at {}",
@@ -5845,7 +5858,7 @@ fn print_live_guest_state(
     headless_chrome: bool,
 ) -> anyhow::Result<()> {
     let remote = render_live_guest_state_script(headless_chrome);
-    let output = run_ssh_with_stdin(ip, ssh_user, ssh_key, host_key, &remote, None)?;
+    let output = run_ssh_with_stdin(ip, ssh_user, ssh_key, host_key, &remote, None, SSH_TIMEOUT_QUICK)?;
     print!("{output}");
     Ok(())
 }
@@ -6079,7 +6092,7 @@ fn read_live_log(
     } else {
         format!("test -f {path} && tail -n {} {path} || true", lines.max(1))
     };
-    run_ssh_with_stdin(ip, ssh_user, ssh_key, host_key, &command, None)
+    run_ssh_with_stdin(ip, ssh_user, ssh_key, host_key, &command, None, SSH_TIMEOUT_QUICK)
 }
 
 impl LogKind {
@@ -6170,7 +6183,7 @@ fn push_live_path(
 
     if let Some(parent) = remote_parent(remote_path) {
         let mkdir = format!("mkdir -p {}", shell_quote(&parent));
-        run_ssh_with_stdin(ip, ssh_user, ssh_key, host_key, &mkdir, None)?;
+        run_ssh_with_stdin(ip, ssh_user, ssh_key, host_key, &mkdir, None, SSH_TIMEOUT_QUICK)?;
     }
 
     let mut command = ProcessCommand::new("scp");
@@ -6282,6 +6295,18 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+/// SSH command time budgets. QUICK bounds readiness/probe/log commands — they
+/// return in well under a second once the guest is up, so the cap only ever
+/// fires on a stalled attempt (and `wait_for_guest_ssh`'s own outer loop retries
+/// within its larger budget). PROVISION covers first-boot installs — `npm
+/// install -g <harness>`, auth seeding, the worker unit restart — which on a
+/// modest 2-vCPU guest contending with cloud-init can legitimately take minutes.
+/// The old flat 30s cap killed those on slower hosts (e.g. a fresh 7GB / 2-core
+/// box), surfacing as "ssh timed out after 30 seconds" and a stale-pid relaunch
+/// loop, even though the guest itself was healthy.
+pub(crate) const SSH_TIMEOUT_QUICK: Duration = Duration::from_secs(30);
+pub(crate) const SSH_TIMEOUT_PROVISION: Duration = Duration::from_secs(600);
+
 fn run_ssh_with_stdin(
     ip: &str,
     ssh_user: &str,
@@ -6289,12 +6314,20 @@ fn run_ssh_with_stdin(
     host_key: &GuestHostKey,
     remote_command: &str,
     stdin_text: Option<&str>,
+    timeout: Duration,
 ) -> anyhow::Result<String> {
     let mut command = ProcessCommand::new("ssh");
     command
         .args(host_key.options())
         .arg("-o")
         .arg("ConnectTimeout=10")
+        // Key-based only, never interactive: a not-yet-ready or auth-rejecting
+        // guest must fail fast instead of stalling on a password/passphrase
+        // prompt with no TTY (which would burn the whole command budget).
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("PreferredAuthentications=publickey")
         .arg("-i")
         .arg(ssh_key)
         .arg(format!("{ssh_user}@{ip}"))
@@ -6314,7 +6347,7 @@ fn run_ssh_with_stdin(
         stdin.write_all(stdin_text.as_bytes())?;
     }
 
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + timeout;
     loop {
         if child.try_wait()?.is_some() {
             break;
@@ -6322,7 +6355,7 @@ fn run_ssh_with_stdin(
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            anyhow::bail!("ssh timed out after 30 seconds");
+            anyhow::bail!("ssh timed out after {} seconds", timeout.as_secs());
         }
         thread::sleep(Duration::from_millis(100));
     }
