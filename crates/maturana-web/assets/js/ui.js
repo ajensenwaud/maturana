@@ -18,8 +18,8 @@ function mount(overlay) {
   return close;
 }
 
-// fields: [{name,label,type,value,placeholder,options:[{value,label}],rows,required,hint}]
-// type: text | textarea | number | select | checkbox | multiselect
+// fields: [{name,label,type,value,placeholder,options:[{value,label}],rows,required,hint,accept}]
+// type: text | textarea | number | select | checkbox | multiselect | file
 export function formDialog({ title, sub, fields = [], submitLabel = "Save", onSubmit }) {
   const overlay = el("div", "modal-overlay");
   const card = el("div", "modal-card");
@@ -55,6 +55,10 @@ export function formDialog({ title, sub, fields = [], submitLabel = "Save", onSu
         l.append(cb, document.createTextNode(" " + o.label));
         input.append(l);
       }
+    } else if (f.type === "file") {
+      input = el("input", "modal-input");
+      input.type = "file";
+      if (f.accept) input.accept = f.accept;
     } else {
       input = el("input", "modal-input");
       input.type = f.type === "number" ? "number" : "text";
@@ -84,6 +88,7 @@ export function formDialog({ title, sub, fields = [], submitLabel = "Save", onSu
     for (const [name, { input, type, required }] of Object.entries(inputs)) {
       if (type === "checkbox") values[name] = input.checked;
       else if (type === "multiselect") values[name] = [...input.querySelectorAll("input:checked")].map((c) => c.value);
+      else if (type === "file") values[name] = input.files && input.files[0] ? input.files[0] : null;
       else values[name] = typeof input.value === "string" ? input.value.trim() : input.value;
       if (required && (values[name] === "" || values[name] == null)) {
         errLine.textContent = `${name} is required`;

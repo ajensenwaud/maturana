@@ -979,75 +979,129 @@ export async function renderPipelock(panel) {
 // ---- tools / skills ----
 
 export async function renderTools(panel) {
+  // Tools = host-registered WASM modules an agent can call (sandboxed, no
+  // ambient authority). This page is about THOSE tools — the catalog, defining
+  // new ones, and wiring them to agents. Skills, MCP servers and capabilities
+  // have their own pages / live under Agents → config.
   const wrap = section("Tools");
-  wrap.append(desc("What each agent can actually do — its tools, skills, MCP servers, and opt-in capabilities, read from each agent's spec. Edit these per agent under Agents → config."));
+  wrap.append(desc("Host-registered WASM tools — sandboxed modules an agent can call over a stdin/stdout JSON contract. Define a tool below, then wire it to an agent."));
   const body = el("div");
   body.append(el("div", "panel-desc", "loading…"));
   wrap.append(body);
   panel.replaceChildren(wrap);
-  let agents = [];
+
+  // 1) The catalog: what tools exist on this host.
+  let tools = [];
   try {
-    agents = await api("/api/agents");
-    const details = await Promise.all(
-      agents.map((a) => api(`/api/agents/${a.agent_id}/detail`).catch(() => null)),
-    );
-    const rows = details.filter(Boolean).map((d) => [
-      el("strong", null, d.agent_id),
-      chipsOf(d.tools),
-      chipsOf(d.skills),
-      chipsOf(d.mcp_servers),
-      chipsOf(Object.entries(d.capabilities || {}).filter(([, v]) => v === true).map(([k]) => k)),
+    tools = (await api("/api/tools")) || [];
+    const rows = tools.map((t) => [
+      el("strong", null, t.name),
+      t.version,
+      t.description || "—",
+      capSummary(t.capabilities),
     ]);
     body.replaceChildren(
       rows.length
-        ? table(["agent", "tools", "skills", "MCP servers", "capabilities"], rows)
-        : el("div", "panel-desc", "no agents deployed"),
+        ? table(["tool", "version", "description", "capabilities"], rows)
+        : el("div", "panel-desc", "No tools registered yet — use “Define a tool” below."),
     );
   } catch (error) {
     body.replaceChildren(el("div", "status-bad", String(error)));
   }
 
-  // Enable a tool for an agent — composes the existing per-agent config API
-  // (GET the tools array, append, PUT it back; the backend re-validates the spec).
-  const enableWrap = section("Enable a tool for an agent");
-  enableWrap.append(desc("Adds a tool to the agent's spec.tools — it takes effect on the agent's next restart. Pick a registered WASM tool below, or type any tool name."));
+  // 2) Define a tool: upload a compiled .wasm + manifest → host registry.
+  const defWrap = section("Define a tool");
+  defWrap.append(desc("Register a compiled WebAssembly module as a tool. Declared capabilities are the ONLY authority it gets (none = pure compute); network is enforced by the egress proxy. Mirrors `maturana tool register`."));
+  defWrap.append(button("Define a tool…", () => openDefineTool(panel)));
+  panel.append(defWrap);
+
+  // 3) Wire a tool to an agent (adds it to spec.tools; effective on restart).
+  const enableWrap = section("Wire a tool to an agent");
+  enableWrap.append(desc("Adds a tool to the agent's spec.tools so the agent may call it. Takes effect on the agent's next restart."));
+  let agents = [];
+  try { agents = (await api("/api/agents")) || []; } catch {}
   const enRow = el("div", "dash-actions");
   const agentSel = el("select", "model-input");
   for (const a of agents) { const o = el("option", null, a.agent_id); o.value = a.agent_id; agentSel.append(o); }
+  const toolSel = el("select", "model-input");
+  { const o = el("option", null, "— pick a registered tool —"); o.value = ""; toolSel.append(o); }
+  for (const t of tools) { const o = el("option", null, `${t.name} (v${t.version})`); o.value = t.name; toolSel.append(o); }
   const toolInput = el("input", "model-input");
-  toolInput.placeholder = "tool name";
+  toolInput.placeholder = "or type a tool name";
+  toolSel.addEventListener("change", () => { if (toolSel.value) toolInput.value = toolSel.value; });
   const enStatus = el("span", "panel-desc");
-  enRow.append(agentSel, toolInput, button("enable", async () => {
+  enRow.append(agentSel, toolSel, toolInput, button("wire", async () => {
     const id = agentSel.value;
-    const tool = toolInput.value.trim();
-    if (!id || !tool) { toast("Pick an agent and enter a tool name", "bad"); return; }
+    const tool = (toolInput.value || toolSel.value).trim();
+    if (!id || !tool) { toast("Pick an agent and a tool", "bad"); return; }
     enStatus.textContent = "saving…";
     try {
       const cur = await api(`/api/agents/${id}/config?section=tools`);
       const list = Array.isArray(cur.value) ? cur.value.slice() : [];
       if (!list.includes(tool)) list.push(tool);
       await api(`/api/agents/${id}/config`, { method: "PUT", body: JSON.stringify({ section: "tools", value: list }) });
-      enStatus.textContent = `enabled "${tool}" for ${id} — applies on next restart`;
+      enStatus.textContent = `wired "${tool}" to ${id} — applies on next restart`;
       toolInput.value = "";
       renderTools(panel);
     } catch (e) { enStatus.textContent = ""; toast(String(e), "bad"); }
   }), enStatus);
   enableWrap.append(enRow);
-  panel.append(enableWrap);
 
-  // Host-side WASM tool registry, secondary.
-  const reg = section("WASM tool registry");
-  reg.append(desc("Host-registered WASM tools available to wire into an agent (maturana tool register)."));
+  // Which tools each agent currently has wired (tools only — not skills).
   try {
-    const tools = await api("/api/tools");
-    const rows = (tools ?? []).map((t) => [t.name, t.version, t.description]);
-    reg.append(rows.length
-      ? table(["name", "version", "description"], rows)
-      : el("div", "panel-desc", "none registered"));
-  } catch (error) {
-    reg.append(el("div", "status-bad", String(error)));
-  }
-  panel.append(reg);
+    const details = await Promise.all(agents.map((a) => api(`/api/agents/${a.agent_id}/detail`).catch(() => null)));
+    const rows = details.filter(Boolean).map((d) => [el("strong", null, d.agent_id), chipsOf(d.tools)]);
+    if (rows.length) enableWrap.append(table(["agent", "wired tools"], rows));
+  } catch {}
+  panel.append(enableWrap);
+}
+
+// One-line capabilities summary for a tool manifest.
+function capSummary(c) {
+  if (!c) return "pure compute";
+  const parts = [];
+  if (c.net && c.net.length) parts.push(`net: ${c.net.join(", ")}`);
+  if (c.fs_read && c.fs_read.length) parts.push(`read: ${c.fs_read.join(", ")}`);
+  if (c.fs_write && c.fs_write.length) parts.push(`write: ${c.fs_write.join(", ")}`);
+  if (c.env && c.env.length) parts.push(`env: ${c.env.join(", ")}`);
+  return parts.length ? parts.join(" · ") : "pure compute";
+}
+
+// Modal: define (register) a tool by uploading a compiled .wasm + manifest.
+function openDefineTool(panel) {
+  formDialog({
+    title: "Define a tool",
+    sub: "Upload a compiled WebAssembly module and declare what it may touch.",
+    fields: [
+      { name: "name", label: "Name", required: true, placeholder: "lowercase-dashes", hint: "lowercase letters, digits, dashes" },
+      { name: "version", label: "Version", value: "0.1.0" },
+      { name: "description", label: "Description", type: "textarea", rows: 2 },
+      { name: "wasm", label: "WASM module (.wasm)", type: "file", accept: ".wasm,application/wasm", required: true },
+      { name: "net", label: "Network hosts", placeholder: "api.example.com, other.com", hint: "comma-separated; enforced by the egress proxy" },
+      { name: "env", label: "Env var names", placeholder: "API_KEY", hint: "comma-separated; values passed through at call time" },
+      { name: "fs_read", label: "Readable dirs", placeholder: "/data", hint: "comma-separated host dirs" },
+      { name: "fs_write", label: "Writable dirs", placeholder: "/tmp/out", hint: "comma-separated host dirs" },
+    ],
+    submitLabel: "Register",
+    onSubmit: async (v) => {
+      if (!v.wasm) throw new Error("a .wasm module is required");
+      const params = new URLSearchParams();
+      params.set("name", v.name);
+      if (v.version) params.set("version", v.version);
+      if (v.description) params.set("description", v.description);
+      for (const k of ["net", "env", "fs_read", "fs_write"]) if (v[k]) params.set(k, v[k]);
+      const bytes = await v.wasm.arrayBuffer();
+      const res = await fetch(`/api/tools?${params.toString()}`, {
+        method: "POST",
+        headers: { "x-maturana-web": "1", "content-type": "application/wasm" },
+        body: bytes,
+      });
+      const payload = await res.json().catch(() => ({ ok: false, error: "bad json" }));
+      if (!payload.ok) throw new Error(payload.error || `http ${res.status}`);
+      toast(`Registered tool "${payload.data.name}" v${payload.data.version}`, "ok");
+      renderTools(panel);
+    },
+  });
 }
 
 // ---- egress (live governance) ----
@@ -1162,7 +1216,7 @@ export async function renderEgress(panel, socket) {
 
 export async function renderSkills(panel) {
   const wrap = section("Skills");
-  wrap.append(desc("Skills are Markdown procedures (SKILL.md) your agents follow — they live host-side under skills/<name>. They do NOT auto-load into a VM and are NOT the host Codex's skills: deploy one to a running agent (below) to copy it into the guest at /agent/skills, where the agent reads it on its next turn."));
+  wrap.append(desc("Skills are Markdown procedures (SKILL.md) the host's Codex console follows — operator-level playbooks for running Maturana, under skills/<name>. They are NOT pushed into agent VMs; an agent gets its own skills from its spec at launch."));
   const detail = el("div", "skill-view");
   const listBox = el("div");
 
@@ -1216,36 +1270,9 @@ export async function renderSkills(panel) {
   }));
   create.append(row, md, createOut);
 
-  // Deploy a skill into a running agent's guest — answers "how do I get a skill
-  // into an agent". Copies the SKILL.md into /agent/skills over SSH (guest IP from
-  // the agent's spec). Composes the CLI `deploy skill` via /api/agents/:id/deploy-skill.
-  const deployCard = section("Deploy a skill to an agent");
-  deployCard.append(desc("Copies a skill into the agent's guest at /agent/skills over SSH — the agent picks it up on its next turn."));
-  const dRow = el("div", "dash-actions");
-  const skillSel = el("select", "model-input");
-  const agentSel2 = el("select", "model-input");
-  const dStatus = el("span", "panel-desc");
-  try {
-    const [sk, ags] = await Promise.all([api("/api/skills").catch(() => []), api("/api/agents").catch(() => [])]);
-    for (const s of sk) { const o = el("option", null, s.name); o.value = s.name; skillSel.append(o); }
-    for (const a of ags) { const o = el("option", null, a.agent_id); o.value = a.agent_id; agentSel2.append(o); }
-    if (!sk.length) dStatus.textContent = "define a skill first";
-  } catch {}
-  dRow.append(skillSel, el("span", "panel-desc", "→"), agentSel2, button("deploy to agent", async () => {
-    const skill = skillSel.value;
-    const agent = agentSel2.value;
-    if (!skill || !agent) { toast("Pick a skill and an agent", "bad"); return; }
-    dStatus.textContent = "deploying…";
-    try {
-      const d = await api(`/api/agents/${agent}/deploy-skill`, { method: "POST", body: JSON.stringify({ skill }) });
-      dStatus.textContent = `deployed ${d.deployed} → ${d.agent}:${d.guest_path}`;
-    } catch (e) { dStatus.textContent = ""; toast(String(e), "bad"); }
-  }), dStatus);
-  deployCard.append(dRow);
-
   await draw();
   wrap.append(listBox);
-  panel.replaceChildren(wrap, deployCard, create, detail);
+  panel.replaceChildren(wrap, create, detail);
 }
 
 // ---- channels (lives everywhere) ----

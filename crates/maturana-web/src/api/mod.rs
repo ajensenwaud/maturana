@@ -75,7 +75,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/search", post(search::search))
         .route("/api/voice/tts", post(voice::tts))
         .route("/api/voice/stt", post(voice::stt))
-        .route("/api/tools", get(tools::list))
+        .route(
+            "/api/tools",
+            get(tools::list).post(tools::register).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
         .route("/api/skills", get(skills::list).post(skills::create))
         .route("/api/skills/:name", get(skills::detail))
         // Schedules (per-agent cron store; mirrors `maturana schedule …`).

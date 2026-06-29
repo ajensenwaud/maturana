@@ -75,6 +75,20 @@ header.top {
 
 .top-right { display: flex; align-items: center; gap: 14px; }
 
+.logout-btn {
+  appearance: none;
+  background: none;
+  border: 1px solid var(--hairline);
+  color: var(--dim);
+  border-radius: 999px;
+  height: 36px;
+  padding: 0 14px;
+  font-family: var(--sans);
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+.logout-btn:hover { color: var(--accent); border-color: var(--accent); box-shadow: 0 0 18px var(--accent-glow); }
+
 header.top .brand {
   font-size: 1.02rem;
   font-weight: 600;
@@ -207,6 +221,17 @@ button.primary:hover {
   flex-direction: column;
   height: 100%;
   gap: 18px;
+}
+
+.console-note {
+  flex: 0 0 auto;
+  border: 1px solid var(--hairline);
+  border-left: 2px solid var(--accent);
+  background: var(--bg-inset);
+  color: var(--dim);
+  padding: 9px 13px;
+  font-size: 0.8rem;
+  line-height: 1.45;
 }
 
 .timeline {

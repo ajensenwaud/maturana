@@ -57,6 +57,11 @@ export class Console {
     const root = document.createElement("div");
     root.className = "console";
 
+    const note = document.createElement("div");
+    note.className = "console-note label";
+    note.textContent =
+      "Direct line to the host's Codex CLI — runs in the maturana repo with the same AGENTS.md and skills as your terminal. This is the operator console, not an agent VM.";
+
     this.timeline = document.createElement("div");
     this.timeline.className = "timeline";
 
@@ -103,7 +108,8 @@ export class Console {
 
     this.sendButton = document.createElement("button");
     this.sendButton.className = "primary";
-    this.sendButton.textContent = "Run · ctrl+↵";
+    this.sendButton.textContent = "Run · ↵";
+    this.sendButton.title = "Enter or Ctrl/Cmd-Enter sends · Shift-Enter inserts a newline";
     this.sendButton.addEventListener("click", () => this.submit());
 
     this.cancelButton = document.createElement("button");
@@ -137,9 +143,18 @@ export class Console {
       parent: editorHost,
       extensions: [
         this.vimCompartment.of(this.vimCheckbox.checked ? vim() : []),
-        basicSetup,
-        markdown(),
+        // Submit bindings must precede basicSetup so they beat its default
+        // Enter→newline (earlier extensions have higher keymap precedence — the
+        // same reason vim() comes first). Enter / Ctrl-Enter / Cmd-Enter send;
+        // Shift-Enter inserts a newline, matching common chat UIs.
         keymap.of([
+          {
+            key: "Enter",
+            run: () => {
+              this.submit();
+              return true;
+            },
+          },
           {
             key: "Ctrl-Enter",
             mac: "Cmd-Enter",
@@ -148,7 +163,16 @@ export class Console {
               return true;
             },
           },
+          {
+            key: "Shift-Enter",
+            run: (view) => {
+              view.dispatch(view.state.replaceSelection("\n"));
+              return true;
+            },
+          },
         ]),
+        basicSetup,
+        markdown(),
         EditorView.theme(
           {
             "&": { backgroundColor: "var(--bg-inset)", color: "var(--ink)" },
@@ -169,7 +193,7 @@ export class Console {
     });
 
     composer.append(editorHost, toolbar);
-    root.append(this.timeline, composer);
+    root.append(note, this.timeline, composer);
     return root;
   }
 

@@ -147,15 +147,28 @@ pub(crate) fn spawn_streaming(
         let mut err_lines = BufReader::new(stderr).lines();
         let mut stderr_tail: Vec<String> = Vec::new();
         let mut completed = false;
+        // Only an EXPLICIT cancel should kill the turn. The kill Sender lives in
+        // the TurnHandle, which the WS layer drops the instant a turn completes
+        // (the handle is removed from the per-socket map). A dropped Sender
+        // resolves this receiver as `Err` — if we treated that the same as a
+        // real cancel we'd race the natural stdout EOF and spuriously report
+        // "cancelled" on a turn that actually succeeded.
+        let mut cancellable = true;
         loop {
             tokio::select! {
-                _ = &mut kill_rx => {
-                    let _ = child.kill().await;
-                    let _ = tx.send(TurnEvent::Completed {
-                        ok: false,
-                        detail: Some("cancelled".to_string()),
-                    }).await;
-                    return;
+                res = &mut kill_rx, if cancellable => {
+                    if res.is_ok() {
+                        let _ = child.kill().await;
+                        let _ = tx.send(TurnEvent::Completed {
+                            ok: false,
+                            detail: Some("cancelled".to_string()),
+                        }).await;
+                        return;
+                    }
+                    // Sender dropped: the turn already finished and its handle
+                    // was released. Stop watching for cancel and let stdout
+                    // drain to its natural EOF.
+                    cancellable = false;
                 }
                 line = lines.next_line() => {
                     match line {

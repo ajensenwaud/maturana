@@ -9,6 +9,14 @@ import { mountThemeSwitcher } from "/assets/js/themes.js";
 
 mountThemeSwitcher(document.getElementById("theme-switch"));
 
+// ---- logout: drop the server session + cookie, return to the login page ----
+document.getElementById("logout-btn")?.addEventListener("click", async () => {
+  try {
+    await fetch("/logout", { method: "POST", headers: { "x-maturana-web": "1" } });
+  } catch {}
+  window.location.href = "/login";
+});
+
 const socket = new CockpitSocket();
 
 // Link status lives in ONE place: the bottom status bar (#sb-link). The old

@@ -1,11 +1,16 @@
 # maturana-web
 
-Use this skill when you need to start, expose, or operate the **Maturana web
-cockpit** — the browser control plane for the agent fleet (`:47836`, WebSocket +
-REST, token login). It complements the Codex CLI and TUI; it does not replace
-them. Because the cockpit has no TLS of its own, **the bind address is the
-security boundary** — so this skill's core job is to choose where it listens,
-always asking the operator when Tailscale is available.
+Use this skill when you need to **enable, disable, start, expose, or operate**
+the **Maturana web cockpit** — the browser control plane for the agent fleet
+(`:47836`, WebSocket + REST, token login). It complements the Codex CLI and TUI;
+it does not replace them. Because the cockpit has no TLS of its own, **the bind
+address is the security boundary** — so this skill's core job is to choose where
+it listens, always asking the operator when Tailscale is available.
+
+**Enable** the cockpit = register the supervised `web` service
+(`maturana service install web`); **disable** it = stop and unregister that
+service (`maturana service uninstall web`). A one-off foreground run
+(`maturana web`) is for trying it; the service is how it stays on across reboots.
 
 ## Grounding
 
@@ -38,6 +43,13 @@ always asking the operator when Tailscale is available.
 - Run as a **service**: `maturana service install web` registers a supervised
   unit. To pin it to the tailnet, set its `ExecStart` to `maturana web
   --tailnet` (edit the unit), or front it with Tailscale Serve.
+- **Enable the cockpit** (operator wants it on, surviving reboots):
+  `maturana service install web`. Confirm the bind first if Tailscale is up.
+- **Disable the cockpit** (operator wants it off): `maturana service uninstall
+  web` — this stops the running cockpit AND unregisters the unit, so it does not
+  come back at boot. Disabling does not touch agents, the plane, or the login
+  token; re-enable later with `install web`.
+- **Check whether it is enabled**: `maturana service status web`.
 - Tailscale **not** up: default to localhost or an explicit `--bind`; do not
   expose `0.0.0.0` on an untrusted network.
 
@@ -56,8 +68,14 @@ maturana web --tailnet
 # Explicit bind (skips the prompt)
 maturana web --bind 127.0.0.1:47836
 
-# Supervised service (restarts on failure + at boot)
+# Enable the cockpit as a supervised service (restarts on failure + at boot)
 maturana service install web
+
+# Is it enabled / running?
+maturana service status web
+
+# Disable the cockpit (stop + unregister; will NOT return at boot)
+maturana service uninstall web
 ```
 
 The cockpit's left-nav exposes (in order): **Overview** (fleet + plane at a
@@ -80,6 +98,9 @@ Before reporting the cockpit up, collect:
   and sets the `maturana_web_session` cookie.
 - When `--tailnet` was used, the bind host is the `tailscale ip -4` address (not
   `0.0.0.0`), so the cockpit is NOT reachable from the LAN.
+- After **enable**: `maturana service status web` shows the unit registered/
+  active, and `/health` answers. After **disable**: `status web` shows it gone
+  and `curl :47836/health` fails (connection refused) — the port is free.
 
 ## Recovery
 
