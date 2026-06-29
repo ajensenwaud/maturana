@@ -25,7 +25,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use crate::session::{message_files, message_text, run_session_once, RunnerOptions};
@@ -727,6 +727,53 @@ pub(crate) fn current_paired_telegram_chat_id(home: &MaturanaHome, agent_id: &st
         .or_else(|_| vault.get(TELEGRAM_CHAT_ID))
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
+}
+
+/// Whether this agent's Telegram bridge is currently alive, so an outbound row
+/// written to its outbox will actually be sent (not parked forever). The bridge
+/// rewrites `heartbeat.json` on every poll loop; a long-poll can be up to ~50s,
+/// so a window of 120s comfortably covers a healthy bridge while still rejecting
+/// an agent whose poller died. Used by card delivery to pick the agent that
+/// genuinely serves the channel rather than any agent that was once paired.
+pub(crate) fn telegram_bridge_live(home: &MaturanaHome, agent_id: &str) -> bool {
+    let hb = telegram_heartbeat_path(home, agent_id);
+    let Ok(meta) = std::fs::metadata(&hb) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified)
+        .map(|age| age <= Duration::from_secs(120))
+        .unwrap_or(false)
+}
+
+/// Where this agent's Discord bridge would push an unsolicited message: the last
+/// channel it received a message in. Discord (unlike Telegram) has no static
+/// paired destination — the bot only learns a channel once someone talks to it
+/// there — so the running bridge persists that channel id here for host-side
+/// delivery to reuse. `None` until the bot has seen at least one message.
+pub(crate) fn current_discord_delivery_channel(home: &MaturanaHome, agent_id: &str) -> Option<String> {
+    let path = discord_last_channel_path(home, agent_id);
+    let raw = std::fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn discord_last_channel_path(home: &MaturanaHome, agent_id: &str) -> PathBuf {
+    home.agent_dir(agent_id)
+        .join("channels/discord/last-channel")
+}
+
+/// Persist the Discord channel the bot last heard from so host-side delivery
+/// (e.g. a finished board card) can reach the same conversation. Best-effort.
+fn remember_discord_channel(home: &MaturanaHome, agent_id: &str, channel_id: &str) {
+    let path = discord_last_channel_path(home, agent_id);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, channel_id);
 }
 
 fn handle_telegram_update(
@@ -6245,8 +6292,11 @@ fn discord_gateway_session(
                         if let Some((channel_id, content, attachments)) =
                             discord_extract_message(&event, self_id.as_deref())
                         {
-                            // Remember where to flush async replies (the 1s loop above).
+                            // Remember where to flush async replies (the 1s loop above)
+                            // AND persist it so host-side delivery (a finished board
+                            // card) can reach the same Discord channel.
                             last_channel = Some(channel_id.clone());
+                            remember_discord_channel(home, &config.agent_id, &channel_id);
                             // Inbound files: download + ingest each attachment so a
                             // file-only message isn't dropped (parity with Telegram).
                             if !attachments.is_empty() {

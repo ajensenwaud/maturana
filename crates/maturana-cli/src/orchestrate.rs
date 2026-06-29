@@ -827,33 +827,122 @@ fn post_chat(home: &MaturanaHome, chat: Option<&ChatTarget>, text: &str) {
     );
 }
 
-/// Best-effort host-side delivery of a finished card's result to a channel, via
-/// the assignee agent's already-configured bridge. The agent never sends it
-/// itself (no bot token in the task VM); the host posts the result to the
-/// agent's paired chat. Failures are logged and never fail the run — the result
-/// is always collected on the board regardless.
-fn deliver_card_result(home: &MaturanaHome, agent_id: &str, channel: &str, text: &str) {
-    let target = match channel.trim().to_ascii_lowercase().as_str() {
-        "telegram" => match crate::channels::current_paired_telegram_chat_id(home, agent_id) {
-            Some(chat_id) => ChatTarget {
-                channel: "telegram".to_string(),
-                platform_id: chat_id.to_string(),
-                thread_id: None,
-                agent_id: agent_id.to_string(),
-                session_id: format!("{agent_id}-main"),
-            },
-            None => {
-                eprintln!("  deliver: {agent_id} has no paired Telegram chat — result kept on the board only");
-                return;
+/// Where a finished card's result should be delivered. Resolved to a concrete
+/// chat on an agent whose bridge is actually serving the channel — NOT the worker
+/// that ran the card. The worker only produces the content; it reaches the human
+/// through the same outbound bridge any agent reply uses.
+#[derive(Debug)]
+struct DeliveryTarget {
+    channel: String,
+    platform_id: String,
+    agent_id: String,
+    session_id: String,
+}
+
+/// Resolve a card's `deliver` spec to a concrete delivery target, the same way a
+/// normal agent reply leaves the system: pick the agent that actually *serves*
+/// the requested channel (a live bridge with a known destination) and address its
+/// main chat session. `deliver` is a channel name (`telegram`, `discord`, …) or
+/// `channel:agent` to pin a specific agent. `prefer` (the card's worker) is tried
+/// first when it also serves the channel. Returns `Err(reason)` — for honest
+/// logging — when no agent can push on that channel from this host.
+fn resolve_channel_delivery(
+    home: &MaturanaHome,
+    deliver: &str,
+    prefer: Option<&str>,
+) -> Result<DeliveryTarget, String> {
+    let (channel, explicit_agent) = match deliver.split_once(':') {
+        Some((c, a)) => (
+            c.trim().to_ascii_lowercase(),
+            Some(a.trim().to_string()).filter(|s| !s.is_empty()),
+        ),
+        None => (deliver.trim().to_ascii_lowercase(), None),
+    };
+    // Candidate agents, preferring an explicit pin, then the worker, then the rest
+    // in a stable order so resolution is deterministic across runs.
+    let candidates: Vec<String> = match &explicit_agent {
+        Some(a) => vec![a.clone()],
+        None => {
+            let mut ids = crate::discover_agent_ids(home).unwrap_or_default();
+            ids.sort();
+            if let Some(p) = prefer {
+                if let Some(pos) = ids.iter().position(|x| x == p) {
+                    let pref = ids.remove(pos);
+                    ids.insert(0, pref);
+                }
             }
-        },
-        other => {
-            eprintln!("  deliver: channel '{other}' not supported yet — result kept on the board only");
-            return;
+            ids
         }
     };
-    post_chat(home, Some(&target), text);
-    println!("  -> delivered card result to {agent_id} via {channel}");
+    // An explicitly pinned agent bypasses the liveness gate (the operator chose it;
+    // its bridge may just be restarting and the row waits in the outbox).
+    let require_live = explicit_agent.is_none();
+    let session_of = |a: &str| {
+        crate::infer_agent_session_id(home, a).unwrap_or_else(|_| format!("{a}-main"))
+    };
+    match channel.as_str() {
+        "telegram" => {
+            for a in &candidates {
+                if require_live && !crate::channels::telegram_bridge_live(home, a) {
+                    continue;
+                }
+                if let Some(chat_id) = crate::channels::current_paired_telegram_chat_id(home, a) {
+                    return Ok(DeliveryTarget {
+                        channel: "telegram".to_string(),
+                        platform_id: chat_id.to_string(),
+                        agent_id: a.clone(),
+                        session_id: session_of(a),
+                    });
+                }
+            }
+            Err("no agent with a live Telegram bridge and a paired chat".to_string())
+        }
+        "discord" => {
+            for a in &candidates {
+                if let Some(channel_id) = crate::channels::current_discord_delivery_channel(home, a) {
+                    return Ok(DeliveryTarget {
+                        channel: "discord".to_string(),
+                        platform_id: channel_id,
+                        agent_id: a.clone(),
+                        session_id: session_of(a),
+                    });
+                }
+            }
+            Err("no agent with a known Discord destination (the bot learns a channel only once someone messages it there)".to_string())
+        }
+        other => Err(format!(
+            "channel '{other}' has no host-side push destination yet (it replies only to its last-seen conversation) — use telegram or discord, or pin an agent with channel:agent"
+        )),
+    }
+}
+
+/// Best-effort host-side delivery of a finished card's result, through the SAME
+/// outbound bridge any agent reply uses (`post_chat` → the owner agent's running
+/// channel bridge sends it). The worker that ran the card has no channel
+/// credentials and never sends anything itself; the host routes the result to the
+/// agent that serves the requested channel. Channel-agnostic — Telegram, Discord
+/// and any future channel go through one path. Failures are logged loudly and
+/// never fail the run; the result is always on the board regardless.
+fn deliver_card_result(home: &MaturanaHome, worker_agent: &str, deliver: &str, text: &str) {
+    match resolve_channel_delivery(home, deliver, Some(worker_agent)) {
+        Ok(target) => {
+            let chat = ChatTarget {
+                channel: target.channel.clone(),
+                platform_id: target.platform_id.clone(),
+                thread_id: None,
+                agent_id: target.agent_id.clone(),
+                session_id: target.session_id.clone(),
+            };
+            post_chat(home, Some(&chat), text);
+            println!(
+                "  -> delivered card result via {} to {} ({})",
+                target.channel, target.agent_id, target.platform_id
+            );
+        }
+        Err(reason) => {
+            eprintln!("  deliver: {reason} — result kept on the board only");
+        }
+    }
 }
 
 /// Like [`post_chat`], but attaches host-side files; the channel's delivery sink
@@ -1827,6 +1916,28 @@ mod tests {
         let fenced = "Here you go:\n```json\n{\"files\":[{\"path\":\"a.py\",\"content\":\"print(1)\"}]}\n```\nDone.";
         let files = extract_file_manifest(fenced).expect("fenced manifest");
         assert_eq!(files[0].path, "a.py");
+    }
+
+    #[test]
+    fn channel_delivery_resolution_is_honest_when_unreachable() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("maturana-deliver-{}-{}", std::process::id(), nanos));
+        std::fs::create_dir_all(&root).unwrap();
+        let home = MaturanaHome::new(root.clone());
+
+        // No live bridges → telegram resolution fails with a clear reason, never panics.
+        let err = resolve_channel_delivery(&home, "telegram", None).unwrap_err();
+        assert!(err.contains("Telegram"), "got: {err}");
+
+        // A channel with no host-side push path is reported honestly (and the
+        // `channel:agent` form still parses to the channel arm).
+        let err = resolve_channel_delivery(&home, "slack:claude-firecracker", None).unwrap_err();
+        assert!(err.contains("no host-side push destination"), "got: {err}");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

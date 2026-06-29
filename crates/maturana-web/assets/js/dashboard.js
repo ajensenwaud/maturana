@@ -1772,7 +1772,14 @@ export async function renderOrchestration(panel, socket) {
       { name: "tenant", label: "Tenant (optional tag)", type: "text", value: card?.tenant || "", advanced: true },
       { name: "scheduled_at", label: "Don't run before (optional)", type: "datetime", value: card?.scheduled_at || "", advanced: true },
       { name: "deliver", label: "Deliver result to", type: "select", value: card?.deliver || "", advanced: true,
-        options: [{ value: "", label: "(don't deliver — collect on the board)" }, { value: "telegram", label: "Telegram (the agent's chat)" }],
+        hint: "when set, the host sends the finished result to that channel via the agent already serving it (you don't get it from the worker VM). Pin an agent with e.g. telegram:claude-firecracker.",
+        options: [
+          { value: "", label: "(don't deliver — collect on the board)" },
+          { value: "telegram", label: "Telegram" },
+          { value: "discord", label: "Discord" },
+          { value: "slack", label: "Slack" },
+          { value: "agentmail", label: "AgentMail" },
+        ],
         hint: "when the card finishes, the host posts its result to the agent's paired chat" },
     ];
   }
