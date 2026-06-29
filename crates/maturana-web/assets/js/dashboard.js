@@ -1413,6 +1413,13 @@ const ORCH_COLUMNS = [
   ["blocked", "Blocked"],
 ];
 
+// A board name is used as a filesystem path segment and a URL path, so it can't
+// contain spaces or symbols. Rather than reject them, fold a friendly name down
+// to a safe slug ("My Board" -> "my-board") so the operator can type naturally.
+function slugifyBoardName(s) {
+  return (s || "").trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64);
+}
+
 function cardPill(st) {
   if (st === "done") return badge("done", "good");
   if (st === "doing") return badge("doing", "warn");
@@ -1487,11 +1494,13 @@ export async function renderOrchestration(panel, socket) {
     bar.append(button("＋ New", () => {
       formDialog({
         title: "New board",
-        fields: [{ name: "name", label: "Board name", type: "text", placeholder: "letters, digits, - _", required: true }],
+        fields: [{ name: "name", label: "Board name", type: "text", placeholder: "e.g. Launch plan", required: true, hint: "spaces & symbols become dashes (it's used in URLs/paths)" }],
         submitLabel: "Create",
         onSubmit: async (v) => {
-          await api("/api/boards", { method: "POST", body: JSON.stringify({ name: v.name }) });
-          state.current = v.name; await loadBoards(); drawBar(); drawBoard(); toast("board created", "ok");
+          const name = slugifyBoardName(v.name);
+          if (!name) throw new Error("name needs at least one letter or digit");
+          await api("/api/boards", { method: "POST", body: JSON.stringify({ name }) });
+          state.current = name; await loadBoards(); drawBar(); drawBoard(); toast(`board "${name}" created`, "ok");
         },
       });
     }));
@@ -1499,11 +1508,13 @@ export async function renderOrchestration(panel, socket) {
       bar.append(button("Rename", () => {
         formDialog({
           title: `Rename board "${state.current}"`,
-          fields: [{ name: "name", label: "New name", type: "text", value: state.current, required: true }],
+          fields: [{ name: "name", label: "New name", type: "text", value: state.current, required: true, hint: "spaces & symbols become dashes" }],
           submitLabel: "Rename",
           onSubmit: async (v) => {
-            await api(`/api/boards/${state.current}/rename`, { method: "POST", body: JSON.stringify({ name: v.name }) });
-            state.current = v.name; await loadBoards(); drawBar(); drawBoard(); toast("renamed", "ok");
+            const name = slugifyBoardName(v.name);
+            if (!name) throw new Error("name needs at least one letter or digit");
+            await api(`/api/boards/${state.current}/rename`, { method: "POST", body: JSON.stringify({ name }) });
+            state.current = name; await loadBoards(); drawBar(); drawBoard(); toast("renamed", "ok");
           },
         });
       }));
@@ -1567,8 +1578,30 @@ export async function renderOrchestration(panel, socket) {
     const total = cards.length;
     const done = cards.filter((c) => c.status === "done").length;
     const doing = cards.filter((c) => c.status === "doing");
+    const isReady = (c) => c.status === "doing" || (c.status === "todo" &&
+      (c.deps || []).every((dep) => cards.find((x) => x.id === dep)?.status === "done"));
     const runBtn = button(d.running ? `running · ${done}/${total}` : "▶ Run board", async () => {
-      try { await api(`/api/boards/${state.current}/run`, { method: "POST" }); toast("dispatching…", "ok"); drawBoard(); }
+      // Pre-flight: a run only dispatches cards in 'To do' (with deps met). The
+      // commonest "nothing happened" is a card left in Triage (a staging area).
+      const ready = cards.filter(isReady);
+      const triage = cards.filter((c) => c.status === "triage");
+      if (!ready.length) {
+        if (triage.length) {
+          const go = await confirmDialog({
+            title: "Nothing ready to run",
+            message: `${triage.length} card(s) are in Triage — a staging area that doesn't run. Move them to "To do" and run now?`,
+            confirmLabel: "Move to To do & run",
+          });
+          if (!go) return;
+          for (const c of triage) {
+            try { await api(`/api/boards/${state.current}/cards/${c.id}`, { method: "PUT", body: JSON.stringify({ status: "todo" }) }); } catch {}
+          }
+        } else {
+          toast("No cards are ready — each is done, blocked, or waiting on an unfinished dependency.", "bad");
+          return;
+        }
+      }
+      try { await api(`/api/boards/${state.current}/run`, { method: "POST" }); toast("dispatching… (needs the assignee agents running)", "ok"); drawBoard(); }
       catch (e) { toast(String(e), "bad"); }
     });
     if (d.running) runBtn.disabled = true;
@@ -1630,6 +1663,19 @@ export async function renderOrchestration(panel, socket) {
     // rebuild body = toolbar2 + cols
     body.replaceChildren(toolbar2, cols);
     if (d.events && d.events.length) body.append(runLog(d.events));
+    // Run output: the detached `board run` process's stdout/stderr. Surfaces WHY
+    // a run did nothing (e.g. "no running agents to reuse") — that never reaches
+    // the board event log, so without this the run just silently no-ops.
+    const out = el("details", "orch-runlog");
+    const sum = document.createElement("summary"); sum.textContent = "Run output";
+    const pre = el("pre", "dash-json"); pre.textContent = "(expand to load the last run's output)";
+    out.append(sum, pre);
+    out.addEventListener("toggle", async () => {
+      if (!out.open) return;
+      try { const r = await api(`/api/boards/${state.current}/run-log`); pre.textContent = (r.log && r.log.trim()) || "(no run output yet — Run the board first)"; }
+      catch (e) { pre.textContent = String(e); }
+    });
+    body.append(out);
   }
 
   function runLog(events) {
@@ -1671,16 +1717,16 @@ export async function renderOrchestration(panel, socket) {
   function cardFields(card, allCards) {
     const depOpts = (allCards || []).filter((x) => !card || x.id !== card.id).map((x) => ({ value: x.id, label: `${x.id} ${x.title.slice(0, 24)}` }));
     return [
-      { name: "title", label: "Title", type: "text", value: card?.title, placeholder: "what the agent should do", required: true },
-      { name: "detail", label: "Detail / acceptance criteria", type: "textarea", value: card?.detail, rows: 4, hint: "the full instructions + how to tell it's done (markdown)" },
-      { name: "assignee", label: "Assignee", type: "select", value: card?.assignee || "", options: assigneeOptions(false) },
-      { name: "deps", label: "Depends on", type: "multiselect", value: card?.deps || [], options: depOpts, hint: "this card waits until these finish; their results are fed in" },
+      { name: "title", label: "Title (one-line task)", type: "text", value: card?.title, placeholder: "e.g. Research competitor pricing", required: true, hint: "the headline; sent to the agent as the first line of the prompt" },
+      { name: "detail", label: "Detail / acceptance criteria", type: "textarea", value: card?.detail, rows: 4, hint: "the actual instructions + how to tell it's done. Title + Detail together ARE the prompt (markdown)" },
+      { name: "assignee", label: "Assignee", type: "select", value: card?.assignee || "", options: assigneeOptions(false), hint: "a role (mapped to a running agent) or a specific agent. Blank = the 'developer' role" },
+      { name: "deps", label: "Depends on", type: "multiselect", value: card?.deps || [], options: depOpts, hint: "this card waits until these finish; their results are fed in as inputs" },
       { name: "priority", label: "Priority (higher runs first)", type: "number", value: card?.priority ?? 0, advanced: true },
       { name: "max_retries", label: "Auto-retries on failure", type: "number", value: card?.max_retries ?? 0, advanced: true },
       { name: "goal", label: "Goal mode (re-run with an acceptance judge until it passes)", type: "checkbox", value: card?.goal || false, advanced: true },
       { name: "goal_max_turns", label: "Goal max rounds (0 = default 5)", type: "number", value: card?.goal_max_turns ?? 0, advanced: true },
       { name: "tenant", label: "Tenant (optional tag)", type: "text", value: card?.tenant || "", advanced: true },
-      { name: "scheduled_at", label: "Don't run before (RFC3339, optional)", type: "text", value: card?.scheduled_at || "", placeholder: "2026-07-01T09:00:00Z", advanced: true },
+      { name: "scheduled_at", label: "Don't run before (optional)", type: "datetime", value: card?.scheduled_at || "", advanced: true },
     ];
   }
 
@@ -1716,7 +1762,7 @@ export async function renderOrchestration(panel, socket) {
           title: v.title, detail: v.detail, assignee: v.assignee || null, deps: v.deps, status: v.status,
           priority: Number(v.priority) || 0, max_retries: Number(v.max_retries) || 0,
           goal: !!v.goal, goal_max_turns: Number(v.goal_max_turns) || 0,
-          tenant: v.tenant || null, scheduled_at: v.scheduled_at,
+          tenant: v.tenant || null, scheduled_at: v.scheduled_at || null,
         };
         await api(`/api/boards/${state.current}/cards/${card.id}`, { method: "PUT", body: JSON.stringify(body) });
         drawBoard(); toast("saved", "ok");

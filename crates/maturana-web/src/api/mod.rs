@@ -94,6 +94,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/boards", get(boards::list).post(boards::create))
         .route("/api/boards/:name", get(boards::detail).delete(boards::delete))
         .route("/api/boards/:name/run", post(boards::run))
+        .route("/api/boards/:name/run-log", get(boards::run_log))
         .route("/api/boards/:name/reset", post(boards::reset))
         .route("/api/boards/:name/rename", post(boards::rename_board))
         .route("/api/boards/:name/attachment", get(boards::download_attachment))

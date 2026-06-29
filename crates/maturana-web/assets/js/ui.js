@@ -60,6 +60,14 @@ export function formDialog({ title, sub, fields = [], submitLabel = "Save", onSu
       input = el("input", "modal-input");
       input.type = "file";
       if (f.accept) input.accept = f.accept;
+    } else if (f.type === "datetime") {
+      input = el("input", "modal-input");
+      input.type = "datetime-local";
+      // Show the stored RFC3339 (UTC) instant in the user's local time.
+      if (f.value) {
+        const d = new Date(f.value);
+        if (!isNaN(d.getTime())) input.value = new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+      }
     } else {
       input = el("input", "modal-input");
       input.type = f.type === "number" ? "number" : "text";
@@ -100,6 +108,7 @@ export function formDialog({ title, sub, fields = [], submitLabel = "Save", onSu
       if (type === "checkbox") values[name] = input.checked;
       else if (type === "multiselect") values[name] = [...input.querySelectorAll("input:checked")].map((c) => c.value);
       else if (type === "file") values[name] = input.files && input.files[0] ? input.files[0] : null;
+      else if (type === "datetime") values[name] = input.value ? new Date(input.value).toISOString() : "";
       else values[name] = typeof input.value === "string" ? input.value.trim() : input.value;
       if (required && (values[name] === "" || values[name] == null)) {
         errLine.textContent = `${name} is required`;

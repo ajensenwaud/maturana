@@ -426,6 +426,29 @@ pub async fn run(State(state): State<AppState>, Path(name): Path<String>) -> Res
     }
 }
 
+/// Tail of the detached `board run` process's stdout+stderr (board/<name>.run.log).
+/// The run is fire-and-forget, and failures like "no running agents to reuse" or
+/// "nothing ready" never reach the board event log — this is how the cockpit
+/// surfaces WHY a run did nothing.
+pub async fn run_log(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    if !valid_id(&name) {
+        return err(StatusCode::BAD_REQUEST, "invalid board name");
+    }
+    let h = home(&state);
+    match blocking(move || {
+        let path = Board::dir(&h).join(format!("{name}.run.log"));
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().collect();
+        let start = lines.len().saturating_sub(120);
+        Ok(serde_json::json!({ "log": lines[start..].join("\n") }))
+    })
+    .await
+    {
+        Ok(data) => ok(data),
+        Err(response) => response,
+    }
+}
+
 #[derive(serde::Deserialize)]
 pub struct CommentBody {
     #[serde(default)]
