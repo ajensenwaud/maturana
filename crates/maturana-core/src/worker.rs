@@ -60,6 +60,29 @@ pub fn render_run_agent() -> &'static str {
     RUN_AGENT
 }
 
+/// Classify an opencode turn's final assistant text. Returns `true` when the text
+/// is (or contains) one of opencode's context/session-overflow error classes that
+/// the harness returns *in place of* an answer — most notably the literal
+/// `ContextOverflowError` emitted when a resumed session overflows the model's
+/// context window. When this is true the persisted session is poisoned: the guest
+/// worker drops the session + SQLite store and retries once with a fresh session
+/// rather than delivering the error string to the user.
+///
+/// Kept in lock-step with the `oc_response_is_context_error` shell function in
+/// [`RUN_AGENT`] (identical marker list); the shell is the runtime, this is the
+/// testable specification. Markers are CamelCase error-class names / provider
+/// codes that do not occur in natural-language answers, so prose that merely
+/// mentions "context window" is not misclassified.
+pub fn opencode_response_is_context_error(response: &str) -> bool {
+    const MARKERS: [&str; 4] = [
+        "ContextOverflowError",
+        "ContextLengthExceededError",
+        "ContextWindowExceededError",
+        "context_length_exceeded",
+    ];
+    MARKERS.iter().any(|marker| response.contains(marker))
+}
+
 pub fn render_guest_bootstrap() -> &'static str {
     GUEST_BOOTSTRAP
 }
@@ -981,6 +1004,33 @@ PY
     # parallel/other session can never hand us the wrong thread. `--continue`
     # bootstraps turn one (no id yet) and is a safe fallback if the id is lost.
     oc_session_file="$HOME/.maturana-opencode-session"
+    oc_db="$HOME/.local/share/opencode/opencode.db"
+    oc_turns_file="$HOME/.maturana-opencode-turns"
+    # Session-reuse caps. The resumed opencode context tracks the SQLite store's
+    # growth, and an unbounded session eventually overflows the model window — at
+    # which point opencode returns its error CLASS NAME ("ContextOverflowError")
+    # AS the assistant text. We bound reuse on BOTH axes so the session is rotated
+    # *before* that happens: SQLite store size and number of reused turns. Either
+    # cap can be overridden via env; 0 disables that axis.
+    oc_db_max_bytes="${MATURANA_OPENCODE_DB_MAX_BYTES:-8388608}"   # 8 MiB
+    oc_max_turns="${MATURANA_OPENCODE_MAX_TURNS:-40}"
+    # Drop the persisted session id, the turn counter, and the SQLite store (db +
+    # WAL/SHM sidecars) so the next `opencode run` starts a brand-new session with
+    # an empty context.
+    oc_reset_session() {
+      rm -f "$oc_session_file" "$oc_turns_file" \
+            "$oc_db" "$oc_db-wal" "$oc_db-shm"
+    }
+    # True when an opencode turn's final text IS (or contains) one of opencode's
+    # context/session-overflow error classes returned in place of an answer. Kept
+    # in lock-step with opencode_response_is_context_error() in maturana-core
+    # (identical marker list) — that Rust fn is the testable specification.
+    oc_response_is_context_error() {
+      case "$1" in
+        *ContextOverflowError*|*ContextLengthExceededError*|*ContextWindowExceededError*|*context_length_exceeded*) return 0 ;;
+        *) return 1 ;;
+      esac
+    }
     oc_model_args=()
     if [ -n "$model" ]; then
       # OpenCode routes OpenRouter models as `openrouter/<vendor>/<model>`. The
@@ -1011,6 +1061,21 @@ PY
       set +o pipefail
       return $rc
     }
+    # Proactive rotation: before reusing a session, retire it if the SQLite store
+    # has grown past the cap or we've reused it for too many turns. This keeps the
+    # resumed context from silently growing until it overflows the model window.
+    if [ -s "$oc_session_file" ]; then
+      oc_db_bytes=0
+      [ -f "$oc_db" ] && oc_db_bytes="$(stat -c %s "$oc_db" 2>/dev/null || echo 0)"
+      oc_turns=0
+      [ -f "$oc_turns_file" ] && oc_turns="$(cat "$oc_turns_file" 2>/dev/null || echo 0)"
+      case "$oc_turns" in ''|*[!0-9]*) oc_turns=0 ;; esac
+      if { [ "$oc_db_max_bytes" -gt 0 ] && [ "$oc_db_bytes" -gt "$oc_db_max_bytes" ]; } \
+         || { [ "$oc_max_turns" -gt 0 ] && [ "$oc_turns" -ge "$oc_max_turns" ]; }; then
+        echo "[opencode] rotating session before reuse (db=${oc_db_bytes}B turns=${oc_turns}); starting fresh" >> /var/log/maturana/worker.err.log
+        oc_reset_session
+      fi
+    fi
     if [ -s "$oc_session_file" ]; then
       run_opencode_turn --session "$(cat "$oc_session_file")" || true
       response="$(cat /tmp/maturana-session-response.txt)"
@@ -1025,6 +1090,31 @@ PY
     else
       run_opencode_turn --continue || true
       response="$(cat /tmp/maturana-session-response.txt)"
+    fi
+    # Context-overflow self-heal: the resumed session overflowed the model window
+    # and opencode handed us its error CLASS NAME as the "answer" (the literal
+    # "ContextOverflowError"). A fresh session is the only fix, so nuke the session
+    # id + SQLite store and retry ONCE with a brand-new session (no --session /
+    # --continue). This automates today's manual fix of clearing the session files.
+    if oc_response_is_context_error "$response"; then
+      echo "[opencode] context-overflow in resumed session; resetting store and retrying fresh" >> /var/log/maturana/worker.err.log
+      oc_reset_session
+      run_opencode_turn || true
+      response="$(cat /tmp/maturana-session-response.txt)"
+      # A fresh session that STILL overflows means this single turn's prompt is
+      # itself too large for the window — don't loop; give a clear, actionable
+      # reply instead of the raw error class or a generic failure.
+      if oc_response_is_context_error "$response"; then
+        response="That request is too large for the model's context window, even with a fresh session. Please try a shorter message or fewer attachments."
+      fi
+    fi
+    # Advance the rotation counter after a successful reused/fresh turn so the
+    # session is retired before it can grow into an overflow.
+    if [ -n "$response" ] && [ -s "$oc_session_file" ]; then
+      oc_turns=0
+      [ -f "$oc_turns_file" ] && oc_turns="$(cat "$oc_turns_file" 2>/dev/null || echo 0)"
+      case "$oc_turns" in ''|*[!0-9]*) oc_turns=0 ;; esac
+      echo $((oc_turns + 1)) > "$oc_turns_file"
     fi
     # Last-ditch fallback ONLY when the stream carried no text at all (e.g. the
     # #26855 race exited before flushing, or a crash mid-stream). Read the last
@@ -1055,6 +1145,10 @@ except Exception:
     pass
 PY
 )"
+      # Never hand back a context-overflow class name read off disk either.
+      if oc_response_is_context_error "$response"; then
+        response=""
+      fi
     fi
     if [ -z "$response" ]; then
       response="I hit an error while processing that message."
@@ -1174,6 +1268,65 @@ mod tests {
         assert!(runner.contains("/session/outbound"));
         assert!(runner.contains("/agent/proxy.env"));
         assert!(runner.contains("MATURANA_PROXY_PORT"));
+    }
+
+    #[test]
+    fn opencode_context_error_is_detected() {
+        // The bare error class — opencode returns it AS the assistant text when a
+        // resumed session overflows the model window. This is the exact string the
+        // worker used to deliver to the user as "the answer".
+        assert!(opencode_response_is_context_error("ContextOverflowError"));
+        // Embedded in surrounding text / JSON error payloads.
+        assert!(opencode_response_is_context_error(
+            "AI_APICallError: ContextOverflowError: too many tokens"
+        ));
+        assert!(opencode_response_is_context_error(
+            "{\"error\":{\"name\":\"ContextLengthExceededError\"}}"
+        ));
+        assert!(opencode_response_is_context_error(
+            "provider returned context_length_exceeded"
+        ));
+        assert!(opencode_response_is_context_error(
+            "ContextWindowExceededError"
+        ));
+    }
+
+    #[test]
+    fn opencode_normal_text_is_not_a_context_error() {
+        assert!(!opencode_response_is_context_error(""));
+        assert!(!opencode_response_is_context_error(
+            "Here is your answer about the project."
+        ));
+        // A legitimate answer that merely *discusses* context windows in prose
+        // must NOT trip the reset (we match error CLASS names, not phrases).
+        assert!(!opencode_response_is_context_error(
+            "The model's context window is large enough for this document."
+        ));
+    }
+
+    #[test]
+    fn runner_self_heals_opencode_context_overflow() {
+        let runner = render_run_agent();
+        // The shell classifier must mirror opencode_response_is_context_error:
+        // every Rust marker has to appear in the embedded run-agent template, or
+        // the guest would fail to detect an overflow the Rust spec recognises.
+        for marker in [
+            "ContextOverflowError",
+            "ContextLengthExceededError",
+            "ContextWindowExceededError",
+            "context_length_exceeded",
+        ] {
+            assert!(runner.contains(marker), "run-agent missing marker {marker}");
+        }
+        // On detection it resets the session + SQLite store (db + WAL/SHM) and
+        // retries with a fresh session.
+        assert!(runner.contains("oc_response_is_context_error"));
+        assert!(runner.contains("oc_reset_session"));
+        assert!(runner.contains("$oc_db-wal"));
+        assert!(runner.contains("$oc_db-shm"));
+        // Proactive reuse caps so the session can't silently grow until overflow.
+        assert!(runner.contains("MATURANA_OPENCODE_DB_MAX_BYTES"));
+        assert!(runner.contains("MATURANA_OPENCODE_MAX_TURNS"));
     }
 
     #[test]
