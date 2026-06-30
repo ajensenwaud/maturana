@@ -146,6 +146,8 @@ pub struct AddCardBody {
     #[serde(default)]
     goal_max_turns: Option<u32>,
     #[serde(default)]
+    deliver: Option<String>,
+    #[serde(default)]
     triage: Option<bool>,
 }
 
@@ -201,6 +203,10 @@ pub async fn add_card(
             c.max_retries = body.max_retries.unwrap_or(0);
             c.goal = body.goal.unwrap_or(false);
             c.goal_max_turns = body.goal_max_turns.unwrap_or(0);
+            c.deliver = body.deliver.and_then(|d| {
+                let d = d.trim().to_string();
+                if d.is_empty() { None } else { Some(d) }
+            });
             if body.triage.unwrap_or(false) {
                 c.status = maturana_core::board::CardStatus::Triage;
             }
@@ -240,6 +246,8 @@ pub struct EditCardBody {
     goal: Option<bool>,
     #[serde(default)]
     goal_max_turns: Option<u32>,
+    #[serde(default)]
+    deliver: Option<String>,
 }
 
 /// Edit a card (any subset of fields). Re-validates the board.
@@ -321,6 +329,10 @@ pub async fn edit_card(
             }
             if let Some(gt) = body.goal_max_turns {
                 card.goal_max_turns = gt;
+            }
+            if let Some(d) = body.deliver {
+                let d = d.trim().to_string();
+                card.deliver = if d.is_empty() { None } else { Some(d) };
             }
             card.updated_at = Some(chrono::Utc::now());
         }
@@ -418,6 +430,29 @@ pub async fn run(State(state): State<AppState>, Path(name): Path<String>) -> Res
             let _ = child.wait();
         });
         Ok(serde_json::json!({ "running": name }))
+    })
+    .await
+    {
+        Ok(data) => ok(data),
+        Err(response) => response,
+    }
+}
+
+/// Tail of the detached `board run` process's stdout+stderr (board/<name>.run.log).
+/// The run is fire-and-forget, and failures like "no running agents to reuse" or
+/// "nothing ready" never reach the board event log — this is how the cockpit
+/// surfaces WHY a run did nothing.
+pub async fn run_log(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    if !valid_id(&name) {
+        return err(StatusCode::BAD_REQUEST, "invalid board name");
+    }
+    let h = home(&state);
+    match blocking(move || {
+        let path = Board::dir(&h).join(format!("{name}.run.log"));
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().collect();
+        let start = lines.len().saturating_sub(120);
+        Ok(serde_json::json!({ "log": lines[start..].join("\n") }))
     })
     .await
     {

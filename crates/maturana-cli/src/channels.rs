@@ -25,7 +25,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use crate::session::{message_files, message_text, run_session_once, RunnerOptions};
@@ -727,6 +727,53 @@ pub(crate) fn current_paired_telegram_chat_id(home: &MaturanaHome, agent_id: &st
         .or_else(|_| vault.get(TELEGRAM_CHAT_ID))
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
+}
+
+/// Whether this agent's Telegram bridge is currently alive, so an outbound row
+/// written to its outbox will actually be sent (not parked forever). The bridge
+/// rewrites `heartbeat.json` on every poll loop; a long-poll can be up to ~50s,
+/// so a window of 120s comfortably covers a healthy bridge while still rejecting
+/// an agent whose poller died. Used by card delivery to pick the agent that
+/// genuinely serves the channel rather than any agent that was once paired.
+pub(crate) fn telegram_bridge_live(home: &MaturanaHome, agent_id: &str) -> bool {
+    let hb = telegram_heartbeat_path(home, agent_id);
+    let Ok(meta) = std::fs::metadata(&hb) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified)
+        .map(|age| age <= Duration::from_secs(120))
+        .unwrap_or(false)
+}
+
+/// Where this agent's Discord bridge would push an unsolicited message: the last
+/// channel it received a message in. Discord (unlike Telegram) has no static
+/// paired destination — the bot only learns a channel once someone talks to it
+/// there — so the running bridge persists that channel id here for host-side
+/// delivery to reuse. `None` until the bot has seen at least one message.
+pub(crate) fn current_discord_delivery_channel(home: &MaturanaHome, agent_id: &str) -> Option<String> {
+    let path = discord_last_channel_path(home, agent_id);
+    let raw = std::fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn discord_last_channel_path(home: &MaturanaHome, agent_id: &str) -> PathBuf {
+    home.agent_dir(agent_id)
+        .join("channels/discord/last-channel")
+}
+
+/// Persist the Discord channel the bot last heard from so host-side delivery
+/// (e.g. a finished board card) can reach the same conversation. Best-effort.
+fn remember_discord_channel(home: &MaturanaHome, agent_id: &str, channel_id: &str) {
+    let path = discord_last_channel_path(home, agent_id);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, channel_id);
 }
 
 fn handle_telegram_update(
@@ -6245,8 +6292,11 @@ fn discord_gateway_session(
                         if let Some((channel_id, content, attachments)) =
                             discord_extract_message(&event, self_id.as_deref())
                         {
-                            // Remember where to flush async replies (the 1s loop above).
+                            // Remember where to flush async replies (the 1s loop above)
+                            // AND persist it so host-side delivery (a finished board
+                            // card) can reach the same Discord channel.
                             last_channel = Some(channel_id.clone());
+                            remember_discord_channel(home, &config.agent_id, &channel_id);
                             // Inbound files: download + ingest each attachment so a
                             // file-only message isn't dropped (parity with Telegram).
                             if !attachments.is_empty() {
@@ -7019,6 +7069,41 @@ pub(crate) struct DispatchHandle {
 ///     orchestrator loop on the host and can NEVER leak into a user's chat.
 /// The orchestrator loop charges the turn budget before calling this, so every
 /// turn is paid for before it is sent.
+/// Prepend the agent's identity + memory to a dispatched task. Without this a
+/// board card (or any A2A task) is a context-free turn: it doesn't know who it
+/// is, what it can do, or who its operator is — which is why a card asked to
+/// "send this to Anders" couldn't tell who Anders was. Bounded, best-effort
+/// reads of the same files the channel prompt uses.
+fn build_dispatch_prompt(home: &MaturanaHome, agent_id: &str, task: &str) -> String {
+    let agent_dir = home.agent_dir(agent_id);
+    let head = |rel: &str, cap: usize| -> String {
+        std::fs::read_to_string(agent_dir.join(rel))
+            .map(|s| s.chars().take(cap).collect::<String>())
+            .unwrap_or_default()
+    };
+    let identity = head("AGENTS.md", 4000);
+    let memory = head("memory/MEMORY.md", 4000);
+    // Section headers must NOT start with "-" : a harness CLI (codex exec, claude
+    // -p, …) is clap-based and treats a positional PROMPT that begins with "--" as
+    // an unknown option, printing usage and failing the whole turn. The old
+    // "--- WHO YOU ARE ---" prefix broke every dispatched (board/A2A) turn that
+    // carried an identity block. "===" is visually equivalent and parser-safe.
+    let mut out = String::new();
+    if !identity.trim().is_empty() {
+        out.push_str("=== WHO YOU ARE ===\n");
+        out.push_str(identity.trim());
+        out.push_str("\n\n");
+    }
+    if !memory.trim().is_empty() {
+        out.push_str("=== YOUR MEMORY (operator, contacts, context) ===\n");
+        out.push_str(memory.trim());
+        out.push_str("\n\n");
+    }
+    out.push_str("=== TASK ===\n");
+    out.push_str(task);
+    out
+}
+
 pub(crate) fn enqueue_dispatch_turn(
     home: &MaturanaHome,
     agent_id: &str,
@@ -7031,7 +7116,7 @@ pub(crate) fn enqueue_dispatch_turn(
     ensure_session(&paths)?;
     let content = serde_json::json!({
         "text": framed_task,
-        "prompt": framed_task,
+        "prompt": build_dispatch_prompt(home, agent_id, framed_task),
         "model": model,
         "reasoning": serde_json::Value::Null,
     });
@@ -7565,6 +7650,27 @@ mod tests {
     fn pair_command_accepts_bot_suffix() {
         assert!(is_pair_command("/pair@LuhmannSystemsBot ABC123", "ABC123"));
         assert!(!is_pair_command("/pair@LuhmannSystemsBot WRONG", "ABC123"));
+    }
+
+    #[test]
+    fn dispatch_prompt_never_starts_with_a_dash() {
+        // Regression: a leading "--" makes a clap-based harness CLI (codex exec,
+        // claude -p) treat the whole PROMPT as an unknown option and fail the turn.
+        let temp = temp_dir("dispatch-prompt-dash");
+        let home = MaturanaHome::new(temp.path().join(".maturana"));
+        let agent_dir = home.agent_dir("agent");
+        fs::create_dir_all(agent_dir.join("memory")).unwrap();
+        fs::write(agent_dir.join("AGENTS.md"), "# Agent\nidentity\n").unwrap();
+        fs::write(agent_dir.join("memory/MEMORY.md"), "operator: Anders\n").unwrap();
+
+        // With identity + memory present.
+        let p = build_dispatch_prompt(&home, "agent", "do the thing");
+        assert!(!p.starts_with('-'), "prompt must not start with '-': {:?}", &p[..20.min(p.len())]);
+        assert!(p.contains("WHO YOU ARE") && p.contains("operator: Anders") && p.contains("do the thing"));
+
+        // With no identity/memory files (bare task) — still safe.
+        let bare = build_dispatch_prompt(&home, "missing-agent", "do the thing");
+        assert!(!bare.starts_with('-'));
     }
 
     #[test]

@@ -1413,6 +1413,13 @@ const ORCH_COLUMNS = [
   ["blocked", "Blocked"],
 ];
 
+// A board name is used as a filesystem path segment and a URL path, so it can't
+// contain spaces or symbols. Rather than reject them, fold a friendly name down
+// to a safe slug ("My Board" -> "my-board") so the operator can type naturally.
+function slugifyBoardName(s) {
+  return (s || "").trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64);
+}
+
 function cardPill(st) {
   if (st === "done") return badge("done", "good");
   if (st === "doing") return badge("doing", "warn");
@@ -1431,12 +1438,12 @@ export async function renderOrchestration(panel, socket) {
   const legend = el("div", "orch-legend");
   const lg = (label, rest) => { const s = el("span"); s.append(el("b", null, label), document.createTextNode(" " + rest)); return s; };
   legend.append(
-    lg("Triage", "rough ideas — use ⚗ Decompose / ✨ Specify to flesh out"),
+    lg("Triage", "ideas you haven't committed to running — open a card to Specify the detail or Decompose it into sub-tasks, then move it to To do"),
     lg("To do", "ready to run"),
     lg("Doing · Done · Blocked", "set by the runner during a Run"),
   );
   const keys = el("span", "orch-legend-keys");
-  keys.textContent = "card badges:  p# priority · after deps · goal judge-loop · ⟳ runs · 📎 files";
+  keys.textContent = "card badges:  p# priority · after deps · goal judge-loop · runs · files";
   legend.append(keys);
   const bar = el("div", "orch-bar");
   const filters = el("div", "orch-filters");
@@ -1467,7 +1474,7 @@ export async function renderOrchestration(panel, socket) {
     return opts;
   }
 
-  function stopPoll() { if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; } }
+  function stopPoll() { if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; } removeRunIndicator(); }
   async function loadBoards() { try { state.boards = await api("/api/boards"); } catch { state.boards = []; } }
 
   // ---------- toolbar ----------
@@ -1487,11 +1494,13 @@ export async function renderOrchestration(panel, socket) {
     bar.append(button("＋ New", () => {
       formDialog({
         title: "New board",
-        fields: [{ name: "name", label: "Board name", type: "text", placeholder: "letters, digits, - _", required: true }],
+        fields: [{ name: "name", label: "Board name", type: "text", placeholder: "e.g. Launch plan", required: true, hint: "spaces & symbols become dashes (it's used in URLs/paths)" }],
         submitLabel: "Create",
         onSubmit: async (v) => {
-          await api("/api/boards", { method: "POST", body: JSON.stringify({ name: v.name }) });
-          state.current = v.name; await loadBoards(); drawBar(); drawBoard(); toast("board created", "ok");
+          const name = slugifyBoardName(v.name);
+          if (!name) throw new Error("name needs at least one letter or digit");
+          await api("/api/boards", { method: "POST", body: JSON.stringify({ name }) });
+          state.current = name; await loadBoards(); drawBar(); drawBoard(); toast(`board "${name}" created`, "ok");
         },
       });
     }));
@@ -1499,11 +1508,13 @@ export async function renderOrchestration(panel, socket) {
       bar.append(button("Rename", () => {
         formDialog({
           title: `Rename board "${state.current}"`,
-          fields: [{ name: "name", label: "New name", type: "text", value: state.current, required: true }],
+          fields: [{ name: "name", label: "New name", type: "text", value: state.current, required: true, hint: "spaces & symbols become dashes" }],
           submitLabel: "Rename",
           onSubmit: async (v) => {
-            await api(`/api/boards/${state.current}/rename`, { method: "POST", body: JSON.stringify({ name: v.name }) });
-            state.current = v.name; await loadBoards(); drawBar(); drawBoard(); toast("renamed", "ok");
+            const name = slugifyBoardName(v.name);
+            if (!name) throw new Error("name needs at least one letter or digit");
+            await api(`/api/boards/${state.current}/rename`, { method: "POST", body: JSON.stringify({ name }) });
+            state.current = name; await loadBoards(); drawBar(); drawBoard(); toast("renamed", "ok");
           },
         });
       }));
@@ -1545,19 +1556,60 @@ export async function renderOrchestration(panel, socket) {
     state.detail = d;
     renderToolbar2(d);
     renderColumns(d);
+    updateRunIndicator(d);
     if (state.drawer) openDrawer(state.drawer);
-    if (d.running) {
-      state.pollTimer = setInterval(async () => {
-        if (!panel.contains(body)) { stopPoll(); return; }
-        try {
-          const nd = await api(`/api/boards/${state.current}`);
-          state.detail = nd; renderToolbar2(nd); renderColumns(nd);
+    // Poll continuously while this board is on screen (NOT gated on d.running):
+    // a freshly-dispatched run isn't "running" yet — no Doing card or event —
+    // so gating missed the card transitioning to Doing, leaving it visually
+    // stuck in To-do. Re-render only when the board actually changed, to avoid
+    // disrupting scroll/drag/typing.
+    state.sig = boardSig(d);
+    state.wasRunning = !!d.running;
+    state.pollTimer = setInterval(async () => {
+      if (!panel.contains(body)) { stopPoll(); return; }
+      try {
+        const nd = await api(`/api/boards/${state.current}`);
+        const sig = boardSig(nd);
+        if (sig !== state.sig) {
+          state.sig = sig; state.detail = nd;
+          renderToolbar2(nd); renderColumns(nd);
           if (state.drawer) openDrawer(state.drawer);
-          if (!nd.running) { stopPoll(); loadBoards().then(drawBar); }
-        } catch { stopPoll(); }
-      }, 1500);
-    }
+        }
+        updateRunIndicator(nd);
+        if (state.wasRunning && !nd.running) loadBoards().then(drawBar); // refresh counts when a run ends
+        state.wasRunning = !!nd.running;
+      } catch { /* transient — keep polling */ }
+    }, 2000);
   }
+
+  // A cheap fingerprint of the board's live state — drives change-detection so the
+  // poll only re-renders columns when something actually moved.
+  function boardSig(d) {
+    return `${d.running}|` + (d.cards || [])
+      .map((c) => `${c.id}:${c.status}:${(c.result || "").length}:${(c.runs || []).length}`)
+      .join(",");
+  }
+
+  // A fixed bottom-right "board is executing" indicator (global, animated). Shown
+  // whenever the current board is running; named which card(s) are executing.
+  function updateRunIndicator(d) {
+    const all = document.querySelectorAll(".orch-run-indicator");
+    if (!d || !d.running) { all.forEach((e) => e.remove()); return; }
+    // Singleton: keep the first, drop any strays (guards against double-append).
+    all.forEach((e, i) => { if (i > 0) e.remove(); });
+    const cards = (d.cards || []).filter((c) => c.status !== "archived");
+    const done = cards.filter((c) => c.status === "done").length;
+    const doing = cards.filter((c) => c.status === "doing").map((c) => c.id);
+    let ind = all[0];
+    if (!ind) { ind = el("div", "orch-run-indicator"); document.body.append(ind); }
+    ind.replaceChildren(
+      el("span", "orch-run-spin", "⟳"),
+      el("span", "orch-run-text",
+        `Board "${state.current}" running · ${done}/${cards.length} done` +
+        (doing.length ? ` · ${doing.join(", ")} executing` : " · dispatching…")),
+    );
+  }
+  function removeRunIndicator() { document.querySelectorAll(".orch-run-indicator").forEach((e) => e.remove()); }
 
   let toolbar2 = null;
   function renderToolbar2(d) {
@@ -1567,8 +1619,30 @@ export async function renderOrchestration(panel, socket) {
     const total = cards.length;
     const done = cards.filter((c) => c.status === "done").length;
     const doing = cards.filter((c) => c.status === "doing");
+    const isReady = (c) => c.status === "doing" || (c.status === "todo" &&
+      (c.deps || []).every((dep) => cards.find((x) => x.id === dep)?.status === "done"));
     const runBtn = button(d.running ? `running · ${done}/${total}` : "▶ Run board", async () => {
-      try { await api(`/api/boards/${state.current}/run`, { method: "POST" }); toast("dispatching…", "ok"); drawBoard(); }
+      // Pre-flight: a run only dispatches cards in 'To do' (with deps met). The
+      // commonest "nothing happened" is a card left in Triage (a staging area).
+      const ready = cards.filter(isReady);
+      const triage = cards.filter((c) => c.status === "triage");
+      if (!ready.length) {
+        if (triage.length) {
+          const go = await confirmDialog({
+            title: "Nothing ready to run",
+            message: `${triage.length} card(s) are in Triage — a staging area that doesn't run. Move them to "To do" and run now?`,
+            confirmLabel: "Move to To do & run",
+          });
+          if (!go) return;
+          for (const c of triage) {
+            try { await api(`/api/boards/${state.current}/cards/${c.id}`, { method: "PUT", body: JSON.stringify({ status: "todo" }) }); } catch {}
+          }
+        } else {
+          toast("No cards are ready — each is done, blocked, or waiting on an unfinished dependency.", "bad");
+          return;
+        }
+      }
+      try { await api(`/api/boards/${state.current}/run`, { method: "POST" }); toast("dispatching… (needs the assignee agents running)", "ok"); drawBoard(); }
       catch (e) { toast(String(e), "bad"); }
     });
     if (d.running) runBtn.disabled = true;
@@ -1630,6 +1704,19 @@ export async function renderOrchestration(panel, socket) {
     // rebuild body = toolbar2 + cols
     body.replaceChildren(toolbar2, cols);
     if (d.events && d.events.length) body.append(runLog(d.events));
+    // Run output: the detached `board run` process's stdout/stderr. Surfaces WHY
+    // a run did nothing (e.g. "no running agents to reuse") — that never reaches
+    // the board event log, so without this the run just silently no-ops.
+    const out = el("details", "orch-runlog");
+    const sum = document.createElement("summary"); sum.textContent = "Run output";
+    const pre = el("pre", "dash-json"); pre.textContent = "(expand to load the last run's output)";
+    out.append(sum, pre);
+    out.addEventListener("toggle", async () => {
+      if (!out.open) return;
+      try { const r = await api(`/api/boards/${state.current}/run-log`); pre.textContent = (r.log && r.log.trim()) || "(no run output yet — Run the board first)"; }
+      catch (e) { pre.textContent = String(e); }
+    });
+    body.append(out);
   }
 
   function runLog(events) {
@@ -1646,6 +1733,7 @@ export async function renderOrchestration(panel, socket) {
 
   function cardTile(c, allCards) {
     const tile = el("div", "board-card");
+    if (c.status === "doing") tile.classList.add("doing"); // executing → highlighted border
     tile.draggable = true;
     tile.addEventListener("dragstart", (e) => { e.dataTransfer.setData("text/card", c.id); e.dataTransfer.effectAllowed = "move"; });
     tile.addEventListener("click", () => { state.drawer = c.id; openDrawer(c.id); });
@@ -1656,14 +1744,16 @@ export async function renderOrchestration(panel, socket) {
     meta.append(el("span", "board-card-asg", `@${c.assignee || "default"}`));
     if (c.priority) meta.append(badge(`p${c.priority}`, "dim"));
     if (c.goal) meta.append(badge("goal", "warn"));
+    if (c.deliver) meta.append(badge(`→${c.deliver}`, "good"));
     if (c.block_kind && c.status === "blocked") meta.append(badge(c.block_kind, "bad"));
     if (c.deps && c.deps.length) meta.append(el("span", "board-card-dep", `after ${c.deps.join(",")}`));
     tile.append(meta);
     const counts = [];
-    if (c.comments && c.comments.length) counts.push(`💬${c.comments.length}`);
-    if (c.runs && c.runs.length) counts.push(`⟳${c.runs.length}`);
-    if (c.attachments && c.attachments.length) counts.push(`📎${c.attachments.length}`);
-    if (counts.length) tile.append(el("div", "board-card-counts", counts.join("  ")));
+    const plural = (n, w) => `${n} ${w}${n > 1 ? "s" : ""}`;
+    if (c.comments && c.comments.length) counts.push(plural(c.comments.length, "comment"));
+    if (c.runs && c.runs.length) counts.push(plural(c.runs.length, "run"));
+    if (c.attachments && c.attachments.length) counts.push(plural(c.attachments.length, "file"));
+    if (counts.length) tile.append(el("div", "board-card-counts", counts.join(" · ")));
     return tile;
   }
 
@@ -1671,16 +1761,26 @@ export async function renderOrchestration(panel, socket) {
   function cardFields(card, allCards) {
     const depOpts = (allCards || []).filter((x) => !card || x.id !== card.id).map((x) => ({ value: x.id, label: `${x.id} ${x.title.slice(0, 24)}` }));
     return [
-      { name: "title", label: "Title", type: "text", value: card?.title, placeholder: "what the agent should do", required: true },
-      { name: "detail", label: "Detail / acceptance criteria", type: "textarea", value: card?.detail, rows: 4, hint: "the full instructions + how to tell it's done (markdown)" },
-      { name: "assignee", label: "Assignee", type: "select", value: card?.assignee || "", options: assigneeOptions(false) },
-      { name: "deps", label: "Depends on", type: "multiselect", value: card?.deps || [], options: depOpts, hint: "this card waits until these finish; their results are fed in" },
+      { name: "title", label: "Title (one-line task)", type: "text", value: card?.title, placeholder: "e.g. Research competitor pricing", required: true, hint: "the headline; sent to the agent as the first line of the prompt" },
+      { name: "detail", label: "Detail / acceptance criteria", type: "textarea", value: card?.detail, rows: 4, hint: "the actual instructions + how to tell it's done. Title + Detail together ARE the prompt (markdown)" },
+      { name: "assignee", label: "Assignee", type: "select", value: card?.assignee || "", options: assigneeOptions(false), hint: "a role (mapped to a running agent) or a specific agent. Blank = the 'developer' role" },
+      { name: "deps", label: "Depends on", type: "multiselect", value: card?.deps || [], options: depOpts, hint: "this card waits until these finish; their results are fed in as inputs" },
       { name: "priority", label: "Priority (higher runs first)", type: "number", value: card?.priority ?? 0, advanced: true },
       { name: "max_retries", label: "Auto-retries on failure", type: "number", value: card?.max_retries ?? 0, advanced: true },
       { name: "goal", label: "Goal mode (re-run with an acceptance judge until it passes)", type: "checkbox", value: card?.goal || false, advanced: true },
       { name: "goal_max_turns", label: "Goal max rounds (0 = default 5)", type: "number", value: card?.goal_max_turns ?? 0, advanced: true },
       { name: "tenant", label: "Tenant (optional tag)", type: "text", value: card?.tenant || "", advanced: true },
-      { name: "scheduled_at", label: "Don't run before (RFC3339, optional)", type: "text", value: card?.scheduled_at || "", placeholder: "2026-07-01T09:00:00Z", advanced: true },
+      { name: "scheduled_at", label: "Don't run before (optional)", type: "datetime", value: card?.scheduled_at || "", advanced: true },
+      { name: "deliver", label: "Deliver result to", type: "select", value: card?.deliver || "", advanced: true,
+        hint: "when set, the host sends the finished result to that channel via the agent already serving it (you don't get it from the worker VM). Pin an agent with e.g. telegram:claude-firecracker.",
+        options: [
+          { value: "", label: "(don't deliver — collect on the board)" },
+          { value: "telegram", label: "Telegram" },
+          { value: "discord", label: "Discord" },
+          { value: "slack", label: "Slack" },
+          { value: "agentmail", label: "AgentMail" },
+        ],
+        hint: "when the card finishes, the host posts its result to the agent's paired chat" },
     ];
   }
 
@@ -1695,6 +1795,7 @@ export async function renderOrchestration(panel, socket) {
           priority: Number(v.priority) || 0, max_retries: Number(v.max_retries) || 0,
           goal: !!v.goal, goal_max_turns: Number(v.goal_max_turns) || 0,
           tenant: v.tenant || null, scheduled_at: v.scheduled_at || null,
+          deliver: v.deliver || null,
           triage: forceStatus === "triage",
         };
         await api(`/api/boards/${state.current}/cards`, { method: "POST", body: JSON.stringify(body) });
@@ -1716,7 +1817,8 @@ export async function renderOrchestration(panel, socket) {
           title: v.title, detail: v.detail, assignee: v.assignee || null, deps: v.deps, status: v.status,
           priority: Number(v.priority) || 0, max_retries: Number(v.max_retries) || 0,
           goal: !!v.goal, goal_max_turns: Number(v.goal_max_turns) || 0,
-          tenant: v.tenant || null, scheduled_at: v.scheduled_at,
+          tenant: v.tenant || null, scheduled_at: v.scheduled_at || null,
+          deliver: v.deliver || "",
         };
         await api(`/api/boards/${state.current}/cards/${card.id}`, { method: "PUT", body: JSON.stringify(body) });
         drawBoard(); toast("saved", "ok");
@@ -1751,6 +1853,7 @@ export async function renderOrchestration(panel, socket) {
     if (c.tenant) bits.push(`tenant ${c.tenant}`);
     if (c.max_retries) bits.push(`retries ${c.max_retries}`);
     if (c.goal) bits.push(`goal (≤${c.goal_max_turns || 5})`);
+    if (c.deliver) bits.push(`delivers result → ${c.deliver}`);
     if (c.scheduled_at) bits.push(`scheduled ${c.scheduled_at}`);
     if (c.block_kind && c.status === "blocked") bits.push(`blocked: ${c.block_kind}`);
     meta.textContent = bits.join(" · ");
@@ -1763,11 +1866,11 @@ export async function renderOrchestration(panel, socket) {
     const acts = el("div", "row-actions");
     acts.append(button("Edit", () => editCardForm(c)));
     if (c.status === "triage") {
-      acts.append(button("⚗ Decompose", async () => {
+      acts.append(button("Decompose", async () => {
         try { await api(`/api/boards/${state.current}/cards/${c.id}/decompose`, { method: "POST" }); toast("decomposing… (refreshes when done)", "ok"); pollOnce(6); }
         catch (e) { toast(String(e), "bad"); }
       }));
-      acts.append(button("✨ Specify", async () => {
+      acts.append(button("Specify", async () => {
         try { await api(`/api/boards/${state.current}/cards/${c.id}/specify`, { method: "POST" }); toast("specifying… (refreshes when done)", "ok"); pollOnce(6); }
         catch (e) { toast(String(e), "bad"); }
       }));
@@ -1797,7 +1900,7 @@ export async function renderOrchestration(panel, socket) {
     for (const p of c.attachments || []) {
       const a = document.createElement("a");
       a.className = "chat-download";
-      a.textContent = `⬇ ${p.split(/[\\/]/).pop()}`;
+      a.textContent = p.split(/[\\/]/).pop();
       a.href = `/api/boards/${state.current}/attachment?path=${encodeURIComponent(p)}`;
       a.setAttribute("download", p.split(/[\\/]/).pop());
       att.append(a);
@@ -1812,17 +1915,25 @@ export async function renderOrchestration(panel, socket) {
       } catch (e) { toast(String(e), "bad"); }
       fileInput.value = "";
     });
-    const upBtn = button("📎 Attach file", () => fileInput.click());
+    const upBtn = button("Attach file", () => fileInput.click());
     att.append(upBtn, fileInput);
     dr.append(att);
 
-    // run history
+    // run history — show the FULL outcome text per attempt (was truncated to 80
+    // chars, which cut the status message mid-sentence).
     if (c.runs && c.runs.length) {
       dr.append(el("div", "board-drawer-sub", "Run history"));
-      const rl = el("div", "log-view");
+      const rl = el("div", "board-runs");
       for (const r of c.runs) {
-        const row = el("div", "log-row");
-        row.append(el("span", "log-time", `#${r.attempt}`), el("span", "log-msg", `${r.outcome} · ${r.agent || "?"} · ${(r.summary || "").slice(0, 80)}`));
+        const row = el("div", "board-run");
+        const head = el("div", "board-run-head");
+        head.append(
+          el("span", "board-run-attempt", `#${r.attempt}`),
+          badge(r.outcome || "?", r.outcome === "completed" ? "good" : r.outcome === "failed" ? "bad" : "dim"),
+          el("span", "board-run-agent", r.agent || "?"),
+        );
+        row.append(head);
+        if (r.summary) { const b = el("div", "board-run-summary"); b.innerHTML = renderMd(r.summary); row.append(b); }
         rl.append(row);
       }
       dr.append(rl);

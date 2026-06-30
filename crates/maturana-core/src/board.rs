@@ -123,6 +123,12 @@ pub struct Card {
     pub goal: bool,
     #[serde(default)]
     pub goal_max_turns: u32,
+    /// Deliver this card's result to a channel when it finishes — host-side, via
+    /// the assignee agent's already-configured bridge (e.g. "telegram"). The
+    /// agent never sends it itself; the host posts the result to the agent's
+    /// paired chat. None = collect the result only.
+    #[serde(default)]
+    pub deliver: Option<String>,
     /// Host-side files delivered into the worker's VM before it runs.
     #[serde(default)]
     pub attachments: Vec<String>,
@@ -233,6 +239,7 @@ impl Board {
             max_retries: 0,
             goal: false,
             goal_max_turns: 0,
+            deliver: None,
             attachments: Vec::new(),
             comments: Vec::new(),
             runs: Vec::new(),

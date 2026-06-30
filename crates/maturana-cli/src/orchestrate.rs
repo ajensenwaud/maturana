@@ -807,7 +807,14 @@ impl ChatTargetArgs {
 /// running delivery thread sends it. Best-effort — a failed post never stops the
 /// run, and a plain CLI run (chat = None) is a no-op.
 fn post_chat(home: &MaturanaHome, chat: Option<&ChatTarget>, text: &str) {
-    let Some(c) = chat else { return };
+    let _ = post_chat_result(home, chat, text);
+}
+
+/// Like [`post_chat`] but surfaces whether the outbox write actually succeeded, so
+/// a caller that reports delivery (card result delivery) doesn't claim success when
+/// the write silently failed. `Ok(false)` = no chat target (nothing to do).
+fn post_chat_result(home: &MaturanaHome, chat: Option<&ChatTarget>, text: &str) -> anyhow::Result<bool> {
+    let Some(c) = chat else { return Ok(false) };
     let paths = maturana_core::session_db::session_paths(&home.agent_dir(&c.agent_id), &c.session_id);
     // write_outbound opens the db with create, but won't make its parent dir — a
     // real chat's session dir already exists, but ensure it so a status post is
@@ -816,7 +823,7 @@ fn post_chat(home: &MaturanaHome, chat: Option<&ChatTarget>, text: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
     let body = serde_json::json!({ "text": text }).to_string();
-    let _ = maturana_core::session_db::write_outbound(
+    maturana_core::session_db::write_outbound(
         &paths,
         None,
         "chat",
@@ -824,7 +831,141 @@ fn post_chat(home: &MaturanaHome, chat: Option<&ChatTarget>, text: &str) {
         &c.platform_id,
         c.thread_id.as_deref(),
         &body,
-    );
+    )?;
+    Ok(true)
+}
+
+/// Where a finished card's result should be delivered. Resolved to a concrete
+/// chat on an agent whose bridge is actually serving the channel — NOT the worker
+/// that ran the card. The worker only produces the content; it reaches the human
+/// through the same outbound bridge any agent reply uses.
+#[derive(Debug)]
+struct DeliveryTarget {
+    channel: String,
+    platform_id: String,
+    agent_id: String,
+    session_id: String,
+}
+
+/// Resolve a card's `deliver` spec to a concrete delivery target, the same way a
+/// normal agent reply leaves the system: pick the agent that actually *serves*
+/// the requested channel (a live bridge with a known destination) and address its
+/// main chat session. `deliver` is a channel name (`telegram`, `discord`, …) or
+/// `channel:agent` to pin a specific agent. `prefer` (the card's worker) is tried
+/// first when it also serves the channel. Returns `Err(reason)` — for honest
+/// logging — when no agent can push on that channel from this host.
+fn resolve_channel_delivery(
+    home: &MaturanaHome,
+    deliver: &str,
+    prefer: Option<&str>,
+) -> Result<DeliveryTarget, String> {
+    let (channel, explicit_agent) = match deliver.split_once(':') {
+        Some((c, a)) => (
+            c.trim().to_ascii_lowercase(),
+            Some(a.trim().to_string()).filter(|s| !s.is_empty()),
+        ),
+        None => (deliver.trim().to_ascii_lowercase(), None),
+    };
+    // Candidate agents, preferring an explicit pin, then the worker, then the rest
+    // in a stable order so resolution is deterministic across runs.
+    let candidates: Vec<String> = match &explicit_agent {
+        Some(a) => vec![a.clone()],
+        None => {
+            let mut ids = crate::discover_agent_ids(home).unwrap_or_default();
+            ids.sort();
+            if let Some(p) = prefer {
+                if let Some(pos) = ids.iter().position(|x| x == p) {
+                    let pref = ids.remove(pos);
+                    ids.insert(0, pref);
+                }
+            }
+            ids
+        }
+    };
+    // An explicitly pinned agent bypasses the liveness gate (the operator chose it;
+    // its bridge may just be restarting and the row waits in the outbox).
+    let require_live = explicit_agent.is_none();
+    let session_of = |a: &str| {
+        crate::infer_agent_session_id(home, a).unwrap_or_else(|_| format!("{a}-main"))
+    };
+    match channel.as_str() {
+        "telegram" => {
+            for a in &candidates {
+                if require_live && !crate::channels::telegram_bridge_live(home, a) {
+                    continue;
+                }
+                if let Some(chat_id) = crate::channels::current_paired_telegram_chat_id(home, a) {
+                    return Ok(DeliveryTarget {
+                        channel: "telegram".to_string(),
+                        platform_id: chat_id.to_string(),
+                        agent_id: a.clone(),
+                        session_id: session_of(a),
+                    });
+                }
+            }
+            Err("no agent with a live Telegram bridge and a paired chat".to_string())
+        }
+        "discord" => {
+            for a in &candidates {
+                if let Some(channel_id) = crate::channels::current_discord_delivery_channel(home, a) {
+                    return Ok(DeliveryTarget {
+                        channel: "discord".to_string(),
+                        platform_id: channel_id,
+                        agent_id: a.clone(),
+                        session_id: session_of(a),
+                    });
+                }
+            }
+            Err("no agent with a known Discord destination (the bot learns a channel only once someone messages it there)".to_string())
+        }
+        other => Err(format!(
+            "channel '{other}' has no host-side push destination yet (it replies only to its last-seen conversation) — use telegram or discord, or pin an agent with channel:agent"
+        )),
+    }
+}
+
+/// Best-effort host-side delivery of a finished card's result, through the SAME
+/// outbound bridge any agent reply uses (`post_chat` → the owner agent's running
+/// channel bridge sends it). The worker that ran the card has no channel
+/// credentials and never sends anything itself; the host routes the result to the
+/// agent that serves the requested channel. Channel-agnostic — Telegram, Discord
+/// and any future channel go through one path. Failures are logged loudly and
+/// never fail the run; the result is always on the board regardless.
+fn deliver_card_result(home: &MaturanaHome, worker_agent: &str, deliver: &str, text: &str) {
+    // The worker produced nothing worth sending (empty, or the silence sentinel a
+    // self-check emits) — never queue an empty/sentinel "result" as if it were one.
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == crate::proactive::SILENCE_SENTINEL {
+        eprintln!("  deliver: card produced no deliverable content — nothing sent");
+        return;
+    }
+    match resolve_channel_delivery(home, deliver, Some(worker_agent)) {
+        Ok(target) => {
+            let chat = ChatTarget {
+                channel: target.channel.clone(),
+                platform_id: target.platform_id.clone(),
+                thread_id: None,
+                agent_id: target.agent_id.clone(),
+                session_id: target.session_id.clone(),
+            };
+            // Honest reporting: only claim the result reached the bridge if the
+            // outbox write actually succeeded. The bridge then performs the send.
+            match post_chat_result(home, Some(&chat), text) {
+                Ok(true) => println!(
+                    "  -> queued result for delivery via {} to {} ({}); the bridge will send it",
+                    target.channel, target.agent_id, target.platform_id
+                ),
+                Ok(false) => eprintln!("  deliver: no chat target resolved — result kept on the board only"),
+                Err(error) => eprintln!(
+                    "  deliver: FAILED to write result to {}'s outbox ({error:#}) — result kept on the board only",
+                    target.agent_id
+                ),
+            }
+        }
+        Err(reason) => {
+            eprintln!("  deliver: {reason} — result kept on the board only");
+        }
+    }
 }
 
 /// Like [`post_chat`], but attaches host-side files; the channel's delivery sink
@@ -1801,6 +1942,28 @@ mod tests {
     }
 
     #[test]
+    fn channel_delivery_resolution_is_honest_when_unreachable() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("maturana-deliver-{}-{}", std::process::id(), nanos));
+        std::fs::create_dir_all(&root).unwrap();
+        let home = MaturanaHome::new(root.clone());
+
+        // No live bridges → telegram resolution fails with a clear reason, never panics.
+        let err = resolve_channel_delivery(&home, "telegram", None).unwrap_err();
+        assert!(err.contains("Telegram"), "got: {err}");
+
+        // A channel with no host-side push path is reported honestly (and the
+        // `channel:agent` form still parses to the channel arm).
+        let err = resolve_channel_delivery(&home, "slack:claude-firecracker", None).unwrap_err();
+        assert!(err.contains("no host-side push destination"), "got: {err}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn prose_is_not_a_manifest() {
         assert!(extract_file_manifest("The answer is 42. Paris has ~2.1M people.").is_none());
         // A JSON object without a files array is prose, not a manifest.
@@ -2542,6 +2705,12 @@ fn run_board_inner(
                     board.record_run(&id, agent.clone(), "completed", &note, started_at);
                     println!("  <- card {id} done");
                     log_event(home, &board_name, "done", Some(&id), "");
+                    // Optional host-side delivery of the result to a channel.
+                    if let (Some(channel), Some(a)) =
+                        (board.card(&id).and_then(|c| c.deliver.clone()), agent.as_deref())
+                    {
+                        deliver_card_result(home, a, &channel, &note);
+                    }
                 }
                 Err(error) => {
                     // AUTO-RETRY: a failed card goes back to Todo until it has used
@@ -2767,6 +2936,11 @@ fn build_card_task(
     let mut body = format!("Task: {}\n", card.title);
     if !card.detail.is_empty() {
         body.push_str(&format!("\n{}\n", card.detail));
+    }
+    if card.deliver.is_some() {
+        body.push_str(
+            "\n[Delivery is handled for you: produce the finished result as your reply and the host will deliver it to the requested channel. Do NOT attempt to send it yourself.]\n",
+        );
     }
     let ctx = board.dependency_context(card);
     if !ctx.trim().is_empty() {
