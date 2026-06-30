@@ -57,13 +57,13 @@ Codex or Claude OAuth harness state.
 Initialize the local vault:
 
 ```powershell
-.\scripts\maturana.ps1 pipelock init
+maturana pipelock init
 ```
 
 Store a secret:
 
 ```powershell
-.\scripts\maturana.ps1 pipelock set telegram/bot-token --value "<token>"
+maturana pipelock set telegram/bot-token --value "<token>"
 ```
 
 Reference it in specs or commands as:
@@ -75,32 +75,32 @@ pipelock:telegram/bot-token
 Create or print the public HTTPS MITM CA certificate path:
 
 ```powershell
-.\scripts\maturana.ps1 pipelock ca-cert
+maturana pipelock ca-cert
 ```
 
 List stored names:
 
 ```powershell
-.\scripts\maturana.ps1 pipelock list
+maturana pipelock list
 ```
 
 Read or delete a value only when the user explicitly asks:
 
 ```powershell
-.\scripts\maturana.ps1 pipelock get telegram/bot-token
-.\scripts\maturana.ps1 pipelock delete telegram/bot-token
+maturana pipelock get telegram/bot-token
+maturana pipelock delete telegram/bot-token
 ```
 
 Run the proxy from a spec:
 
 ```powershell
-.\scripts\maturana.ps1 pipelock proxy --spec .\examples\MATURANA.codex-hyperv.md
+maturana pipelock proxy --spec .\examples\MATURANA.codex-hyperv.md
 ```
 
 Run it with explicit one-off policy flags:
 
 ```powershell
-.\scripts\maturana.ps1 pipelock proxy `
+maturana pipelock proxy `
   --bind 127.0.0.1:47833 `
   --allow api.example.test `
   --inject-header api.example.test:Authorization=pipelock:api/token
@@ -118,7 +118,7 @@ network:
 Apply it by relaunching the agent (the proxy re-reads the spec on launch):
 
 ```powershell
-.\scripts\maturana.ps1 agent launch .maturana\agents\<id>\MATURANA.md --apply
+maturana agent launch .maturana\agents\<id>\MATURANA.md --apply
 ```
 
 Or flip it from the cockpit: Egress panel → choose the agent → tick "Allow all
@@ -126,7 +126,7 @@ egress" → save (re-validates the spec; applies on the agent's next restart). O
 run a one-off proxy with open egress for a quick test:
 
 ```powershell
-.\scripts\maturana.ps1 pipelock proxy --agent-id <id> --allow-all
+maturana pipelock proxy --agent-id <id> --allow-all
 ```
 
 Re-scope later by setting `egress_allow_all: false` and listing the specific

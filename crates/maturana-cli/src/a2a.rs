@@ -17,6 +17,7 @@ use maturana_core::a2a::{
     SendMessageParams, Task,
 };
 use maturana_core::state::MaturanaHome;
+use maturana_ops::agents::infer_agent_session_id;
 
 /// Default A2A bind. Distinct from sessiond (47834), graph (47835), web (47836).
 const DEFAULT_A2A_BIND: &str = "0.0.0.0:47837";
@@ -115,7 +116,11 @@ fn handle_a2a_connection(
             let card = build_agent_card(agent);
             return crate::session::write_json_response(stream, 200, &serde_json::to_value(card)?);
         }
-        return crate::session::write_json_response(stream, 404, &serde_json::json!({"error":"not found"}));
+        return crate::session::write_json_response(
+            stream,
+            404,
+            &serde_json::json!({"error":"not found"}),
+        );
     }
     // POST /a2a/<agent>  (JSON-RPC)
     if request.method == "POST" {
@@ -123,7 +128,11 @@ fn handle_a2a_connection(
             let agent = agent.trim_end_matches('/');
             let rpc: JsonRpcRequest = serde_json::from_slice(&request.body)?;
             let response = dispatch_rpc(home, agent, &rpc);
-            return crate::session::write_json_response(stream, 200, &serde_json::to_value(response)?);
+            return crate::session::write_json_response(
+                stream,
+                200,
+                &serde_json::to_value(response)?,
+            );
         }
     }
     crate::session::write_json_response(stream, 404, &serde_json::json!({"error":"not found"}))
@@ -134,13 +143,18 @@ fn dispatch_rpc(home: &MaturanaHome, agent: &str, rpc: &JsonRpcRequest) -> JsonR
         let params: SendMessageParams = match serde_json::from_value(rpc.params.clone()) {
             Ok(p) => p,
             Err(e) => {
-                return JsonRpcResponse::err(rpc.id.clone(), -32602, &format!("invalid params: {e}"))
+                return JsonRpcResponse::err(
+                    rpc.id.clone(),
+                    -32602,
+                    &format!("invalid params: {e}"),
+                )
             }
         };
         match a2a_dispatch(home, agent, &params.message) {
-            Ok(task) => {
-                JsonRpcResponse::ok(rpc.id.clone(), serde_json::to_value(task).unwrap_or_default())
-            }
+            Ok(task) => JsonRpcResponse::ok(
+                rpc.id.clone(),
+                serde_json::to_value(task).unwrap_or_default(),
+            ),
             Err(e) => JsonRpcResponse::err(rpc.id.clone(), -32000, &format!("{e:#}")),
         }
     } else {
@@ -188,7 +202,7 @@ pub(crate) fn a2a_dispatch(
         ));
     }
 
-    let session_id = crate::infer_agent_session_id(home, target_agent)?;
+    let session_id = infer_agent_session_id(home, target_agent)?;
     // A per-role model override travels in metadata so it survives the A2A hop.
     let model = message
         .metadata
@@ -274,7 +288,10 @@ pub(crate) fn a2a_client_send(
     let req = JsonRpcRequest::new(
         serde_json::json!(1),
         a2a::method::MESSAGE_SEND,
-        serde_json::to_value(SendMessageParams { message, metadata: None })?,
+        serde_json::to_value(SendMessageParams {
+            message,
+            metadata: None,
+        })?,
     );
     let resp: JsonRpcResponse = ureq::post(&url)
         .set("x-maturana-session-token", token)

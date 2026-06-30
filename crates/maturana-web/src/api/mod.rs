@@ -11,6 +11,7 @@ pub mod graph;
 pub mod ops;
 pub mod orchestrator;
 pub mod pipelock;
+pub mod plugins;
 pub mod runtime;
 pub mod schedules;
 pub mod search;
@@ -46,11 +47,20 @@ pub fn router() -> Router<AppState> {
             "/api/agents/:id/chat/upload",
             post(agents::chat_upload).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
-        .route("/api/agents/:id/spec", get(agents::spec_get).put(agents::spec_put))
+        .route(
+            "/api/agents/:id/spec",
+            get(agents::spec_get).put(agents::spec_put),
+        )
         .route("/api/agents/:id/spec/validate", post(agents::spec_validate))
         .route("/api/agents/:id/apply", post(agents::apply))
-        .route("/api/agents/:id/egress", get(agents::egress_get).put(agents::egress_put))
-        .route("/api/agents/:id/config", get(agents::config_get).put(agents::config_put))
+        .route(
+            "/api/agents/:id/egress",
+            get(agents::egress_get).put(agents::egress_put),
+        )
+        .route(
+            "/api/agents/:id/config",
+            get(agents::config_get).put(agents::config_put),
+        )
         .route("/api/egress/approve", post(egress::approve))
         .route("/api/runtime/plan", get(runtime::plan))
         .route("/api/runtime/up", get(runtime::up_state))
@@ -64,20 +74,41 @@ pub fn router() -> Router<AppState> {
         .route("/api/sessions", get(sessions::list))
         .route("/api/sessions/search", get(sessions::search))
         .route("/api/sessions/prune", post(sessions::prune))
-        .route("/api/sessions/:agent/:session/messages", get(sessions::messages))
-        .route("/api/sessions/:agent/:session/export", get(sessions::export))
-        .route("/api/sessions/:agent/:session/label", put(sessions::set_label))
+        .route(
+            "/api/sessions/:agent/:session/messages",
+            get(sessions::messages),
+        )
+        .route(
+            "/api/sessions/:agent/:session/export",
+            get(sessions::export),
+        )
+        .route(
+            "/api/sessions/:agent/:session/label",
+            put(sessions::set_label),
+        )
         .route("/api/graph/stats", post(graph::stats))
         .route("/api/graph/query", post(graph::query))
         .route("/api/graph/ingest", post(graph::ingest))
-        .route("/api/pipelock/secrets", get(pipelock::list).post(pipelock::set))
-        .route("/api/pipelock/secrets/:name", axum::routing::delete(pipelock::delete))
+        .route(
+            "/api/pipelock/secrets",
+            get(pipelock::list).post(pipelock::set),
+        )
+        .route(
+            "/api/pipelock/secrets/:name",
+            axum::routing::delete(pipelock::delete),
+        )
+        .route("/api/plugins", get(plugins::list))
+        .route("/api/plugins/assets", get(plugins::assets))
+        .route("/api/plugins/roots", get(plugins::roots))
+        .route("/api/plugins/:name", get(plugins::detail))
         .route("/api/search", post(search::search))
         .route("/api/voice/tts", post(voice::tts))
         .route("/api/voice/stt", post(voice::stt))
         .route(
             "/api/tools",
-            get(tools::list).post(tools::register).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+            get(tools::list)
+                .post(tools::register)
+                .layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
         .route("/api/skills", get(skills::list).post(skills::create))
         .route("/api/skills/:name", get(skills::detail))
@@ -85,23 +116,47 @@ pub fn router() -> Router<AppState> {
         .route("/api/schedules", get(schedules::list))
         .route("/api/schedules/:agent", post(schedules::add))
         .route("/api/schedules/:agent/:id/toggle", post(schedules::toggle))
-        .route("/api/schedules/:agent/:id", axum::routing::delete(schedules::delete))
+        .route(
+            "/api/schedules/:agent/:id",
+            axum::routing::delete(schedules::delete),
+        )
         // Orchestrator loop runs (LLM-decomposed one-shot goals; read-only viewer).
         .route("/api/orchestrator/runs", get(orchestrator::list_runs))
-        .route("/api/orchestrator/runs/:run_id", get(orchestrator::run_detail))
-        .route("/api/orchestrator/runs/:run_id/abort", post(orchestrator::abort_run))
+        .route(
+            "/api/orchestrator/runs/:run_id",
+            get(orchestrator::run_detail),
+        )
+        .route(
+            "/api/orchestrator/runs/:run_id/abort",
+            post(orchestrator::abort_run),
+        )
         // Durable orchestration boards (user-defined cards, run across agents).
         .route("/api/boards", get(boards::list).post(boards::create))
-        .route("/api/boards/:name", get(boards::detail).delete(boards::delete))
+        .route(
+            "/api/boards/:name",
+            get(boards::detail).delete(boards::delete),
+        )
         .route("/api/boards/:name/run", post(boards::run))
         .route("/api/boards/:name/run-log", get(boards::run_log))
         .route("/api/boards/:name/reset", post(boards::reset))
         .route("/api/boards/:name/rename", post(boards::rename_board))
-        .route("/api/boards/:name/attachment", get(boards::download_attachment))
+        .route(
+            "/api/boards/:name/attachment",
+            get(boards::download_attachment),
+        )
         .route("/api/boards/:name/cards", post(boards::add_card))
-        .route("/api/boards/:name/cards/:id", put(boards::edit_card).delete(boards::delete_card))
-        .route("/api/boards/:name/cards/:id/comment", post(boards::comment_card))
-        .route("/api/boards/:name/cards/:id/decompose", post(boards::decompose))
+        .route(
+            "/api/boards/:name/cards/:id",
+            put(boards::edit_card).delete(boards::delete_card),
+        )
+        .route(
+            "/api/boards/:name/cards/:id/comment",
+            post(boards::comment_card),
+        )
+        .route(
+            "/api/boards/:name/cards/:id/decompose",
+            post(boards::decompose),
+        )
         .route("/api/boards/:name/cards/:id/specify", post(boards::specify))
         .route(
             "/api/boards/:name/cards/:id/attach",
@@ -110,7 +165,10 @@ pub fn router() -> Router<AppState> {
         // Channels overview (configured + live per agent).
         .route("/api/channels", get(channels::overview))
         // PUT routes share the same mutating-CSRF gate as POST/DELETE.
-        .route("/api/_csrf_probe", put(|| async { ok(serde_json::json!({})) }))
+        .route(
+            "/api/_csrf_probe",
+            put(|| async { ok(serde_json::json!({})) }),
+        )
 }
 
 /// Run sync core code off the async runtime, flattening join + app errors.

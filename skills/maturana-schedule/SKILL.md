@@ -45,7 +45,7 @@ personal-agent/session path.
 Add a schedule:
 
 ```powershell
-.\scripts\maturana.ps1 schedule add <agent-id> <name> `
+maturana schedule add <agent-id> <name> `
   --cron "* * * * *" `
   --prompt "Send a status brief" `
   --channel telegram
@@ -54,25 +54,25 @@ Add a schedule:
 List schedules:
 
 ```powershell
-.\scripts\maturana.ps1 schedule list <agent-id>
+maturana schedule list <agent-id>
 ```
 
 Run due schedules once:
 
 ```powershell
-.\scripts\maturana.ps1 schedule run-due <agent-id> --session-id <session-id>
+maturana schedule run-due <agent-id> --session-id <session-id>
 ```
 
 Run the simple scheduler loop:
 
 ```powershell
-.\scripts\maturana.ps1 schedule serve <agent-id> --session-id <session-id>
+maturana schedule serve <agent-id> --session-id <session-id>
 ```
 
 Test a specific time:
 
 ```powershell
-.\scripts\maturana.ps1 schedule run-due <agent-id> `
+maturana schedule run-due <agent-id> `
   --session-id <session-id> `
   --now 2026-06-09T09:00:00Z
 ```

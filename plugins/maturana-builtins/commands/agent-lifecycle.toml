@@ -1,0 +1,4 @@
+kind = "builtin-command-family"
+feature = "agent-lifecycle"
+summary = "Rust-owned agent lifecycle, setup, repair, audit, snapshot, and VM storage operations."
+commands = ["spec", "agent", "snapshot", "vm", "audit", "setup"]

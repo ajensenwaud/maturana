@@ -32,7 +32,8 @@ const INTERNAL_TURN_TAGS: &[&str] = &["proactive", "heartbeat", "schedule", "orc
 const SILENCE_SENTINEL: &str = "[[MATURANA_SILENT]]";
 
 fn is_internal_inbound(m: &session_db::InboundMessage) -> bool {
-    INTERNAL_TURN_TAGS.contains(&m.kind.as_str()) || INTERNAL_TURN_TAGS.contains(&m.channel.as_str())
+    INTERNAL_TURN_TAGS.contains(&m.kind.as_str())
+        || INTERNAL_TURN_TAGS.contains(&m.channel.as_str())
 }
 
 fn is_internal_outbound(m: &session_db::OutboundMessage) -> bool {
@@ -378,12 +379,28 @@ mod tests {
         // A real user message is kept.
         assert!(!is_internal_inbound(&inbound("chat", "web", "hello there")));
         // The agent's silence reply is hidden, whatever channel it lands on.
-        assert!(is_internal_outbound(&outbound("chat", "proactive", "[[MATURANA_SILENT]]")));
-        assert!(is_internal_outbound(&outbound("chat", "web", "[[MATURANA_SILENT]]")));
+        assert!(is_internal_outbound(&outbound(
+            "chat",
+            "proactive",
+            "[[MATURANA_SILENT]]"
+        )));
+        assert!(is_internal_outbound(&outbound(
+            "chat",
+            "web",
+            "[[MATURANA_SILENT]]"
+        )));
         // A genuine agent reply is kept.
-        assert!(!is_internal_outbound(&outbound("chat", "web", "Here's the summary you asked for.")));
+        assert!(!is_internal_outbound(&outbound(
+            "chat",
+            "web",
+            "Here's the summary you asked for."
+        )));
         // A real proactive *message* (routed to a real channel) is kept.
-        assert!(!is_internal_outbound(&outbound("chat", "web", "Reminder: your build finished.")));
+        assert!(!is_internal_outbound(&outbound(
+            "chat",
+            "web",
+            "Reminder: your build finished."
+        )));
     }
 }
 

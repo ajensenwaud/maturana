@@ -1,8 +1,8 @@
 //! Durable orchestration boards: define cards (title, assignee, deps), run them
 //! across agents, and monitor live. The board engine + dispatcher live in the
 //! CLI (`maturana board …`, runs each card in its assignee's VM over A2A); this
-//! API edits the typed `maturana_core::board::Board` store directly and triggers
-//! a run by shelling out to the binary detached — the cockpit never becomes a
+//! API edits the typed `maturana_core::board::Board` store directly and asks the
+//! shared ops layer to launch detached board jobs — the cockpit never becomes a
 //! second, weaker execution path.
 
 use axum::body::Bytes;
@@ -12,6 +12,9 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use maturana_core::board::{Board, CardStatus};
 use maturana_core::state::MaturanaHome;
+use maturana_ops::boards::{
+    is_board_running, launch_board_card_job, launch_board_run, BoardCardJob,
+};
 
 use super::{blocking, err, ok, valid_id};
 use crate::state::AppState;
@@ -20,29 +23,21 @@ fn home(state: &AppState) -> MaturanaHome {
     MaturanaHome::new(state.home_root.clone())
 }
 
-/// A board is "running" if a card is in flight, or its run log's last event
-/// isn't a run_end (a dispatcher is between batches).
-fn is_running(home: &MaturanaHome, board: &Board) -> bool {
-    if board.cards.iter().any(|c| c.status == CardStatus::Doing) {
-        return true;
-    }
-    let events = maturana_core::board::read_events(home, &board.name);
-    matches!(events.last(), Some(e) if e.kind != "run_end")
-}
-
 /// Every board + its column counts + whether it's currently running.
 pub async fn list(State(state): State<AppState>) -> Response {
     let h = home(&state);
     match blocking(move || {
         let mut out = Vec::new();
         for name in Board::list_names(&h) {
-            let Ok(board) = Board::load(&h, &name) else { continue };
+            let Ok(board) = Board::load(&h, &name) else {
+                continue;
+            };
             let (todo, doing, done, blocked) = board.counts();
             out.push(serde_json::json!({
                 "name": name,
                 "total": board.cards.len(),
                 "todo": todo, "doing": doing, "done": done, "blocked": blocked,
-                "running": is_running(&h, &board),
+                "running": is_board_running(&h, &board),
             }));
         }
         Ok(serde_json::json!(out))
@@ -64,7 +59,10 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateBody>)
     let h = home(&state);
     let name = body.name.trim().to_string();
     if !valid_id(&name) {
-        return err(StatusCode::BAD_REQUEST, "invalid board name (use letters, digits, - _ .)");
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid board name (use letters, digits, - _ .)",
+        );
     }
     match blocking(move || {
         if Board::path(&h, &name).exists() {
@@ -94,7 +92,7 @@ pub async fn detail(State(state): State<AppState>, Path(name): Path<String>) -> 
         let events = maturana_core::board::read_events(&h, &name);
         Ok(serde_json::json!({
             "name": board.name,
-            "running": is_running(&h, &board),
+            "running": is_board_running(&h, &board),
             "cards": board.cards,
             "events": events,
         }))
@@ -180,9 +178,18 @@ pub async fn add_card(
         }
         let assignee = body.assignee.and_then(|a| {
             let a = a.trim().to_string();
-            if a.is_empty() { None } else { Some(a) }
+            if a.is_empty() {
+                None
+            } else {
+                Some(a)
+            }
         });
-        let scheduled = match body.scheduled_at.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let scheduled = match body
+            .scheduled_at
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(s) => Some(
                 chrono::DateTime::parse_from_rfc3339(s)
                     .map_err(|e| anyhow::anyhow!("invalid scheduled_at (use RFC3339): {e}"))?
@@ -190,14 +197,23 @@ pub async fn add_card(
             ),
             None => None,
         };
-        let id = board.add(title, body.detail.as_deref().unwrap_or("").trim(), assignee, deps);
+        let id = board.add(
+            title,
+            body.detail.as_deref().unwrap_or("").trim(),
+            assignee,
+            deps,
+        );
         if let Some(c) = board.card_mut(&id) {
             if let Some(p) = body.priority {
                 c.priority = p;
             }
             c.tenant = body.tenant.and_then(|t| {
                 let t = t.trim().to_string();
-                if t.is_empty() { None } else { Some(t) }
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t)
+                }
             });
             c.scheduled_at = scheduled;
             c.max_retries = body.max_retries.unwrap_or(0);
@@ -205,7 +221,11 @@ pub async fn add_card(
             c.goal_max_turns = body.goal_max_turns.unwrap_or(0);
             c.deliver = body.deliver.and_then(|d| {
                 let d = d.trim().to_string();
-                if d.is_empty() { None } else { Some(d) }
+                if d.is_empty() {
+                    None
+                } else {
+                    Some(d)
+                }
             });
             if body.triage.unwrap_or(false) {
                 c.status = maturana_core::board::CardStatus::Triage;
@@ -264,10 +284,9 @@ pub async fn edit_card(
         let mut board = Board::load(&h, &name)?;
         // Resolve the new status (if any) before the mutable borrow.
         let new_status = match &body.status {
-            Some(s) => Some(
-                CardStatus::parse(s)
-                    .ok_or_else(|| anyhow::anyhow!("unknown status '{s}'"))?,
-            ),
+            Some(s) => {
+                Some(CardStatus::parse(s).ok_or_else(|| anyhow::anyhow!("unknown status '{s}'"))?)
+            }
             None => None,
         };
         // Validate deps reference existing cards (and not itself) up front.
@@ -282,16 +301,18 @@ pub async fn edit_card(
             }
         }
         let scheduled = match body.scheduled_at.as_deref().map(str::trim) {
-            Some("") => Some(None),               // explicit clear
+            Some("") => Some(None), // explicit clear
             Some(s) => Some(Some(
                 chrono::DateTime::parse_from_rfc3339(s)
                     .map_err(|e| anyhow::anyhow!("invalid scheduled_at: {e}"))?
                     .with_timezone(&chrono::Utc),
             )),
-            None => None,                          // leave unchanged
+            None => None, // leave unchanged
         };
         {
-            let card = board.card_mut(&id).ok_or_else(|| anyhow::anyhow!("no such card"))?;
+            let card = board
+                .card_mut(&id)
+                .ok_or_else(|| anyhow::anyhow!("no such card"))?;
             if let Some(t) = body.title {
                 let t = t.trim();
                 if !t.is_empty() {
@@ -306,7 +327,11 @@ pub async fn edit_card(
                 card.assignee = if a.is_empty() { None } else { Some(a) };
             }
             if let Some(deps) = body.deps {
-                card.deps = deps.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                card.deps = deps
+                    .into_iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
             }
             if let Some(st) = new_status {
                 card.status = st;
@@ -398,37 +423,9 @@ pub async fn run(State(state): State<AppState>, Path(name): Path<String>) -> Res
     if !valid_id(&name) {
         return err(StatusCode::BAD_REQUEST, "invalid board name");
     }
-    let home_root = state.home_root.clone();
     let h = home(&state);
     match blocking(move || {
-        let board = Board::load(&h, &name)?;
-        if board.cards.is_empty() {
-            anyhow::bail!("board is empty — add cards first");
-        }
-        if is_running(&h, &board) {
-            anyhow::bail!("board is already running");
-        }
-        let exe = std::env::current_exe()?;
-        let log_path = Board::dir(&h).join(format!("{name}.run.log"));
-        if let Some(parent) = log_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let log = std::fs::File::create(&log_path)?;
-        let mut cmd = std::process::Command::new(exe);
-        cmd.arg("--home")
-            .arg(&home_root)
-            .arg("board")
-            .arg("run")
-            .arg("--board")
-            .arg(&name)
-            .stdin(std::process::Stdio::null())
-            .stderr(log.try_clone()?)
-            .stdout(log);
-        let mut child = cmd.spawn()?;
-        // Reap off-thread so the child never zombies after we return.
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
+        launch_board_run(&h, &name)?;
         Ok(serde_json::json!({ "running": name }))
     })
     .await
@@ -483,7 +480,12 @@ pub async fn comment_card(
         if text.is_empty() {
             anyhow::bail!("empty comment");
         }
-        let author = body.author.as_deref().map(str::trim).filter(|a| !a.is_empty()).unwrap_or("operator");
+        let author = body
+            .author
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .unwrap_or("operator");
         let mut board = Board::load(&h, &name)?;
         if !board.comment(&id, author, text) {
             anyhow::bail!("no such card");
@@ -498,44 +500,17 @@ pub async fn comment_card(
     }
 }
 
-/// Spawn a detached `maturana board <args>` (decompose/specify run in the
-/// background; the board JSON + run log update as they progress).
-fn spawn_board(home_root: &std::path::Path, args: &[String], log: &std::path::Path) -> anyhow::Result<()> {
-    let exe = std::env::current_exe()?;
-    if let Some(parent) = log.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let logf = std::fs::File::create(log)?;
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--home").arg(home_root).args(args)
-        .stdin(std::process::Stdio::null())
-        .stderr(logf.try_clone()?)
-        .stdout(logf);
-    let mut child = cmd.spawn()?;
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
-}
-
 /// Decompose a card into children via the coordinator agent (LLM) — detached.
-pub async fn decompose(State(state): State<AppState>, Path((name, id)): Path<(String, String)>) -> Response {
+pub async fn decompose(
+    State(state): State<AppState>,
+    Path((name, id)): Path<(String, String)>,
+) -> Response {
     if !valid_id(&name) || !valid_id(&id) {
         return err(StatusCode::BAD_REQUEST, "invalid id");
     }
-    let home_root = state.home_root.clone();
     let h = home(&state);
     match blocking(move || {
-        let board = Board::load(&h, &name)?;
-        if board.card(&id).is_none() {
-            anyhow::bail!("no such card");
-        }
-        let log = Board::dir(&h).join(format!("{name}.decompose.log"));
-        spawn_board(
-            &home_root,
-            &["board".into(), "decompose".into(), id.clone(), "--board".into(), name.clone()],
-            &log,
-        )?;
+        launch_board_card_job(&h, &name, &id, BoardCardJob::Decompose)?;
         Ok(serde_json::json!({ "decomposing": id }))
     })
     .await
@@ -546,23 +521,16 @@ pub async fn decompose(State(state): State<AppState>, Path((name, id)): Path<(St
 }
 
 /// Flesh out a card via an agent (LLM) — detached.
-pub async fn specify(State(state): State<AppState>, Path((name, id)): Path<(String, String)>) -> Response {
+pub async fn specify(
+    State(state): State<AppState>,
+    Path((name, id)): Path<(String, String)>,
+) -> Response {
     if !valid_id(&name) || !valid_id(&id) {
         return err(StatusCode::BAD_REQUEST, "invalid id");
     }
-    let home_root = state.home_root.clone();
     let h = home(&state);
     match blocking(move || {
-        let board = Board::load(&h, &name)?;
-        if board.card(&id).is_none() {
-            anyhow::bail!("no such card");
-        }
-        let log = Board::dir(&h).join(format!("{name}.specify.log"));
-        spawn_board(
-            &home_root,
-            &["board".into(), "specify".into(), id.clone(), "--board".into(), name.clone()],
-            &log,
-        )?;
+        launch_board_card_job(&h, &name, &id, BoardCardJob::Specify)?;
         Ok(serde_json::json!({ "specifying": id }))
     })
     .await
@@ -652,9 +620,19 @@ pub async fn upload_attachment(
         let base = raw_name.rsplit(['/', '\\']).next().unwrap_or("file");
         let safe: String = base
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
-        let safe = if safe.trim_matches('.').is_empty() { "upload.bin".to_string() } else { safe };
+        let safe = if safe.trim_matches('.').is_empty() {
+            "upload.bin".to_string()
+        } else {
+            safe
+        };
         let dir = attachments_dir(&h, &name, &id);
         std::fs::create_dir_all(&dir)?;
         let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
@@ -706,14 +684,21 @@ pub async fn download_attachment(
         if meta.len() > 50 * 1024 * 1024 {
             anyhow::bail!("file too large to download");
         }
-        let fname = canon.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+        let fname = canon
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
         let bytes = std::fs::read(&canon)?;
         Ok((fname, bytes))
     })
     .await;
     match result {
         Ok((fname, bytes)) => {
-            let disp = format!("attachment; filename=\"{}\"", fname.replace(['"', '\n', '\r'], ""));
+            let disp = format!(
+                "attachment; filename=\"{}\"",
+                fname.replace(['"', '\n', '\r'], "")
+            );
             (
                 [
                     (header::CONTENT_TYPE, "application/octet-stream".to_string()),

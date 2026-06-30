@@ -108,7 +108,10 @@ fn item_phase(event: &serde_json::Value, completed: bool) -> Option<TurnEvent> {
 }
 
 fn render_usage(usage: &serde_json::Value) -> String {
-    let input = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let input = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let output = usage
         .get("output_tokens")
         .and_then(|v| v.as_u64())
@@ -150,7 +153,10 @@ mod tests {
             .collect();
         assert_eq!(deltas, vec!["READY\n"]);
         match events.last() {
-            Some(TurnEvent::Completed { ok: true, detail: Some(detail) }) => {
+            Some(TurnEvent::Completed {
+                ok: true,
+                detail: Some(detail),
+            }) => {
                 assert!(detail.contains("tokens"), "usage detail: {detail}");
             }
             other => panic!("expected successful completion, got {other:?}"),
@@ -176,9 +182,9 @@ mod tests {
         assert_eq!(phases[1].0, "item_0");
         assert!(matches!(phases[1].1, WirePhase::Done { .. }));
         // The final agent message still streams as a delta.
-        assert!(events.iter().any(
-            |e| matches!(e, TurnEvent::Delta(text) if text.contains("maturana-fixture-ok"))
-        ));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, TurnEvent::Delta(text) if text.contains("maturana-fixture-ok"))));
     }
 
     #[test]

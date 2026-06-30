@@ -108,9 +108,7 @@ fn resolve_bws(id: &str, vault: &PipelockVault) -> anyhow::Result<String> {
         .env("BWS_ACCESS_TOKEN", access)
         .output()
         .map_err(|e| {
-            anyhow::anyhow!(
-                "failed to run `bws` (install the Bitwarden Secrets Manager CLI): {e}"
-            )
+            anyhow::anyhow!("failed to run `bws` (install the Bitwarden Secrets Manager CLI): {e}")
         })?;
     if !output.status.success() {
         anyhow::bail!(

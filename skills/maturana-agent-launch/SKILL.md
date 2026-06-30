@@ -105,7 +105,7 @@ the privileged Hyper-V work.
 
 ```powershell
 $env:MATURANA_HYPERV_FORCE = "true" # only when replacing an existing demo VM
-.\scripts\maturana.ps1 agent launch .\examples\MATURANA.codex-hyperv.md --apply
+maturana agent launch .\examples\MATURANA.codex-hyperv.md --apply
 ```
 
 For debugging only, the direct elevated launcher can create/start the Hyper-V
@@ -138,13 +138,13 @@ execution endpoint. Privileged hostd operations require the token in
 Inspect live VM state through the CLI when hostd is running:
 
 ```powershell
-.\scripts\maturana.ps1 agent inspect codex-demo --live
+maturana agent inspect codex-demo --live
 ```
 
 Submit a new live task to the guest harness through the session queue:
 
 ```powershell
-.\scripts\maturana.ps1 agent run codex-demo --prompt "Inspect /agent/MATURANA.md and report status." --wait
+maturana agent run codex-demo --prompt "Inspect /agent/MATURANA.md and report status." --wait
 ```
 
 `agent run` enqueues a CLI message into `sessiond` and waits for the matching
@@ -154,13 +154,13 @@ outbound response when `--wait` is set. Do not revive `/agent/prompt.txt`,
 Push inputs into the guest workspace with `agent push`:
 
 ```powershell
-.\scripts\maturana.ps1 agent push codex-demo .\.maturana\agents\codex-demo\workspace\host-input.txt /workspace/host-input.txt --ip 172.26.183.108
+maturana agent push codex-demo .\.maturana\agents\codex-demo\workspace\host-input.txt /workspace/host-input.txt --ip 172.26.183.108
 ```
 
 Fetch artifacts from the guest workspace with `agent fetch`:
 
 ```powershell
-.\scripts\maturana.ps1 agent fetch codex-demo /workspace/live-run.txt .\.maturana\agents\codex-demo\workspace\live-run.txt --ip 172.26.183.108
+maturana agent fetch codex-demo /workspace/live-run.txt .\.maturana\agents\codex-demo\workspace\live-run.txt --ip 172.26.183.108
 ```
 
 Use `agent push`, `agent run`, and `agent fetch` as the boring, direct work

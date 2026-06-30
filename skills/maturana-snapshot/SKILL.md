@@ -50,22 +50,22 @@ preflight and evidence, not as a bare command wrapper.
 List known local/provider snapshots:
 
 ```powershell
-.\scripts\maturana.ps1 snapshot list <agent-id>
+maturana snapshot list <agent-id>
 ```
 
 Create a local marker only when the user wants a named checkpoint in the
 agent's audit trail but does not need VM restore:
 
 ```powershell
-.\scripts\maturana.ps1 snapshot take <agent-id> <snapshot-name>
+maturana snapshot take <agent-id> <snapshot-name>
 ```
 
 Use `--live` for restorable VM snapshots:
 
 ```powershell
-.\scripts\maturana.ps1 snapshot take <agent-id> <snapshot-name> --live
-.\scripts\maturana.ps1 snapshot list <agent-id> --live
-.\scripts\maturana.ps1 snapshot restore <agent-id> <snapshot-name> --live
+maturana snapshot take <agent-id> <snapshot-name> --live
+maturana snapshot list <agent-id> --live
+maturana snapshot restore <agent-id> <snapshot-name> --live
 ```
 
 Copy-on-write **disk** snapshots of a Firecracker rootfs (Linux; instant +

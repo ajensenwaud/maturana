@@ -277,7 +277,11 @@ impl Board {
     pub fn comment(&mut self, id: &str, author: &str, body: &str) -> bool {
         let now = Utc::now();
         if let Some(c) = self.card_mut(id) {
-            c.comments.push(Comment { at: now, author: author.to_string(), body: body.to_string() });
+            c.comments.push(Comment {
+                at: now,
+                author: author.to_string(),
+                body: body.to_string(),
+            });
             c.updated_at = Some(now);
             true
         } else {
@@ -393,7 +397,10 @@ impl Board {
     pub fn reset_for_rerun(&mut self) -> usize {
         let mut n = 0;
         for card in &mut self.cards {
-            if matches!(card.status, CardStatus::Done | CardStatus::Doing | CardStatus::Blocked) {
+            if matches!(
+                card.status,
+                CardStatus::Done | CardStatus::Doing | CardStatus::Blocked
+            ) {
                 card.status = CardStatus::Todo;
                 card.result = None;
                 n += 1;
@@ -463,7 +470,10 @@ pub fn log_event(home: &MaturanaHome, board: &str, kind: &str, card: Option<&str
         let _ = std::fs::create_dir_all(parent);
     }
     if let (Ok(mut file), Ok(line)) = (
-        std::fs::OpenOptions::new().create(true).append(true).open(&path),
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path),
         serde_json::to_string(&event),
     ) {
         let _ = writeln!(file, "{line}");
@@ -589,9 +599,9 @@ mod tests {
     #[test]
     fn ready_orders_by_priority_then_id() {
         let mut b = Board::new("demo");
-        b.add("low", "", None, vec![]);    // c1
-        b.add("high", "", None, vec![]);   // c2
-        b.add("mid", "", None, vec![]);    // c3
+        b.add("low", "", None, vec![]); // c1
+        b.add("high", "", None, vec![]); // c2
+        b.add("mid", "", None, vec![]); // c3
         b.card_mut("c2").unwrap().priority = 10;
         b.card_mut("c3").unwrap().priority = 5;
         let order: Vec<_> = b.ready().iter().map(|c| c.id.clone()).collect();

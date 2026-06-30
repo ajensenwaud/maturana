@@ -52,64 +52,10 @@ pub async fn list(State(state): State<AppState>) -> Response {
 /// One JSON snapshot of the fleet; shared by the REST list and the agents
 /// dashboard topic poller.
 pub(crate) fn snapshot(root: &std::path::Path) -> anyhow::Result<serde_json::Value> {
-    {
-        let agents_dir = root.join("agents");
-        let mut agents = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&agents_dir) {
-            for entry in entries.flatten() {
-                let dir = entry.path();
-                let spec_path = dir.join("MATURANA.md");
-                if !spec_path.exists() {
-                    continue;
-                }
-                let agent_id = entry.file_name().to_string_lossy().to_string();
-                let spec = AgentSpec::from_maturana_markdown(&spec_path).ok();
-                let status_path = dir.join("worker-status.json");
-                let worker_status: Option<serde_json::Value> =
-                    std::fs::read_to_string(&status_path)
-                        .ok()
-                        .and_then(|raw| serde_json::from_str(&raw).ok());
-                // Liveness by heartbeat FRESHNESS, not the literal status string.
-                // The guest worker rewrites worker-status.json every ~1s while
-                // idle and only ever writes idle/claimed/completed/error — it
-                // never writes "running", so the Overview's old status=="running"
-                // count was always 0 for a healthy idle fleet. An agent is "up"
-                // when its heartbeat is fresh and not in an error state; "busy"
-                // means a turn is actually in flight (status "claimed").
-                let worker_age_s: Option<u64> = std::fs::metadata(&status_path)
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.elapsed().ok())
-                    .map(|d| d.as_secs());
-                let status_str = worker_status
-                    .as_ref()
-                    .and_then(|w| w.get("status"))
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let live = worker_age_s.map(|age| age <= 90).unwrap_or(false)
-                    && status_str != "error";
-                agents.push(serde_json::json!({
-                    "agent_id": agent_id,
-                    "name": spec.as_ref().map(|s| s.identity.name.clone()),
-                    "purpose": spec.as_ref().map(|s| s.identity.purpose.clone()),
-                    "harness": spec.as_ref().map(|s| maturana_core::worker::harness_name(&s.runtime.harness)),
-                    "provider": spec.as_ref().map(|s| format!("{:?}", s.vm.provider)),
-                    "knowledge_graph": spec.as_ref().map(|s| s.knowledge_graph.enabled).unwrap_or(false),
-                    "graph_name": spec.as_ref().filter(|s| s.knowledge_graph.enabled).map(|s| s.knowledge_graph.graph_name(&agent_id)),
-                    "egress_allowlist": spec.as_ref().map(|s| s.network.egress_allowlist.clone()).unwrap_or_default(),
-                    "egress_allow_all": spec.as_ref().map(|s| s.network.egress_allow_all).unwrap_or(false),
-                    "worker_status": worker_status,
-                    "status": status_str,
-                    "live": live,
-                    "worker_age_s": worker_age_s,
-                    "spec_parses": spec.is_some(),
-                }));
-            }
-        }
-        agents.sort_by(|a, b| a["agent_id"].as_str().cmp(&b["agent_id"].as_str()));
-        Ok(serde_json::json!(agents))
-    }
+    let home = MaturanaHome::new(root.to_path_buf());
+    Ok(serde_json::to_value(
+        maturana_ops::agents::list_agent_summaries(&home)?,
+    )?)
 }
 
 pub async fn status(State(state): State<AppState>, Path(id): Path<String>) -> Response {
@@ -117,7 +63,7 @@ pub async fn status(State(state): State<AppState>, Path(id): Path<String>) -> Re
     let state_home = state.home_root.clone();
     match blocking(move || {
         let home = MaturanaHome::new(state_home);
-        let status = maturana_core::materialize::inspect_agent(&home, &id)?;
+        let status = maturana_ops::agents::inspect_live_agent(&home, &id)?;
         Ok(serde_json::to_value(status)?)
     })
     .await
@@ -132,7 +78,7 @@ pub async fn stop(State(state): State<AppState>, Path(id): Path<String>) -> Resp
     let state_home = state.home_root.clone();
     match blocking(move || {
         let home = MaturanaHome::new(state_home);
-        maturana_core::materialize::stop_agent(&home, &id)?;
+        maturana_ops::agents::stop_live_agent(&home, &id)?;
         Ok(serde_json::json!({ "stopped": id }))
     })
     .await
@@ -202,31 +148,15 @@ pub async fn detail(State(state): State<AppState>, Path(id): Path<String>) -> Re
     }
 }
 
-/// Restart a Firecracker agent: relaunch its microVM from the baked rootfs (the
-/// boot-recovery path stops the old one first), via the CLI's repair command.
+/// Restart a Firecracker agent: relaunch its microVM from the baked rootfs.
 pub async fn restart(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     check_id!(id);
-    let home_root = state.home_root.clone();
+    let state_home = state.home_root.clone();
     match blocking(move || {
-        let exe = std::env::current_exe()?;
-        let output = std::process::Command::new(exe)
-            .arg("--home")
-            .arg(&home_root)
-            .args(["repair", "firecracker-harnesses", "--agent-id"])
-            .arg(&id)
-            .args(["--skip-services", "--skip-assets"])
-            .output()?;
-        let tail: Vec<String> = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .rev()
-            .take(6)
-            .map(|l| l.to_string())
-            .collect();
-        if !output.status.success() {
-            let err = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("restart failed: {}", err.trim());
-        }
-        Ok(serde_json::json!({ "restarted": id, "output": tail }))
+        let home = MaturanaHome::new(state_home);
+        Ok(serde_json::to_value(
+            maturana_ops::agents::restart_firecracker_agent(&home, &id)?,
+        )?)
     })
     .await
     {
@@ -273,22 +203,24 @@ pub async fn deploy_skill(
         if !skill_path.exists() {
             anyhow::bail!("skill not found at {}", skill_path.display());
         }
-        let exe = std::env::current_exe()?;
-        let output = std::process::Command::new(exe)
-            .arg("--home")
-            .arg(&home_root)
-            .args(["deploy", "skill"])
-            .arg(&id)
-            .arg(&skill_path)
-            .args(["--ip", &guest_ip])
-            .output()?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "deploy failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(serde_json::json!({ "deployed": skill, "agent": id, "guest_path": "/agent/skills" }))
+        let home = maturana_core::state::MaturanaHome::new(&home_root);
+        let result = maturana_ops::deploy::deploy_item(
+            &home,
+            maturana_ops::deploy::DeployKind::Skill,
+            maturana_ops::deploy::DeployRequest {
+                agent_id: id.clone(),
+                path: skill_path,
+                ip: guest_ip,
+                ssh_user: "ubuntu".to_string(),
+                ssh_key: home_root.join("keys").join("maturana-agent-ed25519"),
+                guest_path: None,
+            },
+        )?;
+        Ok(serde_json::json!({
+            "deployed": skill,
+            "agent": id,
+            "guest_path": result.guest_path,
+        }))
     })
     .await
     {
@@ -350,7 +282,10 @@ fn is_browsable_rel(rel: &str) -> bool {
     if SECRET_HINTS.iter().any(|h| name.contains(h)) {
         return false;
     }
-    match std::path::Path::new(name).extension().and_then(|e| e.to_str()) {
+    match std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+    {
         Some(ext) => SAFE_EXTS.contains(&ext),
         None => false,
     }
@@ -513,7 +448,10 @@ pub async fn file_write(
         let probe = if target.exists() {
             target.clone()
         } else {
-            target.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| dir.clone())
+            target
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| dir.clone())
         };
         let canon = probe.canonicalize()?;
         if !canon.starts_with(&base) {
@@ -551,7 +489,11 @@ pub async fn chat_download(
             anyhow::bail!("invalid path");
         }
         let p = std::path::Path::new(&req);
-        let target = if p.is_absolute() { p.to_path_buf() } else { dir.join(&req) };
+        let target = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            dir.join(&req)
+        };
         let canon = target.canonicalize()?;
         let base = dir.canonicalize()?;
         if !canon.starts_with(&base) {
@@ -572,7 +514,10 @@ pub async fn chat_download(
             .and_then(|n| n.to_str())
             .unwrap_or("file")
             .to_string();
-        if SECRET_HINTS.iter().any(|h| name.to_ascii_lowercase().contains(h)) {
+        if SECRET_HINTS
+            .iter()
+            .any(|h| name.to_ascii_lowercase().contains(h))
+        {
             anyhow::bail!("not a downloadable file");
         }
         let meta = std::fs::metadata(&canon)?;
@@ -588,7 +533,10 @@ pub async fn chat_download(
     .await;
     match result {
         Ok((name, bytes)) => {
-            let disp = format!("attachment; filename=\"{}\"", name.replace(['"', '\n', '\r'], ""));
+            let disp = format!(
+                "attachment; filename=\"{}\"",
+                name.replace(['"', '\n', '\r'], "")
+            );
             (
                 [
                     (header::CONTENT_TYPE, "application/octet-stream".to_string()),
@@ -635,9 +583,19 @@ pub async fn chat_upload(
         let base_name = raw_name.rsplit(['/', '\\']).next().unwrap_or("file");
         let safe: String = base_name
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
-        let safe = if safe.trim_matches('.').is_empty() { "upload.bin".to_string() } else { safe };
+        let safe = if safe.trim_matches('.').is_empty() {
+            "upload.bin".to_string()
+        } else {
+            safe
+        };
         let inbox = dir.join("inbox");
         std::fs::create_dir_all(&inbox)?;
         let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
@@ -690,7 +648,10 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateBody>)
     let id = body.id.trim().to_string();
     check_id!(id);
     if !matches!(body.harness.as_str(), "codex" | "claude" | "opencode") {
-        return err(StatusCode::BAD_REQUEST, "harness must be codex, claude, or opencode");
+        return err(
+            StatusCode::BAD_REQUEST,
+            "harness must be codex, claude, or opencode",
+        );
     }
     let dir = home(&state).agent_dir(&id);
     let path = agent_spec_path(&state, &id);
@@ -719,7 +680,10 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateBody>)
         // Validate before committing anything to disk.
         let report = validate_markdown(&markdown)?;
         if !report.valid {
-            anyhow::bail!("starter spec failed validation: {}", report.errors.join("; "));
+            anyhow::bail!(
+                "starter spec failed validation: {}",
+                report.errors.join("; ")
+            );
         }
         std::fs::create_dir_all(&dir)?;
         std::fs::write(&path, &markdown)?;
@@ -927,7 +891,10 @@ pub async fn egress_put(
         )?;
         let report = validate_markdown(&updated)?;
         if !report.valid {
-            anyhow::bail!("edited spec failed validation: {}", report.errors.join("; "));
+            anyhow::bail!(
+                "edited spec failed validation: {}",
+                report.errors.join("; ")
+            );
         }
         std::fs::write(&path, &updated)?;
         Ok(serde_json::json!({ "report": report }))
@@ -1007,7 +974,10 @@ pub async fn config_put(
         let updated = update_spec_section(&markdown, &body.section, &body.value)?;
         let report = validate_markdown(&updated)?;
         if !report.valid {
-            anyhow::bail!("edited spec failed validation: {}", report.errors.join("; "));
+            anyhow::bail!(
+                "edited spec failed validation: {}",
+                report.errors.join("; ")
+            );
         }
         std::fs::write(&path, &updated)?;
         Ok(serde_json::json!({ "section": body.section, "report": report }))
@@ -1048,7 +1018,9 @@ pub fn update_spec_section(
     Ok(format!("---\n{new_frontmatter}---{body}"))
 }
 
-fn validate_markdown(markdown: &str) -> anyhow::Result<maturana_core::validation::ValidationReport> {
+fn validate_markdown(
+    markdown: &str,
+) -> anyhow::Result<maturana_core::validation::ValidationReport> {
     // from_maturana_markdown reads a file; validate in-memory via a temp file
     // so unsaved editor content can be checked without touching the spec.
     let tmp = std::env::temp_dir().join(format!("mweb-spec-{}.md", uuid::Uuid::new_v4()));
@@ -1108,7 +1080,10 @@ pub fn update_network_block(
         let proxy_key = serde_yaml::Value::String("proxy".to_string());
         if headers.is_empty() {
             // Leave an existing proxy block alone but clear its injections.
-            if let Some(proxy) = network_map.get_mut(&proxy_key).and_then(|p| p.as_mapping_mut()) {
+            if let Some(proxy) = network_map
+                .get_mut(&proxy_key)
+                .and_then(|p| p.as_mapping_mut())
+            {
                 proxy.insert(
                     serde_yaml::Value::String("inject_headers".to_string()),
                     serde_yaml::Value::Sequence(Vec::new()),
@@ -1170,7 +1145,10 @@ body text stays put
             source: "pipelock:brave/api-key".into(),
             prefix: None,
         }];
-        let allowlist = vec!["api.openai.com".to_string(), "api.search.brave.com".to_string()];
+        let allowlist = vec![
+            "api.openai.com".to_string(),
+            "api.search.brave.com".to_string(),
+        ];
         let updated = update_network_block(SPEC, &allowlist, &headers, None).unwrap();
 
         // Re-parse: the edited model holds, the rest is untouched.
@@ -1206,8 +1184,8 @@ body text stays put
         // Setting the flag writes egress_allow_all: true and parses back true; a
         // later edit with None preserves it (an allowlist edit can't silently
         // disable open egress).
-        let opened = update_network_block(SPEC, &["api.openai.com".to_string()], &[], Some(true))
-            .unwrap();
+        let opened =
+            update_network_block(SPEC, &["api.openai.com".to_string()], &[], Some(true)).unwrap();
         assert!(opened.contains("egress_allow_all: true"), "{opened}");
         let tmp = std::env::temp_dir().join(format!("mweb-allowall-{}.md", std::process::id()));
         std::fs::write(&tmp, &opened).unwrap();
@@ -1215,12 +1193,13 @@ body text stays put
         let _ = std::fs::remove_file(&tmp);
         assert!(spec.network.egress_allow_all);
         // None preserves the existing true.
-        let preserved = update_network_block(&opened, &["api.openai.com".to_string()], &[], None)
-            .unwrap();
+        let preserved =
+            update_network_block(&opened, &["api.openai.com".to_string()], &[], None).unwrap();
         assert!(preserved.contains("egress_allow_all: true"), "{preserved}");
         // Some(false) turns it back off.
-        let closed = update_network_block(&opened, &["api.openai.com".to_string()], &[], Some(false))
-            .unwrap();
+        let closed =
+            update_network_block(&opened, &["api.openai.com".to_string()], &[], Some(false))
+                .unwrap();
         assert!(closed.contains("egress_allow_all: false"), "{closed}");
     }
 
@@ -1251,7 +1230,11 @@ body text stays put
             let _ = std::fs::remove_file(&tmp);
             assert_eq!(spec.identity.id, "new-bot");
             let report = validate_spec(&spec);
-            assert!(report.valid, "starter spec for {harness} must validate: {:?}", report.errors);
+            assert!(
+                report.valid,
+                "starter spec for {harness} must validate: {:?}",
+                report.errors
+            );
         }
     }
 
@@ -1260,7 +1243,8 @@ body text stays put
         // A crafted `purpose` that tries to inject a sibling `harness_auth` block
         // (which would read a host file into the guest) must NOT become a real key —
         // it must round-trip as a plain string value of `purpose`.
-        let evil = "ok\nharness_auth:\n- runtime: codex\n  source_path: /etc/shadow\n  guest_path: /tmp/x";
+        let evil =
+            "ok\nharness_auth:\n- runtime: codex\n  source_path: /etc/shadow\n  guest_path: /tmp/x";
         let md = starter_spec("bot", "Bot", evil, "codex");
         let tmp = std::env::temp_dir().join(format!("mweb-inj-{}.md", std::process::id()));
         std::fs::write(&tmp, &md).unwrap();
@@ -1268,8 +1252,14 @@ body text stays put
         let _ = std::fs::remove_file(&tmp);
         // The injected block did not take effect: harness_auth stays empty, and the
         // payload is contained verbatim in purpose.
-        assert!(spec.harness_auth.is_empty(), "injection created harness_auth entries");
-        assert!(spec.identity.purpose.contains("/etc/shadow"), "purpose lost the literal text");
+        assert!(
+            spec.harness_auth.is_empty(),
+            "injection created harness_auth entries"
+        );
+        assert!(
+            spec.identity.purpose.contains("/etc/shadow"),
+            "purpose lost the literal text"
+        );
     }
 
     #[test]
@@ -1289,7 +1279,12 @@ body text stays put
             assert!(!is_browsable_rel(deny), "should DENY {deny}");
         }
         // The user-facing identity/contract docs stay browsable.
-        for allow in ["MATURANA.md", "AGENTS.md", "IDENTITY.md", "worker-status.json"] {
+        for allow in [
+            "MATURANA.md",
+            "AGENTS.md",
+            "IDENTITY.md",
+            "worker-status.json",
+        ] {
             assert!(is_browsable_rel(allow), "should ALLOW {allow}");
         }
     }

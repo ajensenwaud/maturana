@@ -450,7 +450,10 @@ fn ensure_runtime_files(log_path: &Path, metrics_path: &Path) -> anyhow::Result<
             fs::create_dir_all(parent)?;
         }
         if !path.exists() {
-            fs::OpenOptions::new().create(true).append(true).open(path)?;
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
         }
     }
     Ok(())
@@ -561,9 +564,7 @@ fn ensure_kvm_ready() -> anyhow::Result<()> {
         let kvm_loaded = fs::read_to_string("/proc/modules")
             .map(|m| {
                 m.lines().any(|l| {
-                    l.starts_with("kvm ")
-                        || l.starts_with("kvm_intel")
-                        || l.starts_with("kvm_amd")
+                    l.starts_with("kvm ") || l.starts_with("kvm_intel") || l.starts_with("kvm_amd")
                 })
             })
             .unwrap_or(false);

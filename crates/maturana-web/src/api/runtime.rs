@@ -30,9 +30,11 @@ pub async fn plan(State(state): State<AppState>) -> Response {
     let home_root = state.home_root.clone();
     match blocking(move || {
         let probe = |url: &str| -> serde_json::Value {
-            match ureq::get(url).timeout(std::time::Duration::from_secs(2)).call() {
-                Ok(_) => serde_json::json!({ "ok": true }),
-                Err(error) => serde_json::json!({ "ok": false, "error": error.to_string() }),
+            let check = maturana_ops::health::http_health(url);
+            if check.ok {
+                serde_json::json!({ "ok": true })
+            } else {
+                serde_json::json!({ "ok": false, "error": check.message })
             }
         };
         Ok(serde_json::json!({
@@ -48,21 +50,17 @@ pub async fn plan(State(state): State<AppState>) -> Response {
     }
 }
 
-/// Full doctor report via the CLI's own `--json` flag (zero refactor; the
-/// subprocess inherits this server's home).
+/// Full doctor report through the shared ops layer; this keeps the cockpit a
+/// front end instead of shelling back into the CLI as an internal API.
 pub async fn doctor(State(state): State<AppState>) -> Response {
     let home_root = state.home_root.clone();
     match blocking(move || {
-        let exe = std::env::current_exe()?;
-        let output = std::process::Command::new(exe)
-            .arg("--home")
-            .arg(&home_root)
-            .args(["doctor", "--json"])
-            .output()?;
-        // doctor exits non-zero when unhealthy but still prints the report.
-        let report: serde_json::Value = serde_json::from_slice(&output.stdout)
-            .map_err(|_| anyhow::anyhow!(String::from_utf8_lossy(&output.stderr).to_string()))?;
-        Ok(report)
+        let home = maturana_core::state::MaturanaHome::new(home_root);
+        Ok(serde_json::to_value(maturana_ops::doctor::build_report(
+            &home,
+            &[],
+            "http://127.0.0.1:47834",
+        ))?)
     })
     .await
     {

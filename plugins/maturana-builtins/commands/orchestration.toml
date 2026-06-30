@@ -1,0 +1,4 @@
+kind = "builtin-command-family"
+feature = "orchestration"
+summary = "Rust-owned A2A, orchestrator loop, and durable board operations."
+commands = ["orchestrator", "board", "a2a"]

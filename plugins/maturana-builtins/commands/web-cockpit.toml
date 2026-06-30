@@ -1,0 +1,4 @@
+kind = "builtin-command-family"
+feature = "web-cockpit"
+summary = "Rust-owned authenticated browser cockpit operation."
+commands = ["web"]

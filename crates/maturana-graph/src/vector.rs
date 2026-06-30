@@ -63,8 +63,7 @@ mod tests {
             ("b", vec![0.9f32, 0.1]),
             ("c", vec![0.0f32, 1.0]),
         ];
-        let refs: Vec<(&str, &[f32])> =
-            cands.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+        let refs: Vec<(&str, &[f32])> = cands.iter().map(|(id, v)| (*id, v.as_slice())).collect();
         let out = top_k(&[1.0, 0.0], refs, 2, 0.0);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].0, "a");

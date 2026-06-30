@@ -183,7 +183,10 @@ impl RoleRegistry {
     /// synthesis on the next, research on the third — wrapping when there are
     /// fewer agents than that. `agent_ids` must be non-empty.
     pub fn reuse_across(agent_ids: &[String]) -> Self {
-        assert!(!agent_ids.is_empty(), "reuse_across needs at least one agent");
+        assert!(
+            !agent_ids.is_empty(),
+            "reuse_across needs at least one agent"
+        );
         let pick = |i: usize| agent_ids[i.min(agent_ids.len() - 1)].clone();
         Self::from_core(|name| {
             let agent_id = match name {
@@ -262,8 +265,13 @@ impl RoleRegistry {
     /// prefix, then the task. This is the ONLY place a role's persona is applied
     /// — it is never written to the agent's identity files.
     pub fn frame_task(&self, role_name: &str, task: &str) -> Option<String> {
-        self.get(role_name)
-            .map(|role| format!("{}\n\n--- TASK ---\n{}", role.system_prompt.trim(), task.trim()))
+        self.get(role_name).map(|role| {
+            format!(
+                "{}\n\n--- TASK ---\n{}",
+                role.system_prompt.trim(),
+                task.trim()
+            )
+        })
     }
 }
 
@@ -274,12 +282,22 @@ mod tests {
     #[test]
     fn defaults_have_the_core_roles_and_spawn_by_default() {
         let reg = RoleRegistry::defaults("worker-base");
-        for name in ["coordinator", "researcher", "developer", "reviewer", "synthesizer"] {
-            let role = reg.get(name).unwrap_or_else(|| panic!("missing role {name}"));
+        for name in [
+            "coordinator",
+            "researcher",
+            "developer",
+            "reviewer",
+            "synthesizer",
+        ] {
+            let role = reg
+                .get(name)
+                .unwrap_or_else(|| panic!("missing role {name}"));
             // Default placement spawns a dedicated VM (not tied to standing agents).
             assert_eq!(
                 role.placement,
-                RolePlacement::Spawn { base_spec: "worker-base".to_string() }
+                RolePlacement::Spawn {
+                    base_spec: "worker-base".to_string()
+                }
             );
         }
     }
@@ -293,7 +311,13 @@ mod tests {
         ];
         let reg = RoleRegistry::reuse_across(&agents);
         // No role spawns; every role reuses a standing agent.
-        for name in ["coordinator", "researcher", "developer", "reviewer", "synthesizer"] {
+        for name in [
+            "coordinator",
+            "researcher",
+            "developer",
+            "reviewer",
+            "synthesizer",
+        ] {
             assert!(matches!(
                 reg.get(name).unwrap().placement,
                 RolePlacement::Reuse { .. }
@@ -314,10 +338,18 @@ mod tests {
     #[test]
     fn reuse_across_wraps_when_fewer_agents_than_roles() {
         let reg = RoleRegistry::reuse_across(&["solo".to_string()]);
-        for name in ["coordinator", "researcher", "developer", "reviewer", "synthesizer"] {
+        for name in [
+            "coordinator",
+            "researcher",
+            "developer",
+            "reviewer",
+            "synthesizer",
+        ] {
             assert_eq!(
                 reg.get(name).unwrap().placement,
-                RolePlacement::Reuse { agent_id: "solo".to_string() }
+                RolePlacement::Reuse {
+                    agent_id: "solo".to_string()
+                }
             );
         }
     }
@@ -325,15 +357,29 @@ mod tests {
     #[test]
     fn review_and_done_prompts_carry_their_markers() {
         let reg = RoleRegistry::defaults("worker-base");
-        assert!(reg.get("reviewer").unwrap().system_prompt.contains(marker::REVIEW_APPROVE));
-        assert!(reg.get("reviewer").unwrap().system_prompt.contains(marker::REVIEW_REVISE));
-        assert!(reg.get("synthesizer").unwrap().system_prompt.contains(marker::DONE));
+        assert!(reg
+            .get("reviewer")
+            .unwrap()
+            .system_prompt
+            .contains(marker::REVIEW_APPROVE));
+        assert!(reg
+            .get("reviewer")
+            .unwrap()
+            .system_prompt
+            .contains(marker::REVIEW_REVISE));
+        assert!(reg
+            .get("synthesizer")
+            .unwrap()
+            .system_prompt
+            .contains(marker::DONE));
     }
 
     #[test]
     fn frame_task_prepends_the_role_prompt_only() {
         let reg = RoleRegistry::defaults("worker-base");
-        let framed = reg.frame_task("researcher", "find the population of Paris").unwrap();
+        let framed = reg
+            .frame_task("researcher", "find the population of Paris")
+            .unwrap();
         assert!(framed.starts_with("You are the RESEARCHER"));
         assert!(framed.contains("find the population of Paris"));
         // An unknown role yields nothing rather than a bare task with no guidance.
@@ -357,14 +403,22 @@ reuse = { agent_id = "codex-firecracker" }
         // The placement override applied...
         assert_eq!(
             reg.get("developer").unwrap().placement,
-            RolePlacement::Reuse { agent_id: "codex-firecracker".to_string() }
+            RolePlacement::Reuse {
+                agent_id: "codex-firecracker".to_string()
+            }
         );
         // ...while the default DEVELOPER prompt was kept (field-level merge)...
-        assert!(reg.get("developer").unwrap().system_prompt.contains("DEVELOPER"));
+        assert!(reg
+            .get("developer")
+            .unwrap()
+            .system_prompt
+            .contains("DEVELOPER"));
         // ...and the un-overridden roles kept their spawn defaults.
         assert_eq!(
             reg.get("researcher").unwrap().placement,
-            RolePlacement::Spawn { base_spec: "worker-base".to_string() }
+            RolePlacement::Spawn {
+                base_spec: "worker-base".to_string()
+            }
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

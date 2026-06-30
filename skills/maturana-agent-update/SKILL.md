@@ -46,7 +46,7 @@ agent as state that must be inspected before and after the edit.
 Compare current state:
 
 ```powershell
-.\scripts\maturana.ps1 agent inspect <agent-id> --live
+maturana agent inspect <agent-id> --live
 ```
 
 Edit the spec with the smallest change that satisfies the request.
@@ -54,7 +54,7 @@ Edit the spec with the smallest change that satisfies the request.
 Validate:
 
 ```powershell
-.\scripts\maturana.ps1 spec validate MATURANA.md
+maturana spec validate MATURANA.md
 ```
 
 Apply using the appropriate narrow path: launch/relaunch for provider changes,

@@ -123,11 +123,11 @@ pub struct LoginRequest {
     token: String,
 }
 
-pub async fn login(
-    State(state): State<AppState>,
-    Json(request): Json<LoginRequest>,
-) -> Response {
-    if !constant_time_eq(request.token.trim().as_bytes(), state.login_token.as_bytes()) {
+pub async fn login(State(state): State<AppState>, Json(request): Json<LoginRequest>) -> Response {
+    if !constant_time_eq(
+        request.token.trim().as_bytes(),
+        state.login_token.as_bytes(),
+    ) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "ok": false, "error": "invalid token" })),
@@ -165,9 +165,7 @@ pub async fn require_session(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    let public = path == "/health"
-        || path == "/login"
-        || path.starts_with("/assets/");
+    let public = path == "/health" || path == "/login" || path.starts_with("/assets/");
     if public {
         return next.run(request).await;
     }
@@ -183,10 +181,7 @@ pub async fn require_session(
         return Redirect::temporary("/login").into_response();
     }
 
-    let mutating = !matches!(
-        request.method().as_str(),
-        "GET" | "HEAD" | "OPTIONS"
-    );
+    let mutating = !matches!(request.method().as_str(), "GET" | "HEAD" | "OPTIONS");
     if mutating && path.starts_with("/api/") && !request.headers().contains_key(CSRF_HEADER) {
         return (
             StatusCode::FORBIDDEN,
@@ -212,7 +207,10 @@ pub fn origin_matches_host(headers: &HeaderMap) -> bool {
         .strip_prefix("http://")
         .or_else(|| origin.strip_prefix("https://"))
         .unwrap_or(origin);
-    let origin_host = origin_authority.split(':').next().unwrap_or(origin_authority);
+    let origin_host = origin_authority
+        .split(':')
+        .next()
+        .unwrap_or(origin_authority);
     if let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
         let host_name = host.split(':').next().unwrap_or(host);
         if origin_host.eq_ignore_ascii_case(host_name) {

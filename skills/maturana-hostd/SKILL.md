@@ -46,13 +46,13 @@ prompts. It is not a general command runner.
 Check hostd from a normal shell:
 
 ```powershell
-.\scripts\maturana.ps1 hostd status
+maturana hostd status
 ```
 
 Use JSON output when another tool or script needs structured status:
 
 ```powershell
-.\scripts\maturana.ps1 hostd status --json
+maturana hostd status --json
 ```
 
 If `reachable` is false, install or restart the elevated scheduled task:
@@ -64,7 +64,7 @@ If `reachable` is false, install or restart the elevated scheduled task:
 Then retry the original Rust CLI command, for example:
 
 ```powershell
-.\scripts\maturana.ps1 agent inspect codex-demo --live
+maturana agent inspect codex-demo --live
 ```
 
 ## Evidence

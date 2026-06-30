@@ -27,10 +27,8 @@ mod tests {
     use serde_json::json;
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "maturana-graph-{tag}-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("maturana-graph-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -78,7 +76,9 @@ mod tests {
         store.delete_node("p:claude").unwrap();
         assert_eq!(store.stats().nodes, 2);
         assert_eq!(store.stats().edges, 1);
-        assert!(store.get_edge("p:claude\u{1}WORKS_ON\u{1}o:maturana").is_none());
+        assert!(store
+            .get_edge("p:claude\u{1}WORKS_ON\u{1}o:maturana")
+            .is_none());
 
         let _ = std::fs::remove_dir_all(dir);
     }

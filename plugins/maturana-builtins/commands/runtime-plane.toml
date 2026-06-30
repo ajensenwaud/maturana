@@ -1,0 +1,4 @@
+kind = "builtin-command-family"
+feature = "runtime-plane"
+summary = "Rust-owned host runtime plane supervision, health, service, session, hostd, and OAuth refresh operations."
+commands = ["doctor", "up", "list", "status", "session", "service", "hostd", "claude-refresh"]

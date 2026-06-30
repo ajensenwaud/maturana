@@ -13,11 +13,17 @@ use super::{blocking, err, ok, valid_id};
 use crate::state::AppState;
 
 fn schedules_file(root: &std::path::Path, agent: &str) -> std::path::PathBuf {
-    root.join("agents").join(agent).join("schedules").join("schedules.json")
+    root.join("agents")
+        .join(agent)
+        .join("schedules")
+        .join("schedules.json")
 }
 
 fn last_run_file(root: &std::path::Path, agent: &str) -> std::path::PathBuf {
-    root.join("agents").join(agent).join("schedules").join("last-run.json")
+    root.join("agents")
+        .join(agent)
+        .join("schedules")
+        .join("last-run.json")
 }
 
 fn read_array(path: &std::path::Path) -> Vec<serde_json::Value> {
@@ -40,10 +46,24 @@ fn write_array(path: &std::path::Path, arr: &[serde_json::Value]) -> anyhow::Res
 fn slugify(value: &str) -> String {
     let mapped: String = value
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
-    let slug = mapped.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-");
-    if slug.is_empty() { "item".to_string() } else { slug }
+    let slug = mapped
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if slug.is_empty() {
+        "item".to_string()
+    } else {
+        slug
+    }
 }
 
 /// Every schedule across the fleet, tagged with its agent id and last-run time.
@@ -57,17 +77,25 @@ pub async fn list(State(state): State<AppState>) -> Response {
                     continue;
                 }
                 let agent = entry.file_name().to_string_lossy().to_string();
-                let last_run: serde_json::Value = std::fs::read_to_string(last_run_file(&root, &agent))
-                    .ok()
-                    .and_then(|raw| serde_json::from_str(&raw).ok())
-                    .unwrap_or_else(|| serde_json::json!({}));
+                let last_run: serde_json::Value =
+                    std::fs::read_to_string(last_run_file(&root, &agent))
+                        .ok()
+                        .and_then(|raw| serde_json::from_str(&raw).ok())
+                        .unwrap_or_else(|| serde_json::json!({}));
                 for mut sched in read_array(&schedules_file(&root, &agent)) {
                     if let Some(obj) = sched.as_object_mut() {
-                        let id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let id = obj
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         obj.insert("agent_id".into(), serde_json::json!(agent));
                         obj.insert(
                             "last_run".into(),
-                            last_run.get(&id).cloned().unwrap_or(serde_json::Value::Null),
+                            last_run
+                                .get(&id)
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null),
                         );
                     }
                     out.push(sched);
@@ -110,7 +138,11 @@ pub async fn add(
         let name = body.name.trim();
         let cron = body.cron.trim();
         let prompt = body.prompt.trim();
-        let board = body.board.as_deref().map(str::trim).filter(|b| !b.is_empty());
+        let board = body
+            .board
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty());
         if name.is_empty() || cron.is_empty() {
             anyhow::bail!("name and cron are required");
         }

@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use maturana_core::spec::{AgentSpec, HarnessRuntime};
 use maturana_core::state::MaturanaHome;
+use maturana_ops::agents::{infer_agent_session_id, list_agent_ids};
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     layout::{Constraint, Direction, Layout, Rect},
@@ -128,7 +129,7 @@ impl App {
         self.harness = harness_of(&self.home, &agent_id);
         // Match the agent's guest worker session so commands (status, /session,
         // feedback) target the same queue the turns use.
-        self.session_id = crate::infer_agent_session_id(&self.home, &agent_id)
+        self.session_id = infer_agent_session_id(&self.home, &agent_id)
             .unwrap_or_else(|_| "telegram-main".to_string());
         self.agent_id = agent_id;
         // Restore this agent's persisted conversation (empty on first run) so
@@ -237,9 +238,8 @@ impl App {
             role: Role::User,
             text: text.clone(),
         });
-        // The user turn is recorded by the shared front door (channels::enqueue_turn,
-        // reached via agent_chat_turn below), so it is NOT recorded here — doing both
-        // would double-write it to the transcript.
+        // The user turn is recorded by the shared ops conversation front door
+        // reached via agent_chat_turn below, so it is NOT recorded here.
         // Round-trip on a background thread so the UI keeps animating.
         let (tx, rx) = mpsc::channel();
         let home = MaturanaHome::new(self.home.root().to_path_buf());
@@ -259,8 +259,12 @@ impl App {
         use crate::channels::ConsoleCommand;
         // The shared dispatcher reuses the exact handlers the Telegram channel
         // uses, so the console TUI exposes the same command set.
-        match crate::channels::run_console_command(&self.home, &self.agent_id, &self.session_id, cmd)
-        {
+        match crate::channels::run_console_command(
+            &self.home,
+            &self.agent_id,
+            &self.session_id,
+            cmd,
+        ) {
             ConsoleCommand::Reply(text) => self.messages.push(ChatMsg {
                 role: Role::System,
                 text,
@@ -342,7 +346,7 @@ pub fn run_chat(home: &MaturanaHome, agent_id: &str, timeout_seconds: u64) -> Re
 /// HUD opens first; otherwise it starts in that agent. Ctrl+P reopens the selector
 /// and Ctrl+←/→ cycle between agents.
 pub fn run_tui(home: &MaturanaHome, agent_id: Option<&str>, timeout_seconds: u64) -> Result<()> {
-    let mut agents = crate::discover_agent_ids(home)?;
+    let mut agents = list_agent_ids(home)?;
     if let Some(id) = agent_id {
         if !agents.iter().any(|a| a == id) {
             // Allow targeting an agent whose dir exists but wasn't discovered
@@ -942,7 +946,8 @@ mod tests {
     #[test]
     fn banner_shows_and_centers_when_there_is_room() {
         // 90x30: full wordmark (71 wide) fits with a usable body below.
-        let (banner, body) = banner_layout(Rect::new(0, 0, 90, 30), 71, 8).expect("room for banner");
+        let (banner, body) =
+            banner_layout(Rect::new(0, 0, 90, 30), 71, 8).expect("room for banner");
         // Centered horizontally: equal-ish margins.
         assert_eq!(banner.x, (90 - 71) / 2);
         assert_eq!(banner.width, 71);

@@ -115,10 +115,7 @@ fn multipart_transcription(filename: &str, audio: &[u8]) -> (String, Vec<u8>) {
         &mut body,
     );
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-    (
-        format!("multipart/form-data; boundary={boundary}"),
-        body,
-    )
+    (format!("multipart/form-data; boundary={boundary}"), body)
 }
 
 #[cfg(test)]

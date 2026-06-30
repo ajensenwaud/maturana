@@ -20,7 +20,10 @@ const GATEWAY_ACTIONS: &[&str] = &["restart", "stop", "start"];
 /// touched.
 pub async fn gateway(State(_state): State<AppState>, Path(action): Path<String>) -> Response {
     if !GATEWAY_ACTIONS.contains(&action.as_str()) {
-        return err(StatusCode::BAD_REQUEST, "action must be restart, stop, or start");
+        return err(
+            StatusCode::BAD_REQUEST,
+            "action must be restart, stop, or start",
+        );
     }
     match blocking(move || {
         let out = Command::new("systemctl")

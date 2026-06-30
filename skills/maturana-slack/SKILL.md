@@ -45,8 +45,8 @@ normal session messages, and deliver outbox replies with Slack APIs.
 Store credentials:
 
 ```powershell
-.\scripts\maturana.ps1 pipelock set slack/bot-token --value <xoxb-token>
-.\scripts\maturana.ps1 pipelock set slack/signing-secret --value <secret>
+maturana pipelock set slack/bot-token --value <xoxb-token>
+maturana pipelock set slack/signing-secret --value <secret>
 ```
 
 Adapter behavior:

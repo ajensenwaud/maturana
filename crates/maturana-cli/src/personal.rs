@@ -14,7 +14,6 @@ use std::{
     hash::{Hash, Hasher},
     io::Write,
     path::{Path, PathBuf},
-    process::{Command as ProcessCommand, Stdio},
     thread,
     time::Duration,
 };
@@ -532,7 +531,11 @@ fn add_schedule(
 ) -> anyhow::Result<()> {
     let board = board.and_then(|b| {
         let b = b.trim().to_string();
-        if b.is_empty() { None } else { Some(b) }
+        if b.is_empty() {
+            None
+        } else {
+            Some(b)
+        }
     });
     if board.is_none() && prompt.trim().is_empty() {
         anyhow::bail!("a schedule needs a --prompt (or a --board to run)");
@@ -629,7 +632,7 @@ fn enqueue_schedule(
     // A board schedule RUNS an orchestration board: spawn `maturana board run`
     // detached (the real dispatcher) rather than enqueueing a turn. The cron is
     // the trigger; the board is the work.
-    crate::channels::fire_agent_hooks(
+    maturana_ops::conversation::fire_agent_hooks(
         home,
         maturana_core::hooks::HookContext::new(
             maturana_core::hooks::HookEvent::ScheduleFired,
@@ -660,10 +663,10 @@ fn enqueue_schedule(
     // delivered the reply, the same dropped-reply bug fixed for proactivity. The
     // front door also injects context so the reminder turn has memory.
     let chat_id = (channel == "telegram")
-        .then(|| crate::channels::current_paired_telegram_chat_id(home, agent_id))
+        .then(|| maturana_ops::conversation::current_paired_telegram_chat_id(home, agent_id))
         .flatten();
     let id = if let Some(chat_id) = chat_id {
-        crate::channels::enqueue_outreach_turn(
+        maturana_ops::conversation::enqueue_outreach_turn(
             home,
             agent_id,
             session_id,
@@ -800,61 +803,27 @@ fn matches_cron_field(field: &str, value: u32, min: u32, max: u32) -> anyhow::Re
 }
 
 fn deploy_item(home: &MaturanaHome, kind: DeployKind, item: DeployItem) -> anyhow::Result<()> {
-    if !item.path.exists() {
-        anyhow::bail!("deploy path does not exist: {}", item.path.display());
-    }
-    let name = item
-        .path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow::anyhow!("deploy path has no file name"))?;
-    let base = match kind {
-        DeployKind::Skill => "/agent/skills",
-        DeployKind::Tool => "/agent/tools",
+    let kind = match kind {
+        DeployKind::Skill => maturana_ops::deploy::DeployKind::Skill,
+        DeployKind::Tool => maturana_ops::deploy::DeployKind::Tool,
     };
-    let guest_path = item.guest_path.unwrap_or_else(|| format!("{base}/{name}"));
-    let parent = guest_path
-        .rsplit_once('/')
-        .map(|(parent, _)| parent)
-        .filter(|parent| !parent.is_empty())
-        .unwrap_or(base);
-    // Verify the guest host key (strict if pinned for this agent, else
-    // accept-new) so a deploy can't push skills/tools to an impostor.
-    let state_dir = home.agent_dir(&item.agent_id).join("state");
-    let (known_hosts, strict) =
-        maturana_core::ssh_pin::prepare_known_hosts(&state_dir, &item.ip)?;
-    let host_key_opts = maturana_core::ssh_pin::ssh_host_key_options(&known_hosts, strict);
-    run_ssh(
-        &item.ip,
-        &item.ssh_user,
-        &item.ssh_key,
-        &host_key_opts,
-        &format!("mkdir -p {}", shell_quote(parent)),
-    )?;
-    run_scp(
-        &item.ip,
-        &item.ssh_user,
-        &item.ssh_key,
-        &host_key_opts,
-        &item.path,
-        &guest_path,
-    )?;
-    append_event(
-        home.audit_dir().join(format!("{}.jsonl", item.agent_id)),
-        &AuditEvent {
-            at: Utc::now(),
-            agent_id: item.agent_id.clone(),
-            action: format!(
-                "deploy.{}",
-                match kind {
-                    DeployKind::Skill => "skill",
-                    DeployKind::Tool => "tool",
-                }
-            ),
-            message: format!("deployed {} to {}", item.path.display(), guest_path),
+    let result = maturana_ops::deploy::deploy_item(
+        home,
+        kind,
+        maturana_ops::deploy::DeployRequest {
+            agent_id: item.agent_id,
+            path: item.path,
+            ip: item.ip,
+            ssh_user: item.ssh_user,
+            ssh_key: item.ssh_key,
+            guest_path: item.guest_path,
         },
     )?;
-    println!("deployed {} to {}", item.path.display(), guest_path);
+    println!(
+        "deployed {} to {}",
+        result.local_path.display(),
+        result.guest_path
+    );
     Ok(())
 }
 
@@ -1022,66 +991,6 @@ fn read_schedule_runs(path: &Path) -> anyhow::Result<std::collections::HashMap<S
     Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
 }
 
-fn run_scp(
-    ip: &str,
-    ssh_user: &str,
-    ssh_key: &Path,
-    host_key_opts: &[String],
-    local_path: &Path,
-    remote_path: &str,
-) -> anyhow::Result<()> {
-    let mut command = ProcessCommand::new("scp");
-    command
-        .args(host_key_opts)
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg("-i")
-        .arg(ssh_key);
-    if local_path.is_dir() {
-        command.arg("-r");
-    }
-    command
-        .arg(local_path)
-        .arg(format!("{ssh_user}@{ip}:{remote_path}"))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let output = command.output().context("failed to start scp")?;
-    if !output.status.success() {
-        anyhow::bail!("scp failed: {}", String::from_utf8_lossy(&output.stderr));
-    }
-    Ok(())
-}
-
-fn run_ssh(
-    ip: &str,
-    ssh_user: &str,
-    ssh_key: &Path,
-    host_key_opts: &[String],
-    remote_command: &str,
-) -> anyhow::Result<()> {
-    let output = ProcessCommand::new("ssh")
-        .args(host_key_opts)
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg("-i")
-        .arg(ssh_key)
-        .arg(format!("{ssh_user}@{ip}"))
-        .arg(remote_command)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .context("failed to start ssh")?;
-    if !output.status.success() {
-        anyhow::bail!("ssh failed: {}", String::from_utf8_lossy(&output.stderr));
-    }
-    Ok(())
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1187,7 +1096,16 @@ mod tests {
     #[test]
     fn schedule_run_due_enqueues_once_per_minute() {
         let home = test_home("schedule-run-due");
-        add_schedule(&home, "demo", "Every Minute", "* * * * *", "ping", None, None).unwrap();
+        add_schedule(
+            &home,
+            "demo",
+            "Every Minute",
+            "* * * * *",
+            "ping",
+            None,
+            None,
+        )
+        .unwrap();
         run_due_schedules(&home, "demo", "main", Some("2026-06-08T12:34:00Z")).unwrap();
         run_due_schedules(&home, "demo", "main", Some("2026-06-08T12:34:30Z")).unwrap();
         let paths = session_paths(&home.agent_dir("demo"), "main");

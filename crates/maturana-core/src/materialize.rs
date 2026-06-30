@@ -367,7 +367,10 @@ delegating to itself.
     out
 }
 
-fn write_if_absent<F: FnOnce() -> String>(path: &std::path::Path, content: F) -> std::io::Result<()> {
+fn write_if_absent<F: FnOnce() -> String>(
+    path: &std::path::Path,
+    content: F,
+) -> std::io::Result<()> {
     if path.exists() {
         Ok(())
     } else {
@@ -436,15 +439,33 @@ mod tests {
         );
         let out = render_guest_agents(&spec);
         // web-search recipe + DDG fallback + allowlist-only honesty
-        assert!(out.contains("### Web search"), "missing web search recipe:\n{out}");
-        assert!(out.contains("html.duckduckgo.com"), "missing DDG fallback:\n{out}");
-        assert!(out.contains("Only the hosts on your egress allowlist"), "missing allowlist-only note:\n{out}");
+        assert!(
+            out.contains("### Web search"),
+            "missing web search recipe:\n{out}"
+        );
+        assert!(
+            out.contains("html.duckduckgo.com"),
+            "missing DDG fallback:\n{out}"
+        );
+        assert!(
+            out.contains("Only the hosts on your egress allowlist"),
+            "missing allowlist-only note:\n{out}"
+        );
         // self-forge recipe is emitted when the capability is granted
-        assert!(out.contains("### Self-forge"), "missing self-forge recipe:\n{out}");
-        assert!(out.contains("maturana-forge"), "missing forge helper:\n{out}");
+        assert!(
+            out.contains("### Self-forge"),
+            "missing self-forge recipe:\n{out}"
+        );
+        assert!(
+            out.contains("maturana-forge"),
+            "missing forge helper:\n{out}"
+        );
         // honest limits block lists the locked egress
         assert!(out.contains("## Limits"), "missing limits block:\n{out}");
-        assert!(out.contains("api.search.brave.com"), "limits should list egress:\n{out}");
+        assert!(
+            out.contains("api.search.brave.com"),
+            "limits should list egress:\n{out}"
+        );
     }
 
     #[test]
@@ -454,10 +475,19 @@ mod tests {
         );
         let out = render_guest_agents(&spec);
         // forge recipe is gated on self_forge; DDG line gated on duckduckgo in egress
-        assert!(!out.contains("### Self-forge"), "forge recipe must be gated on self_forge:\n{out}");
-        assert!(!out.contains("html.duckduckgo.com"), "DDG fallback only when duckduckgo allowlisted:\n{out}");
+        assert!(
+            !out.contains("### Self-forge"),
+            "forge recipe must be gated on self_forge:\n{out}"
+        );
+        assert!(
+            !out.contains("html.duckduckgo.com"),
+            "DDG fallback only when duckduckgo allowlisted:\n{out}"
+        );
         // the honest limits block is unconditional
-        assert!(out.contains("## Limits"), "limits block must always be present:\n{out}");
+        assert!(
+            out.contains("## Limits"),
+            "limits block must always be present:\n{out}"
+        );
     }
 
     #[test]
@@ -487,7 +517,10 @@ mod tests {
         let unique = spec_from_yaml(
             "identity: { id: hum, name: hum, purpose: p }\nruntime: { harness: codex }\nvm:\n  provider: firecracker\n  guest_os: linux\n  firecracker:\n    kernel_image: img/vmlinux.bin\n    rootfs_image: img/hum.ext4\n    tap_name: tap-mat-hum\n    host_ip: 172.30.10.13\n    guest_ip: 172.30.10.14\n    guest_mac: \"AA:FC:00:00:10:04\"\n",
         );
-        assert!(check_network_collisions(&home, &unique).is_empty(), "unique slot must not collide");
+        assert!(
+            check_network_collisions(&home, &unique).is_empty(),
+            "unique slot must not collide"
+        );
         let codex_self = spec_from_yaml(
             "identity: { id: codex, name: codex, purpose: p }\nruntime: { harness: codex }\nvm:\n  provider: firecracker\n  guest_os: linux\n  firecracker:\n    kernel_image: img/vmlinux.bin\n    rootfs_image: img/codex.ext4\n    tap_name: tap-mat-codex\n    host_ip: 172.30.10.1\n    guest_ip: 172.30.10.2\n    guest_mac: \"AA:FC:00:00:10:01\"\n",
         );

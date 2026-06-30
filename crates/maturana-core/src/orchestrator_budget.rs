@@ -324,15 +324,21 @@ mod tests {
     #[test]
     fn overrides_can_only_tighten() {
         let caps = OrchestratorCaps::default(); // 40 turns, 4 VMs
-        // A request to RAISE turns to 1000 is ignored (min wins); a request to
-        // LOWER VMs to 1 is applied.
+                                                // A request to RAISE turns to 1000 is ignored (min wins); a request to
+                                                // LOWER VMs to 1 is applied.
         let tightened = caps.tighten_with(&CapsOverride {
             max_total_turns: Some(1000),
             max_concurrent_vms: Some(1),
             ..CapsOverride::default()
         });
-        assert_eq!(tightened.max_total_turns, 40, "override cannot raise the cap");
-        assert_eq!(tightened.max_concurrent_vms, 1, "override can lower the cap");
+        assert_eq!(
+            tightened.max_total_turns, 40,
+            "override cannot raise the cap"
+        );
+        assert_eq!(
+            tightened.max_concurrent_vms, 1,
+            "override can lower the cap"
+        );
     }
 
     #[test]
@@ -375,7 +381,7 @@ mod tests {
         // case, fits in 40. (The turn budget no longer contradicts the step cap.)
         assert!(budget.admits_plan(3)); // 20
         assert!(budget.admits_plan(6)); // 38
-        // Over the step cap is rejected regardless of turn math.
+                                        // Over the step cap is rejected regardless of turn math.
         assert!(!budget.admits_plan(7));
         // Empty plans are rejected too.
         assert!(!budget.admits_plan(0));

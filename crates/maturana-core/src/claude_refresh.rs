@@ -238,9 +238,17 @@ mod tests {
             expires_at_ms: 1_000_000,
         };
         // 20 min before expiry, skew 15 min → not yet.
-        assert!(!needs_refresh(&creds, 1_000_000 - 20 * 60 * 1000, REFRESH_SKEW));
+        assert!(!needs_refresh(
+            &creds,
+            1_000_000 - 20 * 60 * 1000,
+            REFRESH_SKEW
+        ));
         // 10 min before expiry → refresh.
-        assert!(needs_refresh(&creds, 1_000_000 - 10 * 60 * 1000, REFRESH_SKEW));
+        assert!(needs_refresh(
+            &creds,
+            1_000_000 - 10 * 60 * 1000,
+            REFRESH_SKEW
+        ));
     }
 
     #[test]

@@ -837,8 +837,15 @@ mod tests {
         let paths = session_paths(&temp, "telegram-main");
         ensure_session(&paths).unwrap();
 
-        let id =
-            insert_inbound(&paths, "chat", "telegram", "chat-1", None, r#"{"text":"hi"}"#).unwrap();
+        let id = insert_inbound(
+            &paths,
+            "chat",
+            "telegram",
+            "chat-1",
+            None,
+            r#"{"text":"hi"}"#,
+        )
+        .unwrap();
         // Not claimed yet → nothing in progress to cancel, and the flag is unset.
         assert_eq!(request_cancel_in_progress(&paths).unwrap(), 0);
         assert!(!is_cancel_requested(&paths, &id).unwrap());
@@ -944,8 +951,16 @@ mod tests {
         let temp = temp_dir();
         let paths = session_paths(&temp, "telegram-main");
         ensure_session(&paths).unwrap();
-        write_outbound(&paths, Some("in-1"), "chat", "telegram", "chat-1", None, r#"{"text":"hi"}"#)
-            .unwrap();
+        write_outbound(
+            &paths,
+            Some("in-1"),
+            "chat",
+            "telegram",
+            "chat-1",
+            None,
+            r#"{"text":"hi"}"#,
+        )
+        .unwrap();
         let id = list_undelivered(&paths).unwrap()[0].id.clone();
 
         // A claim that failed to actually send is released → the reply is
@@ -968,7 +983,15 @@ mod tests {
         let temp = temp_dir();
         let paths = session_paths(&temp, "telegram-main");
         ensure_session(&paths).unwrap();
-        insert_inbound(&paths, "chat", "telegram", "chat-1", None, r#"{"text":"x"}"#).unwrap();
+        insert_inbound(
+            &paths,
+            "chat",
+            "telegram",
+            "chat-1",
+            None,
+            r#"{"text":"x"}"#,
+        )
+        .unwrap();
 
         // Lease 0 + max_tries 2 means: every claim that is not completed is
         // immediately recoverable on the next claim, and the message is dead-
@@ -1009,7 +1032,15 @@ mod tests {
         let temp = temp_dir();
         let paths = session_paths(&temp, "telegram-main");
         ensure_session(&paths).unwrap();
-        insert_inbound(&paths, "chat", "telegram", "chat-1", None, r#"{"text":"x"}"#).unwrap();
+        insert_inbound(
+            &paths,
+            "chat",
+            "telegram",
+            "chat-1",
+            None,
+            r#"{"text":"x"}"#,
+        )
+        .unwrap();
 
         // A long lease means a still-running turn is never double-claimed.
         let policy = ClaimPolicy {
@@ -1020,7 +1051,10 @@ mod tests {
         let first = claim_pending_inbound_with_policy(&paths, 1, policy).unwrap();
         assert_eq!(first.len(), 1);
         let second = claim_pending_inbound_with_policy(&paths, 1, policy).unwrap();
-        assert!(second.is_empty(), "in-flight lease must not be re-handed-out");
+        assert!(
+            second.is_empty(),
+            "in-flight lease must not be re-handed-out"
+        );
         assert_eq!(queue_stats(&paths).unwrap().processing, 1);
     }
 

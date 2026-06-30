@@ -38,8 +38,7 @@ pub fn execute(manifest: &ToolManifest, wasm: &[u8], input: &str) -> anyhow::Res
     config.consume_fuel(true);
     config.epoch_interruption(true);
     let engine = Engine::new(&config).context("failed to construct wasm engine")?;
-    let module =
-        Module::new(&engine, wasm).context("failed to compile tool wasm module")?;
+    let module = Module::new(&engine, wasm).context("failed to compile tool wasm module")?;
 
     let stdout = MemoryOutputPipe::new(4 * 1024 * 1024);
     let stderr = MemoryOutputPipe::new(1024 * 1024);
@@ -223,7 +222,8 @@ mod tests {
         let result = execute(&manifest(limits), &wasm, "{}").unwrap();
         assert!(!result.ok);
         assert!(
-            result.stderr.contains("fuel") || result.stderr.to_lowercase().contains("epoch")
+            result.stderr.contains("fuel")
+                || result.stderr.to_lowercase().contains("epoch")
                 || result.stderr.contains("trap")
                 || result.stderr.contains("interrupt"),
             "unexpected stderr: {}",

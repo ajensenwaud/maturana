@@ -297,7 +297,13 @@ mod tests {
         let mut topics = HashSet::new();
         let mut turns = HashMap::new();
         assert_eq!(
-            handle_client_msg(&state, ClientMsg::Ping { id: 3 }, &mut topics, &mut turns, &tx),
+            handle_client_msg(
+                &state,
+                ClientMsg::Ping { id: 3 },
+                &mut topics,
+                &mut turns,
+                &tx
+            ),
             Some(ServerMsg::Pong { id: 3 })
         );
         handle_client_msg(
@@ -329,7 +335,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
         let reply = handle_client_msg(
             &state,
-            ClientMsg::PromptCancel { turn_id: "t9".into() },
+            ClientMsg::PromptCancel {
+                turn_id: "t9".into(),
+            },
             &mut HashSet::new(),
             &mut HashMap::new(),
             &tx,

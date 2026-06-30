@@ -65,7 +65,9 @@ impl Message {
     pub fn user_text(message_id: &str, text: &str) -> Self {
         Self {
             role: "user".to_string(),
-            parts: vec![Part::Text { text: text.to_string() }],
+            parts: vec![Part::Text {
+                text: text.to_string(),
+            }],
             message_id: message_id.to_string(),
             task_id: None,
             context_id: None,
@@ -148,11 +150,17 @@ impl Task {
         Self {
             id: id.to_string(),
             context_id: context_id.to_string(),
-            status: TaskStatus { state: TaskState::Completed, message: None, timestamp: None },
+            status: TaskStatus {
+                state: TaskState::Completed,
+                message: None,
+                timestamp: None,
+            },
             artifacts: vec![Artifact {
                 artifact_id: format!("{id}-result"),
                 name: Some("result".to_string()),
-                parts: vec![Part::Text { text: text.to_string() }],
+                parts: vec![Part::Text {
+                    text: text.to_string(),
+                }],
             }],
             kind: "task".to_string(),
         }
@@ -240,7 +248,12 @@ pub struct JsonRpcRequest {
 
 impl JsonRpcRequest {
     pub fn new(id: Value, method: &str, params: Value) -> Self {
-        Self { jsonrpc: "2.0".to_string(), id, method: method.to_string(), params }
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            method: method.to_string(),
+            params,
+        }
     }
 }
 
@@ -264,14 +277,23 @@ pub struct JsonRpcResponse {
 
 impl JsonRpcResponse {
     pub fn ok(id: Value, result: Value) -> Self {
-        Self { jsonrpc: "2.0".to_string(), id, result: Some(result), error: None }
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
     pub fn err(id: Value, code: i64, message: &str) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
             id,
             result: None,
-            error: Some(JsonRpcError { code, message: message.to_string(), data: None }),
+            error: Some(JsonRpcError {
+                code,
+                message: message.to_string(),
+                data: None,
+            }),
         }
     }
 }
@@ -300,7 +322,11 @@ mod tests {
         let req = JsonRpcRequest::new(
             serde_json::json!(1),
             method::MESSAGE_SEND,
-            serde_json::to_value(SendMessageParams { message: msg, metadata: None }).unwrap(),
+            serde_json::to_value(SendMessageParams {
+                message: msg,
+                metadata: None,
+            })
+            .unwrap(),
         );
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["jsonrpc"], "2.0");
@@ -330,7 +356,10 @@ mod tests {
 
     #[test]
     fn task_state_is_kebab_case_on_the_wire() {
-        assert_eq!(serde_json::to_value(TaskState::InputRequired).unwrap(), "input-required");
+        assert_eq!(
+            serde_json::to_value(TaskState::InputRequired).unwrap(),
+            "input-required"
+        );
         let s: TaskState = serde_json::from_value(serde_json::json!("working")).unwrap();
         assert_eq!(s, TaskState::Working);
     }

@@ -40,19 +40,19 @@ smallest approved directory into the guest.
 Inspect first:
 
 ```powershell
-.\scripts\maturana.ps1 agent inspect <agent-id> --live
+maturana agent inspect <agent-id> --live
 ```
 
 Deploy a skill:
 
 ```powershell
-.\scripts\maturana.ps1 deploy skill <agent-id> .\skills\<name> --ip <ip>
+maturana deploy skill <agent-id> .\skills\<name> --ip <ip>
 ```
 
 Deploy a tool:
 
 ```powershell
-.\scripts\maturana.ps1 deploy tool <agent-id> .\tools\<name> --ip <ip>
+maturana deploy tool <agent-id> .\tools\<name> --ip <ip>
 ```
 
 Run the smallest guest-side smoke check after copying.

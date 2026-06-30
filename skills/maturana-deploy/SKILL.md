@@ -42,7 +42,7 @@ locally first, then copy only the intended artifact into declared guest paths.
 Deploy a skill:
 
 ```powershell
-.\scripts\maturana.ps1 deploy skill <agent-id> .\skills\my-skill --ip <guest-ip>
+maturana deploy skill <agent-id> .\skills\my-skill --ip <guest-ip>
 ```
 
 Default guest destination:
@@ -54,7 +54,7 @@ Default guest destination:
 Deploy a tool:
 
 ```powershell
-.\scripts\maturana.ps1 deploy tool <agent-id> .\path\to\tool --ip <guest-ip>
+maturana deploy tool <agent-id> .\path\to\tool --ip <guest-ip>
 ```
 
 Default guest destination:
@@ -66,7 +66,7 @@ Default guest destination:
 Use `--guest-path` for MCP bundles or binaries that need a fixed path:
 
 ```powershell
-.\scripts\maturana.ps1 deploy tool <agent-id> .\mcp\my-server `
+maturana deploy tool <agent-id> .\mcp\my-server `
   --ip <guest-ip> `
   --guest-path /agent/tools/mcp/my-server
 ```

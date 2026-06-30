@@ -707,8 +707,7 @@ mcp_servers:
         assert_eq!(notion.egress_hosts, vec!["api.notion.com"]);
         assert_eq!(spec.mcp_servers[1].transport, McpTransport::Http);
         // Transport defaults to stdio when omitted.
-        let bare: McpServer =
-            serde_yaml::from_str("name: x\ncommand: run").unwrap();
+        let bare: McpServer = serde_yaml::from_str("name: x\ncommand: run").unwrap();
         assert_eq!(bare.transport, McpTransport::Stdio);
     }
 
@@ -783,7 +782,11 @@ channels:
         )
         .unwrap();
         let spec = AgentSpec::from_maturana_markdown(&path).unwrap();
-        assert!(spec.network.egress_allowlist.iter().any(|h| h == "models.dev"));
+        assert!(spec
+            .network
+            .egress_allowlist
+            .iter()
+            .any(|h| h == "models.dev"));
 
         // Other harnesses don't get it (they don't use models.dev).
         std::fs::write(
@@ -792,6 +795,10 @@ channels:
         )
         .unwrap();
         let codex = AgentSpec::from_maturana_markdown(&path).unwrap();
-        assert!(!codex.network.egress_allowlist.iter().any(|h| h == "models.dev"));
+        assert!(!codex
+            .network
+            .egress_allowlist
+            .iter()
+            .any(|h| h == "models.dev"));
     }
 }

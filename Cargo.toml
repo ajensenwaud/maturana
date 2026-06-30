@@ -4,6 +4,8 @@ members = [
     "crates/maturana-core",
     "crates/maturana-graph",
     "crates/maturana-ingest",
+    "crates/maturana-ops",
+    "crates/maturana-plugin",
     "crates/maturana-web",
 ]
 resolver = "2"

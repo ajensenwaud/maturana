@@ -75,8 +75,8 @@ impl TrajectoryStore {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        let db = Connection::open(path)
-            .with_context(|| format!("failed to open {}", path.display()))?;
+        let db =
+            Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
         db.pragma_update(None, "busy_timeout", 5000)?;
         db.execute_batch(
             r#"
@@ -115,11 +115,11 @@ impl TrajectoryStore {
         tool_calls: &str,
     ) -> anyhow::Result<String> {
         let id = format!("traj-{}", Uuid::new_v4());
-        let seq: i64 = self
-            .db
-            .query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM trajectories", [], |row| {
-                row.get(0)
-            })?;
+        let seq: i64 = self.db.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM trajectories",
+            [],
+            |row| row.get(0),
+        )?;
         self.db.execute(
             r#"
             INSERT INTO trajectories
@@ -329,9 +329,9 @@ impl TrajectoryStore {
     }
 
     pub fn report(&self) -> anyhow::Result<ImprovementReport> {
-        let total: i64 =
-            self.db
-                .query_row("SELECT COUNT(*) FROM trajectories", [], |row| row.get(0))?;
+        let total: i64 = self
+            .db
+            .query_row("SELECT COUNT(*) FROM trajectories", [], |row| row.get(0))?;
         let rewarded: i64 = self.db.query_row(
             "SELECT COUNT(DISTINCT trajectory_id) FROM rewards",
             [],
@@ -404,7 +404,9 @@ mod tests {
         store
             .attach_reward(&id, "user", signals::THUMBS_UP, Some("nice"))
             .unwrap();
-        store.attach_reward(&id, "task", signals::TASK_SUCCESS, None).unwrap();
+        store
+            .attach_reward(&id, "task", signals::TASK_SUCCESS, None)
+            .unwrap();
         let summary = store.reward_summary(&id).unwrap();
         assert_eq!(summary.count, 2);
         assert!((summary.total - 2.0).abs() < f64::EPSILON);
@@ -413,21 +415,34 @@ mod tests {
     #[test]
     fn learned_examples_ranks_rewarded_turns_for_the_agent() {
         let store = store();
-        let good = store.record("a", "s", "chat", "what is X?", "X is the answer", "[]").unwrap();
-        store.attach_reward(&good, "user", signals::THUMBS_UP, None).unwrap();
+        let good = store
+            .record("a", "s", "chat", "what is X?", "X is the answer", "[]")
+            .unwrap();
+        store
+            .attach_reward(&good, "user", signals::THUMBS_UP, None)
+            .unwrap();
         // Unrewarded + other-agent + tool turns are excluded.
-        store.record("a", "s", "chat", "meh", "whatever", "[]").unwrap();
-        store.record("b", "s", "chat", "other agent", "nope", "[]").unwrap();
+        store
+            .record("a", "s", "chat", "meh", "whatever", "[]")
+            .unwrap();
+        store
+            .record("b", "s", "chat", "other agent", "nope", "[]")
+            .unwrap();
         let other = store.record("a", "s", "tool", "ran", "out", "[]").unwrap();
-        store.attach_reward(&other, "user", signals::THUMBS_UP, None).unwrap();
+        store
+            .attach_reward(&other, "user", signals::THUMBS_UP, None)
+            .unwrap();
 
         let md = store.learned_examples_markdown("a", 5, 0.5).unwrap();
         assert!(md.contains("what is X?"));
         assert!(md.contains("X is the answer"));
         assert!(!md.contains("other agent"));
         assert!(!md.contains("ran")); // tool kind excluded
-        // Nothing above a high bar → empty.
-        assert!(store.learned_examples_markdown("a", 5, 99.0).unwrap().is_empty());
+                                      // Nothing above a high bar → empty.
+        assert!(store
+            .learned_examples_markdown("a", 5, 99.0)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -436,7 +451,9 @@ mod tests {
         store
             .record("agent", "s", "chat", "first", "a", "[]")
             .unwrap();
-        let second = store.record("agent", "s", "chat", "second", "b", "[]").unwrap();
+        let second = store
+            .record("agent", "s", "chat", "second", "b", "[]")
+            .unwrap();
         let target = store
             .reward_latest("agent", "s", "user", signals::THUMBS_DOWN, None)
             .unwrap();
@@ -447,14 +464,22 @@ mod tests {
     #[test]
     fn reward_latest_for_agent_is_session_agnostic() {
         let store = store();
-        store.record("agent", "codex-main", "chat", "q", "a", "[]").unwrap();
+        store
+            .record("agent", "codex-main", "chat", "q", "a", "[]")
+            .unwrap();
         let newest = store
             .record("agent", "telegram-main", "chat", "q2", "b", "[]")
             .unwrap();
         // The old snapshot-rollback bug targeted "<agent>-main", which never
         // matches the real session id → no penalty applied.
         assert!(store
-            .reward_latest("agent", "agent-main", "snapshot", signals::SNAPSHOT_ROLLBACK, None)
+            .reward_latest(
+                "agent",
+                "agent-main",
+                "snapshot",
+                signals::SNAPSHOT_ROLLBACK,
+                None
+            )
             .unwrap()
             .is_none());
         // The session-agnostic call lands on the agent's most recent turn
@@ -469,11 +494,19 @@ mod tests {
     #[test]
     fn curation_filters_and_orders_by_reward() {
         let store = store();
-        let good = store.record("agent", "s", "chat", "q1", "great", "[]").unwrap();
-        let bad = store.record("agent", "s", "chat", "q2", "bad", "[]").unwrap();
-        let neutral = store.record("agent", "s", "chat", "q3", "meh", "[]").unwrap();
+        let good = store
+            .record("agent", "s", "chat", "q1", "great", "[]")
+            .unwrap();
+        let bad = store
+            .record("agent", "s", "chat", "q2", "bad", "[]")
+            .unwrap();
+        let neutral = store
+            .record("agent", "s", "chat", "q3", "meh", "[]")
+            .unwrap();
         store.attach_reward(&good, "user", 3.0, None).unwrap();
-        store.attach_reward(&bad, "user", signals::SNAPSHOT_ROLLBACK, None).unwrap();
+        store
+            .attach_reward(&bad, "user", signals::SNAPSHOT_ROLLBACK, None)
+            .unwrap();
         store.attach_reward(&neutral, "user", 0.5, None).unwrap();
 
         let curated = store.curate(1.0).unwrap();

@@ -41,8 +41,8 @@ it should not be the place where host-side tool design is improvised.
 Scaffold locally:
 
 ```powershell
-.\scripts\maturana.ps1 develop skill <name>
-.\scripts\maturana.ps1 develop tool <name>
+maturana develop skill <name>
+maturana develop tool <name>
 ```
 
 `develop skill` creates a workflow skeleton with grounding, preflight, decision
@@ -56,14 +56,14 @@ commands and the smallest focused tests that prove the tool behavior.
 Inspect the target VM before deployment:
 
 ```powershell
-.\scripts\maturana.ps1 agent inspect <agent-id> --live
+maturana agent inspect <agent-id> --live
 ```
 
 Deploy only after local verification:
 
 ```powershell
-.\scripts\maturana.ps1 deploy skill <agent-id> .\skills\<name> --ip <ip>
-.\scripts\maturana.ps1 deploy tool <agent-id> .\tools\<name> --ip <ip>
+maturana deploy skill <agent-id> .\skills\<name> --ip <ip>
+maturana deploy tool <agent-id> .\tools\<name> --ip <ip>
 ```
 
 For fixed MCP paths, pass:

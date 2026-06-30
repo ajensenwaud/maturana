@@ -194,7 +194,9 @@ mod tests {
             model: Some("anthropic/claude-sonnet-4.5".into()),
             text: "hello".into(),
         });
-        round_trip_client(&ClientMsg::PromptCancel { turn_id: "t1".into() });
+        round_trip_client(&ClientMsg::PromptCancel {
+            turn_id: "t1".into(),
+        });
         round_trip_client(&ClientMsg::Subscribe {
             topics: vec![Topic::Agents, Topic::Runtime],
         });
@@ -269,9 +271,7 @@ mod tests {
         let pairs: Vec<(Phase, WirePhase)> = vec![
             (Phase::Queued, WirePhase::Queued),
             (
-                Phase::Running {
-                    tool: "x".into(),
-                },
+                Phase::Running { tool: "x".into() },
                 WirePhase::Running { tool: "x".into() },
             ),
             (

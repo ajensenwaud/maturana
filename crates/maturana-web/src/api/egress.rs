@@ -58,9 +58,9 @@ fn normalize_host(raw: &str) -> anyhow::Result<String> {
     // warning. Allow-all is only reachable through the deliberate, warned paths
     // (network.egress_allow_all, `pipelock proxy --allow-all`, the cockpit toggle).
     if host.is_empty()
-        || host
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '@' | '/' | '\\' | ':' | '*'))
+        || host.chars().any(|c| {
+            c.is_whitespace() || c.is_control() || matches!(c, '@' | '/' | '\\' | ':' | '*')
+        })
     {
         anyhow::bail!("invalid host");
     }
@@ -118,7 +118,10 @@ fn promote_to_spec(home: &Path, agent_id: &str, host: &str) -> anyhow::Result<()
         maturana_core::validation::validate_spec(&parsed?)
     };
     if !report.valid {
-        anyhow::bail!("promoted spec failed validation: {}", report.errors.join("; "));
+        anyhow::bail!(
+            "promoted spec failed validation: {}",
+            report.errors.join("; ")
+        );
     }
     std::fs::write(&spec_path, &updated)?;
     Ok(())

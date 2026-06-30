@@ -1356,7 +1356,9 @@ mod tests {
         assert!(runner.contains("refresh_token"));
         // Default skew matches the host daemon's REFRESH_SKEW (15 min).
         assert_eq!(crate::claude_refresh::REFRESH_SKEW.as_secs(), 900);
-        assert!(runner.contains("MATURANA_CLAUDE_REFRESH_SKEW_SECONDS") || runner.contains("\"900\""));
+        assert!(
+            runner.contains("MATURANA_CLAUDE_REFRESH_SKEW_SECONDS") || runner.contains("\"900\"")
+        );
         // Writes back atomically + 0600 (never a partial/world-readable token).
         assert!(runner.contains("os.replace(tmp, path)"));
         assert!(runner.contains("0o600"));

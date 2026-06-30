@@ -128,7 +128,11 @@ impl Store {
         Stats {
             nodes: self.nodes.len(),
             edges: self.edges.len(),
-            embedded_nodes: self.nodes.values().filter(|n| n.embedding.is_some()).count(),
+            embedded_nodes: self
+                .nodes
+                .values()
+                .filter(|n| n.embedding.is_some())
+                .count(),
             labels: self.label_index.len(),
         }
     }
