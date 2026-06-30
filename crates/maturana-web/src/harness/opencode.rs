@@ -36,8 +36,7 @@ impl HarnessAdapter for OpencodeAdapter {
     ) -> anyhow::Result<TurnHandle> {
         // The key lives in pipelock and is injected into the child env only —
         // it never reaches the browser or the WS stream.
-        let vault =
-            maturana_core::pipelock::PipelockVault::new(request.home_root.join("pipelock"));
+        let vault = maturana_core::pipelock::PipelockVault::new(request.home_root.join("pipelock"));
         let api_key = vault.get(API_KEY_SECRET).map_err(|_| {
             anyhow::anyhow!(
                 "OpenRouter key missing: `maturana pipelock set {API_KEY_SECRET} <key>` first"

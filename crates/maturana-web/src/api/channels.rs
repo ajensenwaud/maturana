@@ -13,7 +13,10 @@ use crate::state::AppState;
 /// Strip to lowercase alphanumerics so "telegram-channel-codex_fc" matches both
 /// the channel keyword and the agent id regardless of `-`/`_` styling.
 fn norm(s: &str) -> String {
-    s.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_lowercase()).collect()
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 pub async fn overview(State(state): State<AppState>) -> Response {
@@ -54,7 +57,10 @@ pub async fn overview(State(state): State<AppState>) -> Response {
                     "name": "tui", "configured": ch.tui, "live": ch.tui && plane_up,
                     "detail": "terminal chat",
                 }));
-                let surface = |name: &str, configured: bool, detail: String, rows: &mut Vec<serde_json::Value>| {
+                let surface = |name: &str,
+                               configured: bool,
+                               detail: String,
+                               rows: &mut Vec<serde_json::Value>| {
                     rows.push(serde_json::json!({
                         "name": name,
                         "configured": configured,
@@ -62,20 +68,50 @@ pub async fn overview(State(state): State<AppState>) -> Response {
                         "detail": detail,
                     }));
                 };
-                surface("telegram", ch.telegram.is_some(),
-                    ch.telegram.as_ref().map(|t| t.token_source.clone()).unwrap_or_default(), &mut channels);
-                surface("discord", ch.discord.is_some(),
-                    ch.discord.as_ref().map(|d| d.bot_token_source.clone()).unwrap_or_default(), &mut channels);
-                surface("slack", ch.slack.is_some(),
-                    ch.slack.as_ref().map(|s| s.bot_token_source.clone()).unwrap_or_default(), &mut channels);
-                surface("agentmail", ch.agentmail.is_some(),
-                    ch.agentmail.as_ref().and_then(|m| m.inbox.clone()).unwrap_or_default(), &mut channels);
+                surface(
+                    "telegram",
+                    ch.telegram.is_some(),
+                    ch.telegram
+                        .as_ref()
+                        .map(|t| t.token_source.clone())
+                        .unwrap_or_default(),
+                    &mut channels,
+                );
+                surface(
+                    "discord",
+                    ch.discord.is_some(),
+                    ch.discord
+                        .as_ref()
+                        .map(|d| d.bot_token_source.clone())
+                        .unwrap_or_default(),
+                    &mut channels,
+                );
+                surface(
+                    "slack",
+                    ch.slack.is_some(),
+                    ch.slack
+                        .as_ref()
+                        .map(|s| s.bot_token_source.clone())
+                        .unwrap_or_default(),
+                    &mut channels,
+                );
+                surface(
+                    "agentmail",
+                    ch.agentmail.is_some(),
+                    ch.agentmail
+                        .as_ref()
+                        .and_then(|m| m.inbox.clone())
+                        .unwrap_or_default(),
+                    &mut channels,
+                );
 
                 rows.push(serde_json::json!({ "agent_id": agent, "channels": channels }));
             }
         }
         rows.sort_by(|a, b| {
-            a.get("agent_id").and_then(|v| v.as_str()).unwrap_or("")
+            a.get("agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
                 .cmp(b.get("agent_id").and_then(|v| v.as_str()).unwrap_or(""))
         });
         Ok(serde_json::json!(rows))

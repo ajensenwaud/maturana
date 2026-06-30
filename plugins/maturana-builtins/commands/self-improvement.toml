@@ -1,0 +1,4 @@
+kind = "builtin-command-family"
+feature = "self-improvement"
+summary = "Rust-owned trajectory capture, reward, curation, and report operations."
+commands = ["improve"]

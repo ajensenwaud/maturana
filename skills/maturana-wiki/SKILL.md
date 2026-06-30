@@ -48,7 +48,7 @@ MVP.
 Initialize:
 
 ```powershell
-.\scripts\maturana.ps1 wiki init
+maturana wiki init
 ```
 
 This creates:
@@ -59,19 +59,19 @@ This creates:
 Ingest:
 
 ```powershell
-.\scripts\maturana.ps1 wiki ingest .\docs\some-file.md --title Some-File
+maturana wiki ingest .\docs\some-file.md --title Some-File
 ```
 
 Use `--chunk-chars` only when the default chunking is too coarse or too small:
 
 ```powershell
-.\scripts\maturana.ps1 wiki ingest .\docs\long-file.md --title Long-File --chunk-chars 2400
+maturana wiki ingest .\docs\long-file.md --title Long-File --chunk-chars 2400
 ```
 
 Search:
 
 ```powershell
-.\scripts\maturana.ps1 wiki search "network policy" --limit 5
+maturana wiki search "network policy" --limit 5
 ```
 
 ## Evidence

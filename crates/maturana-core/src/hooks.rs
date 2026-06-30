@@ -211,7 +211,10 @@ mod tests {
     fn enqueue_hook_invokes_handler_for_matching_event_only() {
         let calls: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
         let handler = |agent: &str, prompt: &str| {
-            calls.lock().unwrap().push((agent.to_string(), prompt.to_string()));
+            calls
+                .lock()
+                .unwrap()
+                .push((agent.to_string(), prompt.to_string()));
             Ok(())
         };
         let hooks = vec![
@@ -233,14 +236,20 @@ mod tests {
         let ctx = HookContext::new(HookEvent::TurnEnd, "codex");
         fire_list(&hooks, &ctx, Some(&handler));
         let recorded = calls.lock().unwrap();
-        assert_eq!(recorded.as_slice(), &[("scribe".to_string(), "summarize".to_string())]);
+        assert_eq!(
+            recorded.as_slice(),
+            &[("scribe".to_string(), "summarize".to_string())]
+        );
     }
 
     #[test]
     fn enqueue_hook_defaults_to_the_firing_agent() {
         let calls: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
         let handler = |agent: &str, prompt: &str| {
-            calls.lock().unwrap().push((agent.to_string(), prompt.to_string()));
+            calls
+                .lock()
+                .unwrap()
+                .push((agent.to_string(), prompt.to_string()));
             Ok(())
         };
         let hooks = vec![hook(

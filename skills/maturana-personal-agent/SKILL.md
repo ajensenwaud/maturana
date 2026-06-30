@@ -63,7 +63,7 @@ or channel delivery.
 Initialize or preserve personal-agent files:
 
 ```powershell
-.\scripts\maturana.ps1 personal init <agent-id> --spec .\examples\MATURANA.codex-hyperv.md
+maturana personal init <agent-id> --spec .\examples\MATURANA.codex-hyperv.md
 ```
 
 Use `--force` only for explicit identity/memory scaffold replacement.
@@ -71,35 +71,35 @@ Use `--force` only for explicit identity/memory scaffold replacement.
 Heartbeat:
 
 ```powershell
-.\scripts\maturana.ps1 heartbeat beat <agent-id> --status alive --message "ready"
-.\scripts\maturana.ps1 heartbeat status <agent-id>
+maturana heartbeat beat <agent-id> --status alive --message "ready"
+maturana heartbeat status <agent-id>
 ```
 
 Schedules:
 
 ```powershell
-.\scripts\maturana.ps1 schedule add <agent-id> morning `
+maturana schedule add <agent-id> morning `
   --cron "0 9 * * *" `
   --prompt "Send a morning brief" `
   --channel telegram
 
-.\scripts\maturana.ps1 schedule list <agent-id>
-.\scripts\maturana.ps1 schedule run-due <agent-id> --session-id telegram-main
+maturana schedule list <agent-id>
+maturana schedule run-due <agent-id> --session-id telegram-main
 ```
 
 Telegram:
 
 ```powershell
-.\scripts\maturana.ps1 channel pair telegram start --agent-id <agent-id>
+maturana channel pair telegram start --agent-id <agent-id>
 # Ask the user to send the printed /pair CODE to the bot.
-.\scripts\maturana.ps1 channel pair telegram complete --agent-id <agent-id>
-.\scripts\maturana.ps1 channel serve telegram --agent-id <agent-id>
+maturana channel pair telegram complete --agent-id <agent-id>
+maturana channel serve telegram --agent-id <agent-id>
 ```
 
 Discord notification:
 
 ```powershell
-.\scripts\maturana.ps1 notify discord `
+maturana notify discord `
   --webhook-source pipelock:discord/webhook `
   --message "Maturana is alive"
 ```

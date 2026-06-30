@@ -1,0 +1,4 @@
+kind = "builtin-command-family"
+feature = "channels"
+summary = "Rust-owned channel adapters for console, Telegram, Discord, Slack, AgentMail, notifications, and TUI chat."
+commands = ["channel", "notify", "tui"]

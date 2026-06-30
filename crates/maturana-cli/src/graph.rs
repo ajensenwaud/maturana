@@ -91,12 +91,10 @@ pub fn handle_graph(command: GraphCommand, home: &MaturanaHome) -> anyhow::Resul
     }
 }
 
-pub(crate) const SUPPORTED_EXTS: &[&str] = &[
-    "pdf", "pptx", "docx", "md", "markdown", "txt", "text", "html", "htm", "json",
-];
+pub(crate) const SUPPORTED_EXTS: &[&str] = maturana_ops::graph::SUPPORTED_EXTS;
 
 /// Where co-located host processes (the Telegram bridge) reach the service.
-pub(crate) const DEFAULT_LOCAL_URL: &str = "http://127.0.0.1:47835";
+pub(crate) const DEFAULT_LOCAL_URL: &str = maturana_ops::graph::DEFAULT_LOCAL_URL;
 
 /// Parse + chunk one document and upsert it into a named graph via the running
 /// service (single-writer: all mutations go through the service, never a second
@@ -108,24 +106,13 @@ pub(crate) fn ingest_file_into_service(
     file: &std::path::Path,
     chunk_chars: usize,
 ) -> anyhow::Result<usize> {
-    let ingested = maturana_ingest::ingest(file, chunk_chars)?;
-    let body = serde_json::json!({
-        "graph": graph,
-        "nodes": ingested.nodes,
-        "edges": ingested.edges,
-    });
-    post_json(url, "/graph/upsert", token, &body)?;
-    Ok(ingested.chunks)
+    maturana_ops::graph::ingest_file_into_service(url, token, graph, file, chunk_chars)
 }
 
 /// An agent's private memory section: a per-agent graph it alone writes to.
 /// Reads blend this with shared graphs (see `query_blended_context`).
 pub(crate) fn agent_graph_name(agent_id: &str) -> String {
-    let safe: String = agent_id
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c.to_ascii_lowercase() } else { '-' })
-        .collect();
-    format!("agent.{}", safe.trim_matches('-'))
+    maturana_ops::graph::agent_graph_name(agent_id)
 }
 
 /// Blended GraphRAG read across several graphs (e.g. the agent's private section
@@ -138,20 +125,7 @@ pub(crate) fn query_blended_context(
     terms: &[String],
     depth: usize,
 ) -> String {
-    let mut out = String::new();
-    for graph in graphs {
-        if let Ok(rendered) = query_rendered_context(url, token, graph, terms, depth) {
-            let trimmed = rendered.trim();
-            if !trimmed.is_empty() && trimmed != "(no result)" {
-                out.push_str(&format!("[{graph}]\n{trimmed}\n\n"));
-            }
-        }
-    }
-    if out.trim().is_empty() {
-        "(no graph results)".to_string()
-    } else {
-        out.trim_end().to_string()
-    }
+    maturana_ops::graph::query_blended_context(url, token, graphs, terms, depth)
 }
 
 /// Run a keyword GraphRAG query via the running service and return the rendered
@@ -163,14 +137,7 @@ pub(crate) fn query_rendered_context(
     terms: &[String],
     depth: usize,
 ) -> anyhow::Result<String> {
-    let body = serde_json::json!({ "graph": graph, "query_terms": terms, "depth": depth });
-    let response = post_json(url, "/graph/query", token, &body)?;
-    Ok(response
-        .get("result")
-        .and_then(|r| r.get("rendered_context"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("(no result)")
-        .to_string())
+    maturana_ops::graph::query_rendered_context(url, token, graph, terms, depth)
 }
 
 fn ingest_documents(
@@ -219,31 +186,7 @@ fn query_graph(
 }
 
 fn collect_files(path: &std::path::Path, recursive: bool) -> anyhow::Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    if path.is_file() {
-        files.push(path.to_path_buf());
-        return Ok(files);
-    }
-    for entry in std::fs::read_dir(path)
-        .with_context(|| format!("failed to read directory {}", path.display()))?
-    {
-        let entry = entry?;
-        let p = entry.path();
-        if p.is_dir() {
-            if recursive {
-                files.extend(collect_files(&p, true)?);
-            }
-        } else if p
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| SUPPORTED_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-            .unwrap_or(false)
-        {
-            files.push(p);
-        }
-    }
-    files.sort();
-    Ok(files)
+    maturana_ops::graph::collect_ingestible_files(path, recursive)
 }
 
 fn read_token(token_path: &std::path::Path) -> anyhow::Result<String> {
@@ -255,19 +198,6 @@ fn read_token(token_path: &std::path::Path) -> anyhow::Result<String> {
                 token_path.display()
             )
         })
-}
-
-fn post_json(
-    url: &str,
-    path: &str,
-    token: &str,
-    body: &serde_json::Value,
-) -> anyhow::Result<serde_json::Value> {
-    let response = ureq::post(&format!("{url}{path}"))
-        .set("x-maturana-graph-token", token)
-        .send_json(body)
-        .with_context(|| format!("graph request to {path} failed"))?;
-    Ok(response.into_json()?)
 }
 
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -382,7 +312,11 @@ fn handle_request(
                 Err(error) => return write_json_response(stream, 400, &error),
             };
             let result = local_query(store, &body.query);
-            write_json_response(stream, 200, &serde_json::json!({ "ok": true, "result": result }))
+            write_json_response(
+                stream,
+                200,
+                &serde_json::json!({ "ok": true, "result": result }),
+            )
         }
         ("POST", "/graph/delete") => {
             let body: DeleteRequest = serde_json::from_slice(&request.body)?;
@@ -576,7 +510,10 @@ mod tests {
     fn agent_graph_name_is_private_and_valid() {
         // Per-agent private section is a valid (dotted) graph name distinct from
         // any shared graph, and id is sanitized.
-        assert_eq!(agent_graph_name("codex-firecracker"), "agent.codex-firecracker");
+        assert_eq!(
+            agent_graph_name("codex-firecracker"),
+            "agent.codex-firecracker"
+        );
         assert_eq!(agent_graph_name("Ada Lovelace!"), "agent.ada-lovelace");
         assert!(valid_graph_name(&agent_graph_name("codex-firecracker")));
         assert_ne!(agent_graph_name("codex-firecracker"), "personal");

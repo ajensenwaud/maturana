@@ -13,6 +13,7 @@ chrono = { workspace = true }
 include_dir = { workspace = true }
 maturana-core = { path = "../maturana-core" }
 maturana-ingest = { path = "../maturana-ingest" }
+maturana-ops = { path = "../maturana-ops" }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

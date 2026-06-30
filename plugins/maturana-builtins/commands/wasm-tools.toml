@@ -1,0 +1,4 @@
+kind = "builtin-command-family"
+feature = "wasm-tools"
+summary = "Rust-owned WebAssembly tool registry and execution operations."
+commands = ["tool"]

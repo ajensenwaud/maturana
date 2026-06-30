@@ -1,0 +1,4 @@
+kind = "builtin-command-family"
+feature = "pipelock"
+summary = "Rust-owned secret vault, egress governance, CA, proxy, and credential injection operations."
+commands = ["pipelock"]

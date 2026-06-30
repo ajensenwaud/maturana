@@ -128,6 +128,7 @@ Agent capabilities & integrations
 
 Building & extending Maturana
 - `maturana-develop` — develop a new skill, guest tool, or MCP bundle
+- `maturana-plugin` — discover, validate, and design first-party or third-party plugins
 - `maturana-skill-create` — create a new Codex skill (framework or agent)
 - `maturana-tool-create` — create a host or guest tool
 - `maturana-wasm-tool` — build a new executable capability on the fly (WASM)
@@ -136,8 +137,8 @@ Building & extending Maturana
 - `maturana-skill-deploy` — install a tested skill/tool into a target agent
 - `maturana-deploy` — deploy a Codex-developed skill/tool/MCP server
 
-(32 skills. If this index drifts from `skills/`, the directory is the source of
-truth — list it with `ls skills/` and read the relevant `SKILL.md`.)
+(If this index drifts from `skills/`, the directory is the source of truth —
+list it with `ls skills/` and read the relevant `SKILL.md`.)
 
 ### Agent specs
 `MATURANA.md` is the durable unit of agent definition. Codex is expected

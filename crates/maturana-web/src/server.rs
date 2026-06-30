@@ -65,7 +65,9 @@ pub async fn serve(
     println!("maturana web cockpit on http://{bind}");
     println!("  login token: {token_for_banner}");
     println!("  (also at <home>/web/token)");
-    axum::serve(listener, app).await.context("web server exited")
+    axum::serve(listener, app)
+        .await
+        .context("web server exited")
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -113,11 +115,13 @@ async fn web_outbound_poller(state: AppState) {
             .await
             .unwrap_or_default();
         for (agent_id, session_id, message) in pending {
-            let delivered = state.dash_tx.send(Broadcast::Session(ServerMsg::SessionOutbound {
-                agent_id: agent_id.clone(),
-                session_id: session_id.clone(),
-                message: serde_json::to_value(&message).unwrap_or_default(),
-            }));
+            let delivered = state
+                .dash_tx
+                .send(Broadcast::Session(ServerMsg::SessionOutbound {
+                    agent_id: agent_id.clone(),
+                    session_id: session_id.clone(),
+                    message: serde_json::to_value(&message).unwrap_or_default(),
+                }));
             if delivered.is_ok() {
                 let root = state.home_root.clone();
                 let _ = tokio::task::spawn_blocking(move || {
@@ -167,14 +171,16 @@ async fn web_progress_poller(state: AppState) {
             let mut max_seq: Option<u64> = None;
             for event in events {
                 max_seq = Some(max_seq.map_or(event.seq, |m: u64| m.max(event.seq)));
-                let _ = state.dash_tx.send(Broadcast::Session(ServerMsg::SessionProgress {
-                    agent_id: key.0.clone(),
-                    session_id: key.1.clone(),
-                    message_id: key.2.clone(),
-                    seq: event.seq,
-                    kind: event.kind,
-                    text: event.text,
-                }));
+                let _ = state
+                    .dash_tx
+                    .send(Broadcast::Session(ServerMsg::SessionProgress {
+                        agent_id: key.0.clone(),
+                        session_id: key.1.clone(),
+                        message_id: key.2.clone(),
+                        seq: event.seq,
+                        kind: event.kind,
+                        text: event.text,
+                    }));
             }
             if let (Some(max), Ok(mut guard)) = (max_seq, state.active_turns.lock()) {
                 if let Some(watch) = guard.get_mut(&key) {
@@ -230,10 +236,8 @@ fn read_new_progress(
 )> {
     let mut out = Vec::new();
     for (key, last_seq) in watching {
-        let paths = maturana_core::session_db::session_paths(
-            &root.join("agents").join(&key.0),
-            &key.1,
-        );
+        let paths =
+            maturana_core::session_db::session_paths(&root.join("agents").join(&key.0), &key.1);
         let all = maturana_core::session_db::read_progress(&paths, &key.2).unwrap_or_default();
         let terminal = all
             .iter()
@@ -279,7 +283,10 @@ async fn egress_poller(state: AppState) {
 fn read_new_egress(
     audit_dir: &std::path::Path,
     mut offsets: std::collections::HashMap<PathBuf, u64>,
-) -> (Vec<serde_json::Value>, std::collections::HashMap<PathBuf, u64>) {
+) -> (
+    Vec<serde_json::Value>,
+    std::collections::HashMap<PathBuf, u64>,
+) {
     use std::io::{Read, Seek, SeekFrom};
     let mut events = Vec::new();
     let Ok(entries) = std::fs::read_dir(audit_dir) else {

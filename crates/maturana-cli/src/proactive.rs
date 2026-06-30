@@ -159,11 +159,14 @@ fn maybe_fire(
     // through the front door also injects context (memory + recent conversation +
     // graph), so the agent can actually find something worth saying instead of
     // defaulting to silence with nothing to reference.
-    let Some(chat_id) = crate::channels::current_paired_telegram_chat_id(home, agent_id) else {
+    let Some(chat_id) = maturana_ops::conversation::current_paired_telegram_chat_id(home, agent_id)
+    else {
         return Ok(false);
     };
-    let prompt = directive.map(str::to_string).unwrap_or_else(proactive_prompt);
-    crate::channels::enqueue_outreach_turn(
+    let prompt = directive
+        .map(str::to_string)
+        .unwrap_or_else(proactive_prompt);
+    maturana_ops::conversation::enqueue_outreach_turn(
         home,
         agent_id,
         session_id,

@@ -168,9 +168,8 @@ pub fn validate_spec(spec: &AgentSpec) -> ValidationReport {
             &mut errors,
         );
         if !host_allowlisted(spec, "api.slack.com") {
-            warnings.push(
-                "channels.slack: add api.slack.com to network.egress_allowlist".to_string(),
-            );
+            warnings
+                .push("channels.slack: add api.slack.com to network.egress_allowlist".to_string());
         }
     }
     if let Some(agentmail) = &spec.channels.agentmail {
@@ -204,7 +203,11 @@ pub fn validate_spec(spec: &AgentSpec) -> ValidationReport {
             }
         }
         for env in &server.env {
-            validate_secret_source(&env.source, &format!("{label}.env.{}", env.name), &mut errors);
+            validate_secret_source(
+                &env.source,
+                &format!("{label}.env.{}", env.name),
+                &mut errors,
+            );
         }
         for host in &server.egress_hosts {
             if !host_allowlisted(spec, host) {
@@ -346,8 +349,7 @@ fn is_safe_guest_path(path: &str) -> bool {
         .iter()
         .any(|root| path.starts_with(root));
     let allowed_exact = ["/agent", "/opt/maturana"].contains(&path);
-    (allowed_root || allowed_exact)
-        && !path.split('/').any(|seg| seg == "..")
+    (allowed_root || allowed_exact) && !path.split('/').any(|seg| seg == "..")
 }
 
 fn validate_id(id: &str, errors: &mut Vec<String>) {

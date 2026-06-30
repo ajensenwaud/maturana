@@ -1,0 +1,4 @@
+kind = "builtin-command-family"
+feature = "developer-tools"
+summary = "Rust-owned local development, deployment, skill installation, and plugin catalog operations."
+commands = ["deploy", "develop", "skill", "plugin"]

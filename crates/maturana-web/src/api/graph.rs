@@ -43,7 +43,11 @@ pub async fn stats(State(state): State<AppState>, Json(body): Json<GraphBody>) -
     let root = state.home_root.clone();
     match blocking(move || {
         let token = graph_token(&root)?;
-        post_json(&token, "/graph/stats", &serde_json::json!({ "graph": body.graph }))
+        post_json(
+            &token,
+            "/graph/stats",
+            &serde_json::json!({ "graph": body.graph }),
+        )
     })
     .await
     {
@@ -86,7 +90,10 @@ pub async fn ingest(
         .and_then(|v| v.to_str().ok())
         .map(sanitize_filename)
     else {
-        return err(StatusCode::BAD_REQUEST, "missing x-maturana-filename header");
+        return err(
+            StatusCode::BAD_REQUEST,
+            "missing x-maturana-filename header",
+        );
     };
     let graph = headers
         .get("x-maturana-graph")

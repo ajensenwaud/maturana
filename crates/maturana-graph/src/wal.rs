@@ -129,8 +129,8 @@ pub fn write_snapshot(dir: &Path, snapshot: &Snapshot) -> anyhow::Result<()> {
     fs::create_dir_all(dir)?;
     let target = dir.join(SNAPSHOT_FILE);
     let tmp = dir.join(format!("{SNAPSHOT_FILE}.tmp"));
-    let mut file = File::create(&tmp)
-        .with_context(|| format!("failed to create {}", tmp.display()))?;
+    let mut file =
+        File::create(&tmp).with_context(|| format!("failed to create {}", tmp.display()))?;
     file.write_all(serde_json::to_string(snapshot)?.as_bytes())?;
     file.sync_all()?;
     fs::rename(&tmp, &target)

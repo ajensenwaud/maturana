@@ -428,13 +428,19 @@ mod tests {
             .iter()
             .find(|p| p.name == "channel:slack:personal")
             .expect("slack channel");
-        assert!(slack.args.windows(2).any(|w| w == ["--bot-token-source", "pipelock:slack/bot-token"]));
+        assert!(slack
+            .args
+            .windows(2)
+            .any(|w| w == ["--bot-token-source", "pipelock:slack/bot-token"]));
         let mail = processes
             .iter()
             .find(|p| p.name == "channel:agentmail:personal")
             .expect("agentmail channel");
         assert!(mail.args.windows(2).any(|w| w == ["--inbox", "box-1"]));
-        assert!(mail.args.windows(2).any(|w| w == ["--api-key-source", "pipelock:agentmail/api-key"]));
+        assert!(mail
+            .args
+            .windows(2)
+            .any(|w| w == ["--api-key-source", "pipelock:agentmail/api-key"]));
     }
 
     #[test]
@@ -449,11 +455,19 @@ mod tests {
         assert!(!daemon.critical);
         assert_eq!(daemon.args[0], "claude-refresh");
         assert_eq!(daemon.args[1], "serve");
-        assert!(daemon.args.windows(2).any(|w| w == ["--agent-id", "claude-a"]));
-        assert!(daemon.args.windows(2).any(|w| w == ["--agent-id", "claude-b"]));
+        assert!(daemon
+            .args
+            .windows(2)
+            .any(|w| w == ["--agent-id", "claude-a"]));
+        assert!(daemon
+            .args
+            .windows(2)
+            .any(|w| w == ["--agent-id", "claude-b"]));
         // No claude agents → no daemon.
         let bare = OrchestratorConfig::default();
-        assert!(plan_processes(&bare).iter().all(|p| p.name != "claude-refresh"));
+        assert!(plan_processes(&bare)
+            .iter()
+            .all(|p| p.name != "claude-refresh"));
     }
 
     #[test]

@@ -1,0 +1,298 @@
+name = "maturana-builtins"
+version = "0.1.0"
+description = "First-party plugin catalog for built-in Maturana feature families"
+author = "Maturana"
+
+[[features]]
+name = "agent-lifecycle"
+kind = "host-op"
+description = "Agent spec validation, materialization, launch, inspect, stop, repair, and snapshot operations"
+entrypoint = "commands/agent-lifecycle.toml"
+default_enabled = true
+
+[[features]]
+name = "runtime-plane"
+kind = "host-op"
+description = "Host runtime supervision, service management, session queue, status, doctor, and OAuth refresh operations"
+entrypoint = "commands/runtime-plane.toml"
+default_enabled = true
+
+[[features]]
+name = "pipelock"
+kind = "secret-provider"
+description = "Pipelock secret vault, egress allowlist proxy, header injection, and audit"
+entrypoint = "commands/pipelock.toml"
+default_enabled = true
+
+[[features]]
+name = "channels"
+kind = "channel"
+description = "Console, Telegram, Discord, Slack, AgentMail, notify, and TUI channel bridges"
+entrypoint = "commands/channels.toml"
+default_enabled = true
+
+[[features]]
+name = "personal-agent"
+kind = "host-op"
+description = "Personal assistant setup, wiki, heartbeat, scheduling, and proactive outreach"
+entrypoint = "commands/personal-agent.toml"
+default_enabled = true
+
+[[features]]
+name = "orchestration"
+kind = "host-op"
+description = "A2A, bounded orchestrator loop, and durable orchestration boards"
+entrypoint = "commands/orchestration.toml"
+default_enabled = true
+
+[[features]]
+name = "maturana-graph"
+kind = "mcp"
+description = "Shared markdown/wiki and graph-backed context retrieval"
+entrypoint = "commands/maturana-graph.toml"
+default_enabled = true
+
+[[features]]
+name = "wasm-tools"
+kind = "tool"
+description = "Capability-gated WebAssembly tool registry and self-forge runtime"
+entrypoint = "commands/wasm-tools.toml"
+default_enabled = true
+
+[[features]]
+name = "web-search"
+kind = "tool"
+description = "Host-side web search through governed Brave or Tavily providers"
+entrypoint = "commands/web-search.toml"
+default_enabled = true
+
+[[features]]
+name = "self-improvement"
+kind = "host-op"
+description = "Trajectory capture, reward signals, and curated examples for agent improvement"
+entrypoint = "commands/self-improvement.toml"
+default_enabled = true
+
+[[features]]
+name = "developer-tools"
+kind = "host-op"
+description = "Skill, plugin, tool, and deployment development workflows"
+entrypoint = "commands/developer-tools.toml"
+default_enabled = true
+
+[[features]]
+name = "web-cockpit"
+kind = "web"
+description = "Authenticated browser cockpit over the shared Maturana operations layer"
+entrypoint = "commands/web-cockpit.toml"
+default_enabled = false
+
+[[commands]]
+name = "spec"
+description = "Validate MATURANA.md specs before launch"
+entrypoint = "commands/agent-lifecycle.toml"
+feature = "agent-lifecycle"
+
+[[commands]]
+name = "agent"
+description = "Launch, inspect, stop, chat with, run, and transfer files for agents"
+entrypoint = "commands/agent-lifecycle.toml"
+feature = "agent-lifecycle"
+
+[[commands]]
+name = "snapshot"
+description = "Take, list, and restore agent snapshots"
+entrypoint = "commands/agent-lifecycle.toml"
+feature = "agent-lifecycle"
+
+[[commands]]
+name = "vm"
+description = "Copy-on-write VM storage clone, snapshot, and rollback helpers"
+entrypoint = "commands/agent-lifecycle.toml"
+feature = "agent-lifecycle"
+
+[[commands]]
+name = "audit"
+description = "Read governed audit-log events for an agent"
+entrypoint = "commands/agent-lifecycle.toml"
+feature = "agent-lifecycle"
+
+[[commands]]
+name = "setup"
+description = "Prepare and repair host or guest prerequisites"
+entrypoint = "commands/agent-lifecycle.toml"
+feature = "agent-lifecycle"
+
+[[commands]]
+name = "doctor"
+description = "Run pass/fail health checks over the runtime plane and agents"
+entrypoint = "commands/runtime-plane.toml"
+feature = "runtime-plane"
+
+[[commands]]
+name = "up"
+description = "Bring the host runtime plane online"
+entrypoint = "commands/runtime-plane.toml"
+feature = "runtime-plane"
+
+[[commands]]
+name = "list"
+description = "List materialized agents with a compact host-side health snapshot"
+entrypoint = "commands/runtime-plane.toml"
+feature = "runtime-plane"
+
+[[commands]]
+name = "status"
+description = "Show runtime plane and per-agent health"
+entrypoint = "commands/runtime-plane.toml"
+feature = "runtime-plane"
+
+[[commands]]
+name = "session"
+description = "Operate the low-level session queue and sessiond"
+entrypoint = "commands/runtime-plane.toml"
+feature = "runtime-plane"
+
+[[commands]]
+name = "service"
+description = "Register and manage host services"
+entrypoint = "commands/runtime-plane.toml"
+feature = "runtime-plane"
+
+[[commands]]
+name = "hostd"
+description = "Run or inspect the Windows Hyper-V host daemon"
+entrypoint = "commands/runtime-plane.toml"
+feature = "runtime-plane"
+
+[[commands]]
+name = "claude-refresh"
+description = "Refresh host-owned Claude OAuth credentials"
+entrypoint = "commands/runtime-plane.toml"
+feature = "runtime-plane"
+
+[[commands]]
+name = "pipelock"
+description = "Manage secrets, egress proxying, and credential injection policy"
+entrypoint = "commands/pipelock.toml"
+feature = "pipelock"
+
+[[commands]]
+name = "channel"
+description = "Pair and serve chat channels"
+entrypoint = "commands/channels.toml"
+feature = "channels"
+
+[[commands]]
+name = "notify"
+description = "Send one-off Telegram or Discord notifications"
+entrypoint = "commands/channels.toml"
+feature = "channels"
+
+[[commands]]
+name = "tui"
+description = "Open the interactive console chat TUI"
+entrypoint = "commands/channels.toml"
+feature = "channels"
+
+[[commands]]
+name = "personal"
+description = "Scaffold and manage a single-user personal agent"
+entrypoint = "commands/personal-agent.toml"
+feature = "personal-agent"
+
+[[commands]]
+name = "wiki"
+description = "Manage per-agent document wiki context"
+entrypoint = "commands/personal-agent.toml"
+feature = "personal-agent"
+
+[[commands]]
+name = "heartbeat"
+description = "Write or read agent liveness records"
+entrypoint = "commands/personal-agent.toml"
+feature = "personal-agent"
+
+[[commands]]
+name = "schedule"
+description = "Manage cron-style scheduled agent tasks"
+entrypoint = "commands/personal-agent.toml"
+feature = "personal-agent"
+
+[[commands]]
+name = "proactive"
+description = "Run the machine-managed proactive outreach loop"
+entrypoint = "commands/personal-agent.toml"
+feature = "personal-agent"
+
+[[commands]]
+name = "orchestrator"
+description = "Run a goal across multiple worker agents in a bounded loop"
+entrypoint = "commands/orchestration.toml"
+feature = "orchestration"
+
+[[commands]]
+name = "board"
+description = "Define and run durable orchestration boards"
+entrypoint = "commands/orchestration.toml"
+feature = "orchestration"
+
+[[commands]]
+name = "a2a"
+description = "Serve Agent2Agent endpoints"
+entrypoint = "commands/orchestration.toml"
+feature = "orchestration"
+
+[[commands]]
+name = "graph"
+description = "Serve, ingest, and query MaturanaGraph context"
+entrypoint = "commands/maturana-graph.toml"
+feature = "maturana-graph"
+
+[[commands]]
+name = "tool"
+description = "Register, inspect, and run sandboxed WebAssembly tools"
+entrypoint = "commands/wasm-tools.toml"
+feature = "wasm-tools"
+
+[[commands]]
+name = "search"
+description = "Run governed host-side web search"
+entrypoint = "commands/web-search.toml"
+feature = "web-search"
+
+[[commands]]
+name = "improve"
+description = "Record trajectories, reward outputs, and curate learned examples"
+entrypoint = "commands/self-improvement.toml"
+feature = "self-improvement"
+
+[[commands]]
+name = "deploy"
+description = "Deploy tested skills, tools, or MCP bundles to a live agent"
+entrypoint = "commands/developer-tools.toml"
+feature = "developer-tools"
+
+[[commands]]
+name = "develop"
+description = "Scaffold local skills and tools"
+entrypoint = "commands/developer-tools.toml"
+feature = "developer-tools"
+
+[[commands]]
+name = "skill"
+description = "Validate and install Codex skills"
+entrypoint = "commands/developer-tools.toml"
+feature = "developer-tools"
+
+[[commands]]
+name = "plugin"
+description = "Discover, validate, install, enable, and inspect plugins"
+entrypoint = "commands/developer-tools.toml"
+feature = "developer-tools"
+
+[[commands]]
+name = "web"
+description = "Serve the authenticated web cockpit"
+entrypoint = "commands/web-cockpit.toml"
+feature = "web-cockpit"

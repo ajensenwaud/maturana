@@ -1585,12 +1585,12 @@ dependencies = [
  "maturana-core",
  "maturana-graph",
  "maturana-ingest",
+ "maturana-ops",
  "maturana-web",
  "rand",
  "ratatui",
  "serde",
  "serde_json",
- "sha2",
  "tungstenite 0.21.0",
  "ureq",
 ]
@@ -1648,6 +1648,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "maturana-ops"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "maturana-core",
+ "maturana-ingest",
+ "maturana-plugin",
+ "rand",
+ "serde",
+ "serde_json",
+ "sha2",
+ "ureq",
+]
+
+[[package]]
+name = "maturana-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "maturana-web"
 version = "0.1.0"
 dependencies = [
@@ -1657,6 +1683,7 @@ dependencies = [
  "include_dir",
  "maturana-core",
  "maturana-ingest",
+ "maturana-ops",
  "rand",
  "serde",
  "serde_json",

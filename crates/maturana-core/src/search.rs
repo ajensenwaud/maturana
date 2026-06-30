@@ -78,10 +78,7 @@ pub fn build_request(
         SearchProviderKind::Tavily => BuiltRequest {
             method: "POST",
             url: format!("https://{TAVILY_HOST}/search"),
-            headers: vec![(
-                "Authorization".to_string(),
-                format!("Bearer {api_key}"),
-            )],
+            headers: vec![("Authorization".to_string(), format!("Bearer {api_key}"))],
             body: Some(serde_json::json!({
                 "query": request.query,
                 "max_results": count,
@@ -151,11 +148,15 @@ pub fn search(
         SearchProviderKind::Brave => BRAVE_KEY_SOURCE,
         SearchProviderKind::Tavily => TAVILY_KEY_SOURCE,
     };
-    let key = resolve_secret_source_with_home(key_source, home_root)
-        .map_err(|_| anyhow::anyhow!("missing API key: `maturana pipelock set {}` first", key_source.trim_start_matches("pipelock:")))?;
+    let key = resolve_secret_source_with_home(key_source, home_root).map_err(|_| {
+        anyhow::anyhow!(
+            "missing API key: `maturana pipelock set {}` first",
+            key_source.trim_start_matches("pipelock:")
+        )
+    })?;
     let built = build_request(provider, request, key.expose_for_runtime());
-    let mut call = ureq::request(built.method, &built.url)
-        .timeout(std::time::Duration::from_secs(20));
+    let mut call =
+        ureq::request(built.method, &built.url).timeout(std::time::Duration::from_secs(20));
     for (name, value) in &built.headers {
         call = call.set(name, value);
     }
@@ -233,7 +234,10 @@ mod tests {
     fn count_is_clamped() {
         let built = build_request(
             SearchProviderKind::Brave,
-            &SearchRequest { query: "q".into(), count: 999 },
+            &SearchRequest {
+                query: "q".into(),
+                count: 999,
+            },
             "k",
         );
         assert!(built.url.ends_with("count=20"));
@@ -264,8 +268,12 @@ mod tests {
 
     #[test]
     fn empty_or_alien_responses_yield_no_results() {
-        assert!(parse_response(SearchProviderKind::Brave, "{}").unwrap().is_empty());
-        assert!(parse_response(SearchProviderKind::Tavily, "{}").unwrap().is_empty());
+        assert!(parse_response(SearchProviderKind::Brave, "{}")
+            .unwrap()
+            .is_empty());
+        assert!(parse_response(SearchProviderKind::Tavily, "{}")
+            .unwrap()
+            .is_empty());
         assert!(parse_response(SearchProviderKind::Brave, "not json").is_err());
     }
 }

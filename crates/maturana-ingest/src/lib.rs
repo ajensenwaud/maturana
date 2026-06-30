@@ -145,7 +145,8 @@ pub fn to_graph(doc: &Document, chunk_chars: usize) -> Ingested {
         let chunk_id = format!("chunk:{doc_slug}:{i}");
         let mut node = Node::new(chunk_id.clone());
         node.labels = vec!["Chunk".into()];
-        node.props.insert("name".into(), json!(format!("{} #{i}", doc.title)));
+        node.props
+            .insert("name".into(), json!(format!("{} #{i}", doc.title)));
         node.props.insert("source".into(), json!(doc.source));
         node.props.insert("position".into(), json!(i));
         node.props.insert("text".into(), json!(text));
@@ -251,8 +252,15 @@ mod tests {
         };
         let ing = to_graph(&doc, 500); // target 500 -> at least 2 chunks
         assert!(ing.chunks >= 2);
-        assert!(ing.nodes.iter().any(|n| n.labels.contains(&"Document".to_string())));
-        let chunk_count = ing.nodes.iter().filter(|n| n.labels.contains(&"Chunk".to_string())).count();
+        assert!(ing
+            .nodes
+            .iter()
+            .any(|n| n.labels.contains(&"Document".to_string())));
+        let chunk_count = ing
+            .nodes
+            .iter()
+            .filter(|n| n.labels.contains(&"Chunk".to_string()))
+            .count();
         assert_eq!(chunk_count, ing.chunks);
         assert!(ing.edges.iter().any(|e| e.etype == "CONTAINS"));
         assert!(ing.edges.iter().any(|e| e.etype == "NEXT"));

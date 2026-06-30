@@ -43,13 +43,13 @@ memory/context.
 Store the API key:
 
 ```powershell
-.\scripts\maturana.ps1 pipelock set agentmail/api-key --value <token>
+maturana pipelock set agentmail/api-key --value <token>
 ```
 
 Scaffold the local tool:
 
 ```powershell
-.\scripts\maturana.ps1 develop tool agentmail-inbox
+maturana develop tool agentmail-inbox
 ```
 
 Create an inbox from the tool using AgentMail's API:
@@ -66,7 +66,7 @@ The response should include `inbox_id` and `email`.
 Deploy the tested tool:
 
 ```powershell
-.\scripts\maturana.ps1 deploy tool <agent-id> .\tools\agentmail-inbox --ip <guest-ip>
+maturana deploy tool <agent-id> .\tools\agentmail-inbox --ip <guest-ip>
 ```
 
 ## Evidence

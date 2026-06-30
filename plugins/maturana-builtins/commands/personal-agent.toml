@@ -1,0 +1,4 @@
+kind = "builtin-command-family"
+feature = "personal-agent"
+summary = "Rust-owned personal assistant setup, wiki, heartbeat, scheduling, and proactive outreach."
+commands = ["personal", "wiki", "heartbeat", "schedule", "proactive"]

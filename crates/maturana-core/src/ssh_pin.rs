@@ -156,10 +156,8 @@ mod tests {
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "maturana-sshpin-{tag}-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("maturana-sshpin-{tag}-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -209,11 +207,14 @@ mod tests {
 
     #[test]
     fn cloud_init_block_indents_private_key_and_emits_public() {
-        let pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\ndef\n-----END OPENSSH PRIVATE KEY-----";
+        let pem =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\ndef\n-----END OPENSSH PRIVATE KEY-----";
         let block = cloud_init_ssh_keys_block(pem, "ssh-ed25519 AAAAPUB maturana-host\n");
         assert!(block.starts_with("ssh_keys:\n  ed25519_private: |\n"));
         assert!(block.contains("    -----BEGIN OPENSSH PRIVATE KEY-----\n"));
         assert!(block.contains("    abc\n"));
-        assert!(block.trim_end().ends_with("ed25519_public: ssh-ed25519 AAAAPUB maturana-host"));
+        assert!(block
+            .trim_end()
+            .ends_with("ed25519_public: ssh-ed25519 AAAAPUB maturana-host"));
     }
 }

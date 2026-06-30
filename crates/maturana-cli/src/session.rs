@@ -6,8 +6,7 @@ use maturana_core::{
     session_db::{
         append_progress, claim_pending_inbound, ensure_session, insert_inbound,
         is_cancel_requested, list_recent_inbound, list_undelivered, mark_delivered,
-        mark_inbound_completed,
-        session_paths, write_outbound, ProgressEvent, SessionPaths,
+        mark_inbound_completed, session_paths, write_outbound, ProgressEvent, SessionPaths,
     },
     state::MaturanaHome,
 };
@@ -461,7 +460,11 @@ fn forge_impl(
         }
     };
 
-    emit(0, "forge.building", format!("🔨 Building `{name}` — assembling WebAssembly…"));
+    emit(
+        0,
+        "forge.building",
+        format!("🔨 Building `{name}` — assembling WebAssembly…"),
+    );
     let registry = ToolRegistry::new(home.agent_dir(&body.agent_id).join("forge"));
     let spec = forge::ForgeSpec {
         name: &name,
@@ -679,7 +682,14 @@ fn record_chat_trajectory(
     };
     let output = message_text(&body.content).unwrap_or_default();
     let store = TrajectoryStore::open(&TrajectoryStore::store_path(home.root()))?;
-    store.record(&body.agent_id, &body.session_id, "chat", &input, &output, "[]")?;
+    store.record(
+        &body.agent_id,
+        &body.session_id,
+        "chat",
+        &input,
+        &output,
+        "[]",
+    )?;
     Ok(())
 }
 

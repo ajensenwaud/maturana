@@ -69,7 +69,10 @@ fn launch_invocation(command: &str, args: &[String]) -> (String, Vec<String>) {
     if command == "npx" {
         if let Some(pos) = args.iter().position(|a| !a.starts_with('-')) {
             if let Some(bin) = resident_npm_bin(strip_npm_version(&args[pos])) {
-                return (format!("{GUEST_NPM_GLOBAL_BIN}/{bin}"), args[pos + 1..].to_vec());
+                return (
+                    format!("{GUEST_NPM_GLOBAL_BIN}/{bin}"),
+                    args[pos + 1..].to_vec(),
+                );
             }
         }
     }
@@ -120,7 +123,10 @@ fn resolve_env(
     }
     if !server.egress_hosts.is_empty() {
         let no_proxy = server.egress_hosts.join(",");
-        env.insert("NO_PROXY".into(), serde_json::Value::String(no_proxy.clone()));
+        env.insert(
+            "NO_PROXY".into(),
+            serde_json::Value::String(no_proxy.clone()),
+        );
         env.insert("no_proxy".into(), serde_json::Value::String(no_proxy));
     }
     Ok(env)
@@ -337,13 +343,19 @@ mod tests {
         let doc: toml::Value = rendered.contents.parse().unwrap();
         // Operator settings and the pre-existing server survive.
         assert_eq!(doc["model"].as_str(), Some("gpt-5.5"));
-        assert_eq!(doc["mcp_servers"]["existing"]["command"].as_str(), Some("keep"));
+        assert_eq!(
+            doc["mcp_servers"]["existing"]["command"].as_str(),
+            Some("keep")
+        );
         // Ours is added with resolved env, rewritten to the resident binary.
         assert_eq!(
             doc["mcp_servers"]["notion"]["command"].as_str(),
             Some("/usr/local/bin/notion-mcp-server")
         );
-        assert!(doc["mcp_servers"]["notion"]["args"].as_array().unwrap().is_empty());
+        assert!(doc["mcp_servers"]["notion"]["args"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert_eq!(
             doc["mcp_servers"]["notion"]["env"]["NOTION_TOKEN"].as_str(),
             Some("ntn_secret")
@@ -360,14 +372,20 @@ mod tests {
         // Known package → resident binary, npx flags dropped, trailing args kept.
         let (cmd, args) = launch_invocation(
             "npx",
-            &["-y".into(), "@notionhq/notion-mcp-server".into(), "--verbose".into()],
+            &[
+                "-y".into(),
+                "@notionhq/notion-mcp-server".into(),
+                "--verbose".into(),
+            ],
         );
         assert_eq!(cmd, "/usr/local/bin/notion-mcp-server");
         assert_eq!(args, vec!["--verbose".to_string()]);
 
         // Versioned spec still maps.
-        let (cmd, _) =
-            launch_invocation("npx", &["-y".into(), "@notionhq/notion-mcp-server@1.2.3".into()]);
+        let (cmd, _) = launch_invocation(
+            "npx",
+            &["-y".into(), "@notionhq/notion-mcp-server@1.2.3".into()],
+        );
         assert_eq!(cmd, "/usr/local/bin/notion-mcp-server");
 
         // Unknown package → unchanged npx fallback.
@@ -377,7 +395,10 @@ mod tests {
 
         // Package extraction for pre-install.
         assert_eq!(
-            npx_package(Some("npx"), &["-y".into(), "@notionhq/notion-mcp-server".into()]),
+            npx_package(
+                Some("npx"),
+                &["-y".into(), "@notionhq/notion-mcp-server".into()]
+            ),
             Some("@notionhq/notion-mcp-server".to_string())
         );
         assert_eq!(npx_package(Some("notion-mcp-server"), &[]), None);
@@ -395,11 +416,15 @@ mod tests {
             env: vec![],
             egress_hosts: vec![],
         };
-        let claude = render_mcp_config(&HarnessRuntime::ClaudeCode, &[server.clone()], &home, &home)
-            .unwrap()
-            .unwrap();
+        let claude =
+            render_mcp_config(&HarnessRuntime::ClaudeCode, &[server.clone()], &home, &home)
+                .unwrap()
+                .unwrap();
         let v: serde_json::Value = serde_json::from_str(&claude.contents).unwrap();
         assert_eq!(v["mcpServers"]["remote"]["type"], "http");
-        assert_eq!(v["mcpServers"]["remote"]["url"], "https://mcp.example.com/sse");
+        assert_eq!(
+            v["mcpServers"]["remote"]["url"],
+            "https://mcp.example.com/sse"
+        );
     }
 }

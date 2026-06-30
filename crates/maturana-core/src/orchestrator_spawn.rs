@@ -11,8 +11,8 @@
 //! This module owns the two pieces that are pure and therefore unit-testable:
 //! choosing a non-colliding network triple, and deriving the role's spec from a
 //! base. The live steps (create the host TAP, launch, install the worker, wait,
-//! tear down) are driven by the orchestrator loop using these plus the existing
-//! `materialize_agent` / `stop_agent` / guest-worker install.
+//! tear down) live behind `maturana-ops`, so front ends do not become VM
+//! provisioning control planes.
 
 use std::collections::HashSet;
 

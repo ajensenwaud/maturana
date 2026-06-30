@@ -1,0 +1,4 @@
+kind = "builtin-command-family"
+feature = "maturana-graph"
+summary = "Rust-owned graph service, document ingestion, and GraphRAG query operations."
+commands = ["graph"]

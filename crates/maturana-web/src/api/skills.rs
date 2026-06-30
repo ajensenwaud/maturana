@@ -20,9 +20,14 @@ pub struct SkillBody {
 pub async fn create(State(state): State<AppState>, Json(body): Json<SkillBody>) -> Response {
     let name = body.name.trim().to_string();
     if name.is_empty()
-        || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
     {
-        return err(StatusCode::BAD_REQUEST, "invalid skill name (use a-z 0-9 - _)");
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid skill name (use a-z 0-9 - _)",
+        );
     }
     if body.markdown.trim().is_empty() {
         return err(StatusCode::BAD_REQUEST, "skill body is empty");

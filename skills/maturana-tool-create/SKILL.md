@@ -39,7 +39,7 @@ Tools own executable side effects. Skills explain when and why to invoke them.
 Scaffold:
 
 ```powershell
-.\scripts\maturana.ps1 develop tool <name>
+maturana develop tool <name>
 ```
 
 Implement the smallest executable contract. Add tests or a smoke command.
@@ -47,7 +47,7 @@ Implement the smallest executable contract. Add tests or a smoke command.
 Deploy only after local verification:
 
 ```powershell
-.\scripts\maturana.ps1 deploy tool <agent-id> .\tools\<name> --ip <ip>
+maturana deploy tool <agent-id> .\tools\<name> --ip <ip>
 ```
 
 Document the calling skill and expected environment variables.

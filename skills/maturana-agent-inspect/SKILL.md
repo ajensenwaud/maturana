@@ -59,7 +59,7 @@ Run local inspect first. It is cheap, does not require elevation, and catches
 missing materialization, stale specs, snapshots, and audit state.
 
 ```powershell
-.\scripts\maturana.ps1 agent inspect <agent-id>
+maturana agent inspect <agent-id>
 ```
 
 ## Evidence
@@ -84,7 +84,7 @@ Evidence to collect across local/live/guest inspect:
 Use provider-aware live inspect next:
 
 ```powershell
-.\scripts\maturana.ps1 agent inspect <agent-id> --live
+maturana agent inspect <agent-id> --live
 ```
 
 Expected live inspect details:
@@ -101,7 +101,7 @@ Expected live inspect details:
 When Rust hostd is running, inspect Hyper-V state through the CLI:
 
 ```powershell
-.\scripts\maturana.ps1 agent inspect codex-demo --live
+maturana agent inspect codex-demo --live
 ```
 
 To include guest health, harness versions, systemd status, heartbeat, last
@@ -109,14 +109,14 @@ message, agent log tail, and browser smoke output when configured, ask Rust to
 run the governed SSH diagnostic:
 
 ```powershell
-.\scripts\maturana.ps1 agent inspect codex-demo --live --guest
+maturana agent inspect codex-demo --live --guest
 ```
 
 If hostd cannot discover the guest IP but the VM is running, pass a known guest
 IP and inspect directly over SSH:
 
 ```powershell
-.\scripts\maturana.ps1 agent inspect codex-demo --live --guest --ip 172.26.183.108
+maturana agent inspect codex-demo --live --guest --ip 172.26.183.108
 ```
 
 The SSH-backed inspect prints the guest hostname, harness binary/version,
@@ -127,8 +127,8 @@ guest health, not as a replacement for provider inspect.
 Read known guest logs with:
 
 ```powershell
-.\scripts\maturana.ps1 agent logs codex-demo --ip 172.26.183.108 --kind agent --lines 80
-.\scripts\maturana.ps1 agent logs codex-demo --ip 172.26.183.108 --kind last-message
+maturana agent logs codex-demo --ip 172.26.183.108 --kind agent --lines 80
+maturana agent logs codex-demo --ip 172.26.183.108 --kind last-message
 ```
 
 Allowed log kinds are `agent`, `error`, `stdout`, `stderr`, and
@@ -140,7 +140,7 @@ Live inspect and log reads append events to `.maturana/audit/<agent-id>.jsonl`.
 Read recent audit events with:
 
 ```powershell
-.\scripts\maturana.ps1 audit list codex-demo --limit 10
+maturana audit list codex-demo --limit 10
 ```
 
 ## Linux Firecracker

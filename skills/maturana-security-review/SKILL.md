@@ -46,8 +46,8 @@ effects.
 Run targeted validation first:
 
 ```powershell
-.\scripts\maturana.ps1 spec validate MATURANA.md
-.\scripts\maturana.ps1 skill validate skills
+maturana spec validate MATURANA.md
+maturana skill validate skills
 ```
 
 Run focused tests for changed Rust modules and then the normal CI gate.

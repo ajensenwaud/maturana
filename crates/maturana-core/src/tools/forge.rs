@@ -12,7 +12,10 @@
 use anyhow::Context;
 use base64::Engine as _;
 
-use super::{is_wasm_module, run_tool, Capabilities, ResourceLimits, ToolManifest, ToolRegistry, ToolRunResult};
+use super::{
+    is_wasm_module, run_tool, Capabilities, ResourceLimits, ToolManifest, ToolRegistry,
+    ToolRunResult,
+};
 
 /// How the agent delivered the module source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

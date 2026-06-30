@@ -412,10 +412,18 @@ fn handle_mitm_connect(
     // As in handle_connect: the request is parsed and sent under the 15s
     // timeouts, but the response may stream with long idle gaps, so relax the
     // socket timeouts before relaying it.
-    client_tls.sock.set_read_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
-    client_tls.sock.set_write_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
-    upstream_tls.sock.set_read_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
-    upstream_tls.sock.set_write_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
+    client_tls
+        .sock
+        .set_read_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
+    client_tls
+        .sock
+        .set_write_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
+    upstream_tls
+        .sock
+        .set_read_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
+    upstream_tls
+        .sock
+        .set_write_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
 
     let mut total_bytes = 0u64;
     let mut buf = [0u8; 16 * 1024];
@@ -472,9 +480,7 @@ fn normalize_host(raw: &str) -> anyhow::Result<String> {
 }
 
 fn normalize_host_str(raw: &str) -> String {
-    raw.trim()
-        .trim_end_matches('.')
-        .to_ascii_lowercase()
+    raw.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
 fn has_injections(host: &str, config: &ProxyConfig) -> bool {
@@ -858,7 +864,9 @@ fn spawn_runtime_allow_watcher(path: PathBuf, grants: Arc<RwLock<Vec<String>>>) 
             .and_then(|m| m.modified().ok());
         loop {
             thread::sleep(Duration::from_secs(1));
-            let current = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+            let current = std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok());
             if current != last {
                 last = current;
                 load_runtime_allow(&path, &grants);
@@ -885,10 +893,22 @@ mod tests {
     fn host_normalization_and_allowlist_boundaries() {
         let allow = vec!["api.anthropic.com".to_string()];
         // Trailing-dot FQDN form must not evade the allowlist or injection match.
-        assert_eq!(normalize_host("API.Anthropic.com.").unwrap(), "api.anthropic.com");
-        assert!(host_allowed(&normalize_host("api.anthropic.com.").unwrap(), &allow));
-        assert!(host_allowed(&normalize_host("v1.api.anthropic.com").unwrap(), &allow));
-        assert!(!host_allowed(&normalize_host("api.anthropic.com.evil.com").unwrap(), &allow));
+        assert_eq!(
+            normalize_host("API.Anthropic.com.").unwrap(),
+            "api.anthropic.com"
+        );
+        assert!(host_allowed(
+            &normalize_host("api.anthropic.com.").unwrap(),
+            &allow
+        ));
+        assert!(host_allowed(
+            &normalize_host("v1.api.anthropic.com").unwrap(),
+            &allow
+        ));
+        assert!(!host_allowed(
+            &normalize_host("api.anthropic.com.evil.com").unwrap(),
+            &allow
+        ));
         assert!(!host_allowed(&normalize_host("evil.com").unwrap(), &allow));
         // Embedded credentials / fragments / whitespace are rejected outright.
         for bad in [
@@ -990,7 +1010,10 @@ network:
             config.classify_host("api.example.test"),
             AllowSource::AllowAll
         );
-        assert_eq!(config.classify_host("totally.random.example"), AllowSource::AllowAll);
+        assert_eq!(
+            config.classify_host("totally.random.example"),
+            AllowSource::AllowAll
+        );
         assert_eq!(AllowSource::AllowAll.label(), "allow_all");
     }
 
@@ -1005,7 +1028,10 @@ network:
             allow_all: false,
             runtime_allow: Default::default(),
         };
-        assert_eq!(spec_star.classify_host("anything.example"), AllowSource::AllowAll);
+        assert_eq!(
+            spec_star.classify_host("anything.example"),
+            AllowSource::AllowAll
+        );
 
         // A "*" added to the LIVE runtime grants opens everything without a restart.
         let runtime_star = ProxyConfig {
@@ -1016,9 +1042,19 @@ network:
             allow_all: false,
             runtime_allow: Default::default(),
         };
-        assert_eq!(runtime_star.classify_host("api.notion.com"), AllowSource::Denied);
-        runtime_star.runtime_allow.write().unwrap().push("*".to_string());
-        assert_eq!(runtime_star.classify_host("api.notion.com"), AllowSource::AllowAll);
+        assert_eq!(
+            runtime_star.classify_host("api.notion.com"),
+            AllowSource::Denied
+        );
+        runtime_star
+            .runtime_allow
+            .write()
+            .unwrap()
+            .push("*".to_string());
+        assert_eq!(
+            runtime_star.classify_host("api.notion.com"),
+            AllowSource::AllowAll
+        );
     }
 
     #[test]
@@ -1100,7 +1136,10 @@ network:
         let headers = injected_headers("api.tavily.com", &config).unwrap();
         assert_eq!(
             headers,
-            vec![("Authorization".to_string(), "Bearer tvly-secret".to_string())]
+            vec![(
+                "Authorization".to_string(),
+                "Bearer tvly-secret".to_string()
+            )]
         );
         let _ = std::fs::remove_dir_all(&home);
     }

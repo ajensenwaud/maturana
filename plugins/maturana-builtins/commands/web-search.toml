@@ -1,0 +1,4 @@
+kind = "builtin-command-family"
+feature = "web-search"
+summary = "Rust-owned governed web-search operation using configured providers."
+commands = ["search"]

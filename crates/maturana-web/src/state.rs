@@ -32,11 +32,10 @@ pub enum Broadcast {
     Session(ServerMsg),
 }
 
-/// The shared channel front door, injected by maturana-cli (which owns the
-/// context builder). Args: home_root, agent_id, session_id, user text; returns
-/// the enqueued message id. The web cockpit calls THIS instead of inserting a raw
-/// inbound, so its turns get the same transcript memory + model/reasoning + routing
-/// as Telegram/TUI/Discord. See `channels::enqueue_turn` for the implementation.
+/// The web chat front door, injected by the CLI so slash commands can reuse the
+/// channel command catalog. Plain chat turns flow through `maturana-ops`
+/// conversation enqueueing instead of raw session DB writes, so they keep the
+/// same transcript memory, model/reasoning, and routing as Telegram/TUI/Discord.
 pub type EnqueueTurnFn =
     Arc<dyn Fn(&std::path::Path, &str, &str, &str) -> anyhow::Result<String> + Send + Sync>;
 

@@ -42,7 +42,7 @@ should explain grounding, decisions, evidence, recovery, and boundaries.
 Scaffold:
 
 ```powershell
-.\scripts\maturana.ps1 develop skill <name>
+maturana develop skill <name>
 ```
 
 Fill out the required sections:
@@ -58,7 +58,7 @@ Fill out the required sections:
 Validate:
 
 ```powershell
-.\scripts\maturana.ps1 skill validate skills
+maturana skill validate skills
 ```
 
 Deploy only after validation when the skill is intended for a guest.

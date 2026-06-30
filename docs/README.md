@@ -5,7 +5,7 @@ directory goes deeper. Two files at the repo root are also worth reading early:
 
 - [`AGENTS.md`](../AGENTS.md) — the orientation file Codex reads; principles, the skill index,
   and the architecture in the project's own words.
-- [`skills/`](../skills) — the ~32 skill workflows that are Maturana's primary surface. Each
+- [`skills/`](../skills) — the skill workflows that are Maturana's primary surface. Each
   `skills/<name>/SKILL.md` is an operational playbook.
 
 ## Recommended reading order
@@ -44,6 +44,7 @@ directory goes deeper. Two files at the repo root are also worth reading early:
 | Doc | What it covers |
 | --- | --- |
 | [wasm-tools.md](wasm-tools.md) | The capability-gated WASM tool framework agents use to build their own tools. |
+| [plugins.md](plugins.md) | Plugin manifest/discovery contract for first-party and third-party extensions. |
 | [self-improvement-rl.md](self-improvement-rl.md) | The RL data flywheel: capture trajectories, reward, curate, redeploy behind a snapshot. |
 | [skill-workflows.md](skill-workflows.md) | The required shape for a Maturana skill (grounding, preflight, evidence, recovery, boundaries). |
 | [script-boundary.md](script-boundary.md) | The "Rust owns decisions, scripts are leaf adapters" rule and how scripts are classified. |

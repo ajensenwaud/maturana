@@ -264,8 +264,8 @@ example, and re-run — never weaken validation, and don't guess at new fields.
    *Telegram delivery* (the outbox thread pushing to the chat), which `agent run`
    doesn't cover. Don't make this a routine relay-and-say-"sent" step.
 
-(On Windows you can use `.\scripts\maturana.ps1 …` if `maturana` isn't yet on
-PATH in the current shell.)
+(On Windows, reopen the shell after installation if `maturana` is not yet on
+PATH.)
 
 ## Evidence
 

@@ -118,7 +118,10 @@ impl ToolManifest {
             anyhow::bail!("tool '{}' is missing a wasm module path", self.name);
         }
         if self.wasm.contains("..") || self.wasm.starts_with('/') || self.wasm.contains('\\') {
-            anyhow::bail!("tool '{}' wasm path must stay inside its directory", self.name);
+            anyhow::bail!(
+                "tool '{}' wasm path must stay inside its directory",
+                self.name
+            );
         }
         if self.limits.timeout_ms == 0 {
             anyhow::bail!("tool '{}' timeout_ms must be greater than zero", self.name);
@@ -133,7 +136,12 @@ impl ToolManifest {
         // reject traversal sequences that would let a declared grant escape the
         // directory it names. (Operators still vet the absolute roots a tool may
         // request via the security-review skill.)
-        for dir in self.capabilities.fs_read.iter().chain(&self.capabilities.fs_write) {
+        for dir in self
+            .capabilities
+            .fs_read
+            .iter()
+            .chain(&self.capabilities.fs_write)
+        {
             if dir.split(|c| c == '/' || c == '\\').any(|seg| seg == "..") {
                 anyhow::bail!(
                     "tool '{}' capability path '{dir}' must not contain '..'",
@@ -207,8 +215,7 @@ impl ToolRegistry {
             );
         }
         let dir = self.tool_dir(&manifest.name);
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("failed to create {}", dir.display()))?;
+        fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
 
         let wasm_name = "module.wasm";
         fs::write(dir.join(wasm_name), wasm_bytes)
@@ -216,8 +223,11 @@ impl ToolRegistry {
 
         let mut stored = manifest.clone();
         stored.wasm = wasm_name.to_string();
-        fs::write(self.manifest_path(&manifest.name), serde_json::to_string_pretty(&stored)?)
-            .with_context(|| format!("failed to write manifest for {}", manifest.name))?;
+        fs::write(
+            self.manifest_path(&manifest.name),
+            serde_json::to_string_pretty(&stored)?,
+        )
+        .with_context(|| format!("failed to write manifest for {}", manifest.name))?;
         Ok(stored)
     }
 
@@ -275,11 +285,7 @@ pub fn is_wasm_module(bytes: &[u8]) -> bool {
 /// With the `wasm-runtime` feature this executes the module in a sandbox; the
 /// control-plane build (default) returns an explanatory error so callers can
 /// still register, list, and reason about tools.
-pub fn run_tool(
-    registry: &ToolRegistry,
-    name: &str,
-    input: &str,
-) -> anyhow::Result<ToolRunResult> {
+pub fn run_tool(registry: &ToolRegistry, name: &str, input: &str) -> anyhow::Result<ToolRunResult> {
     let manifest = registry.load(name)?;
     let wasm = registry.wasm_bytes(&manifest)?;
     run_manifest(&manifest, &wasm, input)
@@ -452,7 +458,9 @@ mod tests {
         };
         reg.register(&manifest, &tiny_wasm()).unwrap();
         let error = run_tool(&reg, "echo", "{}").unwrap_err();
-        assert!(error.to_string().contains("wasm execution engine not built in"));
+        assert!(error
+            .to_string()
+            .contains("wasm execution engine not built in"));
         let _ = fs::remove_dir_all(reg.root());
     }
 }

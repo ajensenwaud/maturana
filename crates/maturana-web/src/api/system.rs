@@ -29,9 +29,11 @@ fn host_stats() -> serde_json::Value {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(0);
-    let uptime = std::fs::read_to_string("/proc/uptime")
-        .ok()
-        .and_then(|s| s.split_whitespace().next().and_then(|x| x.parse::<f64>().ok()));
+    let uptime = std::fs::read_to_string("/proc/uptime").ok().and_then(|s| {
+        s.split_whitespace()
+            .next()
+            .and_then(|x| x.parse::<f64>().ok())
+    });
     let loadavg: Vec<f64> = std::fs::read_to_string("/proc/loadavg")
         .ok()
         .map(|s| {
@@ -83,7 +85,10 @@ fn disk_usage(path: &str) -> (Option<u64>, Option<u64>) {
     }
     let text = String::from_utf8_lossy(&out.stdout);
     if let Some(line) = text.lines().nth(1) {
-        let nums: Vec<u64> = line.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+        let nums: Vec<u64> = line
+            .split_whitespace()
+            .filter_map(|x| x.parse().ok())
+            .collect();
         if nums.len() == 2 {
             return (Some(nums[0]), Some(nums[1]));
         }
@@ -157,11 +162,7 @@ pub async fn logs(State(state): State<AppState>, Query(q): Query<LogQuery>) -> R
 pub async fn log_sources(State(state): State<AppState>) -> Response {
     let root = state.home_root.clone();
     match blocking(move || {
-        let mut sources = vec![
-            "plane".to_string(),
-            "web".to_string(),
-            "fleet".to_string(),
-        ];
+        let mut sources = vec!["plane".to_string(), "web".to_string(), "fleet".to_string()];
         if let Ok(rd) = std::fs::read_dir(root.join("audit")) {
             for entry in rd.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
